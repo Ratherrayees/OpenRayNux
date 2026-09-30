@@ -101,13 +101,25 @@ mod tests {
     #[test]
     fn codes_are_distinct() {
         let all = [
-            DomainError::InvalidId { kind: "task", reason: "empty".into() },
+            DomainError::InvalidId {
+                kind: "task",
+                reason: "empty".into(),
+            },
             DomainError::UnknownCapability(CapabilityId::new("c")),
-            DomainError::IllegalTransition { from: TaskState::Completed, to: TaskState::Running },
+            DomainError::IllegalTransition {
+                from: TaskState::Completed,
+                to: TaskState::Running,
+            },
             DomainError::ApprovalDigestMismatch,
-            DomainError::ApprovalExpired { expires_at_ms: 1, now_ms: 2 },
+            DomainError::ApprovalExpired {
+                expires_at_ms: 1,
+                now_ms: 2,
+            },
             DomainError::ActorMayNotGrant { label: "ai" },
-            DomainError::InvalidParams { capability: CapabilityId::new("c"), reason: "x".into() },
+            DomainError::InvalidParams {
+                capability: CapabilityId::new("c"),
+                reason: "x".into(),
+            },
             DomainError::DataClassExceeded {
                 required: DataClass::Regulated,
                 permitted: DataClass::Public,
@@ -122,7 +134,10 @@ mod tests {
 
     #[test]
     fn messages_carry_useful_context() {
-        let e = DomainError::IllegalTransition { from: TaskState::Completed, to: TaskState::Running };
+        let e = DomainError::IllegalTransition {
+            from: TaskState::Completed,
+            to: TaskState::Running,
+        };
         let msg = e.to_string();
         assert!(msg.contains("Completed"), "message lost context: {msg}");
         assert!(msg.contains("Running"), "message lost context: {msg}");

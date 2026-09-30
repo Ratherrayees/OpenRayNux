@@ -15,6 +15,10 @@ publish.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Error types are part of the wire vocabulary: a client must be able to match on
+# `RpcErrorCode` and render a message, so the derive belongs to the crate that
+# defines them rather than to every consumer.
+thiserror = { workspace = true }
 orxnud-domain = { workspace = true }
 
 [dev-dependencies]

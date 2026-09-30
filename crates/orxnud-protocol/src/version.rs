@@ -16,6 +16,14 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
 #[serde(transparent)]
 pub struct ProtocolVersion(pub u16);
 
+impl ProtocolVersion {
+    /// The number, as the wire represents it.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
 impl std::fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -47,7 +55,10 @@ impl VersionRange {
 
 impl Default for VersionRange {
     fn default() -> Self {
-        Self { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION }
+        Self {
+            min: PROTOCOL_VERSION,
+            max: PROTOCOL_VERSION,
+        }
     }
 }
 
@@ -77,7 +88,10 @@ pub fn negotiate(
     let low = client.min.max(server.min);
     let high = client.max.min(server.max);
     if low > high {
-        return Err(ProtocolError::VersionMismatch { client: client.clone(), server: server.clone() });
+        return Err(ProtocolError::VersionMismatch {
+            client: client.clone(),
+            server: server.clone(),
+        });
     }
     // Prefer the highest mutually acceptable version, so a newer client is not
     // silently downgraded when the daemon could speak more.
@@ -90,22 +104,22 @@ impl ProtocolError {
     pub fn to_rpc(&self) -> RpcError {
         match self {
             Self::VersionMismatch { .. } | Self::InvalidVersionRange { .. } => RpcError {
-                code: RpcErrorCode::UnsupportedProtocolVersion,
+                code: RpcErrorCode::UNSUPPORTED_PROTOCOL_VERSION,
                 message: self.to_string(),
                 data: None,
             },
             Self::FrameTooLarge { size, limit } => RpcError {
-                code: RpcErrorCode::InvalidRequest,
+                code: RpcErrorCode::INVALID_REQUEST,
                 message: self.to_string(),
                 data: Some(serde_json::json!({ "size": size, "limit": limit })),
             },
             Self::DepthExceeded { depth, limit } => RpcError {
-                code: RpcErrorCode::InvalidRequest,
+                code: RpcErrorCode::INVALID_REQUEST,
                 message: self.to_string(),
                 data: Some(serde_json::json!({ "depth": depth, "limit": limit })),
             },
             Self::Malformed { reason } => RpcError {
-                code: RpcErrorCode::ParseError,
+                code: RpcErrorCode::PARSE_ERROR,
                 message: self.to_string(),
                 data: Some(serde_json::json!({ "reason": reason })),
             },
@@ -129,8 +143,14 @@ mod tests {
 
     #[test]
     fn negotiation_prefers_the_highest_common_version() {
-        let client = VersionRange { min: v(1), max: v(3) };
-        let server = VersionRange { min: v(2), max: v(5) };
+        let client = VersionRange {
+            min: v(1),
+            max: v(3),
+        };
+        let server = VersionRange {
+            min: v(2),
+            max: v(5),
+        };
         assert_eq!(negotiate(&client, &server), Ok(v(3)));
     }
 
@@ -138,8 +158,14 @@ mod tests {
     fn disjoint_ranges_error_rather_than_downgrade_silently() {
         // Silently picking a version neither side wanted is how protocol bugs
         // become unreproducible.
-        let client = VersionRange { min: v(1), max: v(1) };
-        let server = VersionRange { min: v(2), max: v(2) };
+        let client = VersionRange {
+            min: v(1),
+            max: v(1),
+        };
+        let server = VersionRange {
+            min: v(2),
+            max: v(2),
+        };
         assert!(matches!(
             negotiate(&client, &server),
             Err(ProtocolError::VersionMismatch { .. })
@@ -148,7 +174,10 @@ mod tests {
 
     #[test]
     fn inverted_range_is_rejected() {
-        let bad = VersionRange { min: v(5), max: v(1) };
+        let bad = VersionRange {
+            min: v(5),
+            max: v(1),
+        };
         assert!(matches!(
             negotiate(&bad, &VersionRange::default()),
             Err(ProtocolError::InvalidVersionRange { .. })
@@ -161,7 +190,7 @@ mod tests {
         let server = VersionRange::exact(v(2));
         let err = negotiate(&client, &server).expect_err("should mismatch");
         let rpc = err.to_rpc();
-        assert_eq!(rpc.code, RpcErrorCode::UnsupportedProtocolVersion);
+        assert_eq!(rpc.code, RpcErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
         assert!(!rpc.message.is_empty());
     }
 
@@ -174,7 +203,10 @@ mod tests {
 
     #[test]
     fn range_acceptance_is_inclusive_at_both_ends() {
-        let r = VersionRange { min: v(2), max: v(4) };
+        let r = VersionRange {
+            min: v(2),
+            max: v(4),
+        };
         assert!(!r.accepts(v(1)));
         assert!(r.accepts(v(2)));
         assert!(r.accepts(v(4)));

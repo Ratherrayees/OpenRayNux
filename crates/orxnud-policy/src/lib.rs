@@ -55,8 +55,28 @@ pub mod digest;
 pub mod engine;
 pub mod policy_set;
 
-pub use budget::{BudgetLedger, BudgetError, Ceiling};
+pub use budget::{BudgetError, BudgetLedger, Ceiling};
 pub use decision::{Decision, DenialReason, PolicyError};
-pub use digest::{digest_for, DigestError};
+pub use digest::{DigestError, digest_for};
 pub use engine::PolicyEngine;
 pub use policy_set::{Grant, PolicySet};
+
+/// This crate's authorisation seal.
+///
+/// Named here so the policy engine has one obvious way to obtain it. Gate G2 in
+/// `scripts/ci-gates.sh` fails the build if any crate other than
+/// `orxnud-policy` references `PolicySeal`, so this is the only place a proof
+/// can come from.
+pub fn seal() -> orxnud_domain::PolicySeal {
+    orxnud_domain::PolicySeal::attest("orxnud-policy")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_seal_names_this_crate() {
+        assert_eq!(seal().issued_by(), "orxnud-policy");
+    }
+}

@@ -84,7 +84,11 @@ pub struct ModelProvenance {
 impl ModelProvenance {
     /// Builds a provenance record with no revision.
     #[must_use]
-    pub fn new(model: impl Into<String>, prompt_hash: impl Into<String>, request_id: RequestId) -> Self {
+    pub fn new(
+        model: impl Into<String>,
+        prompt_hash: impl Into<String>,
+        request_id: RequestId,
+    ) -> Self {
         Self {
             model: model.into(),
             revision: None,
@@ -252,9 +256,19 @@ mod tests {
 
     fn all_actors() -> Vec<Actor> {
         vec![
-            Actor::Human { user: human(), via: AuthChannel::LocalInteractive },
-            Actor::Ai { delegated_by: human(), run: run(), task: task(), provenance: provenance() },
-            Actor::System { component: SystemComponent::Backup },
+            Actor::Human {
+                user: human(),
+                via: AuthChannel::LocalInteractive,
+            },
+            Actor::Ai {
+                delegated_by: human(),
+                run: run(),
+                task: task(),
+                provenance: provenance(),
+            },
+            Actor::System {
+                component: SystemComponent::Backup,
+            },
             Actor::Integration {
                 capability: CapabilityId::new("c"),
                 granted_by: human(),
@@ -265,7 +279,10 @@ mod tests {
                 authorised_by: human(),
                 task: task(),
             },
-            Actor::External { source: ExternalSource::Unknown, request: request() },
+            Actor::External {
+                source: ExternalSource::Unknown,
+                request: request(),
+            },
         ]
     }
 
@@ -286,11 +303,20 @@ mod tests {
     fn system_and_external_have_no_authority_root() {
         // System and External cannot borrow a human's authority. This is what
         // stops a webhook from acting with the user's permissions.
-        assert!(Actor::System { component: SystemComponent::Migration }.authority_root().is_none());
         assert!(
-            Actor::External { source: ExternalSource::Unknown, request: request() }
-                .authority_root()
-                .is_none()
+            Actor::System {
+                component: SystemComponent::Migration
+            }
+            .authority_root()
+            .is_none()
+        );
+        assert!(
+            Actor::External {
+                source: ExternalSource::Unknown,
+                request: request()
+            }
+            .authority_root()
+            .is_none()
         );
     }
 
@@ -311,7 +337,10 @@ mod tests {
     fn ai_actor_never_outranks_its_human() {
         // The structural statement of "never additive": an AI actor derives
         // its authority, it does not hold any of its own.
-        let human_actor = Actor::Human { user: human(), via: AuthChannel::LocalInteractive };
+        let human_actor = Actor::Human {
+            user: human(),
+            via: AuthChannel::LocalInteractive,
+        };
         let ai_actor = Actor::Ai {
             delegated_by: human(),
             run: run(),

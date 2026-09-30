@@ -11,6 +11,10 @@ publish.workspace = true
 
 # One of exactly three crates permitted to contain cfg(target_os) (CI gate G7).
 [dependencies]
+thiserror = { workspace = true }
+# `Zeroizing` so a secret read out of the store is wiped on drop rather than left
+# in a heap allocation for the allocator to reuse at some later point.
+zeroize = { workspace = true }
 orxnud-domain = { workspace = true }
 keyring = { workspace = true }
 

@@ -24,6 +24,12 @@ orxnud-store = { workspace = true }
 orxnud-policy = { workspace = true }
 orxnud-audit = { workspace = true }
 
+# The Phase 2 engine writes task rows directly (ADR-0006: one writer, one
+# connection), and the TP-7 power-loss victim runs a *standalone* script that
+# must not go through the engine under test -- otherwise the test would be
+# testing the code it is meant to validate.
+rusqlite = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 trybuild = { workspace = true }

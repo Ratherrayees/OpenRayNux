@@ -166,7 +166,10 @@ mod tests {
     fn hex_is_lowercase_and_64_chars() {
         let hex = ApprovalDigest::from_bytes([0xABu8; 32]).to_hex();
         assert_eq!(hex.len(), 64);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(hex, "ab".repeat(32));
     }
 
@@ -184,7 +187,10 @@ mod tests {
     fn a_zero_digest_is_never_valid() {
         // Defence in depth: a record with no digest must not be honoured, even
         // inside its time window.
-        let r = ApprovalRecord { digest: ApprovalDigest::ZERO, ..record() };
+        let r = ApprovalRecord {
+            digest: ApprovalDigest::ZERO,
+            ..record()
+        };
         assert!(!r.is_valid_at(1_500));
     }
 
@@ -197,12 +203,30 @@ mod tests {
         // drops one is caught.
         let base = record();
         let variants = [
-            ApprovalRecord { actor_label: "other".into(), ..base.clone() },
-            ApprovalRecord { capability: "delete-file".into(), ..base.clone() },
-            ApprovalRecord { target: "https://example.invalid/bob".into(), ..base.clone() },
-            ApprovalRecord { params: NormalizedParams::canonical("{\"to\":\"bob\"}"), ..base.clone() },
-            ApprovalRecord { issued_at_ms: 1_001, ..base.clone() },
-            ApprovalRecord { expires_at_ms: 2_001, ..base.clone() },
+            ApprovalRecord {
+                actor_label: "other".into(),
+                ..base.clone()
+            },
+            ApprovalRecord {
+                capability: "delete-file".into(),
+                ..base.clone()
+            },
+            ApprovalRecord {
+                target: "https://example.invalid/bob".into(),
+                ..base.clone()
+            },
+            ApprovalRecord {
+                params: NormalizedParams::canonical("{\"to\":\"bob\"}"),
+                ..base.clone()
+            },
+            ApprovalRecord {
+                issued_at_ms: 1_001,
+                ..base.clone()
+            },
+            ApprovalRecord {
+                expires_at_ms: 2_001,
+                ..base.clone()
+            },
         ];
         for v in &variants {
             assert_ne!(base, *v, "mutation did not change the record");

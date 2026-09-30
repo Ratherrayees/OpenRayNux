@@ -48,6 +48,35 @@ impl SecretRef {
             account: account.into(),
         }
     }
+
+    /// The logical name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The service the entry lives under.
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// The account within the service.
+    #[must_use]
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    /// The composite key a single-entry backend would use.
+    ///
+    /// A `SecretRef` names a `(service, account)` pair, but most credential stores
+    /// key on a single string. Joining them here — in one place, with the
+    /// separator visible — means an adapter cannot invent a different joining and
+    /// end up addressing a different entry than the reference names.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}::{}", self.service, self.account)
+    }
 }
 
 /// A filesystem request, already scoped to a granted root.
@@ -64,22 +93,37 @@ pub trait FsContract {
     /// `max_bytes` is a parameter rather than a constant so a caller cannot
     /// accidentally read a 10 GB "log file" into memory — the deserialisation
     /// bound from control S21.
-    fn read_bounded(
-        &self,
-        path: &std::path::Path,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, Self::Error>;
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if the path is outside the granted root, does
+    /// not exist, or is larger than `max_bytes`.
+    fn read_bounded(&self, path: &std::path::Path, max_bytes: u64) -> Result<Vec<u8>, Self::Error>;
 
     /// Writes atomically: to a temporary sibling, then rename.
     ///
     /// Atomic rather than in-place because a torn file in `critical` state is
     /// worse than a missing one.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if the path is outside the granted root, or if
+    /// the temporary write or the rename fails.
     fn write_atomic(&self, path: &std::path::Path, contents: &[u8]) -> Result<(), Self::Error>;
 
     /// Whether a path exists within the granted root.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if the path is outside the granted root.
     fn exists(&self, path: &std::path::Path) -> Result<bool, Self::Error>;
 
     /// Creates a directory and its parents, idempotently.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if the path is outside the granted root or
+    /// cannot be created.
     fn ensure_dir(&self, path: &std::path::Path) -> Result<(), Self::Error>;
 }
 
@@ -129,12 +173,28 @@ pub trait SecretsContract {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Resolves a reference to its value.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if no secret store is available, or the
+    /// reference cannot be resolved.
     fn get(&self, reference: &SecretRef) -> Result<SecretLookup, Self::Error>;
 
     /// Stores a value. Used by an explicit user action, never automatically.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if no secret store is available, or the write
+    /// fails. A caller must treat failure as a refusal, never as "stored
+    /// anyway".
     fn set(&self, reference: &SecretRef, value: &str) -> Result<(), Self::Error>;
 
     /// Removes a stored value.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if no secret store is available, or the delete
+    /// fails.
     fn delete(&self, reference: &SecretRef) -> Result<(), Self::Error>;
 
     /// Whether a usable secret store exists on this host.
@@ -151,6 +211,12 @@ pub trait NotifyContract {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Delivers a notification.
+    ///
+    /// # Errors
+    ///
+    /// The implementation's error if no transport exists or delivery fails. A
+    /// caller should check [`Self::is_available`] first; Phase 1 has no
+    /// interface, so this is expected to fail rather than to silently succeed.
     fn deliver(&self, request: &NotificationRequest) -> Result<(), Self::Error>;
 
     /// Whether a real transport exists on this host.

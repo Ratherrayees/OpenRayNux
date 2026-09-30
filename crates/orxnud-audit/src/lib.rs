@@ -36,10 +36,40 @@ pub use record::{AuditOutcome, AuditRecord, OutcomeKind};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orxnud_domain::{Actor, AuthChannel, DataClass, RiskClass, UserId};
 
-    /// A canonical, deterministic clock for tests. The journal takes time as a
-    /// parameter so tests never depend on the wall clock.
-    pub(crate) fn fixed_now() -> i64 {
+    /// A canonical, deterministic instant for tests.
+    ///
+    /// The journal takes time as a parameter, so tests never read the wall clock;
+    /// this is the value they pass.
+    #[must_use]
+    pub(crate) const fn fixed_now() -> i64 {
         1_700_000_000_000
+    }
+
+    #[test]
+    fn the_test_clock_is_the_value_the_chain_records() {
+        // Keeps the helper honest: if the journal ever starts stamping its own
+        // time, this is where it shows up.
+        let record = AuditRecord::authorised(
+            Actor::Human {
+                user: UserId::new("u"),
+                via: AuthChannel::LocalInteractive,
+            },
+            "capability.test",
+            None,
+            DataClass::Public,
+            RiskClass::Low,
+            "policy/1",
+            None,
+            None,
+            None,
+            None,
+            fixed_now(),
+        );
+        assert_eq!(
+            record.outcome,
+            AuditOutcome::Authorised { at_ms: fixed_now() }
+        );
     }
 }

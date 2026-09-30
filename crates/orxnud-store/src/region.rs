@@ -63,7 +63,9 @@ impl RegionRegistry {
     /// An empty registry.
     #[must_use]
     pub fn empty() -> Self {
-        Self { regions: BTreeMap::new() }
+        Self {
+            regions: BTreeMap::new(),
+        }
     }
 
     /// Declares a region.
@@ -99,7 +101,8 @@ impl RegionRegistry {
     /// same rule as risk classification.
     #[must_use]
     pub fn intent_layer_may_write(&self, name: &str) -> bool {
-        self.get(name).is_some_and(StateRegion::writable_by_intent_layer)
+        self.get(name)
+            .is_some_and(StateRegion::writable_by_intent_layer)
     }
 
     /// The regions whose loss would be a lost *action*.
@@ -124,7 +127,12 @@ mod tests {
     use orxnud_domain::{StateClass, StateConsistency};
 
     fn region(name: &'static str, class: StateClass) -> StateRegion {
-        StateRegion { name, class, owner: "orxnud-test", retention: "indefinite" }
+        StateRegion {
+            name,
+            class,
+            owner: "orxnud-test",
+            retention: "indefinite",
+        }
     }
 
     #[test]
@@ -145,9 +153,12 @@ mod tests {
     #[test]
     fn only_derived_regions_are_intent_writable() {
         let mut reg = RegionRegistry::empty();
-        reg.declare(region("summaries", StateClass::Derived)).expect("declare");
-        reg.declare(region("tasks", StateClass::Critical)).expect("declare");
-        reg.declare(region("policy", StateClass::Authoritative)).expect("declare");
+        reg.declare(region("summaries", StateClass::Derived))
+            .expect("declare");
+        reg.declare(region("tasks", StateClass::Critical))
+            .expect("declare");
+        reg.declare(region("policy", StateClass::Authoritative))
+            .expect("declare");
         assert!(reg.intent_layer_may_write("summaries"));
         assert!(!reg.intent_layer_may_write("tasks"));
         assert!(!reg.intent_layer_may_write("policy"));
@@ -156,18 +167,25 @@ mod tests {
     #[test]
     fn duplicate_declarations_are_rejected() {
         let mut reg = RegionRegistry::empty();
-        reg.declare(region("tasks", StateClass::Critical)).expect("first");
+        reg.declare(region("tasks", StateClass::Critical))
+            .expect("first");
         assert!(reg.declare(region("tasks", StateClass::Derived)).is_err());
         // The first declaration wins; a later one must not silently replace it.
-        assert_eq!(reg.get("tasks").map(|r| r.class), Some(StateClass::Critical));
+        assert_eq!(
+            reg.get("tasks").map(|r| r.class),
+            Some(StateClass::Critical)
+        );
     }
 
     #[test]
     fn critical_regions_are_enumerable() {
         let mut reg = RegionRegistry::empty();
-        reg.declare(region("tasks", StateClass::Critical)).expect("declare");
-        reg.declare(region("schedules", StateClass::Critical)).expect("declare");
-        reg.declare(region("summaries", StateClass::Derived)).expect("declare");
+        reg.declare(region("tasks", StateClass::Critical))
+            .expect("declare");
+        reg.declare(region("schedules", StateClass::Critical))
+            .expect("declare");
+        reg.declare(region("summaries", StateClass::Derived))
+            .expect("declare");
         let critical: Vec<&str> = reg.critical_regions().iter().map(|r| r.name).collect();
         assert_eq!(critical, vec!["schedules", "tasks"]);
     }

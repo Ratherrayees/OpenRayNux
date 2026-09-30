@@ -11,6 +11,7 @@ publish.workspace = true
 
 # One of exactly three crates permitted to contain cfg(target_os) (CI gate G7).
 [dependencies]
+thiserror = { workspace = true }
 orxnud-domain = { workspace = true }
 
 [dev-dependencies]

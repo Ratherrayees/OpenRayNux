@@ -54,7 +54,11 @@ impl RpcError {
     /// Builds an error with no structured data.
     #[must_use]
     pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), data: None }
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
     }
 
     /// The JSON-RPC method-not-found error, used for unknown methods.
@@ -141,6 +145,16 @@ pub enum ProtocolError {
     },
 }
 
+impl std::fmt::Display for crate::version::VersionRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.min == self.max {
+            write!(f, "{}", self.min)
+        } else {
+            write!(f, "{}..{}", self.min, self.max)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +192,29 @@ mod tests {
         ] {
             assert!(!e.message.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn a_version_range_renders_readably_in_a_mismatch() {
+        // `ProtocolError::VersionMismatch` interpolates these into its message,
+        // so a range that cannot be displayed is a broken error, not a cosmetic
+        // problem.
+        use crate::version::{PROTOCOL_VERSION, ProtocolVersion, VersionRange};
+        let exact = VersionRange::exact(PROTOCOL_VERSION);
+        assert_eq!(exact.to_string(), PROTOCOL_VERSION.to_string());
+        let span = VersionRange {
+            min: ProtocolVersion(1),
+            max: ProtocolVersion(3),
+        };
+        assert_eq!(span.to_string(), "1..3");
+
+        let err = ProtocolError::VersionMismatch {
+            client: span.clone(),
+            server: exact.clone(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("1..3"), "{rendered}");
+        assert!(rendered.contains(&exact.to_string()), "{rendered}");
     }
 
     #[test]

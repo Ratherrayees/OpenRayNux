@@ -98,7 +98,10 @@ impl Pragma {
     /// necessarily across power loss. Cheaper per commit.
     #[must_use]
     pub fn derived() -> Self {
-        Self { synchronous: "normal", ..Self::critical() }
+        Self {
+            synchronous: "normal",
+            ..Self::critical()
+        }
     }
 
     /// The set for an **in-memory** database. Tests only.
@@ -114,7 +117,11 @@ impl Pragma {
     /// no crash recovery, so it cannot exercise TP-1, TP-4, or TP-7 at all.
     #[must_use]
     pub fn in_memory() -> Self {
-        Self { journal_mode: "memory", synchronous: "full", ..Self::critical() }
+        Self {
+            journal_mode: "memory",
+            synchronous: "full",
+            ..Self::critical()
+        }
     }
 
     /// The statements to apply, in order.
@@ -124,14 +131,29 @@ impl Pragma {
     #[must_use]
     pub fn statements(self) -> Vec<(&'static str, String)> {
         vec![
-            ("journal_mode", format!("PRAGMA journal_mode = {};", self.journal_mode)),
-            ("synchronous", format!("PRAGMA synchronous = {};", self.synchronous)),
+            (
+                "journal_mode",
+                format!("PRAGMA journal_mode = {};", self.journal_mode),
+            ),
+            (
+                "synchronous",
+                format!("PRAGMA synchronous = {};", self.synchronous),
+            ),
             (
                 "foreign_keys",
-                format!("PRAGMA foreign_keys = {};", if self.foreign_keys { "ON" } else { "OFF" }),
+                format!(
+                    "PRAGMA foreign_keys = {};",
+                    if self.foreign_keys { "ON" } else { "OFF" }
+                ),
             ),
-            ("busy_timeout", format!("PRAGMA busy_timeout = {};", self.busy_timeout_ms)),
-            ("cache_size", format!("PRAGMA cache_size = {};", self.cache_size_kib)),
+            (
+                "busy_timeout",
+                format!("PRAGMA busy_timeout = {};", self.busy_timeout_ms),
+            ),
+            (
+                "cache_size",
+                format!("PRAGMA cache_size = {};", self.cache_size_kib),
+            ),
         ]
     }
 
@@ -142,7 +164,8 @@ impl Pragma {
     /// [`PragmaError::Apply`] on the first statement that fails.
     pub fn apply(self, conn: &Connection) -> Result<(), PragmaError> {
         for (name, sql) in self.statements() {
-            conn.execute_batch(&sql).map_err(|source| PragmaError::Apply { name, source })?;
+            conn.execute_batch(&sql)
+                .map_err(|source| PragmaError::Apply { name, source })?;
         }
         Ok(())
     }
@@ -159,7 +182,10 @@ impl Pragma {
     pub fn verify(self, conn: &Connection) -> Result<(), PragmaError> {
         let actual_mode: String = conn
             .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
-            .map_err(|source| PragmaError::Read { name: "journal_mode", source })?;
+            .map_err(|source| PragmaError::Read {
+                name: "journal_mode",
+                source,
+            })?;
         if !actual_mode.eq_ignore_ascii_case(self.journal_mode) {
             return Err(PragmaError::Mismatch {
                 name: "journal_mode",
@@ -171,7 +197,10 @@ impl Pragma {
         // SQLite reports synchronous as an integer: 0=OFF 1=NORMAL 2=FULL 3=EXTRA.
         let actual_sync: i64 = conn
             .query_row("PRAGMA synchronous;", [], |r| r.get(0))
-            .map_err(|source| PragmaError::Read { name: "synchronous", source })?;
+            .map_err(|source| PragmaError::Read {
+                name: "synchronous",
+                source,
+            })?;
         let expected_sync = match self.synchronous {
             "off" => 0,
             "normal" => 1,
@@ -189,7 +218,10 @@ impl Pragma {
 
         let actual_fk: i64 = conn
             .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
-            .map_err(|source| PragmaError::Read { name: "foreign_keys", source })?;
+            .map_err(|source| PragmaError::Read {
+                name: "foreign_keys",
+                source,
+            })?;
         let expected_fk = i64::from(self.foreign_keys);
         if actual_fk != expected_fk {
             return Err(PragmaError::Mismatch {
@@ -236,7 +268,9 @@ mod tests {
         let p = Pragma::derived();
         p.apply(&conn).expect("apply");
         p.verify(&conn).expect("verify");
-        let sync: i64 = conn.query_row("PRAGMA synchronous;", [], |r| r.get(0)).expect("read");
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous;", [], |r| r.get(0))
+            .expect("read");
         assert_eq!(sync, 1, "derived should be NORMAL(1), not FULL(2)");
         let _ = std::fs::remove_file(&path);
     }
@@ -260,7 +294,13 @@ mod tests {
         // Deliberately do NOT apply, then verify: journal_mode will not be WAL.
         let p = Pragma::critical();
         assert!(
-            matches!(p.verify(&conn), Err(PragmaError::Mismatch { name: "journal_mode", .. })),
+            matches!(
+                p.verify(&conn),
+                Err(PragmaError::Mismatch {
+                    name: "journal_mode",
+                    ..
+                })
+            ),
             "verify must fail when the pragma was never applied"
         );
     }
@@ -271,7 +311,8 @@ mod tests {
         // an :memory: database for WAL yields "memory", and verify() catches
         // the discrepancy rather than letting it slide.
         let conn = Connection::open_in_memory().expect("open");
-        conn.execute_batch("PRAGMA journal_mode = wal;").expect("attempt wal");
+        conn.execute_batch("PRAGMA journal_mode = wal;")
+            .expect("attempt wal");
         let actual: String = conn
             .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
             .expect("read");
@@ -279,12 +320,16 @@ mod tests {
 
         let p = Pragma::in_memory();
         p.apply(&conn).expect("apply");
-        p.verify(&conn).expect("verify with the honest in-memory set");
+        p.verify(&conn)
+            .expect("verify with the honest in-memory set");
 
         // And the critical set correctly *fails* here rather than pretending.
         assert!(matches!(
             Pragma::critical().verify(&conn),
-            Err(PragmaError::Mismatch { name: "journal_mode", .. })
+            Err(PragmaError::Mismatch {
+                name: "journal_mode",
+                ..
+            })
         ));
     }
 

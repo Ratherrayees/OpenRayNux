@@ -1,5 +1,10 @@
 [workspace]
 resolver = "3"
+# Listed exhaustively rather than as `crates/*` globs. `cargo deny` treats a glob
+# as a wildcard dependency and rejects it, and separately: a glob would silently
+# pick up a new crate directory, which is exactly the drift the contract forbids
+# without an ADR. Gate G7 fails if this list and the directory contents disagree,
+# so a new crate cannot join by being dropped into `crates/`.
 members = [
     "crates/orxnud-domain",
     "crates/orxnud-protocol",
@@ -38,6 +43,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# A build-dependency only: it makes `DEP_SQLITE3_INCLUDE` available to
+# `orxnud-store`'s build script, which parses the bundled `sqlite3.h` to
+# assert the linked version at compile time. Never linked into the library.
+libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt", "std"] }
@@ -45,16 +54,17 @@ clap = { version = "4.6.7", features = ["derive"] }
 blake3 = "1.8.7"
 zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 toml = "0.9.8"
-croner = "4.0.0"
+croner = { version = "4.0.0", default-features = false, features = ["jiff"] }
 jiff = "0.2.37"
-# One credential-store backend per supported platform family. The backend is
-# chosen at build time here; Phase 2 selects a *runtime* fallback and warns
-# loudly on a headless Linux session with no Secret Service (control S9).
-keyring = { version = "4.2.0", default-features = false, features = [
-  "apple-native-keyring-store",
-  "windows-native-keyring-store",
-  "zbus-secret-service-keyring-store",
-] }
+# One credential-store backend per supported platform family, chosen at build
+# time; Phase 2 selects a *runtime* fallback and warns loudly on a headless Linux
+# session with no Secret Service (control S9).
+#
+# `v1` is the feature to ask for, not the individual store crates. It is what
+# `keyring` requires (the crate `compile_error!`s without `v1` or `cli`) and it is
+# what pulls in the three native backends. Naming the store crates directly is a
+# compile error, so this is the supported spelling rather than a shorthand.
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 directories = "6.0.0"
 uuid = { version = "1.26.1", features = ["v4"] }
 

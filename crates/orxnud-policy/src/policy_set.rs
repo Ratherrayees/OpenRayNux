@@ -187,13 +187,22 @@ mod tests {
     fn lookup_distinguishes_valid_revoked_and_expired() {
         let mut p = PolicySet::deny_all("v1").with_grant(grant(1000));
         let cap = CapabilityId::new("send-message");
-        assert_eq!(p.find_grant(&cap, 500).map(|(_, l)| l), Some(GrantLookup::Valid));
-        assert_eq!(p.find_grant(&cap, 1000).map(|(_, l)| l), Some(GrantLookup::Expired(1000)));
+        assert_eq!(
+            p.find_grant(&cap, 500).map(|(_, l)| l),
+            Some(GrantLookup::Valid)
+        );
+        assert_eq!(
+            p.find_grant(&cap, 1000).map(|(_, l)| l),
+            Some(GrantLookup::Expired(1000))
+        );
 
         let mut g = grant(1000);
         g.revoked = true;
         p = PolicySet::deny_all("v1").with_grant(g);
-        assert_eq!(p.find_grant(&cap, 0).map(|(_, l)| l), Some(GrantLookup::Revoked));
+        assert_eq!(
+            p.find_grant(&cap, 0).map(|(_, l)| l),
+            Some(GrantLookup::Revoked)
+        );
     }
 
     #[test]

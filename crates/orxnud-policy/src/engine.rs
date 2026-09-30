@@ -3,14 +3,15 @@
 use orxnud_audit::{AuditChain, AuditOutcome, OutcomeKind};
 use orxnud_domain::ids::{CapabilityId, RequestId};
 use orxnud_domain::{
-    ActionRequest, Actor, ApprovalRecord, AuthorisationProof, CapabilityInvocation,
-    DataClass, InvocationContext, NormalizedParams, RiskClass,
+    ActionRequest, Actor, ApprovalRecord, AuthorisationProof, CapabilityInvocation, DataClass,
+    InvocationContext, NormalizedParams, RiskClass,
 };
 
-use crate::budget::{scope_for_risk, BudgetLedger};
+use crate::budget::{BudgetLedger, scope_for_risk};
 use crate::decision::{Decision, DenialReason, PolicyError};
 use crate::digest::digest_for;
 use crate::policy_set::{GrantLookup, PolicySet};
+use crate::seal;
 
 /// A capability's declared contract, as policy sees it.
 ///
@@ -36,8 +37,20 @@ pub struct CapabilityDeclaration {
 impl CapabilityDeclaration {
     /// A minimal declaration. Phase 1 registers none.
     #[must_use]
-    pub fn new(id: CapabilityId, risk: RiskClass, max_data_class: DataClass, networked: bool, cost: u64) -> Self {
-        Self { id, risk, max_data_class, networked, cost }
+    pub fn new(
+        id: CapabilityId,
+        risk: RiskClass,
+        max_data_class: DataClass,
+        networked: bool,
+        cost: u64,
+    ) -> Self {
+        Self {
+            id,
+            risk,
+            max_data_class,
+            networked,
+            cost,
+        }
     }
 }
 
@@ -111,7 +124,9 @@ impl PolicyEngine {
         // else is even looked at.
         if !actor.can_grant() && actor.authority_root().is_none() {
             return Ok(Decision::Deny {
-                reason: DenialReason::NoAuthorityRoot { actor: actor.label().to_owned() },
+                reason: DenialReason::NoAuthorityRoot {
+                    actor: actor.label().to_owned(),
+                },
             });
         }
 
@@ -139,12 +154,16 @@ impl PolicyEngine {
         match self.policy.find_grant(&request.capability, now_ms) {
             None => {
                 return Ok(Decision::Deny {
-                    reason: DenialReason::NoGrant { capability: request.capability.to_string() },
+                    reason: DenialReason::NoGrant {
+                        capability: request.capability.to_string(),
+                    },
                 });
             }
-            Some((grant, GrantLookup::Revoked)) => {
+            Some((_, GrantLookup::Revoked)) => {
                 return Ok(Decision::Deny {
-                    reason: DenialReason::NoGrant { capability: request.capability.to_string() },
+                    reason: DenialReason::NoGrant {
+                        capability: request.capability.to_string(),
+                    },
                 });
             }
             Some((_, GrantLookup::Expired(expired_at_ms))) => {
@@ -172,10 +191,14 @@ impl PolicyEngine {
         let risk = request.effective_risk(decl.risk);
 
         // --- 7. Egress consent, for networked capabilities only ---
-        if decl.networked && effective.requires_explicit_consent() && !self.policy.egress_consented(effective)
+        if decl.networked
+            && effective.requires_explicit_consent()
+            && !self.policy.egress_consented(effective)
         {
             return Ok(Decision::Deny {
-                reason: DenialReason::EgressNotConsented { data_class: effective },
+                reason: DenialReason::EgressNotConsented {
+                    data_class: effective,
+                },
             });
         }
 
@@ -205,7 +228,9 @@ impl PolicyEngine {
                 record.expires_at_ms,
             );
             if recomputed != record.digest {
-                return Ok(Decision::Deny { reason: DenialReason::ApprovalDigestMismatch });
+                return Ok(Decision::Deny {
+                    reason: DenialReason::ApprovalDigestMismatch,
+                });
             }
             // An approval is honoured only for the human who gave it, so the
             // gate names that human rather than the delegating actor kind.
@@ -217,7 +242,11 @@ impl PolicyEngine {
                 // Unreachable: step 0 already refused any actor without a root.
                 None => actor.clone(),
             };
-            return Ok(Decision::Gate { risk, required_digest: recomputed, approver });
+            return Ok(Decision::Gate {
+                risk,
+                required_digest: recomputed,
+                approver,
+            });
         }
 
         // --- 8. Budget is checked at authorise(), because it mutates ---
@@ -239,6 +268,12 @@ impl PolicyEngine {
     /// # Errors
     ///
     /// Fails closed on any journal failure.
+    // Eight parameters, which is the point: this is the single narrowing point
+    // where actor, context, target, params, approval and time all meet. Bundling
+    // them into a struct would move the decision behind a constructor and make
+    // it harder to see that nothing is dropped. `audit_pair` is the same shape
+    // because it records the same decision.
+    #[allow(clippy::too_many_arguments)]
     pub fn authorise(
         &mut self,
         request: ActionRequest,
@@ -249,7 +284,14 @@ impl PolicyEngine {
         approval: Option<&ApprovalRecord>,
         now_ms: i64,
     ) -> Result<Decision, PolicyError> {
-        let decision = self.evaluate(&request, &actor, target.as_deref(), &params, approval, now_ms)?;
+        let decision = self.evaluate(
+            &request,
+            &actor,
+            target.as_deref(),
+            &params,
+            approval,
+            now_ms,
+        )?;
 
         // --- 2. Budget, before anything is recorded as authorised. ---
         let declared_cost = self.declaration(&request.capability).map_or(0, |d| d.cost);
@@ -263,7 +305,9 @@ impl PolicyEngine {
             let tightest = self
                 .budget
                 .tightest()
-                .map_or((scope.to_owned(), 0, 0), |(name, limit, spent)| (name.to_owned(), limit, spent));
+                .map_or((scope.to_owned(), 0, 0), |(name, limit, spent)| {
+                    (name.to_owned(), limit, spent)
+                });
             let denial = Decision::Deny {
                 reason: DenialReason::BudgetExceeded {
                     scope: tightest.0,
@@ -271,12 +315,28 @@ impl PolicyEngine {
                     spent: tightest.2,
                 },
             };
-            self.audit_pair(&request, &actor, &risk, target.as_deref(), approval, &denial, now_ms)?;
+            self.audit_pair(
+                &request,
+                &actor,
+                &risk,
+                target.as_deref(),
+                approval,
+                &denial,
+                now_ms,
+            )?;
             return Ok(denial);
         }
 
         // --- 3 + 5. Audit. Fails closed. ---
-        self.audit_pair(&request, &actor, &risk, target.as_deref(), approval, &decision, now_ms)?;
+        self.audit_pair(
+            &request,
+            &actor,
+            &risk,
+            target.as_deref(),
+            approval,
+            &decision,
+            now_ms,
+        )?;
 
         if decision.is_denied() {
             return Ok(decision);
@@ -289,18 +349,23 @@ impl PolicyEngine {
             let _ = self.budget.charge_all(declared_cost);
         }
 
-        let proof = AuthorisationProof {
-            policy_version: self.policy_version.clone(),
-            approval: match &decision {
-                Decision::Gate { required_digest, .. } => Some(*required_digest),
+        let proof = AuthorisationProof::issue(
+            &seal(),
+            self.policy_version.clone(),
+            match &decision {
+                Decision::Gate {
+                    required_digest, ..
+                } => Some(*required_digest),
                 _ => approval.map(|a| a.digest),
             },
-            assessed_risk: risk,
-        };
+            risk,
+        );
         // Constructed and immediately dropped: Phase 1 has no dispatcher to hand
-        // it to, and creating one would be a capability. The construction is the
-        // assertion that the seal holds -- it cannot be forged from outside.
-        let _invocation = CapabilityInvocation::authorise(request, actor, context, proof);
+        // it to, and building one would be a capability. Constructing it here is
+        // the proof that policy is the only crate that can -- the constructor
+        // demands this crate's seal, and gate G2 forbids any other crate from
+        // naming it.
+        let _invocation = CapabilityInvocation::authorise(&seal(), request, actor, context, proof);
         Ok(decision)
     }
 
@@ -309,6 +374,7 @@ impl PolicyEngine {
     ///
     /// Both records share a correlation key, so `unresolved_authorisations`
     /// closes correctly (the journal is append-only; a record cannot be updated).
+    #[allow(clippy::too_many_arguments)]
     fn audit_pair(
         &mut self,
         request: &ActionRequest,
@@ -321,7 +387,9 @@ impl PolicyEngine {
     ) -> Result<(), PolicyError> {
         let request_id = RequestId::new(correlation_of(request));
         let approved_digest = match decision {
-            Decision::Gate { required_digest, .. } => Some(*required_digest),
+            Decision::Gate {
+                required_digest, ..
+            } => Some(*required_digest),
             _ => approval.map(|a| a.digest),
         };
         let authorised = orxnud_audit::AuditRecord::authorised(
@@ -388,7 +456,10 @@ mod tests {
     const NOW: i64 = 1_000;
 
     fn human() -> Actor {
-        Actor::Human { user: UserId::new("u-1"), via: AuthChannel::LocalInteractive }
+        Actor::Human {
+            user: UserId::new("u-1"),
+            via: AuthChannel::LocalInteractive,
+        }
     }
     fn cap() -> CapabilityId {
         CapabilityId::new("send-message")
@@ -398,8 +469,13 @@ mod tests {
     }
     fn request(a: DataClass, b: DataClass) -> ActionRequest {
         ActionRequest::new(
-            TaskId::new("t-1"), RunId::new("r-1"), 0, cap(),
-            orxnud_domain::json!({}), a, b,
+            TaskId::new("t-1"),
+            RunId::new("r-1"),
+            0,
+            cap(),
+            orxnud_domain::json!({}),
+            a,
+            b,
         )
     }
     fn grant(max: DataClass, expires: i64) -> crate::policy_set::Grant {
@@ -413,7 +489,11 @@ mod tests {
             revoked: false,
         }
     }
-    fn engine_with(decl: CapabilityDeclaration, policy: PolicySet, budget: BudgetLedger) -> PolicyEngine {
+    fn engine_with(
+        decl: CapabilityDeclaration,
+        policy: PolicySet,
+        budget: BudgetLedger,
+    ) -> PolicyEngine {
         let mut e = PolicyEngine::new(policy, budget, "v1");
         e.register(decl);
         e
@@ -428,13 +508,24 @@ mod tests {
     #[test]
     fn an_external_actor_is_refused_before_anything_else_is_examined() {
         // The step that makes webhooks safe to accept at all.
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
         let external = Actor::External {
             source: orxnud_domain::ids::ExternalSource::Unknown,
             request: RequestId::new("r"),
         };
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &external, Some("alice"), &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &external,
+                Some("alice"),
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert!(d.is_denied());
         assert_eq!(d.denial().map(|r| r.code()), Some("no_authority_root"));
@@ -442,10 +533,23 @@ mod tests {
 
     #[test]
     fn a_system_actor_is_refused_likewise() {
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
-        let sys = Actor::System { component: SystemComponent::Backup };
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
+        let sys = Actor::System {
+            component: SystemComponent::Backup,
+        };
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &sys, None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &sys,
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert!(d.is_denied());
     }
@@ -453,7 +557,11 @@ mod tests {
     #[test]
     fn an_unregistered_capability_is_refused() {
         // The engine registers `cap()`; this asks for a *different* one.
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
         let mut req = request(DataClass::Public, DataClass::Public);
         req.capability = CapabilityId::new("never-registered");
         let d = e
@@ -464,9 +572,20 @@ mod tests {
 
     #[test]
     fn no_grant_means_denied() {
-        let e = engine_with(ok_decl(), PolicySet::deny_all("v1"), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            PolicySet::deny_all("v1"),
+            BudgetLedger::empty().with_global(100),
+        );
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("no_grant"));
     }
@@ -477,16 +596,34 @@ mod tests {
         let expiring = PolicySet::deny_all("v1").with_grant(grant(DataClass::Personal, 1_000));
         let e = engine_with(ok_decl(), expiring, BudgetLedger::empty().with_global(100));
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), None, &params(), None, 2_000)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                None,
+                &params(),
+                None,
+                2_000,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("grant_expired"));
     }
 
     #[test]
     fn data_class_beyond_the_grant_is_denied() {
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
         let d = e
-            .evaluate(&request(DataClass::Sensitive, DataClass::Sensitive), &human(), None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Sensitive, DataClass::Sensitive),
+                &human(),
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("data_class_exceeded"));
     }
@@ -496,33 +633,60 @@ mod tests {
         let decl = CapabilityDeclaration::new(cap(), RiskClass::Low, DataClass::Public, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let d = e
-            .evaluate(&request(DataClass::Sensitive, DataClass::Sensitive), &human(), None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Sensitive, DataClass::Sensitive),
+                &human(),
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("data_class_exceeded"));
     }
 
     #[test]
     fn a_low_risk_permitted_action_is_allowed() {
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), Some("alice"), &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("alice"),
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert!(d.is_allowed(), "expected allow, got {d:?}");
     }
 
     #[test]
     fn a_high_risk_action_without_approval_is_denied_as_requiring_one() {
-        let decl = CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), Some("alice"), &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("alice"),
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("approval_required"));
     }
 
     #[test]
     fn a_matching_approval_gates_the_action() {
-        let decl = CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 2_000);
         let approval = ApprovalRecord {
@@ -536,11 +700,20 @@ mod tests {
             digest,
         };
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), Some("alice"), &params(), Some(&approval), NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("alice"),
+                &params(),
+                Some(&approval),
+                NOW,
+            )
             .expect("evaluate");
         assert!(d.is_gated(), "expected gate, got {d:?}");
         match d {
-            Decision::Gate { required_digest, .. } => assert_eq!(required_digest, digest),
+            Decision::Gate {
+                required_digest, ..
+            } => assert_eq!(required_digest, digest),
             other => panic!("expected gate, got {other:?}"),
         }
     }
@@ -549,7 +722,8 @@ mod tests {
     fn an_approval_for_a_different_target_is_a_digest_mismatch() {
         // THE anti-Loopjacking test: the user approved "alice"; the action is
         // for "bob". It must be refused, not silently executed.
-        let decl = CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 2_000);
         let approval = ApprovalRecord {
@@ -563,14 +737,25 @@ mod tests {
             digest,
         };
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), Some("bob"), &params(), Some(&approval), NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("bob"),
+                &params(),
+                Some(&approval),
+                NOW,
+            )
             .expect("evaluate");
-        assert_eq!(d.denial().map(|r| r.code()), Some("approval_digest_mismatch"));
+        assert_eq!(
+            d.denial().map(|r| r.code()),
+            Some("approval_digest_mismatch")
+        );
     }
 
     #[test]
     fn an_approval_for_different_params_is_a_digest_mismatch() {
-        let decl = CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 2_000);
         let approval = ApprovalRecord {
@@ -585,14 +770,25 @@ mod tests {
         };
         let other = NormalizedParams::canonical("{\"to\":\"bob\"}");
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), Some("alice"), &other, Some(&approval), NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("alice"),
+                &other,
+                Some(&approval),
+                NOW,
+            )
             .expect("evaluate");
-        assert_eq!(d.denial().map(|r| r.code()), Some("approval_digest_mismatch"));
+        assert_eq!(
+            d.denial().map(|r| r.code()),
+            Some("approval_digest_mismatch")
+        );
     }
 
     #[test]
     fn an_expired_approval_is_denied() {
-        let decl = CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 1_000);
         let approval = ApprovalRecord {
@@ -606,7 +802,14 @@ mod tests {
             digest,
         };
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &human(), Some("alice"), &params(), Some(&approval), 1_000)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("alice"),
+                &params(),
+                Some(&approval),
+                1_000,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("approval_expired"));
     }
@@ -620,7 +823,14 @@ mod tests {
         let policy = PolicySet::deny_all("v1").with_grant(grant(DataClass::Sensitive, i64::MAX));
         let e = engine_with(decl, policy, BudgetLedger::empty().with_global(100));
         let d = e
-            .evaluate(&request(DataClass::Sensitive, DataClass::Sensitive), &human(), None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Sensitive, DataClass::Sensitive),
+                &human(),
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("egress_not_consented"));
     }
@@ -632,7 +842,14 @@ mod tests {
         let decl = CapabilityDeclaration::new(cap(), RiskClass::Low, DataClass::Sensitive, true, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
         let d = e
-            .evaluate(&request(DataClass::Sensitive, DataClass::Sensitive), &human(), None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Sensitive, DataClass::Sensitive),
+                &human(),
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
         assert_eq!(d.denial().map(|r| r.code()), Some("data_class_exceeded"));
     }
@@ -643,9 +860,19 @@ mod tests {
         let policy = PolicySet::deny_all("v1").with_grant(grant(DataClass::Regulated, i64::MAX));
         let e = engine_with(decl, policy, BudgetLedger::empty().with_global(100));
         let d = e
-            .evaluate(&request(DataClass::Regulated, DataClass::Regulated), &human(), None, &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Regulated, DataClass::Regulated),
+                &human(),
+                None,
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
-        assert!(d.is_denied(), "regulated egress must never pass standing policy: {d:?}");
+        assert!(
+            d.is_denied(),
+            "regulated egress must never pass standing policy: {d:?}"
+        );
     }
 
     #[test]
@@ -659,9 +886,13 @@ mod tests {
         req.capability = cap();
         let d = e2
             .authorise(
-                req, human(),
+                req,
+                human(),
                 InvocationContext::new("k", 1000, "c"),
-                None, params(), None, NOW,
+                None,
+                params(),
+                None,
+                NOW,
             )
             .expect("authorise");
         assert_eq!(d.denial().map(|r| r.code()), Some("budget_exceeded"));
@@ -673,9 +904,13 @@ mod tests {
         e.register(ok_decl());
         let d = e
             .authorise(
-                request(DataClass::Public, DataClass::Public), human(),
+                request(DataClass::Public, DataClass::Public),
+                human(),
                 InvocationContext::new("k-1", 1000, "c"),
-                Some("alice".into()), params(), None, NOW,
+                Some("alice".into()),
+                params(),
+                None,
+                NOW,
             )
             .expect("authorise");
         assert!(d.is_allowed(), "{d:?}");
@@ -687,17 +922,25 @@ mod tests {
     #[test]
     fn a_denial_is_audited_too() {
         // A policy that logs allows and not denies cannot be reviewed.
-        let mut e = PolicyEngine::new(PolicySet::deny_all("v1"), BudgetLedger::empty().with_global(100), "v1");
+        let mut e = PolicyEngine::new(
+            PolicySet::deny_all("v1"),
+            BudgetLedger::empty().with_global(100),
+            "v1",
+        );
         e.register(ok_decl());
         let d = e
             .authorise(
-                request(DataClass::Public, DataClass::Public), human(),
+                request(DataClass::Public, DataClass::Public),
+                human(),
                 InvocationContext::new("k-2", 1000, "c"),
-                None, params(), None, NOW,
+                None,
+                params(),
+                None,
+                NOW,
             )
             .expect("authorise");
         assert!(d.is_denied());
-        assert!(e.audit().len() >= 1, "the denial must leave a record");
+        assert!(!e.audit().is_empty(), "the denial must leave a record");
     }
 
     #[test]
@@ -708,11 +951,25 @@ mod tests {
             authorised_by: UserId::new("u-1"),
             task: TaskId::new("t-1"),
         };
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &scheduled, Some("alice"), &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &scheduled,
+                Some("alice"),
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
-        assert!(d.is_allowed(), "a scheduled task within its grant should proceed: {d:?}");
+        assert!(
+            d.is_allowed(),
+            "a scheduled task within its grant should proceed: {d:?}"
+        );
     }
 
     #[test]
@@ -724,10 +981,24 @@ mod tests {
             task: TaskId::new("t-1"),
             provenance: ModelProvenance::new("m", "p", RequestId::new("q")),
         };
-        let e = engine_with(ok_decl(), low_policy(), BudgetLedger::empty().with_global(100));
+        let e = engine_with(
+            ok_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
         let d = e
-            .evaluate(&request(DataClass::Public, DataClass::Public), &ai, Some("alice"), &params(), None, NOW)
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &ai,
+                Some("alice"),
+                &params(),
+                None,
+                NOW,
+            )
             .expect("evaluate");
-        assert!(d.is_allowed(), "an AI actor within its human's grant should proceed: {d:?}");
+        assert!(
+            d.is_allowed(),
+            "an AI actor within its human's grant should proceed: {d:?}"
+        );
     }
 }

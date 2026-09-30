@@ -67,7 +67,14 @@ pub fn digest_for(
     issued_at_ms: i64,
     expires_at_ms: i64,
 ) -> ApprovalDigest {
-    let bytes = canonical_bytes(actor, capability, target, params, issued_at_ms, expires_at_ms);
+    let bytes = canonical_bytes(
+        actor,
+        capability,
+        target,
+        params,
+        issued_at_ms,
+        expires_at_ms,
+    );
     ApprovalDigest::from_bytes(*blake3::hash(&bytes).as_bytes())
 }
 
@@ -82,7 +89,10 @@ mod tests {
         CapabilityId::new("send-message")
     }
     fn human() -> Actor {
-        Actor::Human { user: UserId::new("u-1"), via: AuthChannel::LocalInteractive }
+        Actor::Human {
+            user: UserId::new("u-1"),
+            via: AuthChannel::LocalInteractive,
+        }
     }
     fn params() -> NormalizedParams {
         NormalizedParams::canonical("{\"to\":\"alice\"}")
@@ -115,11 +125,29 @@ mod tests {
         let other_target = d(&human(), &cap(), Some("bob"), &params(), 100, 200);
         let no_target = d(&human(), &cap(), None, &params(), 100, 200);
         let other_params = d(
-            &human(), &cap(), Some("alice"),
-            &NormalizedParams::canonical("{\"to\":\"bob\"}"), 100, 200,
+            &human(),
+            &cap(),
+            Some("alice"),
+            &NormalizedParams::canonical("{\"to\":\"bob\"}"),
+            100,
+            200,
         );
-        let empty_params = d(&human(), &cap(), Some("alice"), &NormalizedParams::canonical(""), 100, 200);
-        let other_cap = d(&human(), &CapabilityId::new("delete-file"), Some("alice"), &params(), 100, 200);
+        let empty_params = d(
+            &human(),
+            &cap(),
+            Some("alice"),
+            &NormalizedParams::canonical(""),
+            100,
+            200,
+        );
+        let other_cap = d(
+            &human(),
+            &CapabilityId::new("delete-file"),
+            Some("alice"),
+            &params(),
+            100,
+            200,
+        );
         let other_issued = d(&human(), &cap(), Some("alice"), &params(), 101, 200);
         let other_expiry = d(&human(), &cap(), Some("alice"), &params(), 100, 201);
         let other_actor = Actor::Human {
@@ -162,10 +190,34 @@ mod tests {
     #[test]
     fn a_field_separator_cannot_be_forged_across_fields() {
         // Without separators, ("a|b") and ("a", "b") would hash identically.
-        let one = d(&human(), &CapabilityId::new("a"), None, &NormalizedParams::canonical("b"), 100, 200);
-        let two = d(&human(), &CapabilityId::new("a"), None, &NormalizedParams::canonical("b"), 100, 200);
-        let split = d(&human(), &CapabilityId::new("a"), Some("b"), &NormalizedParams::canonical(""), 100, 200);
-        assert_ne!(one, split);
+        let whole = d(
+            &human(),
+            &CapabilityId::new("a"),
+            None,
+            &NormalizedParams::canonical("b"),
+            100,
+            200,
+        );
+        let same = d(
+            &human(),
+            &CapabilityId::new("a"),
+            None,
+            &NormalizedParams::canonical("b"),
+            100,
+            200,
+        );
+        let split = d(
+            &human(),
+            &CapabilityId::new("a"),
+            Some("b"),
+            &NormalizedParams::canonical(""),
+            100,
+            200,
+        );
+        // Sanity: identical inputs are identical, so the difference below is
+        // caused by the field split and not by hashing being nondeterministic.
+        assert_eq!(whole, same);
+        assert_ne!(whole, split);
     }
 
     #[test]
@@ -174,7 +226,10 @@ mod tests {
         // approval.
         let bytes = canonical_bytes(&human(), &cap(), Some("a"), &params(), 1, 2);
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.starts_with("orxnud-approval-v1|"), "missing version prefix: {s}");
+        assert!(
+            s.starts_with("orxnud-approval-v1|"),
+            "missing version prefix: {s}"
+        );
     }
 
     proptest! {

@@ -37,7 +37,7 @@ pub mod version;
 pub use error::{ProtocolError, RpcError, RpcErrorCode};
 pub use frame::{Notification, Request, Response, Success};
 pub use method::Method;
-pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
+pub use version::{PROTOCOL_VERSION, ProtocolVersion, negotiate};
 
 /// The framing limits applied to every inbound message.
 ///

@@ -15,6 +15,9 @@ publish.workspace = true
 # now would be speculative (docs-02 §3).
 [dependencies]
 serde = { workspace = true }
+# The in-memory value form *is* the wire form, so config and the protocol crate
+# speak one vocabulary rather than two. `toml` is for parsing config files only.
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 orxnud-domain = { workspace = true }

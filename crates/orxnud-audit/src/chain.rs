@@ -53,7 +53,9 @@ impl AuditChain {
     /// An empty chain.
     #[must_use]
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// The most recent hash, or [`GENESIS_HASH`] when empty.
@@ -111,7 +113,10 @@ impl AuditChain {
     pub fn append(&mut self, mut record: AuditRecord) -> Result<u64, ChainError> {
         let expected = self.entries.len() as u64;
         if record.seq != 0 && record.seq != expected {
-            return Err(ChainError::OutOfOrder { expected, got: record.seq });
+            return Err(ChainError::OutOfOrder {
+                expected,
+                got: record.seq,
+            });
         }
         record.seq = expected;
         let hash = Self::hash_of(&record, self.head());
@@ -129,7 +134,10 @@ impl AuditChain {
         let mut prev = GENESIS_HASH;
         for (i, (record, stored)) in self.entries.iter().enumerate() {
             if record.seq != i as u64 {
-                return Err(ChainError::OutOfOrder { expected: i as u64, got: record.seq });
+                return Err(ChainError::OutOfOrder {
+                    expected: i as u64,
+                    got: record.seq,
+                });
             }
             let recomputed = Self::hash_of(record, prev);
             if recomputed != *stored {
@@ -158,7 +166,9 @@ impl AuditChain {
     pub fn unresolved_authorisations(&self) -> Vec<u64> {
         let mut open: Vec<(u64, String)> = Vec::new();
         for (record, _) in &self.entries {
-            let Some(corr) = record.correlation_key() else { continue };
+            let Some(corr) = record.correlation_key() else {
+                continue;
+            };
             match &record.outcome {
                 AuditOutcome::Authorised { .. } => open.push((record.seq, corr)),
                 AuditOutcome::Finished { .. } => {
@@ -182,9 +192,20 @@ mod tests {
 
     fn rec() -> AuditRecord {
         AuditRecord::authorised(
-            Actor::Human { user: UserId::new("u-1"), via: AuthChannel::LocalInteractive },
-            "c", None, DataClass::Personal, RiskClass::Low, "v1", None, None,
-            Some(TaskId::new("t-1")), None, 1000,
+            Actor::Human {
+                user: UserId::new("u-1"),
+                via: AuthChannel::LocalInteractive,
+            },
+            "c",
+            None,
+            DataClass::Personal,
+            RiskClass::Low,
+            "v1",
+            None,
+            None,
+            Some(TaskId::new("t-1")),
+            None,
+            1000,
         )
     }
 
@@ -226,7 +247,10 @@ mod tests {
 
         // Alter the first record's capability. Everything after it is now wrong.
         c.entries[0].0.capability = "tampered".into();
-        assert!(matches!(c.verify(), Err(ChainError::HashMismatch { seq: 0 })));
+        assert!(matches!(
+            c.verify(),
+            Err(ChainError::HashMismatch { seq: 0 })
+        ));
     }
 
     #[test]
@@ -245,7 +269,13 @@ mod tests {
         c.append(rec()).expect("a");
         let mut bad = rec();
         bad.seq = 7;
-        assert!(matches!(c.append(bad), Err(ChainError::OutOfOrder { expected: 1, got: 7 })));
+        assert!(matches!(
+            c.append(bad),
+            Err(ChainError::OutOfOrder {
+                expected: 1,
+                got: 7
+            })
+        ));
         assert_eq!(c.len(), 1, "the refused append must not have been stored");
     }
 
@@ -260,19 +290,27 @@ mod tests {
     fn unresolved_authorisations_are_found() {
         // The "outcome unknown" detector, which is what makes TP-12 auditable.
         let mut c = AuditChain::new();
-        c.append(corr("A")).expect("a");   // seq 0: authorised, never terminated
-        c.append(corr("B")).expect("b");   // seq 1: authorised
-        c.append(corr("B").finished(OutcomeKind::Completed, 2, None)).expect("c"); // closes B
+        c.append(corr("A")).expect("a"); // seq 0: authorised, never terminated
+        c.append(corr("B")).expect("b"); // seq 1: authorised
+        c.append(corr("B").finished(OutcomeKind::Completed, 2, None))
+            .expect("c"); // closes B
         let unresolved = c.unresolved_authorisations();
-        assert!(unresolved.contains(&0), "seq 0 was never resolved: {unresolved:?}");
-        assert!(!unresolved.contains(&1), "seq 1 was resolved by the correlated record");
+        assert!(
+            unresolved.contains(&0),
+            "seq 0 was never resolved: {unresolved:?}"
+        );
+        assert!(
+            !unresolved.contains(&1),
+            "seq 1 was resolved by the correlated record"
+        );
     }
 
     #[test]
     fn a_complete_lifecycle_leaves_nothing_unresolved() {
         let mut c = AuditChain::new();
         c.append(corr("A")).expect("a");
-        c.append(corr("A").finished(OutcomeKind::Completed, 2, None)).expect("b");
+        c.append(corr("A").finished(OutcomeKind::Completed, 2, None))
+            .expect("b");
         assert!(c.unresolved_authorisations().is_empty());
     }
 
@@ -281,7 +319,8 @@ mod tests {
         // A policy that logs its allows and not its denies cannot be reviewed.
         let mut c = AuditChain::new();
         c.append(corr("A")).expect("a");
-        c.append(corr("A").finished(OutcomeKind::Denied, 2, Some("no grant".into()))).expect("b");
+        c.append(corr("A").finished(OutcomeKind::Denied, 2, Some("no grant".into())))
+            .expect("b");
         assert!(c.verify().is_ok());
         assert!(c.unresolved_authorisations().is_empty());
     }
@@ -293,7 +332,8 @@ mod tests {
         // human adjudication happens in the task engine, not the journal.
         let mut c = AuditChain::new();
         c.append(corr("A")).expect("a");
-        c.append(corr("A").finished(OutcomeKind::Uncertain, 2, None)).expect("b");
+        c.append(corr("A").finished(OutcomeKind::Uncertain, 2, None))
+            .expect("b");
         assert!(c.unresolved_authorisations().is_empty());
     }
 

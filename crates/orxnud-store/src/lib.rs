@@ -48,8 +48,10 @@ pub mod region;
 pub mod repository;
 pub mod sqlite;
 
-pub use migration::{Migration, MigrationError, MigrationRunner, MIGRATIONS};
+pub use migration::{MIGRATIONS, Migration, MigrationError, MigrationRunner};
 pub use pragma::{Pragma, PragmaError};
 pub use region::{RegionRegistry, StateRegion};
 pub use repository::{Repository, RepositoryError, SchemaMeta};
-pub use sqlite::{open, verify_sqlite_version, SqliteVersion, Store, StoreError, MIN_SQLITE_VERSION};
+pub use sqlite::{
+    MIN_SQLITE_VERSION, SqliteVersion, Store, StoreError, open, verify_sqlite_version,
+};

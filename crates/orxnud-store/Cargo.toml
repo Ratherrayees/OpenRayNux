@@ -19,5 +19,15 @@ thiserror = { workspace = true }
 rusqlite = { workspace = true }
 orxnud-domain = { workspace = true }
 
+# Build-time only. Cargo exports a `links = "sqlite3"` package's metadata to
+# **build scripts of packages that depend on it directly**, so a
+# `[build-dependencies]` entry is not enough: `DEP_SQLITE3_INCLUDE` never arrives
+# and `build.rs` cannot find the header. It must be a normal dependency.
+#
+# That sounds wrong for something never used in code, but the dependency is not
+# referenced by any Rust source: it exists solely so `build.rs` can read
+# `DEP_SQLITE3_INCLUDE`. `unused_crate_dependencies` is off for this reason.
+libsqlite3-sys = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }

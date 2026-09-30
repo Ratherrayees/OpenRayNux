@@ -11,6 +11,10 @@ publish.workspace = true
 
 # One of exactly three crates permitted to contain cfg(target_os) (CI gate G7).
 [dependencies]
+# The contract this crate implements, and thiserror for its error type. Both are
+# dependencies of an adapter; neither is a platform branch, so this crate stays
+# inside the portable-core grep gate's allowed set.
+thiserror = { workspace = true }
 orxnud-domain = { workspace = true }
 
 [dev-dependencies]

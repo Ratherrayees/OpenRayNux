@@ -75,11 +75,7 @@ pub struct ProposedStep {
 impl ProposedStep {
     /// Builds a step with a rationale and no extra decoration.
     #[must_use]
-    pub fn new(
-        index: u32,
-        capability: impl Into<CapabilityId>,
-        params: serde_json::Value,
-    ) -> Self {
+    pub fn new(index: u32, capability: impl Into<CapabilityId>, params: serde_json::Value) -> Self {
         Self {
             index,
             capability: capability.into(),
@@ -172,6 +168,10 @@ mod tests {
     }
 
     #[test]
+    // Exact float comparisons are the assertion here, not an oversight: `clamp`
+    // returns the boundary itself, so `2.0 -> 1.0` must be bit-exact and a
+    // tolerance would hide a clamp that stopped short of the limit.
+    #[allow(clippy::float_cmp)]
     fn confidence_is_clamped_and_nan_becomes_zero() {
         assert_eq!(proposal().with_confidence(2.0).confidence, 1.0);
         assert_eq!(proposal().with_confidence(-1.0).confidence, 0.0);
@@ -182,10 +182,21 @@ mod tests {
     #[test]
     fn confidence_always_serialises_as_a_valid_number() {
         for c in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -5.0, 5.0] {
-            let json = serde_json::to_string(&proposal().with_confidence(c))
-                .expect("serialise");
+            let json = serde_json::to_string(&proposal().with_confidence(c)).expect("serialise");
+            // The literal tokens `NaN`/`Infinity` are what would break a strict
+            // JSON parser. (`serde_json` maps non-finite floats to `null`; that
+            // is its documented behaviour and the receiving `Proposal` clamps it
+            // back to a finite value, which the assertions below confirm.)
+            assert!(
+                !json.contains("NaN") && !json.contains("Infinity"),
+                "non-finite confidence leaked into the wire format: {json}"
+            );
             let back: Proposal = serde_json::from_str(&json).expect("round-trip");
-            assert!(back.confidence.is_finite(), "non-finite confidence survived");
+            assert!(
+                back.confidence.is_finite(),
+                "non-finite confidence survived"
+            );
+            // Inclusive bounds: `0.0` and `1.0` are valid confidences.
             assert!((0.0..=1.0).contains(&back.confidence));
         }
     }
@@ -198,7 +209,10 @@ mod tests {
     #[test]
     fn act_with_no_steps_cannot_cause_side_effects() {
         // Belt and braces: an "act" with nothing to act on is not an action.
-        let p = Proposal { intent: IntentKind::Act, ..proposal() };
+        let p = Proposal {
+            intent: IntentKind::Act,
+            ..proposal()
+        };
         assert!(!p.may_cause_side_effects());
     }
 

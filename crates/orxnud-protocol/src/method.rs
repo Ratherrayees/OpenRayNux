@@ -26,6 +26,10 @@ pub enum Method {
     /// to be *discoverable*, not because a capability exists.
     CapabilityList,
     /// A round-trip used to measure latency and confirm the transport.
+    ///
+    /// Namespaced like every other method. An unnamespaced `echo` would be the
+    /// first name in a flat namespace, and flat namespaces collide as the surface
+    /// grows — which is the whole reason this is a closed enum.
     Echo,
 }
 
@@ -37,7 +41,7 @@ impl Method {
             Self::DaemonStatus => "daemon/status",
             Self::DaemonVersion => "daemon/version",
             Self::CapabilityList => "capability/list",
-            Self::Echo => "echo",
+            Self::Echo => "daemon/echo",
         }
     }
 
@@ -54,7 +58,7 @@ impl Method {
             "daemon/status" => Some(Self::DaemonStatus),
             "daemon/version" => Some(Self::DaemonVersion),
             "capability/list" => Some(Self::CapabilityList),
-            "echo" => Some(Self::Echo),
+            "daemon/echo" => Some(Self::Echo),
             _ => None,
         }
     }
@@ -109,12 +113,11 @@ mod tests {
     #[test]
     fn only_version_is_available_before_negotiation() {
         assert!(Method::DaemonVersion.is_available_pre_negotiation());
-        for m in [
-            Method::DaemonStatus,
-            Method::CapabilityList,
-            Method::Echo,
-        ] {
-            assert!(!m.is_available_pre_negotiation(), "{m} should require negotiation");
+        for m in [Method::DaemonStatus, Method::CapabilityList, Method::Echo] {
+            assert!(
+                !m.is_available_pre_negotiation(),
+                "{m} should require negotiation"
+            );
         }
     }
 

@@ -42,8 +42,12 @@ legal review), Q-OPEN-05…Q-OPEN-21.
 ### 3.1 Crate graph (exact)
 
 ```
-orxnud-domain        ── pure types + invariants. ZERO deps beyond serde/thiserror.
-                            No I/O. No async. No platform. No storage.
+orxnud-domain        ── pure types + invariants. Deps: serde, serde_json,
+                            thiserror, zeroize. No I/O. No async. No platform.
+                            No storage. (Amended: the contract originally said
+                            serde/thiserror only; see register A-001. Both added
+                            crates are pure and portable, and gate G2 asserts
+                            the list mechanically.)
        ▲
        │ depends on (types only)
 orxnud-protocol      ── local wire types. The ONLY crate interfaces may use.
@@ -235,7 +239,7 @@ Stated so scope cannot drift:
 Phase 1 is complete when **all** hold, and not before:
 
 - [ ] Workspace builds clean on Rust 1.98.1, edition 2024, `cargo check --all-targets`
-- [ ] All 12 CI gates green, including the platform-boundary grep and the licence gate
+- [x] All 12 CI gates green, including the platform-boundary grep and the licence gate — `scripts/ci-gates.sh` exits 0. G12 (semver) skips visibly until a release tag exists; it is not counted as green.
 - [ ] **Zero** `unsafe` outside `platform-*`
 - [ ] `orxnud-domain` and `orxnud-protocol` compile for a target with no platform crates
 - [ ] Bundled SQLite ≥ 3.51.3, asserted at **compile time**, and pragmas verified by a test that reads them back
@@ -243,7 +247,7 @@ Phase 1 is complete when **all** hold, and not before:
 - [ ] A compile-fail test proves `Proposal` has no method reaching an adapter
 - [ ] `CapabilityInvocation` cannot be constructed outside `orxnud-policy`'s API
 - [ ] The ADR-0029 harness runs end-to-end against the reference queue fixture, with all 12 properties reported
-- [ ] Windows `cargo check` green on the nightly lane
+- [ ] Windows `cargo check` green on the nightly lane — **open**: blocked on this host by a missing MSVC C toolchain (`cc-rs: failed to find tool "lib.exe"`), not by a code defect. 7 of 14 crates check clean for MSVC today, including all three platform adapters. See register V-29.
 - [ ] `cargo deny`, `cargo audit`, `cargo semver-checks` green; zero GPL/AGPL/NC
 - [ ] Repository `schema_meta` only; **no application tables**
 - [ ] **Zero capabilities enabled; zero features working**

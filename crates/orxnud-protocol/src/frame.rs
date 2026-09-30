@@ -109,10 +109,13 @@ impl Request {
                 limit: limits::MAX_FRAME_BYTES,
             });
         }
-        let value: Value =
-            serde_json::from_slice(bytes).map_err(|e| ProtocolError::Malformed { reason: e.to_string() })?;
+        let value: Value = serde_json::from_slice(bytes).map_err(|e| ProtocolError::Malformed {
+            reason: e.to_string(),
+        })?;
         check_depth(&value, 0)?;
-        serde_json::from_value(value).map_err(|e| ProtocolError::Malformed { reason: e.to_string() })
+        serde_json::from_value(value).map_err(|e| ProtocolError::Malformed {
+            reason: e.to_string(),
+        })
     }
 
     /// Whether the `jsonrpc` field is the expected version string.
@@ -137,7 +140,11 @@ pub struct Notification {
 impl Notification {
     /// Builds a notification.
     pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {
-        Self { jsonrpc: "2.0".to_owned(), method: method.into(), params }
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            method: method.into(),
+            params,
+        }
     }
 }
 
@@ -155,7 +162,11 @@ pub struct Success {
 impl Success {
     /// Builds a success response.
     pub fn new(id: RequestId, result: Value) -> Self {
-        Self { jsonrpc: "2.0".to_owned(), id, result }
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            id,
+            result,
+        }
     }
 }
 
@@ -178,13 +189,23 @@ impl Response {
     /// Builds a success response.
     #[must_use]
     pub fn ok(id: RequestId, result: Value) -> Self {
-        Self { jsonrpc: "2.0".to_owned(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     /// Builds an error response.
     #[must_use]
     pub fn err(id: RequestId, error: crate::error::RpcError) -> Self {
-        Self { jsonrpc: "2.0".to_owned(), id, result: None, error: Some(error) }
+        Self {
+            jsonrpc: "2.0".to_owned(),
+            id,
+            result: None,
+            error: Some(error),
+        }
     }
 
     /// Whether this response carries a result rather than an error.
@@ -252,7 +273,10 @@ mod tests {
     fn absent_params_are_omitted_not_nulled() {
         let bytes = Request::new(id(), "m").encode().expect("encode");
         let v: Value = serde_json::from_slice(&bytes).expect("json");
-        assert!(v.get("params").is_none(), "params should be omitted, not null");
+        assert!(
+            v.get("params").is_none(),
+            "params should be omitted, not null"
+        );
     }
 
     #[test]
@@ -273,13 +297,19 @@ mod tests {
     fn oversized_frames_are_refused_before_encoding() {
         let big = "x".repeat(limits::MAX_FRAME_BYTES + 1);
         let r = Request::new(id(), "m").with_params(json!({ "blob": big }));
-        assert!(matches!(r.encode(), Err(ProtocolError::FrameTooLarge { .. })));
+        assert!(matches!(
+            r.encode(),
+            Err(ProtocolError::FrameTooLarge { .. })
+        ));
     }
 
     #[test]
     fn oversized_inbound_frames_are_refused_before_decoding() {
         let bytes = vec![b'x'; limits::MAX_FRAME_BYTES + 1];
-        assert!(matches!(Request::decode(&bytes), Err(ProtocolError::FrameTooLarge { .. })));
+        assert!(matches!(
+            Request::decode(&bytes),
+            Err(ProtocolError::FrameTooLarge { .. })
+        ));
     }
 
     #[test]

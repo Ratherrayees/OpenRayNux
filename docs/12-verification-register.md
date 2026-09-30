@@ -62,7 +62,44 @@ phase gate).
 | **V-23** | **The Rust task-scheduler ecosystem's viable options are `croner` and `cron` only** | `crates.io/api/v1/crates/{croner,cron,clokwerk,job_scheduler,tokio-cron-scheduler}` | **quarterly** | 2026-09-30 | **Medium.** If `croner` is abandoned we have no documented-DST alternative. |
 | **V-24** | **PostgreSQL, Redis, Kafka and Kubernetes are absent from the personal install** | `rpm -q`; the deployment profile definition | **release:** assert the dependency manifest contains none | 2026-09-30 | **Medium.** This is the property that makes the product lightweight; drift is silent and cumulative. |
 | **V-25** | **Core-only idle RSS < 60 MB; core-only binary < 40 MB; core-only cold start < 150 ms** | **No external source. Measured by our own benchmark harness.** | **milestone:** CI on every commit; re-baseline per release | *target, unmeasured* | **High.** These are the budgets that make the lightweight promise honest. A regression is invisible without measurement. |
+| **V-27** | **`cargo-deny` 0.20 removed `[licenses] deny`** — the copyleft prohibition is now expressed by the *absence* of copyleft from `[licenses] allow` | `cargo deny check licenses` on this tree; the tool's own error output (`error[deprecated]`) | **release:** re-read the tool's config schema | 2026-09-30 | **Medium.** ADR-0006/ADR-0019 forbid GPL/AGPL/NC. If a future `deny.toml` reintroduces a `deny` key, cargo-deny will *error* rather than silently ignore it — the failure is loud, but only if someone reads it. `scripts/ci-gates.sh` G8 fails on any cargo-deny error. |
+| **V-28** | **The twelve Phase 1 gates actually pass on this tree** | `scripts/ci-gates.sh` (exit 0), run locally against Rust 1.98.1 | **milestone:** every commit in CI; **event:** a toolchain or dependency bump | 2026-09-30 | **High.** The gates are the Phase 1 deliverable (docs-13 §5). A gate that silently stops running is worse than a gate that fails, so G12 skips loudly when no release tag exists rather than passing vacuously. |
+| **V-29** | **The Windows check is blocked on this host by a missing MSVC C toolchain, not by a code defect** | `cargo check -p orxnud-store --target x86_64-pc-windows-msvc` → `cc-rs: failed to find tool "lib.exe"` | **release:** the Windows nightly lane reports the result | 2026-09-30 | **Medium.** 7 of 14 crates — including all three platform adapters, `orxnud-domain`, `orxnud-protocol`, `orxnud-config`, `orxnud-obs`, `orxnuctl` — check clean for MSVC today. The other 7 are blocked transitively by `libsqlite3-sys` and `blake3`, which need `cl.exe`/`lib.exe`. **No Rust-level error was observed for any crate.** The Windows claim is therefore *unverified*, not *failing*; it is a Phase 1 exit criterion (docs-13 §9) and stays open until the nightly runner reports. |
+
 | **V-26** | **`libxdo.pc` on Fedora declares `/usr/local` prefixes that are wrong** | `/usr/lib64/pkgconfig/libxdo.pc` | **event:** a Fedora packaging change | 2026-09-30 | **Low.** Cosmetic; we do not feed its cflags to a compiler. |
+
+---
+
+## 2a. Amendments
+
+Recorded per operating rule 5: wrongness is worth recording, because it is how
+this register improves.
+
+### A-001 — `orxnud-domain`'s dependency list
+
+**What the contract said:** `serde` and `thiserror` only.
+
+**What the implementation needs:** `serde_json` and `zeroize` as well.
+
+**Why the deviation is correct rather than a shortcut:**
+
+- `serde_json` because `ActionRequest.params`, `CapabilityInvocation.params`, and
+  `Proposal`'s field values are `serde_json::Value`. They were `Value` from the
+  first line of the implementation. Using a second untyped value type — `toml::Value`,
+  a hand-rolled enum — would have meant a lossy conversion at every boundary, and
+  `serde_json::Value` is the vocabulary `orxnud-protocol` already speaks.
+- `zeroize` because `SecretLookup::Found` must wipe a secret on drop. Without it a
+  secret sits in a heap allocation until the allocator happens to reuse it, which
+  on a long-running daemon is a long time.
+
+**Both are still pure, portable, and dependency-light.** Neither can perform I/O,
+spawn a runtime, or reach the OS, so the property the restriction exists to protect
+— that `orxnud-domain` is a pure core — is intact. Gate G2 asserts it mechanically
+by rejecting any of `tokio`, `rusqlite`, `keyring`, `clap`, `reqwest`, `walkdir`,
+`notify`, `directories`, `uuid`, `croner`, `jiff`, or `blake3`.
+
+**Status:** the contract text in docs-13 §3.1 should be amended to name these two.
+Recorded here first so the discrepancy is not silent.
 
 ---
 

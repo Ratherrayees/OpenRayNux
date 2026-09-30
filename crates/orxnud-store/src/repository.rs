@@ -141,7 +141,12 @@ mod tests {
     }
 
     fn region() -> StateRegion {
-        StateRegion { name: "schema_meta", class: StateClass::Critical, owner: "orxnud-store", retention: "indefinite" }
+        StateRegion {
+            name: "schema_meta",
+            class: StateClass::Critical,
+            owner: "orxnud-store",
+            retention: "indefinite",
+        }
     }
 
     #[test]
@@ -167,8 +172,14 @@ mod tests {
         use std::collections::BTreeSet;
         let errs = [
             RepositoryError::DuplicateRegion { name: "t" },
-            RepositoryError::NotFound { entity: "task", id: "1".into() },
-            RepositoryError::DerivedNotAuthoritative { entity: "memory", id: "1".into() },
+            RepositoryError::NotFound {
+                entity: "task",
+                id: "1".into(),
+            },
+            RepositoryError::DerivedNotAuthoritative {
+                entity: "memory",
+                id: "1".into(),
+            },
         ];
         let mut names: BTreeSet<String> = BTreeSet::new();
         for e in &errs {
@@ -181,7 +192,10 @@ mod tests {
 
     #[test]
     fn derived_rows_are_refused_where_authority_is_required() {
-        let e = RepositoryError::DerivedNotAuthoritative { entity: "memory", id: "m-1".into() };
+        let e = RepositoryError::DerivedNotAuthoritative {
+            entity: "memory",
+            id: "m-1".into(),
+        };
         assert!(e.to_string().contains("derived"));
     }
 }

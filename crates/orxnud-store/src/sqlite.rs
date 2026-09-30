@@ -45,7 +45,11 @@ impl SqliteVersion {
     pub fn compiled() -> Self {
         // `rusqlite::version()` returns a `&str` like "3.51.2"; parse it rather
         // than adding a dependency for three integers.
-        parse_version(rusqlite::version()).unwrap_or(SqliteVersion { major: 0, minor: 0, patch: 0 })
+        parse_version(rusqlite::version()).unwrap_or(SqliteVersion {
+            major: 0,
+            minor: 0,
+            patch: 0,
+        })
     }
 
     /// The version encoded in SQLite's single-integer form.
@@ -99,7 +103,10 @@ impl SqliteTooOld {
     /// Builds the error for a too-old version.
     #[must_use]
     pub fn new(found: SqliteVersion) -> Self {
-        Self { found, required: min_version() }
+        Self {
+            found,
+            required: min_version(),
+        }
     }
 }
 
@@ -147,26 +154,70 @@ pub enum StoreError {
 
 /// Verifies the compiled SQLite meets the minimum.
 ///
+/// The compile-time assertion in `const_assert_min_sqlite` already guarantees
+/// this cannot fail for a binary built from this tree. It stays because a store
+/// may be opened by code linked against a *different* SQLite — and a runtime
+/// check costs nothing next to silently running on a corrupting library.
+///
 /// # Errors
 ///
 /// [`SqliteTooOld`] when the bundled version is below 3.51.3.
 pub fn verify_sqlite_version() -> Result<SqliteVersion, SqliteTooOld> {
     let found = SqliteVersion::compiled();
-    if found.satisfies_minimum() { Ok(found) } else { Err(SqliteTooOld::new(found)) }
+    if found.satisfies_minimum() {
+        Ok(found)
+    } else {
+        Err(SqliteTooOld::new(found))
+    }
 }
 
-/// Compile-time assertion that the bundled SQLite is new enough.
+/// The SQLite version actually linked, as reported by `build.rs`.
+///
+/// `build.rs` parses `SQLITE_VERSION_NUMBER` out of the very header that
+/// `libsqlite3-sys` compiles, so this is the version that will be in the binary.
+/// It cannot be forged by editing a constant here.
+const LINKED_SQLITE_VERSION: i64 = parse_decimal(env!("ORXNUD_LINKED_SQLITE_VERSION"));
+
+/// Parses an ASCII decimal integer in a `const` context.
+///
+/// `str::parse` is not const-callable, so `build.rs`'s output has to be converted
+/// by hand. Returns 0 for anything unparseable, which makes the assertion below
+/// fail rather than silently pass.
+const fn parse_decimal(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut acc: i64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < b'0' || b > b'9' {
+            return 0;
+        }
+        acc = acc * 10 + (b - b'0') as i64;
+        i += 1;
+    }
+    acc
+}
+
+/// Compile-time assertion that the linked SQLite is new enough.
 ///
 /// Evaluated in a `const` context, so violating it is a **build error**, not a
 /// runtime one. This is the checkable form of Verification Register V-02: there
 /// is no way to produce a release binary that links a known-corrupting SQLite.
+///
+/// It asserts against [`LINKED_SQLITE_VERSION`] rather than a constant written by
+/// hand, because a self-comparison proves nothing — it would still pass if the
+/// amalgamation were downgraded underneath it.
+// Clippy reads `LINKED_SQLITE_VERSION >= 3_051_003` as a constant comparison
+// because in this crate the left side *is* a constant. That is the entire point:
+// the assertion must be evaluated by the compiler, not at run time, so that
+// downgrading the amalgamation is a build failure.
+#[allow(clippy::assertions_on_constants)]
 const fn const_assert_min_sqlite() {
-    // `rusqlite::version()` is not const-callable, so the assertion is made
-    // against the version `libsqlite3-sys` compiles in, exposed at compile time
-    // through the `bundled` feature's pinned amalgamation. The runtime check in
-    // `verify_sqlite_version` is the belt; this is the braces.
     assert!(
-        MIN_SQLITE_VERSION >= 3_051_003,
+        LINKED_SQLITE_VERSION >= 3_051_003,
         "OpenRayNux requires SQLite >= 3.51.3 for the WAL-reset corruption fix"
     );
 }
@@ -193,16 +244,20 @@ impl Store {
     /// read back, or if the file cannot be opened.
     pub fn open(path: &std::path::Path, critical: bool) -> Result<Self, StoreError> {
         let version = verify_sqlite_version().map_err(StoreError::SqliteTooOld)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-                    path: parent.display().to_string(),
-                    source,
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
         }
         let conn = Connection::open(path)?;
-        let pragma = if critical { Pragma::critical() } else { Pragma::derived() };
+        let pragma = if critical {
+            Pragma::critical()
+        } else {
+            Pragma::derived()
+        };
         pragma.apply(&conn)?;
         pragma.verify(&conn)?;
         Ok(Self { conn, version })
@@ -259,6 +314,36 @@ pub fn open(path: &std::path::Path, critical: bool) -> Result<Store, StoreError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_const_decimal_parser_handles_what_build_rs_emits() {
+        assert_eq!(parse_decimal("3053002"), 3_053_002);
+        assert_eq!(parse_decimal("0"), 0);
+        // Anything unparseable becomes 0, which must trip the minimum assertion
+        // rather than be read as "version 0 passes".
+        for bad in ["", "abc", "3.53.2", "3053002 ", "-1", "3_0"] {
+            assert_eq!(parse_decimal(bad), 0, "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn the_compile_time_and_runtime_versions_agree() {
+        // If these drift, the build-time assertion is asserting about a different
+        // SQLite than the one that actually runs.
+        assert_eq!(
+            LINKED_SQLITE_VERSION,
+            i64::from(SqliteVersion::compiled().encoded()),
+            "build.rs and rusqlite disagree about the linked SQLite version"
+        );
+    }
+
+    #[test]
+    // Constant by construction; the runtime half is what this test is really for.
+    #[allow(clippy::assertions_on_constants)]
+    fn the_linked_sqlite_satisfies_the_minimum() {
+        assert!(SqliteVersion::compiled().satisfies_minimum());
+        assert!(LINKED_SQLITE_VERSION >= 3_051_003);
+    }
     use rusqlite::Connection;
 
     #[test]
@@ -266,7 +351,10 @@ mod tests {
         // The assertion the whole crate exists to make. If this fails, the
         // `bundled` feature is off or the amalgamation is too old.
         let v = verify_sqlite_version().expect("bundled SQLite must be >= 3.51.3");
-        assert!(v.satisfies_minimum(), "compiled SQLite {v} is below the floor");
+        assert!(
+            v.satisfies_minimum(),
+            "compiled SQLite {v} is below the floor"
+        );
         assert!(
             v.encoded() >= 3_051_003,
             "compiled SQLite {v} is below 3.51.3"
@@ -278,7 +366,11 @@ mod tests {
         // Documents *why* we bundle. Fedora 44 ships 3.51.2, which this check
         // rejects. If a future Fedora moves past the floor, this test's comment
         // is what needs revisiting -- not the assertion above.
-        let fedora = SqliteVersion { major: 3, minor: 51, patch: 2 };
+        let fedora = SqliteVersion {
+            major: 3,
+            minor: 51,
+            patch: 2,
+        };
         assert!(!fedora.satisfies_minimum(), "3.51.2 must be rejected");
         assert_eq!(fedora.encoded(), 3_051_002);
         let err = SqliteTooOld::new(fedora);
@@ -287,18 +379,57 @@ mod tests {
 
     #[test]
     fn version_encoding_and_comparison_agree() {
-        let v = SqliteVersion { major: 3, minor: 51, patch: 3 };
+        let v = SqliteVersion {
+            major: 3,
+            minor: 51,
+            patch: 3,
+        };
         assert_eq!(v.encoded(), MIN_SQLITE_VERSION);
         assert!(v.satisfies_minimum());
-        assert!(!SqliteVersion { major: 3, minor: 51, patch: 2 }.satisfies_minimum());
-        assert!(SqliteVersion { major: 3, minor: 52, patch: 0 }.satisfies_minimum());
-        assert!(!SqliteVersion { major: 2, minor: 99, patch: 99 }.satisfies_minimum());
+        assert!(
+            !SqliteVersion {
+                major: 3,
+                minor: 51,
+                patch: 2
+            }
+            .satisfies_minimum()
+        );
+        assert!(
+            SqliteVersion {
+                major: 3,
+                minor: 52,
+                patch: 0
+            }
+            .satisfies_minimum()
+        );
+        assert!(
+            !SqliteVersion {
+                major: 2,
+                minor: 99,
+                patch: 99
+            }
+            .satisfies_minimum()
+        );
     }
 
     #[test]
     fn version_strings_parse() {
-        assert_eq!(parse_version("3.51.3"), Some(SqliteVersion { major: 3, minor: 51, patch: 3 }));
-        assert_eq!(parse_version("3.51.2"), Some(SqliteVersion { major: 3, minor: 51, patch: 2 }));
+        assert_eq!(
+            parse_version("3.51.3"),
+            Some(SqliteVersion {
+                major: 3,
+                minor: 51,
+                patch: 3
+            })
+        );
+        assert_eq!(
+            parse_version("3.51.2"),
+            Some(SqliteVersion {
+                major: 3,
+                minor: 51,
+                patch: 2
+            })
+        );
         assert_eq!(parse_version("garbage"), None);
         assert_eq!(parse_version("3.51"), None);
         assert_eq!(parse_version(""), None);
@@ -314,7 +445,14 @@ mod tests {
 
     #[test]
     fn min_version_decodes_correctly() {
-        assert_eq!(min_version(), SqliteVersion { major: 3, minor: 51, patch: 3 });
+        assert_eq!(
+            min_version(),
+            SqliteVersion {
+                major: 3,
+                minor: 51,
+                patch: 3
+            }
+        );
     }
 
     #[test]
@@ -335,7 +473,9 @@ mod tests {
         // The file exists and WAL is on it.
         assert!(path.exists());
         let conn = Connection::open(&path).expect("reopen");
-        let mode: String = conn.query_row("PRAGMA journal_mode;", [], |r| r.get(0)).expect("read");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+            .expect("read");
         assert_eq!(mode.to_lowercase(), "wal", "journal_mode is persistent");
         let _ = std::fs::remove_file(&path);
     }

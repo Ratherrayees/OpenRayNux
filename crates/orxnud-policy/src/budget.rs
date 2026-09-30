@@ -88,7 +88,9 @@ impl BudgetLedger {
     /// no permission to spend.
     #[must_use]
     pub fn empty() -> Self {
-        Self { ceilings: BTreeMap::new() }
+        Self {
+            ceilings: BTreeMap::new(),
+        }
     }
 
     /// Declares a ceiling for a scope.
@@ -116,7 +118,9 @@ impl BudgetLedger {
     /// direction: a capability whose cost nobody budgeted cannot spend.
     #[must_use]
     pub fn permits(&self, scope: &str, amount: u64) -> bool {
-        self.ceilings.get(scope).is_some_and(|c| !c.would_exceed(amount))
+        self.ceilings
+            .get(scope)
+            .is_some_and(|c| !c.would_exceed(amount))
     }
 
     /// Checks an amount against **every declared ceiling**.
@@ -142,7 +146,9 @@ impl BudgetLedger {
     /// undeclared ledger would create spend that no ceiling could ever catch.
     pub fn charge_all(&mut self, amount: u64) -> Result<(), BudgetError> {
         if self.ceilings.is_empty() {
-            return Err(BudgetError::UnknownScope { scope: "<undeclared>".to_owned() });
+            return Err(BudgetError::UnknownScope {
+                scope: "<undeclared>".to_owned(),
+            });
         }
         for c in self.ceilings.values_mut() {
             c.charge(amount);
@@ -163,7 +169,9 @@ impl BudgetLedger {
                 c.charge(amount);
                 Ok(())
             }
-            None => Err(BudgetError::UnknownScope { scope: scope.to_owned() }),
+            None => Err(BudgetError::UnknownScope {
+                scope: scope.to_owned(),
+            }),
         }
     }
 
@@ -175,7 +183,7 @@ impl BudgetLedger {
     pub fn tightest(&self) -> Option<(&str, u64, u64)> {
         self.ceilings
             .iter()
-            .min_by_key(|(name, c)| c.limit.saturating_sub(c.spent))
+            .min_by_key(|(_, c)| c.limit.saturating_sub(c.spent))
             .map(|(name, c)| (name.as_str(), c.limit, c.spent))
     }
 
@@ -229,7 +237,10 @@ mod tests {
     #[test]
     fn the_boundary_is_exact() {
         let l = BudgetLedger::empty().with_global(100);
-        assert!(l.permits("global", 100), "spending exactly the limit must be allowed");
+        assert!(
+            l.permits("global", 100),
+            "spending exactly the limit must be allowed"
+        );
         assert!(!l.permits("global", 101));
     }
 
@@ -241,7 +252,10 @@ mod tests {
         assert!(!l.permits("global", 41));
         l.charge("global", 40).expect("charge");
         assert_eq!(l.ceiling("global").map(|c| c.spent), Some(100));
-        assert!(!l.permits("global", 1), "a full budget permits nothing further");
+        assert!(
+            !l.permits("global", 1),
+            "a full budget permits nothing further"
+        );
     }
 
     #[test]
@@ -289,7 +303,10 @@ mod tests {
         assert_eq!(l.ceiling("global").map(|c| c.spent), Some(10));
         assert_eq!(l.ceiling("cost:low").map(|c| c.spent), Some(10));
         assert!(!l.permits_all(1), "the risk scope is now exhausted");
-        assert!(matches!(l.charge_all(1), Ok(())), "charging is not gated by permits");
+        assert!(
+            matches!(l.charge_all(1), Ok(())),
+            "charging is not gated by permits"
+        );
     }
 
     #[test]
@@ -300,14 +317,32 @@ mod tests {
         // The exact wrapping case: spent is at the maximum, so any positive
         // charge overflows. `saturating_add` would clamp to u64::MAX and then
         // compare as *not* greater than a u64::MAX limit, reading as FITTING.
-        let overflowing = Ceiling { limit: u64::MAX, spent: u64::MAX };
-        assert!(overflowing.would_exceed(1), "overflow must read as exceeding");
+        let overflowing = Ceiling {
+            limit: u64::MAX,
+            spent: u64::MAX,
+        };
+        assert!(
+            overflowing.would_exceed(1),
+            "overflow must read as exceeding"
+        );
 
         // And a charge that does not wrap behaves arithmetically.
-        let roomy = Ceiling { limit: u64::MAX, spent: 0 };
-        assert!(!roomy.would_exceed(1), "a tiny charge against a huge limit fits");
-        assert!(!roomy.would_exceed(u64::MAX), "an exact fit at the limit is allowed");
-        let nearly = Ceiling { limit: 10, spent: 9 };
+        let roomy = Ceiling {
+            limit: u64::MAX,
+            spent: 0,
+        };
+        assert!(
+            !roomy.would_exceed(1),
+            "a tiny charge against a huge limit fits"
+        );
+        assert!(
+            !roomy.would_exceed(u64::MAX),
+            "an exact fit at the limit is allowed"
+        );
+        let nearly = Ceiling {
+            limit: 10,
+            spent: 9,
+        };
         assert!(!nearly.would_exceed(1), "9 + 1 == 10 is an exact fit");
         assert!(nearly.would_exceed(2), "9 + 2 > 10 exceeds");
     }
@@ -319,14 +354,21 @@ mod tests {
         l.charge("global", 50).expect("charge");
         assert_eq!(l.utilisation("global"), Some(0.5));
         l.charge("global", 500).expect("charge");
-        assert_eq!(l.utilisation("global"), Some(1.0), "utilisation must clamp at 1.0");
+        assert_eq!(
+            l.utilisation("global"),
+            Some(1.0),
+            "utilisation must clamp at 1.0"
+        );
         assert_eq!(l.utilisation("missing"), None);
     }
 
     #[test]
     fn risk_scopes_are_distinct() {
         let all = [
-            RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical,
+            RiskClass::Low,
+            RiskClass::Medium,
+            RiskClass::High,
+            RiskClass::Critical,
         ];
         let mut names: Vec<&str> = all.iter().copied().map(scope_for_risk).collect();
         names.sort_unstable();

@@ -1,4 +1,4 @@
-//! OpenRayNux domain types and invariants.
+//! `OpenRayNux` domain types and invariants.
 //!
 //! # What this crate is
 //!
@@ -52,11 +52,10 @@ pub use ids::{
 pub use intent::{IntentKind, Proposal, ProposedStep};
 pub use invocation::{
     ActionRequest, AuthorisationProof, CapabilityInvocation, DispatchView, InvocationContext,
+    PolicySeal,
 };
-pub use platform::{FsContract, NotifyContract, NotificationRequest, SecretsContract, SecretRef};
-pub use task_state::{
-    MisfirePolicy, ScheduleFire, ScheduleSpec, TaskKind, TaskState, TaskStatus,
-};
+pub use platform::{FsContract, NotificationRequest, NotifyContract, SecretRef, SecretsContract};
+pub use task_state::{MisfirePolicy, ScheduleFire, ScheduleSpec, TaskKind, TaskState, TaskStatus};
 
 /// Re-export of [`serde_json::json!`] so downstream crates and compile-fail
 /// cases can build untrusted parameter payloads without declaring their own

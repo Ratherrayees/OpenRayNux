@@ -1,22 +1,32 @@
 //! Action requests and authorised capability invocations.
 //!
-//! # The type-level choke point
+//! # The choke point
 //!
-//! [`CapabilityInvocation`] is the *only* way to reach a capability adapter,
-//! and **its fields are crate-private to `orxnud-domain`**. The single
-//! constructor is [`CapabilityInvocation::authorise`], which takes an
-//! [`AuthorisationProof`] that only `orxnud-policy` can produce (via
-//! [`crate::ApprovalDigest`] plus its own private seal type).
+//! [`CapabilityInvocation`] is the *only* way to reach a capability adapter.
+//! Both its fields **and** those of [`AuthorisationProof`] are private, so
+//! neither type can be built with a struct literal from outside this crate.
 //!
-//! The result, at the type level:
+//! # What actually enforces this, stated honestly
 //!
-//! * No code outside `orxnud-domain` can construct an invocation by field
-//!   literal, because the fields are not `pub`.
-//! * No code outside `orxnud-domain` can call the constructor, because
-//!   [`AuthorisationProof`] cannot be built without a policy decision.
+//! Rust has no friend crates: a `pub fn` in this crate is callable by every
+//! crate in the workspace, including ones that should not hold an
+//! authorisation. So the guarantee is **two mechanisms, neither of them the
+//! type system alone**:
 //!
-//! So "the model called the tool directly" is not merely discouraged by review
-//! — it does not compile. See ADR-0012 and ADR-0027.
+//! 1. **Opacity.** Neither type has public fields, so no caller can assemble one
+//!    from parts. [`AuthorisationProof::issue`] is the single path, and it takes
+//!    a [`PolicySeal`].
+//! 2. **The dependency-graph gate** (`scripts/ci-gates.sh`, gate G2): only
+//!    `orxnud-policy` is permitted to name `AuthorisationProof`,
+//!    `PolicySeal`, or [`CapabilityInvocation::authorise`]. Any other crate
+//!    referencing them fails the build.
+//!
+//! Claiming the type system alone guarantees "only the policy layer can
+//! authorise" would be false, and a false security claim is worse than a
+//! documented two-part mechanism. Gate G2 is what closes the gap; the
+//! compile-fail tests in `tests/compile_fail/` prove the opacity half.
+//!
+//! See ADR-0012 and ADR-0027.
 
 use serde::{Deserialize, Serialize};
 
@@ -126,17 +136,89 @@ impl InvocationContext {
 
 /// Proof that the policy layer evaluated and authorised an action.
 ///
-/// **Not constructible outside this crate.** It is the seal that makes
-/// [`CapabilityInvocation`] unforgeable, which is the mechanism behind "the LLM
-/// must never be the authority that grants itself permission".
+/// Fields are private, so this cannot be assembled from parts outside
+/// `orxnud-domain`. It is the value that makes [`CapabilityInvocation`]
+/// unforgeable, which is the mechanism behind "the LLM must never be the
+/// authority that grants itself permission".
+///
+/// Obtain one from [`AuthorisationProof::issue`], which additionally requires a
+/// [`PolicySeal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorisationProof {
-    /// The policy version that made the decision, recorded in the audit journal.
-    pub policy_version: String,
-    /// Digest of the approval, when the risk class required one.
-    pub approval: Option<ApprovalDigest>,
+    policy_version: String,
+    approval: Option<ApprovalDigest>,
+    assessed_risk: RiskClass,
+}
+
+impl AuthorisationProof {
+    /// Issues a proof. Requires a [`PolicySeal`], which gate G2 restricts to
+    /// `orxnud-policy`.
+    #[must_use]
+    pub fn issue(
+        _seal: &PolicySeal,
+        policy_version: impl Into<String>,
+        approval: Option<ApprovalDigest>,
+        assessed_risk: RiskClass,
+    ) -> Self {
+        Self {
+            policy_version: policy_version.into(),
+            approval,
+            assessed_risk,
+        }
+    }
+
+    /// The policy version that made the decision.
+    #[must_use]
+    pub fn policy_version(&self) -> &str {
+        &self.policy_version
+    }
+
+    /// The approval digest, when the risk class required one.
+    #[must_use]
+    pub fn approval(&self) -> Option<ApprovalDigest> {
+        self.approval
+    }
+
     /// The risk the policy assigned, after escalation.
-    pub assessed_risk: RiskClass,
+    #[must_use]
+    pub fn assessed_risk(&self) -> RiskClass {
+        self.assessed_risk
+    }
+}
+
+/// The capability of issuing an [`AuthorisationProof`].
+///
+/// Deliberately **not** constructible in a useful way: its only constructor
+/// records the issuing crate name, and gate G2 permits that name to be
+/// `orxnud-policy` and nothing else. Rust offers no way to express "only this
+/// crate may call this", so the restriction is mechanical rather than nominal —
+/// which is why it lives in a script that fails the build rather than in a
+/// comment.
+///
+/// A caller that reached this type without a real policy evaluation has still
+/// gained nothing: `CapabilityInvocation::authorise` grants no capability by
+/// itself. The dispatcher resolves the capability against the registry, and
+/// Phase 1's registry is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySeal {
+    issued_by: &'static str,
+}
+
+impl PolicySeal {
+    /// The name recorded for a seal.
+    #[must_use]
+    pub fn issued_by(&self) -> &'static str {
+        self.issued_by
+    }
+
+    /// Creates a seal attributed to `issued_by`.
+    ///
+    /// Public because Rust cannot restrict it; the gate is the enforcement.
+    /// Callers outside `orxnud-policy` are a build failure, not a runtime one.
+    #[must_use]
+    pub fn attest(issued_by: &'static str) -> Self {
+        Self { issued_by }
+    }
 }
 
 /// A **policy-authorised** request to invoke a capability.
@@ -170,6 +252,7 @@ impl CapabilityInvocation {
     /// evaluation. A caller that has not evaluated policy cannot call this.
     #[must_use]
     pub fn authorise(
+        _seal: &PolicySeal,
         request: ActionRequest,
         actor: Actor,
         context: InvocationContext,
@@ -305,15 +388,20 @@ mod tests {
     }
 
     fn proof() -> AuthorisationProof {
-        AuthorisationProof {
-            policy_version: "v1".into(),
-            approval: None,
-            assessed_risk: RiskClass::Low,
-        }
+        AuthorisationProof::issue(&seal(), "v1", None, RiskClass::Low)
+    }
+
+    fn seal() -> PolicySeal {
+        // In-crate, so this is the honest spelling of what `orxnud-policy` does
+        // across the crate boundary.
+        PolicySeal::attest("orxnud-domain-test")
     }
 
     fn actor() -> Actor {
-        Actor::Human { user: UserId::new("u"), via: AuthChannel::LocalInteractive }
+        Actor::Human {
+            user: UserId::new("u"),
+            via: AuthChannel::LocalInteractive,
+        }
     }
 
     fn ctx() -> InvocationContext {
@@ -355,6 +443,7 @@ mod tests {
     #[test]
     fn dispatch_view_hides_the_actor() {
         let inv = CapabilityInvocation::authorise(
+            &seal(),
             request(DataClass::Public, DataClass::Public),
             actor(),
             ctx(),
@@ -374,10 +463,14 @@ mod tests {
 
     #[test]
     fn authorise_records_policy_version_and_risk() {
-        let mut p = proof();
-        p.assessed_risk = RiskClass::Critical;
-        p.approval = Some(ApprovalDigest::from_bytes([7u8; 32]));
+        let p = AuthorisationProof::issue(
+            &seal(),
+            "v1",
+            Some(ApprovalDigest::from_bytes([7u8; 32])),
+            RiskClass::Critical,
+        );
         let inv = CapabilityInvocation::authorise(
+            &seal(),
             request(DataClass::Sensitive, DataClass::Sensitive),
             actor(),
             ctx(),

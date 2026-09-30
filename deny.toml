@@ -1,0 +1,129 @@
+# `cargo deny` policy — the supply-chain and licence gate (docs-13 §5).
+#
+# # Why this file is stricter than a default
+#
+# The default `cargo deny` behaviour rejects everything, which fails the build
+# on first run and gets "fixed" by someone loosening it until the build goes
+# green. This file instead states the licences OpenRayNux accepts, so an
+# unexpected licence is a deliberate decision someone has to write down.
+#
+# The rule that matters most is the copyleft one. ADR-0006 and ADR-0019 forbid
+# GPL, AGPL, and non-commercial licences **anywhere** in the tree, including
+# transitively. That is stricter than most projects: a single GPL transitive
+# dependency makes the combined work licence-encumbered, and an NC licence makes
+# it unsellable.
+
+[graph]
+# Only the crates we actually build. `all-features = false` matters because an
+# unused feature can pull in a dependency with a worse licence than the one we
+# selected — checking the graph we do not build would be checking the wrong tree.
+all-features = false
+# `exclude-dev` rather than the older `no-dev`: dev-dependencies are still
+# checked, because a test-only crate with a copyleft licence is still code that
+# gets compiled on a maintainer's machine.
+exclude-dev = false
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+version = 2
+# Report advisories without failing the build. Phase 1 has no released binary, so
+# an advisory cannot be exploited in the field; a hard failure here would train
+# people to reach for `--no-deny-warnings`, which defeats the gate entirely.
+# Set back to "deny" once there is a shipped artifact to protect.
+ignore = []
+yanked = "warn"
+# RustSec advisories without a CVE are still real; they are only not-yet-scored.
+# `workspace` scopes this to crates we author, so an unmaintained crate pulled in
+# transitively does not block the build.
+unmaintained = "workspace"
+# A licence change in a dependency is not a security matter and is checked
+# properly by the licence gate below.
+[licenses]
+version = 2
+# Permissive licences we accept. Anything outside this list fails.
+# Only licences actually encountered in the current tree. An unmatched allowance
+# is reported as a warning, which is the point: it means the list has drifted from
+# reality and someone should look. A blanket list of "licences we might accept"
+# would silently rot.
+#
+# Entries are single licences, never whole SPDX expressions. cargo-deny matches a
+# crate's expression against this list branch by branch, so "MIT OR Apache-2.0"
+# is satisfied by the presence of `MIT`. Writing the whole expression here is a
+# hard error, not a no-op.
+allow = [
+    "MIT",                              # most of the tree
+    "Apache-2.0",                       # rusqlite, tokio, and friends
+    "Apache-2.0 WITH LLVM-exception",   # via the `wasi` chain
+    "Unlicense",                         # via `blake3`
+    "Zlib",                              # via `jiff`/`croner`
+    "Unicode-3.0",                       # `idna`, via the URL machinery
+    # `CC0-1.0` and `MIT-0` arrive inside disjunctions that also permit Apache-2.0
+    # or MIT, so they are already satisfied. They are listed anyway so a future
+    # crate offering one *alone* does not fail on a technicality.
+    "CC0-1.0",
+    "MIT-0",
+]
+confidence-threshold = 0.93
+# # The copyleft prohibition
+#
+# There is deliberately no `deny` list: cargo-deny 0.20 removed it, and the
+# absence is the enforcement. Only the licences in `allow` above are accepted, so
+# a crate licensed GPL-3.0 *only* fails.
+#
+# This still produces the right answer for the disjunction that trips people up.
+# `r-efi` is "MIT OR Apache-2.0 OR LGPL-2.1-or-later" and is accepted — correctly,
+# because an `OR` is a *choice*, and cargo-deny confirms we can build under MIT.
+# What must never pass is a crate offering *only* copyleft, or a disjunct where
+# every branch is copyleft. Neither matches anything in `allow`.
+#
+# The practical consequence to remember: adding a permissive licence to `allow` is
+# a decision, and adding one that appears in a copyleft disjunct is safe only
+# because the other branch is also permitted. Read the whole expression.
+
+[bans]
+# Multiple versions of one crate is normal and not automatically wrong — `cargo`
+# resolves it — but it is worth seeing, so it warns rather than fails.
+multiple-versions = "warn"
+# A wildcard dependency (`foo = "*"`) makes the build irreproducible and is a way
+# to smuggle in a licence change without a review noticing.
+wildcards = "deny"
+# `{ workspace = true }` is reported as a wildcard by cargo-deny, but it is the
+# opposite of one: the version is pinned once in `[workspace.dependencies]` and
+# every member inherits that exact value. Refusing it would mean duplicating the
+# version in fourteen manifests, which is the drift the wildcard check exists to
+# prevent. The real version check lives in gate G2, which reads
+# `[workspace.dependencies]` and requires every internal dependency to inherit
+# from it.
+allow-wildcard-paths = true
+highlight = "all"
+
+# Both remaining duplicates are inside the `zbus` -> `secret-service` subtree that
+# `keyring` pulls in for Linux Secret Service support. Neither is reachable from
+# our code and neither can be resolved without a patch to `zbus` or `keyring`,
+# which is a worse trade than carrying two copies of a proc-macro.
+#
+# Listed explicitly, with reasons, because "multiple-versions = warn" with no
+# notes would leave a reviewer unable to tell an accepted duplicate from a new one.
+skip = [
+    # `zbus` 5.19 uses `syn` 3 through `async-trait`, and `darling` (via
+    # `zbus_macros`) still uses `syn` 2. Upstream's problem.
+    { crate = "syn@2.0.119", reason = "zbus 5.19 pulls syn 2 via darling and syn 3 via async-trait; not resolvable without patching zbus" },
+    # `toml_edit` (via `proc-macro-crate`) uses `toml_datetime` 1.x while `toml`
+    # itself uses 0.7.x. Both are pulled by the same subtree.
+    { crate = "toml_datetime@0.7.5+spec-1.1.0", reason = "toml 0.9 uses toml_datetime 0.7 while toml_edit 0.25 (via proc-macro-crate) uses 1.x" },
+]
+skip-tree = []
+
+[sources]
+# Unknown registries are a supply-chain risk: an alternative index can serve a
+# different crate under the same name.
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io only. A registry other than this one must be added deliberately.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

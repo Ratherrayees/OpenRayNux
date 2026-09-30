@@ -13,8 +13,10 @@ publish.workspace = true
 # domain types would eventually reimplement a rule to render a state it
 # disagrees with (docs-03 §2).
 [dependencies]
-clap = { workspace = true }
-serde_json = { workspace = true }
+# The argument parser is hand-written rather than derived: the command set is
+# closed and tiny, and refusing an unexpected argument is a rule worth writing
+# by hand. `clap` would be a larger dependency for the same two verbs.
+thiserror = { workspace = true }
 orxnud-protocol = { workspace = true }
 
 [dev-dependencies]

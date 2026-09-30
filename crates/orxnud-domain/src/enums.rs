@@ -143,6 +143,20 @@ impl DataClass {
     }
 }
 
+impl std::fmt::Display for DataClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wire spelling, so an error message matches what a config file or
+        // wire frame shows rather than using a different vocabulary.
+        let s = match self {
+            Self::Public => "public",
+            Self::Personal => "personal",
+            Self::Sensitive => "sensitive",
+            Self::Regulated => "regulated",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Where a capability's code runs, and therefore how much we trust it
 /// (ADR-0009).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -154,6 +168,17 @@ pub enum IsolationTier {
     Subprocess,
     /// Remote over MCP Streamable HTTP. Untrusted.
     Remote,
+}
+
+impl Default for IsolationTier {
+    /// `InProcess` — the least-privileged assumption.
+    ///
+    /// A capability that has not declared its isolation is treated as in-process,
+    /// so anything needing a sandbox must say so. Defaulting to `Subprocess` would
+    /// imply isolation the capability may not actually have.
+    fn default() -> Self {
+        Self::InProcess
+    }
 }
 
 impl IsolationTier {
@@ -266,7 +291,10 @@ mod tests {
     #[test]
     fn unknown_capability_classifies_as_high_not_low() {
         // The single most important behaviour in this file.
-        assert_eq!(RiskClass::classify_unknown("brand-new-thing"), RiskClass::High);
+        assert_eq!(
+            RiskClass::classify_unknown("brand-new-thing"),
+            RiskClass::High
+        );
         assert!(RiskClass::classify_unknown("brand-new-thing").requires_approval());
         assert_eq!(RiskClass::classify_unknown("read"), RiskClass::Low);
         assert_eq!(RiskClass::classify_unknown("delete"), RiskClass::Critical);
@@ -308,7 +336,10 @@ mod tests {
             );
         }
         assert_eq!(ApprovalLevel::for_risk(RiskClass::High), ApprovalLevel::L3);
-        assert_eq!(ApprovalLevel::for_risk(RiskClass::Critical), ApprovalLevel::L4);
+        assert_eq!(
+            ApprovalLevel::for_risk(RiskClass::Critical),
+            ApprovalLevel::L4
+        );
     }
 
     #[test]
@@ -321,7 +352,10 @@ mod tests {
             DataClass::Regulated.combine(DataClass::Public),
             DataClass::Regulated
         );
-        assert_eq!(DataClass::Sensitive.combine(DataClass::Personal), DataClass::Sensitive);
+        assert_eq!(
+            DataClass::Sensitive.combine(DataClass::Personal),
+            DataClass::Sensitive
+        );
     }
 
     #[test]
@@ -368,9 +402,18 @@ mod tests {
     #[test]
     fn critical_and_authoritative_require_strong_consistency() {
         // This is why they get `synchronous = FULL` and derived does not.
-        assert_eq!(StateClass::Critical.required_consistency(), StateConsistency::Strong);
-        assert_eq!(StateClass::Authoritative.required_consistency(), StateConsistency::Strong);
-        assert_eq!(StateClass::Derived.required_consistency(), StateConsistency::Eventual);
+        assert_eq!(
+            StateClass::Critical.required_consistency(),
+            StateConsistency::Strong
+        );
+        assert_eq!(
+            StateClass::Authoritative.required_consistency(),
+            StateConsistency::Strong
+        );
+        assert_eq!(
+            StateClass::Derived.required_consistency(),
+            StateConsistency::Eventual
+        );
     }
 
     #[test]

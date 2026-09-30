@@ -1,23 +1,31 @@
-error[E0451]: fields `task`, `step`, `actor`, `capability`, `params`, `data_class`, `context`, `assessed_risk` and `policy_version` of struct `CapabilityInvocation` are private
-  --> tests/compile_fail/invocation_is_policy_sealed.rs:25:9
+error[E0616]: field `assessed_risk` of struct `AuthorisationProof` is private
+  --> tests/compile_fail/invocation_is_policy_sealed.rs:62:14
    |
-24 |     let _invocation = CapabilityInvocation {
-   |                       -------------------- in this type
-25 |         task: TaskId::from("t-1"),
-   |         ^^^^ private field
-26 |         step: 0,
-   |         ^^^^ private field
-27 |         actor: Actor::Human { user: UserId::from("u"), via: AuthChannel::LocalInteractive },
-   |         ^^^^^ private field
-28 |         capability: CapabilityId::from("c"),
-   |         ^^^^^^^^^^ private field
-29 |         params: orxnud_domain::json!({}),
-   |         ^^^^^^ private field
-30 |         data_class: DataClass::Public,
-   |         ^^^^^^^^^^ private field
-31 |         context: InvocationContext::new("k", 1, "c"),
-   |         ^^^^^^^ private field
-32 |         assessed_risk: RiskClass::Low,
-   |         ^^^^^^^^^^^^^ private field
-33 |         policy_version: "forged".to_owned(),
-   |         ^^^^^^^^^^^^^^ private field
+62 |     obtained.assessed_risk = RiskClass::Critical;
+   |              ^^^^^^^^^^^^^ private field
+
+error[E0616]: field `policy_version` of struct `AuthorisationProof` is private
+  --> tests/compile_fail/invocation_is_policy_sealed.rs:63:14
+   |
+63 |     obtained.policy_version = "escalated".to_owned();
+   |              ^^^^^^^^^^^^^^ private field
+
+error[E0061]: this function takes 5 arguments but 4 arguments were supplied
+  --> tests/compile_fail/invocation_is_policy_sealed.rs:76:13
+   |
+76 |     let _ = CapabilityInvocation::authorise(
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+77 |         request,
+   |         ------- argument #1 of type `&PolicySeal` is missing
+   |
+note: associated function defined here
+  --> src/invocation.rs
+   |
+   |     pub fn authorise(
+   |            ^^^^^^^^^
+help: provide the argument
+   |
+76 |     let _ = CapabilityInvocation::authorise(
+77 ~         /* &PolicySeal */,
+78 ~         request,
+   |

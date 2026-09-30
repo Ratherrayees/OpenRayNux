@@ -152,12 +152,11 @@ impl ExternalSource {
     /// never grant authority (ADR-0027, control S33).
     #[must_use]
     pub fn is_verified(&self) -> bool {
-        match self {
-            Self::Webhook { .. } => false,
-            Self::Messaging { .. } => false,
-            Self::FileWatch { .. } => true,
-            Self::Unknown => false,
-        }
+        // Only a local file watch carries verifiable identity: the daemon created
+        // the watch itself and owns the path. A webhook's signature is about the
+        // *request*, not about the sender having any authority, so it verifies
+        // nothing that could raise its trust level.
+        matches!(self, Self::FileWatch { .. })
     }
 }
 
@@ -187,7 +186,12 @@ mod tests {
     #[test]
     fn external_source_verification_defaults_to_unverified() {
         assert!(!ExternalSource::Unknown.is_verified());
-        assert!(!ExternalSource::Webhook { listener: "l".into() }.is_verified());
+        assert!(
+            !ExternalSource::Webhook {
+                listener: "l".into()
+            }
+            .is_verified()
+        );
         assert!(ExternalSource::FileWatch { root: "/x".into() }.is_verified());
     }
 }

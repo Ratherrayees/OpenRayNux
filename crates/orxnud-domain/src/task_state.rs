@@ -159,7 +159,8 @@ impl TaskStatus {
     /// Whether a lease has expired at `now_ms`.
     #[must_use]
     pub fn lease_is_expired_at(&self, now_ms: i64) -> bool {
-        self.lease_expires_at_ms.is_some_and(|expiry| now_ms >= expiry)
+        self.lease_expires_at_ms
+            .is_some_and(|expiry| now_ms >= expiry)
     }
 
     /// Whether the retry budget is exhausted.
@@ -232,10 +233,9 @@ pub struct ScheduleFire {
 #[must_use]
 pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
     use TaskState::{
-        Cancelled, Completed, DeadLettered, Failed, NeedsVerification, Paused, Pending,
+        Cancelled, Completed, DeadLettered, Failed, NeedsVerification, Paused, Pending, Running,
         WaitingForExternal, WaitingForUser,
     };
-    use TaskState::Running;
 
     // Terminal is terminal. This is the invariant that stops a resurrected task.
     if from.is_terminal() {
@@ -246,29 +246,40 @@ pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
     if from == to {
         return false;
     }
-    matches!(
-        (from, to),
-        (Pending, Running)
-            | (Pending, Cancelled)
-            | (Pending, WaitingForUser)
-            | (Pending, WaitingForExternal)
-            | (Pending, Paused)
-            | (Running, Completed)
-            | (Running, Failed)
-            | (Running, Cancelled)
-            | (Running, WaitingForUser)
-            | (Running, WaitingForExternal)
-            | (Running, Paused)
-            | (Running, NeedsVerification)
-            | (Running, DeadLettered)
-            | (Failed, Running) // a retry
-            | (WaitingForUser, Running)
-            | (WaitingForUser, Cancelled)
-            | (WaitingForExternal, Running)
-            | (WaitingForExternal, Cancelled)
-            | (Paused, Running) // explicit resume
-            | (Paused, Cancelled)
-    )
+    // Written as a match on the source state rather than one large
+    // `(from, to)` pattern: it reads as the actual rules ("from Pending, these
+    // are legal") instead of a flat list of pairs, and it keeps each line
+    // reviewable on its own.
+    match from {
+        Pending => matches!(
+            to,
+            Running | Cancelled | WaitingForUser | WaitingForExternal | Paused
+        ),
+        Running => matches!(
+            to,
+            Completed
+                | Failed
+                | Cancelled
+                | WaitingForUser
+                | WaitingForExternal
+                | Paused
+                | NeedsVerification
+                | DeadLettered
+        ),
+        // A retry.
+        Failed => matches!(to, Running),
+        WaitingForUser => {
+            matches!(to, Running | Cancelled)
+        }
+        WaitingForExternal => {
+            matches!(to, Running | Cancelled)
+        }
+        // An explicit resume.
+        Paused => matches!(to, Running | Cancelled),
+        // Terminal states go nowhere. Notably `Completed` cannot become
+        // `Running`: that would be resurrection, and TP-1 depends on it.
+        Completed | Cancelled | NeedsVerification | DeadLettered => false,
+    }
 }
 
 #[cfg(test)]
@@ -306,7 +317,10 @@ mod tests {
     #[test]
     fn no_self_transitions() {
         for s in ALL {
-            assert!(!is_legal_transition(s, s), "self-transition allowed for {s:?}");
+            assert!(
+                !is_legal_transition(s, s),
+                "self-transition allowed for {s:?}"
+            );
         }
     }
 
@@ -321,9 +335,7 @@ mod tests {
             TaskState::Paused,
         ] {
             assert!(terminal.is_terminal());
-            let reachable = ALL
-                .iter()
-                .any(|from| is_legal_transition(*from, terminal));
+            let reachable = ALL.iter().any(|from| is_legal_transition(*from, terminal));
             assert!(reachable, "no path reaches {terminal:?}");
         }
     }
@@ -367,7 +379,10 @@ mod tests {
         // whether an effect happened.
         assert!(TaskState::NeedsVerification.is_terminal());
         assert!(TaskState::NeedsVerification.is_uncertain());
-        assert!(is_legal_transition(TaskState::Running, TaskState::NeedsVerification));
+        assert!(is_legal_transition(
+            TaskState::Running,
+            TaskState::NeedsVerification
+        ));
         // And it is not a failure, so it is not retried.
         assert!(!TaskState::NeedsVerification.is_claimable());
     }
@@ -390,9 +405,16 @@ mod tests {
 
     #[test]
     fn retry_budget_is_inclusive_at_the_boundary() {
-        let s = TaskStatus { attempts: 2, max_attempts: 3, ..TaskStatus::pending(3) };
+        let s = TaskStatus {
+            attempts: 2,
+            max_attempts: 3,
+            ..TaskStatus::pending(3)
+        };
         assert!(!s.retries_exhausted());
-        let done = TaskStatus { attempts: 3, ..TaskStatus::pending(3) };
+        let done = TaskStatus {
+            attempts: 3,
+            ..TaskStatus::pending(3)
+        };
         assert!(done.retries_exhausted());
     }
 
@@ -408,7 +430,11 @@ mod tests {
     #[test]
     fn only_pending_is_claimable() {
         for s in ALL {
-            assert_eq!(s.is_claimable(), s == TaskState::Pending, "claimable wrong for {s:?}");
+            assert_eq!(
+                s.is_claimable(),
+                s == TaskState::Pending,
+                "claimable wrong for {s:?}"
+            );
         }
     }
 

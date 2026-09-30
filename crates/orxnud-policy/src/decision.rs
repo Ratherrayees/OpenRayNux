@@ -144,7 +144,9 @@ impl DenialReason {
     pub fn is_user_actionable(&self) -> bool {
         !matches!(
             self,
-            Self::PolicyUnavailable { .. } | Self::AuditUnavailable { .. } | Self::NoAuthorityRoot { .. }
+            Self::PolicyUnavailable { .. }
+                | Self::AuditUnavailable { .. }
+                | Self::NoAuthorityRoot { .. }
         )
     }
 }
@@ -230,23 +232,39 @@ mod tests {
 
     fn all_reasons() -> Vec<DenialReason> {
         vec![
-            DenialReason::NoAuthorityRoot { actor: "external".into() },
+            DenialReason::NoAuthorityRoot {
+                actor: "external".into(),
+            },
             DenialReason::ActorMayNotGrant { actor: "ai".into() },
-            DenialReason::UnknownCapability { capability: "c".into() },
-            DenialReason::InvalidParams { capability: "c".into(), detail: "x".into() },
+            DenialReason::UnknownCapability {
+                capability: "c".into(),
+            },
+            DenialReason::InvalidParams {
+                capability: "c".into(),
+                detail: "x".into(),
+            },
             DenialReason::DataClassExceeded {
                 required: DataClass::Regulated,
                 permitted: DataClass::Public,
             },
-            DenialReason::EgressNotConsented { data_class: DataClass::Sensitive },
-            DenialReason::NoGrant { capability: "c".into() },
+            DenialReason::EgressNotConsented {
+                data_class: DataClass::Sensitive,
+            },
+            DenialReason::NoGrant {
+                capability: "c".into(),
+            },
             DenialReason::GrantExpired {
                 capability: "c".into(),
                 expired_at_ms: 1,
                 now_ms: 2,
             },
-            DenialReason::ApprovalRequired { risk: RiskClass::High },
-            DenialReason::ApprovalExpired { expired_at_ms: 1, now_ms: 2 },
+            DenialReason::ApprovalRequired {
+                risk: RiskClass::High,
+            },
+            DenialReason::ApprovalExpired {
+                expired_at_ms: 1,
+                now_ms: 2,
+            },
             DenialReason::ApprovalDigestMismatch,
             DenialReason::BudgetExceeded {
                 scope: "daily".into(),
@@ -272,24 +290,44 @@ mod tests {
         for r in [
             DenialReason::PolicyUnavailable { detail: "x".into() },
             DenialReason::AuditUnavailable { detail: "x".into() },
-            DenialReason::NoAuthorityRoot { actor: "external".into() },
+            DenialReason::NoAuthorityRoot {
+                actor: "external".into(),
+            },
         ] {
-            assert!(!r.is_user_actionable(), "{} should not be user-actionable", r.code());
+            assert!(
+                !r.is_user_actionable(),
+                "{} should not be user-actionable",
+                r.code()
+            );
         }
-        assert!(DenialReason::NoGrant { capability: "c".into() }.is_user_actionable());
+        assert!(
+            DenialReason::NoGrant {
+                capability: "c".into()
+            }
+            .is_user_actionable()
+        );
     }
 
     #[test]
     fn decision_predicates_are_exclusive() {
-        let allow = Decision::Allow { risk: RiskClass::Low };
-        let deny = Decision::Deny { reason: DenialReason::ApprovalDigestMismatch };
+        let allow = Decision::Allow {
+            risk: RiskClass::Low,
+        };
+        let deny = Decision::Deny {
+            reason: DenialReason::ApprovalDigestMismatch,
+        };
         let gate = Decision::Gate {
             risk: RiskClass::High,
             required_digest: ApprovalDigest::from_bytes([1u8; 32]),
-            approver: Actor::System { component: orxnud_domain::actor::SystemComponent::Backup },
+            approver: Actor::System {
+                component: orxnud_domain::actor::SystemComponent::Backup,
+            },
         };
         for d in [&allow, &gate, &deny] {
-            let n = [d.is_allowed(), d.is_gated(), d.is_denied()].iter().filter(|b| **b).count();
+            let n = [d.is_allowed(), d.is_gated(), d.is_denied()]
+                .iter()
+                .filter(|b| **b)
+                .count();
             assert_eq!(n, 1, "a decision must be exactly one of allow/gate/deny");
         }
         assert!(deny.denial().is_some());

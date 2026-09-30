@@ -101,7 +101,11 @@ impl<'a> MigrationRunner<'a> {
             return Ok(0);
         }
         self.conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_meta;", [], |r| r.get(0))
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_meta;",
+                [],
+                |r| r.get(0),
+            )
             .map_err(|source| MigrationError::Failed { version: 0, source })
     }
 
@@ -121,18 +125,27 @@ impl<'a> MigrationRunner<'a> {
         let current = self.applied_version()?;
         let mut applied = Vec::new();
         for m in MIGRATIONS.iter().filter(|m| m.version > current) {
-            let tx = self
-                .conn
-                .unchecked_transaction()
-                .map_err(|source| MigrationError::Failed { version: m.version, source })?;
+            let tx =
+                self.conn
+                    .unchecked_transaction()
+                    .map_err(|source| MigrationError::Failed {
+                        version: m.version,
+                        source,
+                    })?;
             tx.execute_batch(m.sql)
-                .map_err(|source| MigrationError::Failed { version: m.version, source })?;
+                .map_err(|source| MigrationError::Failed {
+                    version: m.version,
+                    source,
+                })?;
             tx.execute(
                 "INSERT OR REPLACE INTO schema_meta (version, name, applied_at) VALUES (?1, ?2, ?3);",
                 rusqlite::params![m.version, m.name, now_ms()],
             )
             .map_err(|source| MigrationError::Failed { version: m.version, source })?;
-            tx.commit().map_err(|source| MigrationError::Failed { version: m.version, source })?;
+            tx.commit().map_err(|source| MigrationError::Failed {
+                version: m.version,
+                source,
+            })?;
             applied.push(m.version);
         }
         Ok(applied)
@@ -152,7 +165,10 @@ fn now_ms() -> i64 {
 /// # Errors
 ///
 /// Any [`StoreError`].
-pub fn open_and_migrate(path: &std::path::Path, snapshot_verified: bool) -> Result<crate::sqlite::Store, StoreError> {
+pub fn open_and_migrate(
+    path: &std::path::Path,
+    snapshot_verified: bool,
+) -> Result<crate::sqlite::Store, StoreError> {
     let store = crate::sqlite::Store::open(path, true)?;
     MigrationRunner::new(store.conn()).run(snapshot_verified)?;
     Ok(store)
@@ -164,7 +180,9 @@ mod tests {
 
     fn mem() -> Connection {
         let c = Connection::open_in_memory().expect("open");
-        crate::pragma::Pragma::critical().apply(&c).expect("apply pragmas");
+        crate::pragma::Pragma::critical()
+            .apply(&c)
+            .expect("apply pragmas");
         c
     }
 
@@ -203,13 +221,23 @@ mod tests {
             Err(MigrationError::NoSnapshot)
         ));
         // And nothing was applied.
-        assert_eq!(MigrationRunner::new(&conn).applied_version().expect("version"), 0);
+        assert_eq!(
+            MigrationRunner::new(&conn)
+                .applied_version()
+                .expect("version"),
+            0
+        );
     }
 
     #[test]
     fn applied_version_is_zero_on_a_fresh_database() {
         let conn = mem();
-        assert_eq!(MigrationRunner::new(&conn).applied_version().expect("version"), 0);
+        assert_eq!(
+            MigrationRunner::new(&conn)
+                .applied_version()
+                .expect("version"),
+            0
+        );
     }
 
     #[test]
@@ -219,7 +247,10 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), before, "duplicate migration version");
-        assert!(seen.windows(2).all(|w| w[0] < w[1]), "migration versions must ascend");
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "migration versions must ascend"
+        );
     }
 
     #[test]
@@ -231,14 +262,18 @@ mod tests {
 
         let store = open_and_migrate(&path, true).expect("open+migrate");
         assert_eq!(
-            MigrationRunner::new(store.conn()).applied_version().expect("version"),
+            MigrationRunner::new(store.conn())
+                .applied_version()
+                .expect("version"),
             1
         );
         drop(store);
         // Reopen: the version is durable.
         let store2 = open_and_migrate(&path, true).expect("reopen");
         assert_eq!(
-            MigrationRunner::new(store2.conn()).run(true).expect("rerun"),
+            MigrationRunner::new(store2.conn())
+                .run(true)
+                .expect("rerun"),
             Vec::<u32>::new()
         );
         let _ = std::fs::remove_file(&path);

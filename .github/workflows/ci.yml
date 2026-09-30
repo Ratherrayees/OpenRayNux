@@ -1,0 +1,117 @@
+# OpenRayNux CI.
+#
+# # Two lanes, and why there are only two
+#
+# * `pr` runs on every change. It is the lane that has to be fast enough that
+#   people do not batch commits to avoid it, so it does the full Linux gate set
+#   and nothing else.
+# * `windows-nightly` runs `cargo check` only, once a night. Full Windows test
+#   parity is deferred because the GUI arrives in Phase 6 and WebView2 needs a
+#   real Windows runner (docs-13 §5, ADR-0026). Checking nightly rather than per
+#   PR keeps Windows-specific breakage from blocking unrelated work.
+#
+# # `CI: true` matters
+#
+# `scripts/ci-gates.sh` skips a gate whose tool is missing unless `CI` is set. In
+# CI a missing tool is therefore a hard failure rather than a silent skip — the
+# whole failure mode being prevented is a green build that checked less than it
+# claimed to.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:17 UTC daily. Not on the hour: scheduled runs cluster at :00, and the
+    # queue is longer than the work.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# A new push to a PR supersedes the previous run. Without this, a five-commit
+# series burns five full gate runs to produce one result nobody reads.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Reproducible builds: no incremental state carried between CI machines, and no
+  # absolute paths baked into the output.
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  linux-gates:
+    name: Linux gates (G1-G11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # cargo semver-checks needs history; audit needs tags
+
+      # rust-toolchain.toml pins the version, so this reads it rather than
+      # duplicating it. A second place to update is a second place to forget.
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Add the portable-core target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install the gate tools
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-audit --locked
+          cargo install cargo-semver-checks --locked
+          cargo install cargo-nextest --locked
+
+      # The gates script is the single source of truth; CI invokes it rather than
+      # re-implementing the checks. A duplicated gate drifts from the local one.
+      - name: Run the gates
+        env:
+          CI: "true"
+        run: ./scripts/ci-gates.sh
+
+      - name: Build documentation
+        # Missing docs are denied in the crates, but `cargo doc` also catches
+        # broken intra-doc links, which nothing else does.
+        run: cargo doc --workspace --no-deps
+
+  windows-check:
+    name: Windows cargo check (nightly)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Check, not build or test: the MSVC target has no working linker for every
+      # dependency on a bare runner, and Phase 1's Windows requirement is that the
+      # code *compiles* for MSVC — a Windows-incompatible construct would show up
+      # here. Anything deeper arrives with the GUI (docs-13 §5).
+      - name: cargo check for MSVC
+        run: cargo check --workspace --all-targets
+
+  # A dedicated lane for the portable-core claim, because it is the one gate whose
+  # failure would invalidate an architectural claim rather than just a build.
+  portable-core:
+    name: Portable core builds for wasm32
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the portable core
+        run: cargo check -p orxnud-domain -p orxnud-protocol --target wasm32-unknown-unknown

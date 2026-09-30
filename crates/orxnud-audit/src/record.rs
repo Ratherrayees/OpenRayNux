@@ -121,7 +121,11 @@ impl AuditRecord {
     /// Attaches the terminal outcome, consuming the record.
     #[must_use]
     pub fn finished(mut self, kind: OutcomeKind, at_ms: i64, detail: Option<String>) -> Self {
-        self.outcome = AuditOutcome::Finished { kind, at_ms, detail };
+        self.outcome = AuditOutcome::Finished {
+            kind,
+            at_ms,
+            detail,
+        };
         self
     }
 
@@ -173,7 +177,12 @@ impl AuditRecord {
         s.push('|');
         s.push_str(&self.policy_version);
         s.push('|');
-        s.push_str(&self.approval.map(|d| d.to_hex()).unwrap_or_else(|| "-".to_owned()));
+        s.push_str(
+            &self
+                .approval
+                .map(|d| d.to_hex())
+                .unwrap_or_else(|| "-".to_owned()),
+        );
         s.push('|');
         s.push_str(self.secret_ref.as_deref().unwrap_or("-"));
         s.push('|');
@@ -184,7 +193,10 @@ impl AuditRecord {
         s.push_str(&match &self.outcome {
             AuditOutcome::Authorised { at_ms } => format!("authorised@{at_ms}"),
             AuditOutcome::Finished { kind, at_ms, .. } => {
-                format!("{}@{at_ms}", serde_json::to_string(kind).unwrap_or_else(|_| "?".to_owned()))
+                format!(
+                    "{}@{at_ms}",
+                    serde_json::to_string(kind).unwrap_or_else(|_| "?".to_owned())
+                )
             }
         });
         s.into_bytes()
@@ -199,7 +211,10 @@ mod tests {
 
     fn rec() -> AuditRecord {
         AuditRecord::authorised(
-            Actor::Human { user: UserId::new("u-1"), via: AuthChannel::LocalInteractive },
+            Actor::Human {
+                user: UserId::new("u-1"),
+                via: AuthChannel::LocalInteractive,
+            },
             "send-message",
             Some("alice".into()),
             DataClass::Personal,
@@ -217,8 +232,19 @@ mod tests {
     fn authority_root_is_derived_from_the_actor() {
         assert_eq!(rec().authority_root.as_deref(), Some("u-1"));
         let sys = AuditRecord::authorised(
-            Actor::System { component: SystemComponent::Backup },
-            "c", None, DataClass::Public, RiskClass::Low, "v1", None, None, None, None, 0,
+            Actor::System {
+                component: SystemComponent::Backup,
+            },
+            "c",
+            None,
+            DataClass::Public,
+            RiskClass::Low,
+            "v1",
+            None,
+            None,
+            None,
+            None,
+            0,
         );
         assert_eq!(sys.authority_root, None);
     }
@@ -271,7 +297,13 @@ mod tests {
     #[test]
     fn finished_replaces_the_outcome() {
         let r = rec().finished(OutcomeKind::Completed, 2000, Some("ok".into()));
-        assert!(matches!(r.outcome, AuditOutcome::Finished { kind: OutcomeKind::Completed, .. }));
+        assert!(matches!(
+            r.outcome,
+            AuditOutcome::Finished {
+                kind: OutcomeKind::Completed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -281,11 +313,17 @@ mod tests {
         // `OutcomeKind` is serialised kebab-case, so the canonical form carries
         // "uncertain" rather than "Uncertain".
         let bytes = String::from_utf8_lossy(&r.canonical_bytes()).to_string();
-        assert!(bytes.contains("uncertain"), "uncertain outcome not canonicalised: {bytes}");
+        assert!(
+            bytes.contains("uncertain"),
+            "uncertain outcome not canonicalised: {bytes}"
+        );
         // And it must differ from every other outcome, or the hash would not bind it.
         let completed = String::from_utf8_lossy(
-            &rec().finished(OutcomeKind::Completed, 2000, None).canonical_bytes(),
-        ).to_string();
+            &rec()
+                .finished(OutcomeKind::Completed, 2000, None)
+                .canonical_bytes(),
+        )
+        .to_string();
         assert_ne!(bytes, completed);
     }
 
@@ -300,7 +338,11 @@ mod tests {
         // Every string field is a name/ref, never a long opaque blob.
         for (k, v) in value.as_object().expect("object") {
             if let Some(s) = v.as_str() {
-                assert!(s.len() < 200, "field {k} is suspiciously long: {} bytes", s.len());
+                assert!(
+                    s.len() < 200,
+                    "field {k} is suspiciously long: {} bytes",
+                    s.len()
+                );
             }
         }
     }
