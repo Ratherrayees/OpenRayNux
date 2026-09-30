@@ -1,0 +1,52 @@
+# Ignore rules — OpenRayNux
+#
+# Scope note: this file is deliberately minimal and covers only
+# non-speculative categories (OS/editor cruft and credential leakage).
+# Build, target and packaging paths are intentionally NOT listed yet —
+# they will be added by the phase that introduces them, so that this
+# file never claims to cover output that does not exist.
+
+# --- credentials and secrets -------------------------------------------------
+# A committed secret cannot be un-committed. These guards exist because
+# `08-testing-engineering-standards.md` §5 requires that committing real
+# keys is structurally impossible, not merely discouraged.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+secrets.toml
+secrets.yaml
+secrets.yml
+*.keystore
+
+# --- local development state -------------------------------------------------
+*.local
+.cache/
+.direnv/
+
+# --- operating system cruft --------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.Spotlight-V100
+.Trashes
+
+# --- editor cruft ------------------------------------------------------------
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# --- build output (generic; phase-specific entries added later) --------------
+/target/
+/dist/
+/build/
+node_modules/
+*.tsbuildinfo

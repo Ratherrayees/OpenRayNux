@@ -1,0 +1,419 @@
+# 08 — Testing & Engineering Standards
+
+Status: **Draft v0.1**
+
+---
+
+## Part I — Testing strategy
+
+## 1. The problem with testing an AI system
+
+An OpenRayNux test suite has to answer two different questions:
+
+1. **Are the deterministic parts correct?** — fully decidable. Proptest, model
+   checking, crash injection, golden tests.
+2. **Is the probabilistic part useful?** — not decidable by assertion. "Did the
+   intent classifier pick the right intent?" has no stable ground truth, and
+   asserting on model output produces a suite that fails on model updates and
+   passes on a bad model.
+
+**The resolution:** the probabilistic layer is tested by *contract and
+distribution*, never by exact-output assertion. And critically — **most of the
+system is deterministic**, so most of the system is tested normally. That is a
+direct benefit of the determinism boundary in `00-…` §6.
+
+---
+
+## 2. The pyramid
+
+| Layer | Share | What | Determinism |
+|---|---|---|---|
+| **Unit** | ~60 % | Pure domain logic, validators, state machine, schema, policy evaluation, redaction | 100 % |
+| **Property** | ~15 % | `proptest` over parsers, state machines, policy, migrations, idempotency | 100 % |
+| **Contract** | ~10 % | Every capability against the shared contract suite; every LLM provider against the abstraction | 100 % (mocked) |
+| **Integration** | ~10 % | Real SQLite (temp files), real IPC, real subprocesses, real scheduler | 100 % |
+| **Failure injection** | ~3 % | Kill, timeouts, malformed output, partial writes, provider outages | 100 % |
+| **E2E** | ~2 % | Scripted user journeys across the daemon and one interface | Mostly |
+| **AI evaluation** | separate track | Offline dataset + distribution metrics, run on demand, **not** in the blocking CI gate | N/A |
+
+The proportions are a target, not a rule. The invariant that matters: **the
+blocking CI gate is 100 % deterministic.** A test that requires a live model or
+network does not block a merge.
+
+---
+
+## 3. Deterministic AI testing
+
+### 3.1 Provider simulation (mandatory)
+
+A **scripted, replayable provider** implementing the same `ModelProvider` trait:
+
+- Returns recorded responses for recorded requests.
+- Can inject: malformed JSON, schema-valid-but-nonsense content, refusals,
+  tool calls with wrong argument types, multi-step plans, empty responses,
+  truncated streams, and timeouts.
+- Records every request for assertion: "did we send the right schema?", "did we
+  redact before sending?"
+
+This is what makes LLM-dependent code testable at all. A test that needs an API
+key is a test that will not run.
+
+### 3.2 The AI evaluation track (separate, non-blocking)
+
+- A **golden dataset**: real utterances → expected intent class, expected
+  required capabilities, expected `should_not_include` properties.
+- **Metrics**, not assertions: intent accuracy, per-class precision/recall,
+  capability-selection accuracy, plan-step precision, refusal rate on
+  out-of-scope inputs, **false-approval rate** (the metric that matters most).
+- Run on a schedule and on demand; compared against the previous run. A regression
+  is a signal, not a build failure.
+- The **false-approval rate** is the headline number: a system that is
+  *appropriately* refusing is safe; a system that is confidently wrong about
+  permissions is not.
+
+### 3.3 Determinism for the probabilistic layer itself
+
+Three techniques make probabilistic behaviour testable:
+
+1. **Seeded sampling.** Where a model call only decides *presentation*, allow a
+   seeded deterministic mode. Never for anything safety-relevant.
+2. **Recorded-transcript replay.** Full end-to-end replay of a session from the
+   event log, with a scripted provider.
+3. **Assertion on *invariants*, not content.** "The proposal's `steps` only
+   reference registered capabilities", "no step has risk above HIGH without a
+   gate", "the proposal does not contain a credential path". These hold for
+   *all* model outputs and are the assertions that matter.
+
+---
+
+## 4. Test layers in detail
+
+### 4.1 Unit
+
+- Domain invariants, state machine transitions (legal/illegal), config merge
+  semantics, schema validation, redaction patterns, budget arithmetic,
+  DST/cron edge cases, approval-digest computation and mismatch detection.
+
+### 4.2 Property-based (`proptest`)
+
+| Property | Why property testing, not examples |
+|---|---|
+| Policy evaluation never widens a grant | Monotone, hard to enumerate |
+| State machine: no illegal transition reachable | Exhaustive by construction |
+| Parser round-trip: `parse(encode(x)) == x` for all valid `x` | Finds the weird inputs |
+| Redaction removes all secrets, keeps non-secrets | Secret shapes are unbounded |
+| Migration: schema N → N+1 → N is lossless; N → N+2 is valid | Migrations are the riskiest code |
+| Idempotency: replaying a step N times == once | Timing and crash interleavings |
+| Config layering is deterministic regardless of file order | Merge bugs are order bugs |
+| Approval digest detects any single-parameter mutation | Security-critical, combinatorial |
+| Task table survives arbitrary kill points | The crash test as a property |
+| No `%` in SQL strings (compile-time or lint assertion) | Injection surface |
+
+### 4.3 Contract (per capability, mandatory — `07-…` §8)
+
+The ten-point suite listed there. It runs for **every** implementation of every
+capability, which is the mechanism that makes substitutability real.
+
+### 4.4 Integration
+
+- **Real SQLite on real temp files.** Never `:memory:` for anything touching
+  durability. A memory DB cannot test WAL, `synchronous=FULL`, crash recovery,
+  or migration on an existing file.
+- **Real IPC.** The daemon over a real socket, a real client.
+- **Real subprocesses.** Tier 1 adapters over real stdio, including the
+  kill-and-recover path.
+- **Real scheduler.** Including DST transitions and machine-off catch-up.
+- **Real migrations** on a copy of a previous-version database.
+
+### 4.5 Task-engine correctness properties (ADR-0029) — normative
+
+These are the contract for the task engine, independent of implementation. A
+future engine (e.g. `apalis`) is substitutable **iff** it passes this suite.
+
+| ID | Property | Test that proves it |
+|----|----------|---------------------|
+| TP-1 | No task silently disappears | Kill-at-N-random-points; every task reaches a terminal or provably-owned state |
+| TP-2 | Exactly-once where required, at-least-once otherwise | Per-capability injected outcomes; `idempotent: false` + uncertain outcome ⇒ `needs_verification`, never auto-retry |
+| TP-3 | Cancellation is observable | Cancel is durably recorded *before* it is acted on; survives restart; bounded latency per capability |
+| TP-4 | Restart recovers durable work | No task left `running` with a dead owner after unclean shutdown |
+| TP-5 | **Expired leases cannot execute** | **Zombie-worker test:** force lease expiry, then let the original worker attempt to commit. It **must fail** (fence re-validated at commit, not just at claim) |
+| TP-6 | Retries never inherit approvals | Retry after approval expiry is refused by policy; actor re-derived, delegation re-checked |
+| TP-7 | Power loss cannot corrupt task state | Kill-at-random-points; state is pre- or post-transaction, never torn (WAL + `synchronous=FULL`) |
+| TP-8 | Scheduling deterministic under time manipulation | Property tests over DST transitions and forward/backward clock jumps |
+| TP-9 | Catch-up bounded and explicit | A week offline does not execute a week of backlog; `catch_up_cap` and misfire policy honoured; collapsed runs flagged |
+| TP-10 | Bounded resources | Every spawn has a concurrency limit; a wedged task is killed at its deadline |
+| TP-11 | Dead-lettering terminal and visible | A permanently failing task dead-letters, surfaces, and stops |
+| TP-12 | Every side effect is accounted for | No effect can occur without a recorded result or an explicit "outcome unknown" state |
+
+**Master property across all of them:** *no failure injection ever produces
+silent data loss or an unauthorised side effect.*
+
+### 4.6 Failure injection
+
+| Injected failure | Expected behaviour |
+|---|---|
+| `kill -9` at each of N random points during a task | No lost, duplicated, or orphaned task; non-idempotent steps marked `needs_verification` |
+| Model returns malformed JSON | Rejected cleanly; task fails with a clear error; no partial effect |
+| Model returns a `refusal` | Handled as a distinct outcome, not as malformed output |
+| Model returns a tool call with wrong arg types | Rejected before dispatch |
+| Model requests an unregistered capability | Rejected; recorded as an attempt |
+| Policy evaluation throws | **Fail closed.** Deny |
+| Audit write fails | **Fail closed.** Deny |
+| Adapter segfaults | Daemon survives; task recoverable; adapter quarantined after N |
+| Adapter hangs | Deadline kills it; backoff; quarantine |
+| Provider returns 429 | Respect `Retry-After`; no hot loop |
+| Provider 5xx for an hour | Circuit breaker opens; user notified; not silent |
+| Disk full | Graceful degradation; no partial state |
+| Clock jumps backwards/forwards | Scheduler stays correct |
+| Migration fails midway | Rollback; previous binary works |
+| SQLite WAL corrupted | Detected; restore from backup |
+| Approval tampered with | Digest mismatch; abort |
+
+**Property:** *no failure injection ever produces a silent data loss or an
+unauthorised side effect.* That single property is the most valuable test in the
+suite.
+
+### 4.7 Concurrency
+
+- Task claim under N concurrent workers → exactly one winner.
+- No deadlock between the DB thread, the policy engine, and adapters.
+- Cancellation is prompt and complete (bounded latency).
+- Bounded concurrency actually bounds: a runaway task cannot exhaust memory.
+- `tokio::task` leak detection over a long soak.
+
+### 4.8 Security tests (in CI, not optional)
+
+- **S1 verification:** the intent-layer context **cannot** resolve a secret.
+- **S33 / ADR-0027 authority:** an `External` actor cannot grant; an expired
+  delegation is refused; an approval bound to one actor is rejected for another.
+- Prompt-injection corpus → assert no unauthorised side effect ever occurs.
+- SSRF: every outbound request's destination is checked against the grant.
+- Path traversal in any capability that accepts a path.
+- Command injection: metacharacters in every user-controlled parameter.
+- Deserialisation bombs: depth and size limits enforced.
+- Redaction: secrets never appear in logs, traces, or error messages.
+- Audit chain: tampering is detectable.
+- Approval digest: any parameter mutation invalidates it.
+- Sandbox: an adapter attempting an undeclared path or host is blocked.
+
+---
+
+## 5. Test data & fixtures
+
+- **No production data in tests.** Synthetic fixtures with realistic *shapes*.
+- **No real credentials, ever.** A `.env` with real keys must be structurally
+  impossible to commit (CI grep + pre-commit hook).
+- **Deterministic time.** A `Clock` trait so DST and time-travel tests are exact.
+- **Deterministic IDs.** A seeded ID generator, so golden tests are stable.
+- **Golden files** for provider request/response pairs, versioned, with a
+  documented regeneration procedure (never "just re-record" without review).
+
+---
+
+## 6. CI gates
+
+**Blocking:**
+
+- `cargo fmt --check`
+- `cargo clippy -- -D warnings`
+- `cargo nextest run` (parallel; faster than `cargo test`)
+- `cargo deny check` (advisories, licences, bans, duplicates)
+- `cargo audit`
+- `cargo vet`
+- Property tests
+- Contract tests, all capabilities
+- Security tests
+- Migrations up **and down** on a copy of a real previous DB
+- Cross-compile check for the portable core (proves the platform boundary)
+- `cfg(target_os)` grep gate
+- Licence scan of model manifests
+- Feature-matrix resource regression check (CR-2)
+
+**Non-blocking / scheduled:**
+
+- Full soak (72 h)
+- AI evaluation track
+- Performance benchmarks with comparison reports
+- Fuzz targets
+- Windows / macOS / ARM builds (Tier B/C)
+
+---
+
+# Part II — Engineering standards
+
+## 7. Module boundaries
+
+1. **The core defines traits; adapters implement them.** Never the reverse.
+2. **No module may reach past its neighbour.** Enforced by crate boundaries.
+3. **Interfaces import protocol types only.** No domain types.
+4. **A crate has one reason to change.** If you need "and" to describe it, split it.
+5. **Policy is a choke point, not a layer.** One construction site for
+   `CapabilityInvocation`.
+6. **No circular crate dependencies.** Enforced structurally.
+
+## 8. Dependency direction
+
+Inward only, toward the core. Never sideways. Enforced by workspace layout,
+reviewed in PRs, and by the `cfg(target_os)` gate for the platform boundary.
+
+**New dependency rule:** a new direct dependency requires an ADR, a licence
+check, a maintenance check (last release date, bus factor), and a written reason.
+Transitive additions are reviewed via `cargo deny`.
+
+## 9. Error handling
+
+- **Errors are values, not panics.** `thiserror` for libraries, `anyhow` only at
+  the top of a binary.
+- **Every error carries a user-facing message** and a machine-readable code.
+  "Something went wrong" is a bug.
+- **Never swallow an error silently.** `let _ =` on a `Result` needs a comment
+  explaining why it is safe.
+- **Panics are for bugs only.** In a Tier 0 adapter, a panic is caught at the
+  dispatch boundary and converted to a task failure — it must never take down
+  the daemon.
+- **No `unwrap()` / `expect()` outside tests** — enforced by clippy configuration
+  and review.
+- **Error chains are preserved** for diagnosis but **redacted** for display.
+
+## 10. Ownership and lifetimes
+
+- Prefer owned data at boundaries; borrow internally.
+- No interior mutability in the core. If you need `Arc<Mutex<_>>`, you probably
+  need a message-passing design instead.
+- `Send + Sync` is a design constraint, checked at compile time, not asserted.
+- Shared caches are bounded (`moka`) and evicting, never unbounded `HashMap`.
+- No `static mut`. No interior `unsafe`. `unsafe` requires a written invariant
+  plus a test; the default is to find a safe alternative.
+
+## 11. Async boundaries
+
+- **Async all the way down, or not at all.** No blocking calls in an async
+  context — use `spawn_blocking` (rusqlite is synchronous by design).
+- **Every long operation has a deadline and a `CancellationToken`.**
+- **No unbounded fan-out.** Every spawn site has a concurrency limit.
+- **Structured supervision.** Each task runs under a supervisor that restarts it
+  with backoff and escalates after N. Tokio has no built-in supervision, so we
+  build a small, explicit one.
+- **The DB thread model is explicit and documented.** One writer, a bounded read
+  pool, no surprises.
+- **No `block_on` inside a runtime.** Ever.
+
+## 12. Naming and API design
+
+- `new` for constructors; `with_*` for builders; `try_*` for fallible; `_*_async`
+  reserved for the few APIs that are genuinely async.
+- Public items get doc comments with a `# Errors` section where relevant.
+- Errors are enums, not strings, at library boundaries.
+- Constructors take `impl Into<String>`-style arguments; getters return `&str`.
+- Public APIs are `pub(crate)` by default and promoted deliberately.
+- Semver is respected: pre-1.0 crates are `0.x` and may break; the **protocol**
+  is versioned independently of the implementation.
+
+## 13. Documentation
+
+- Every public item: what it does, what it guarantees, what it does *not* do.
+- `ADR` for every architectural decision.
+- Module-level `//!` explaining *why the module exists*.
+- **Decision-shaped comments** (`// SAFETY:`, `// INVARIANT:`, `// WHY NOT:`) for
+  anything non-obvious. A comment explaining *what* is noise; *why* is essential.
+- A `CHANGELOG.md` kept by hand, with a `[Unreleased]` section, following
+  Keep a Changelog. Written for users, not generated from commits.
+
+## 14. `unsafe` and FFI
+
+- `unsafe` requires: a `// SAFETY:` comment proving the invariant, a test that
+  exercises the invariant, and a second reviewer.
+- FFI boundaries are isolated in dedicated modules with a safe wrapper. The rest
+  of the codebase never sees a raw pointer.
+- `cargo geiger` in CI; `unsafe` count is a tracked metric that must not grow
+  without an ADR.
+- Every FFI dependency's licence and maintenance is reviewed (this is how we
+  caught the GPL/NC/AGPL landmines).
+
+## 15. Feature flags
+
+- Every optional capability is a Cargo feature. No runtime "enable/disable" via
+  env var for compile-time-conditional code.
+- Additive by default: a feature may only *add* behaviour. It may never change
+  the meaning of existing code.
+- Every feature has a test that builds with it on and off.
+- CR-2 is enforced by a resource-delta test across the feature matrix.
+
+## 16. Versioning and compatibility
+
+- Follow semver strictly; `cargo semver-checks` in CI.
+- **The wire protocol is versioned independently** and negotiated at runtime.
+  Clients tolerate unknown methods and fields.
+- **Config schema is versioned**, and migrations are one-way, tested, and
+  reversible.
+- **Capability contracts are versioned per capability.** A capability declares
+  which contract versions it implements; the dispatcher adapts.
+- **Data migrations are irreversible but snapshot-protected** (ADR-0017).
+- **Deprecation policy:** announce → 2 minor releases → remove. Model it on MCP's
+  own 12-month window, which is a good external reference.
+
+## 17. Security advisories
+
+- `cargo audit` blocks the build on a known advisory.
+- `cargo deny` blocks unapproved licences, duplicate versions, and yanked crates.
+- **Advisories are triaged within 48 h.** A critical RCE: patch or mitigate
+  immediately, with a release. A low-severity informational item: document and
+  defer with a reason.
+- Dependabot/Renovate for version bumps, with the same gates.
+- **Model and browser artefacts are checksum-pinned** (S23) and reverified on
+  use.
+
+## 18. Supply-chain security
+
+- `Cargo.lock` committed; `--locked` in CI.
+- **Reproducible release builds** with documented, pinned toolchain and target.
+- SBOM generated per release.
+- Release binaries are **signed** (minisign for Linux, Authenticode for Windows).
+- Dependencies reviewed on addition, not just on alert.
+- No build-time downloads from unpinned URLs. This is why
+  `sherpa-onnx`'s "auto-download a prebuilt `-lib`" needs a pinned, checksummed
+  mirror in our build.
+- Minimal `.github/dependabot.yml` breadth — no auto-merge on anything touching
+  auth, crypto, network, or serialisation.
+
+## 19. CI
+
+- Linux x86_64 on every PR (fast lane, < 10 min target).
+- Windows x86_64 and Linux aarch64 nightly (Tier A/T-B).
+- macOS weekly (Tier B).
+- Matrix over feature combinations for the CR-2 check.
+- Caching keyed on `Cargo.lock` + toolchain, never on a mutable ref.
+- Release pipeline separated from the PR pipeline, with manual approval and
+  signature.
+
+## 20. Code review
+
+- Two approvals for: `unsafe`, capability contracts, policy, migrations,
+  anything touching credentials, anything touching the network.
+- The ADR list is the review checklist — a PR touching a boundary names the ADR.
+- Reviewer must be able to answer "what could this break?" before approving.
+- **Reviewers read the diff for intent, not just correctness.** The most
+  expensive bugs are wrong-but-plausible code.
+
+## 21. Architecture decision records
+
+Every architectural decision gets an ADR with: Context, Problem, Options
+considered, Evidence, Decision, Why, Trade-offs, Consequences, Rejected
+alternatives, and **Revisit conditions**. A decision without revisit conditions
+is a decision that will never be revisited, which is a smell.
+
+## 22. What we deliberately do *not* do
+
+Over-engineering is a real failure mode, not a hypothetical one. We do **not**:
+
+- build a generic plugin framework before the third real capability,
+- build a rule engine before the fifth real policy,
+- build a vector index before the retrieval quality demands it,
+- abstract storage before a second backend is actually needed,
+- add a dependency for something we can write in 100 correct lines,
+- build a UI component library before the third screen,
+- support a platform before someone can test it,
+- write a scheduler before we know the cron semantics we need.
+
+**Every abstraction needs a stated reason and a named cost.** If a reviewer
+cannot name the concrete thing it buys, it is not yet justified.

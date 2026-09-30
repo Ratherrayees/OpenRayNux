@@ -1,0 +1,2136 @@
+# 09 — Architecture Decision Records
+
+Status: **Draft v0.1** · 2026-09-30 · All evidence verified on that date.
+
+Each ADR follows: Context · Problem · Options · Evidence · Decision · Why ·
+Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
+
+Revisit conditions are mandatory. A decision without them is a decision that
+will never be revisited, which is a smell.
+
+**Index**
+
+| ADR | Decision | Status |
+|---|---|---|
+| [0001](#adr-0001) | Core language: Rust | Accepted |
+| [0002](#adr-0002) | Desktop: Tauri 2 + Svelte, as an optional separate process | Accepted |
+| [0003](#adr-0003) | Local transport: Unix socket / named pipe + JSON-RPC 2.0 | Accepted |
+| [0004](#adr-0004) | Runtime: Tokio + an explicit supervisor | Accepted |
+| [0005](#adr-0005) | Frontend: Svelte 5 + Vite 8; **TS 7.0.2 baseline + TS 6.0.3 co-installed** | **Amended (rev 2)** |
+| [0006](#adr-0006) | Storage: SQLite via rusqlite, bundled ≥ 3.51.3 | Accepted |
+| [0007](#adr-0007) | Task engine: hand-rolled durable task table | Accepted with contingency |
+| [0008](#adr-0008) | No vector database | Accepted |
+| [0009](#adr-0009) | Capability model: three isolation tiers, no dynamic plugins | Accepted |
+| [0010](#adr-0010) | MCP as an external integration protocol only | Accepted |
+| [0011](#adr-0011) | Provider-neutral LLM abstraction with capability negotiation | Accepted |
+| [0012](#adr-0012) | Model proposes, deterministic engine disposes | Accepted |
+| [0013](#adr-0013) | Memory: derived vs authoritative, with an enforced distinction | Accepted |
+| [0014](#adr-0014) | Voice: abstraction first, `sherpa-onnx` default, eSpeak-NG floor | Accepted |
+| [0015](#adr-0015) | Browser: HTTP-first, browser opt-in, a11y-tree grounding | Accepted |
+| [0016](#adr-0016) | Messaging: narrow common denominator; defer WhatsApp; refuse Signal/userbots | Accepted |
+| [0017](#adr-0017) | Updates: no self-updater; snapshot-migrate-rollback | Accepted |
+| [0018](#adr-0018) | Configuration: 11 layers, schema-versioned, secrets by reference | Accepted |
+| [0019](#adr-0019) | Dependency & licence policy: permissive-only in core | Accepted |
+| [0020](#adr-0020) | Observability: tracing always, OTLP optional, zero telemetry | Accepted |
+| [0021](#adr-0021) | Scheduling: `croner` + `jiff`, explicit misfire policy | Accepted |
+| [0022](#adr-0022) | Deployment: one codebase, four profiles | Accepted |
+| [0023](#adr-0023) | Platform: Linux + Windows T-A; ARM64 T-B; macOS T-B | Accepted |
+| [0024](#adr-0024) | Reject agent frameworks; own a thin harness | Accepted |
+| [0025](#adr-0025) | Tests: deterministic gate; AI evaluation on a separate track | Accepted |
+| [0026](#adr-0026) | Windows as the second first-class platform, prepared early | Accepted |
+| [0027](#adr-0027) | **Identity & Actor as a first-class concept** | **Accepted (new)** |
+| [0028](#adr-0028) | **State as a first-class concept** | **Accepted (new)** |
+| [0029](#adr-0029) | **Task-engine correctness properties are normative; the implementation is not** | **Accepted (new)** |
+| [0030](#adr-0030) | **"Disabled" means zero operational cost and zero reachable capability** | **Accepted (new)** |
+
+---
+
+<a id="adr-0001"></a>
+## ADR-0001 — Core language: Rust
+
+**Context.** The product is a long-lived personal daemon that runs continuously,
+holds credentials, acts on a person's behalf, must be cross-platform, and must
+be light on memory.
+
+**Problem.** Choose an implementation language for the portable core.
+
+**Options.** Rust · Go · C++ · TypeScript (Node).
+
+**Evidence.**
+
+| | Rust 1.98.1 | Go 1.27.1 | C++ |
+|---|---|---|---|
+| Memory safety | Compile-time; no UB | GC; `unsafe` + cgo surface | UB is the default hazard |
+| Concurrency safety | `Send`/`Sync` enforced | goroutines are safe; shared state is not free | threads; UB |
+| Idle RSS | Lowest | GC + runtime overhead | Lowest, but unsafe |
+| Domain ecosystem | `tokio` 238 M dl/30 d; `serde` 331 M; `tracing` 203 M; `axum` 123 M | thinner for desktop/ML FFI | fragmented |
+| Desktop options | Tauri 2.12.0, Slint 1.18.1, egui 0.36.2 | weak | Qt/wxWidgets (heavy) |
+| ONNX/ML FFI | `ort`, `sherpa-onnx` (first-party) | cgo | best, natively |
+| Supply-chain tooling | `cargo deny`, `cargo audit`, `cargo vet`, crates.io MSRV metadata | `govulncheck` | varies |
+| Cross-compile | needs a per-target C toolchain | near-trivial | painful |
+
+**Decision.** **Rust** for the portable core, the daemon, all capability
+adapters, and the CLI. MSRV 1.98.1.
+
+**Why.** The dominant requirement is *not* raw speed — it is **a long-lived
+process holding credentials that must not corrupt its own memory or have its
+concurrent state silently racy.** Rust enforces both at compile time. Go's GC
+and C++'s UB model are both poor fits for a security-critical resident process.
+Rust's desktop and ML ecosystems are mature enough; Go's are not. And Rust's
+supply-chain tooling is the best in the industry, which matters for a project
+whose threat model includes dependency compromise (TH-17).
+
+**Trade-offs.** Slower iteration than Go. FFI friction for C/C++/CUDA model
+runtimes. Higher compile times. A ~4-minor-version MSRV headroom against the
+tightest dependencies (`sqlx` 1.94, `egui` 1.95).
+
+**Consequences.** `unsafe` is minimised and audited. Cross-compilation needs
+per-target C toolchains (only a build concern, not a correctness one). Compile
+times are a real cost in the inner loop and CI must be budgeted for it.
+
+**Rejected alternatives.** **Go** — no credible desktop story, GC in a resident
+credential-holding process, and the ML FFI story is cgo. **C++** — UB is
+structurally incompatible with a product holding user credentials.
+**TypeScript/Node** — a ~130 MB runtime for the core, the worst memory profile,
+and the weakest guarantee story. Also, MCP already standardises JSON-RPC, so
+there is no protocol advantage.
+
+**Revisit conditions.** If a hard performance requirement appears that Rust
+cannot meet on the baseline profile, benchmark it and revisit with data — not
+with a preference. Revisit the MSRV floor if a required dependency demands
+> 1.99.
+
+---
+
+<a id="adr-0002"></a>
+## ADR-0002 — Desktop: Tauri 2, as an optional separate process
+
+**Context.** The product needs a desktop GUI on Linux and Windows, on a 15 GiB
+laptop, competing for memory with everything else. Tauri was proposed.
+
+**Problem.** Which desktop technology, and does it compromise the lightweight
+goal?
+
+**Options.** Tauri 2 (system webview) · Wry (raw) · Slint · egui/eframe ·
+iced.
+
+**Evidence.**
+
+| | Tauri 2.12.0 | Slint 1.18.1 | egui 0.36.2 | iced 0.14.0 |
+|---|---|---|---|---|
+| Runtime | System WebView (WebKitGTK 4.1 / WebView2 / WKWebView) | Native | Native | Native |
+| Binary size | Small (no bundled browser) | Small | Small | Small |
+| **Incremental RSS** | **+80–150 MB** (WebKitGTK web process) | Likely lowest | Low | Low |
+| Cold start to interactive | ~0.7–1.2 s | Likely faster | Fast | Fast |
+| Rich text / complex widgets | **Excellent** (whole web platform) | Good, fewer primitives | Adequate | Adequate |
+| Streaming async UI | **Excellent** | Good | Awkward | Good |
+| Accessibility | Web platform (good, if authored well) | **Genuinely good** | Poor | Poor |
+| Ecosystem for the UI | **Largest** (any web lib) | Younger | Smaller | Smaller |
+| Maturity | 2.12.0, active, plugins for notification/autostart/shell | 1.18.1, active | Active | ~10 mo stale |
+| MSRV | 1.90 | 1.92 | **1.95** | 1.88 |
+| Security surface | Web content + IPC (mitigable: CSP, isolation pattern, capability-scoped IPC) | Smaller | Smaller | Smaller |
+
+WebView behaviour differs across WebKitGTK / WebView2 / WKWebView — a real cost.
+
+**Decision.** **Tauri 2.12.0 for the desktop shell, running as a separate
+process** from the daemon, and **entirely optional** (CR-2).
+
+**Why.** The product needs streaming async UI, rich text, lists, forms, and
+long-lived reactive state. In a webview that is free; in a native toolkit it is
+months of work we should not spend. The webview's memory cost is real, so we
+contain it: **the GUI is a separate process**, which makes "GUI cost" literally
+opt-in — a CLI-only or TUI-only user never pays the 80–150 MB. And Tauri 2's
+plugin ecosystem already covers the OS concerns we need (notifications 2.5.0,
+autostart 2.6.0, shell 2.4.0).
+
+**Trade-offs.** The largest single resource cost in the product. A second
+process and a second protocol client. Webview behavioural divergence across
+platforms. A JS attack surface, mitigated by CSP, Tauri's isolation pattern, and
+capability-scoped IPC. Requires the full Node/Vite toolchain to build the
+frontend.
+
+**Consequences.** The frontend build is a real toolchain commitment (ADR-0005).
+`cfg(target_os)` is forbidden outside `crates/platform-*` even though Tauri is
+itself OS-specific — the GUI crate is the one place that is allowed to know about
+webviews, and it does so via its own adapters. Accessibility must be *authored*,
+not assumed. Startup is dominated by the webview's first launch, which is why
+the target is < 1.2 s, not < 100 ms.
+
+**Rejected alternatives.** **Slint** — genuinely attractive (native, small, good
+a11y, no JS surface) and the strongest fallback; rejected only because rich-text
+and complex async UI would cost us months. **egui** — immediate mode is a poor
+fit for a polished long-lived product, and MSRV 1.95 is only 3 minor versions
+below ours. Rejected for the product shell, **adopted for an in-app
+diagnostics panel**, where immediate mode is ideal. **iced** — stale. **Wry** —
+Tauri's own renderer; using it directly means reimplementing Tauri's plugin,
+IPC, and packaging layers for no benefit.
+
+**Revisit conditions.** Revisit Slint if (a) the measured GUI RSS exceeds 200 MB
+on the baseline profile, or (b) accessibility authoring proves impractical, or
+(c) the web toolchain becomes a maintenance burden. Revisit if Tauri 2
+materially regresses in maintenance or security. Revisit `egui` MSRV if it
+exceeds our toolchain.
+
+---
+
+<a id="adr-0003"></a>
+## ADR-0003 — Local transport: Unix socket / named pipe + JSON-RPC 2.0
+
+**Context.** Six interfaces (GUI, TUI, CLI, voice, messaging, API) must drive
+one capability set. Cloud deployment must reuse the same logic.
+
+**Problem.** Choose the inter-process contract.
+
+**Options.** HTTP/axum as the local transport · Unix socket + JSON-RPC ·
+gRPC/protobuf · a bespoke binary protocol · WebSocket.
+
+**Evidence.** MCP's wire format **is JSON-RPC 2.0** (spec 2026-07-28), and its
+SDK is the largest in the ecosystem. `axum` 0.8.9 / `hyper` 1.11.1 are excellent
+for remote services. Filesystem permissions on a socket are enforced by the
+kernel.
+
+**Decision.** **JSON-RPC 2.0 over a Unix domain socket (Linux/macOS) or a named
+pipe (Windows)** as the primary local transport. The same frames travel over
+HTTPS via `axum` **only** in the cloud profile.
+
+**Why.** Four reasons, in order of weight:
+
+1. **One protocol stack.** Local clients, the MCP client, and the remote API
+   share framing, error codes, and vocabulary. One implementation, one test
+   suite, one debugging story.
+2. **Authorization for free.** A socket file has filesystem permissions. That is
+   the authorisation boundary, enforced by the kernel, with no tokens to manage.
+   A loopback HTTP port has neither identity nor a natural ACL.
+3. **Deployment simplicity.** No port allocation, no "which port is it on", no
+   firewall prompt, no TLS ceremony for a socket only this user can open.
+4. **It is not a network API by fashion.** The brief explicitly warned against
+   creating a network API because APIs are fashionable. A local socket is not
+   that.
+
+**Trade-offs.** Not cross-machine by default (solved by a TCP listener in cloud
+mode). Named pipes have different ACL and timeout semantics from Unix sockets,
+so the transport is genuinely tested twice. No HTTP tooling (`curl`,
+`devtools`) for local debugging — mitigated by a `orxnuctl rpc` debug subcommand
+and a documented frame format.
+
+**Consequences.** One protocol to spec, version, and test. Clients must be
+tolerant of unknown methods and fields. The `platform-*` crate owns the socket
+setup; the core never names a socket.
+
+**Rejected alternatives.** **HTTP/axum as the local transport** — the strongest
+runner-up, and it is exactly what we are avoiding: port allocation, no ambient
+identity, TLS ceremony for a loopback socket. Axum is retained for the cloud
+profile. **gRPC** — codegen, a poor fit for dynamic tool schemas, no local-socket
+story. **A bespoke binary protocol** — no ecosystem, no interop, and MCP
+compatibility would have to be built anyway. **WebSocket** — fine for remote
+streaming, needless locally.
+
+**Revisit conditions.** Revisit if MCP's protocol diverges so far from JSON-RPC
+2.0 that sharing a stack costs more than it saves. Revisit if Windows named-pipe
+limitations (max pipe instances, message size, ACL granularity) prove
+insufficient for the interface set.
+
+---
+
+<a id="adr-0004"></a>
+## ADR-0004 — Runtime: Tokio, plus an explicit supervisor
+
+**Context.** Concurrent I/O across the network, the database, subprocesses,
+audio, and a browser.
+
+**Problem.** Choose an async runtime, and compensate for its weaknesses.
+
+**Options.** Tokio · async-std/smol · std threads · a bespoke executor.
+
+**Evidence.** `tokio` 1.53.1 (2026-07-20, MSRV 1.71) at **238.3 M downloads in
+30 days** — an order of magnitude above everything else. `tokio-util` 0.7.19
+supplies `CancellationToken`. async-std/smol are materially smaller but have no
+cancellation story and a fraction of the ecosystem.
+
+**Decision.** **Tokio** for the runtime, with two explicit compensations we own:
+a **task supervisor** and a **structured cancellation discipline**.
+
+**Why.** The ecosystem gravity is decisive and irrepeatable: every capability
+we might write will assume Tokio. Fighting it would cost us in adapters forever.
+Its real weaknesses are well understood and both are addressable.
+
+**Trade-offs and the two compensations:**
+
+| Tokio gap | Our mitigation |
+|---|---|
+| No structured concurrency — detached tasks can outlive their parent | A supervisor actor per task tree: `JoinSet` for the subtree, restart with backoff, escalate after N, and **no `tokio::spawn` outside the supervisor** (enforced in review) |
+| No built-in backpressure or bounded concurrency | Every spawn site has an explicit `Semaphore`; the DB writer is a single bounded queue |
+| Detached-task leaks | Leak detection in tests; soak test asserts no growth |
+
+**Consequences.** Structured concurrency is a **convention plus a review rule**,
+not a type-system guarantee — the one place where our determinism story is
+weaker than we would like, and it is called out rather than glossed over. A
+bounded scheduler abstraction is needed; that is Phase 2 work.
+
+**Consequences (continued).** Shutdown must be explicit and bounded: stop
+accepting, drain in-flight, persist state, release locks, within a deadline.
+
+**Rejected alternatives.** **async-std/smol** — smaller, but no cancellation and a
+much weaker ecosystem; the long-run cost is higher. **std threads** — retained
+*inside* blocking tasks (`spawn_blocking` for rusqlite), not as the main runtime.
+
+**Revisit conditions.** Revisit if Tokio's MSRV exceeds ours by a wide margin, or
+if a credible alternative reaches comparable adoption with structured concurrency
+built in.
+
+---
+
+<a id="adr-0005"></a>
+## ADR-0005 — Frontend: Svelte 5 + Vite 8, with TypeScript 7.0.2 as the baseline and 6.0.3 co-installed
+
+> **Amended 2026-09-30 (revision 2).** The original decision ("TypeScript 6, not
+> 7") was **too strong and is corrected here.** `svelte-check` ships a supported
+> TS7 path that the original research missed. The *pattern* is dual-install; the
+> *baseline* is TypeScript 7. See the Amendment record at the end of this ADR.
+
+**Context.** The Tauri frontend needs a framework, a bundler, and a type
+checker. The brief proposed Svelte, TypeScript, Vite, Tauri.
+
+**Problem.** Verify actual current compatibility rather than assuming each
+project is individually stable — and do not let a tooling constraint masquerade
+as an architectural decision.
+
+**Options.** Svelte 5 · React 19. Bundler: Vite 8. TypeScript: 7.0.2 alone ·
+6.0.3 alone · **7.0.2 + 6.0.3 co-installed**.
+
+**Evidence.** Verified against the npm registry and the published package
+contents on 2026-09-30.
+
+| Package | `latest` | Released | Relevant fact |
+|---|---|---|---|
+| `svelte` | 5.57.1 | — | runes (compile-time reactivity) |
+| `svelte-check` | **4.7.6** | — | peers `svelte ^4\|\|^5`, `typescript ^5\|\|^6`; **but ships a TS7 path** |
+| `svelte-language-server` | **0.18.4** | — | **also contains `tsgo` / `tsgo-experimental-api` support** (editor support exists) |
+| `vite` | 8.3.1 | — | `engines: ^20.19.0 \|\| >=22.12.0` |
+| `@sveltejs/vite-plugin-svelte` | 7.3.1 | — | `^20.19 \|\| ^22.12 \|\| >=24` |
+| `typescript` | **7.0.2** | 2026-07-08 | latest stable; native Go port; **no stable programmatic API until 7.1** |
+| `typescript` | **6.0.3** | 2026-04-16 | the release that still ships the compiler API |
+
+**The decisive evidence** is inside `svelte-check` 4.7.6 itself. Its README:
+
+> "TypeScript 7 support currently requires the `--tsgo` or
+> `--tsgo-experimental-api` flag. **You need to install both TypeScript 7 and
+> TypeScript 6.**"
+
+and its own flag table:
+
+> `--tsgo` | Use TypeScript's Go implementation. Needs to have
+> `@typescript/native-preview` installed. Subject to the same limitations as
+> `--incremental`
+
+and, most authoritatively, `bin/ts-version-check.js`, which is what actually
+runs:
+
+> "TypeScript 7 support currently requires both TypeScript 7 and TypeScript 6
+> installed in your project, and requires using the `--tsgo` or
+> `--tsgo-experimental-api` flag. You can setup both version with an npm alias
+> via the following command.
+> `npm install --save-dev typescript@~6 @typescript/native@npm:typescript@7`"
+
+Microsoft's TS 7.0 announcement documents the same co-install pattern
+independently (`@typescript/native` plus `@typescript/typescript6` via npm
+alias), and notes that TS 7.0 "does not ship with an API… We expect TypeScript
+7.1 to ship with a new (and different) API."
+
+**Reading this together:** the `typescript@^5 || ^6` peer range is *not* a
+statement that TS7 is unsupported. It is a statement that **the package named
+`typescript` must be 6.x**, because tools that *embed* the compiler API still
+need 6.0's API. TS7 is reached **alongside**, under an alias, selected by flag.
+
+**Decision.**
+
+1. **TypeScript 7.0.2 is the baseline** — the language level, the target, and
+   what we evaluate against. We do **not** architect around a superseded
+   compiler.
+2. **TypeScript 6.0.3 is co-installed under the conventional package name**
+   (`typescript@~6`) wherever tooling requires the compiler API. This is the
+   documented vendor-recommended pattern, not a workaround.
+3. **TypeScript 7 is installed as `@typescript/native`** (aliasing
+   `typescript@7`) and enabled with `--tsgo` / `--tsgo-experimental-api`.
+4. **Editor support** uses `svelte-language-server` 0.18.4, which also carries
+   the `tsgo` path.
+5. **TS7 adoption is evaluated explicitly** — a tracked, deliberate decision with
+   a measurement, not a silent default in either direction. If `--tsgo` produces
+   diagnostics that differ from the TS6 path, that difference is a tracked issue,
+   not a reason to disable TS7.
+6. **Svelte 5.57.1 + Vite 8.3.1.** Node 24 (Krypton LTS) as the build runtime
+   (satisfies Vite's `>=22.12`).
+
+**Why.** The original decision conflated *"the package named `typescript` must be
+6.x"* with *"TypeScript 7 is unsupported for Svelte."* They are different
+claims, and only the first is true. Pinning 6.0.3 outright would have made a
+**tooling constraint into an architectural decision** — exactly the error the
+brief warned against ("do not choose 'latest' versions blindly when
+maturity/compatibility argue against them" — the converse error is just as real).
+TS7 is stable, first-party, documented by the framework's own maintainers, and
+available to us today. Declining it would be declining the current stable
+release on the basis of a peer-dependency artefact.
+
+**Trade-offs.** Two TypeScript installations to reason about, and a flag whose
+name and package (`--tsgo` vs `@typescript/native` vs the README's older
+`@typescript/native-preview`) is inconsistent *between the vendor's own docs* —
+pinned explicitly in the lockfile to remove ambiguity. `--tsgo` is documented as
+subject to the same limitations as `--incremental`, so it is not a
+parity-guaranteed path and must be validated, not assumed. A smaller ecosystem
+and hiring pool than React. **The frontend build requires Node ≥ 24**, and the
+workstation's `node` currently resolves to v26.7.0 (Current, non-LTS) — see
+Q-OPEN-03.
+
+**Consequences.** Exact pins in the lockfile for *both* compilers, so a
+`pnpm update` cannot silently cross a boundary. A short Phase-6 work item:
+*verify TS6 and `--tsgo` diagnostics agree on our own code*; any divergence is
+filed and tracked. Frontend accessibility must be authored, not inherited
+(NR-07).
+
+**Rejected alternatives.** **TypeScript 6.0.3 alone** — *rejected in revision 2*;
+declines the current stable release for a peer-dependency artefact.
+**TypeScript 7.0.2 alone, with no 6.x** — not possible: tools that embed the
+compiler API need 6.0, and the vendor's own install command installs both.
+**React 19** — viable and a near-trivial change since both run on Vite; rejected
+on runtime size and boilerplate, not capability. **Vite 7** — no reason to prefer
+an older major.
+
+**Revisit conditions.** Revisit when TypeScript 7.1 ships the stable
+programmatic API — at which point the dual-install may collapse to TS7 alone and
+`svelte-check`'s peer range may widen to `^7`. Re-evaluate if `svelte-check`
+retires the `--tsgo` flag. Revisit Svelte vs React if Svelte 6 changes the
+reactivity model in a way that breaks our assumptions, or if a required UI
+dependency becomes React-only.
+
+### Amendment record — revision 1 → revision 2
+
+| | Revision 1 (original) | Revision 2 (current) |
+|---|---|---|
+| Claim | "Microsoft explicitly excludes Svelte from TS7" | **Overstated.** Microsoft excludes Svelte from the *`tsc`/API path*; `svelte-check` ships a flagged TS7 path |
+| Evidence used | `svelte-check` peer range `^5 \|\| ^6` | Peer range **plus** `svelte-check` README + `bin/ts-version-check.js` + `svelte-language-server` 0.18.4 |
+| Decision | TS 6.0.3 only | **TS 7.0.2 baseline + TS 6.0.3 co-installed** |
+| Error class | **Converse of "latest-blinkism"**: a tooling constraint promoted to an architectural decision | Corrected |
+
+**Lesson recorded because it is generalisable:** a peer-dependency range tells
+you what a package *declares*, not what is *possible*. Before promoting a
+tooling limitation to an architectural decision, read the tool's own source and
+docs for a supported path.
+
+---
+
+<a id="adr-0006"></a>
+## ADR-0006 — Storage: SQLite via rusqlite, bundled ≥ 3.51.3
+
+**Context.** Local-first, no server, durable across power loss, possibly
+Postgres later.
+
+**Problem.** Choose the storage engine and the Rust driver.
+
+**Options.** `rusqlite` (sync, bundled) · `sqlx` 0.9 (async) · PostgreSQL ·
+embedded KV · document store.
+
+**Evidence.**
+
+| | `rusqlite` 0.40.2 | `sqlx` 0.9.0 |
+|---|---|---|
+| MSRV | — | **1.94** (≈4 of our minor versions) |
+| Model | Synchronous | Native async |
+| Compile-time SQL checking | Yes, via macros | Yes |
+| Multi-backend (for cloud) | No | Yes (SQLite, Postgres, MySQL) |
+| Downloads/30 d | 37.4 M | 40.7 M |
+
+SQLite facts (from `sqlite.org/wal.html`, updated 2026-08-25):
+- WAL mode is mandatory and persistent.
+- **"There can only be a single writer at a time."** (also `isolation.html`)
+- `synchronous=NORMAL` in WAL: *"syncing the content to the disk is not
+  required, as long as the application is willing to sacrifice durability
+  following a power loss or hard reboot."* — **not** power-loss safe.
+- `synchronous=FULL` in WAL: *"Writers sync the WAL on every transaction
+  commit."*
+- **A corruption bug (WAL-reset) is present in all versions 3.7.0 → 3.51.2, fixed
+  in 3.51.3** (2026-03-13), plus backports 3.50.7 and 3.44.6.
+
+**Decision.**
+1. **SQLite** as the local store, accessed through `rusqlite` 0.40.2 with
+   **`libsqlite3-sys` `bundled`**, and the bundled version asserted **≥ 3.51.3** in
+   a build-time test.
+2. **All access through a repository layer** that exposes domain operations, not
+   raw SQL. The driver is therefore swappable.
+3. **`journal_mode=WAL` + `synchronous=FULL`** on the task/queue connection,
+   because the brief requires survival of power loss.
+4. **`sqlx` is deferred**, not rejected — see revisit conditions.
+5. **Packaging policy (added 2026-09-30, revision 2):** OpenRayNux **bundles and
+   pins its own SQLite**. It does **not** link the system library, and it does not
+   rely on whatever SQLite the host happens to ship. See below.
+
+**Why.**
+
+- **SQLite over any server** because the product must be a single local process
+  with no daemon to install, start, secure, back up, or upgrade. This is the
+  decision that makes "lightweight" real.
+- **`rusqlite` over `sqlx`** because SQLite *is* single-writer — the async
+  benefit largely does not exist for our dominant access pattern — while
+  `sqlx`'s MSRV 1.94 consumes a quarter of our headroom for a benefit we do not
+  need. `rusqlite` also keeps rows directly inspectable with the `sqlite3` CLI,
+  which matters during development and for support.
+- **Bundle ≥ 3.51.3** because Fedora 44 ships 3.51.2, which carries the
+  WAL-reset corruption bug — and a durable task queue is precisely the
+  multi-connection write workload that triggers it.
+- **`synchronous=FULL`** because `NORMAL` explicitly does not survive power loss,
+  and the brief requires it. We accept the fsync cost and will measure it
+  (`05-…` §7).
+
+**Trade-offs.** Synchronous access must not block the runtime — mitigated with a
+single writer thread plus `spawn_blocking` for reads. `synchronous=FULL` costs an
+fsync per state transition. Single-writer means the DB must not be opened by
+another writer process. `rusqlite` gives no path to Postgres for the cloud
+profile — which is precisely why the repository layer is mandatory. **Bundling
+SQLite means we own a C build in our toolchain and a pin in our release process**
+(see below).
+
+### Packaging and version policy (revision 2)
+
+The SQLite 3.51.3 finding is only half a decision. The other half is: *what do we
+actually ship?*
+
+| Environment | SQLite | Verdict |
+|---|---|---|
+| **Development workstation (Fedora 44)** | 3.51.2 | **Acceptable for development only.** It is *below* the 3.51.3 fix, so a durability bug present in our target is **not reproducible locally** — which is itself a reason not to develop against it exclusively. |
+| **What we ship** | **Bundled, pinned, ≥ 3.51.3** | The only version we support. |
+
+**Policy:**
+
+1. **Bundle, do not link the system library.** `libsqlite3-sys` with the
+   `bundled` feature. Every platform gets a *known* SQLite, not a distro's.
+2. **Assert the version at build time.** A compile-time assertion (and a test)
+   that the bundled `SQLITE_VERSION_NUMBER` ≥ 3.51.3. A release that fails this
+   does not build. This makes the requirement mechanically enforced rather than
+   a comment.
+3. **Pin the exact amalgamation** in the lockfile, and record the pinned
+   `SQLITE_SOURCE_ID` / SHA3 in the SBOM. SQLite releases are
+   security-relevant artefacts.
+4. **Track SQLite releases** as a supply-chain dependency (ADR-0019), because the
+   WAL-reset bug class is exactly the kind of thing that appears without an
+   announcement in a changelog.
+5. **Document the minimum for anyone building from source outside our build**
+   (distro packagers, contributors), and make a too-old system SQLite a
+   **clear build error**, not a warning.
+6. **A development-machine SQLite below the minimum is permitted but must be
+   called out**, because it means local testing does not cover the shipped
+   configuration. Our own machine is currently in exactly this state — which is a
+   reason to bundle sooner rather than later.
+
+**Why bundle rather than require.** OpenRayNux is a personal application
+installed on machines we do not control, across Linux distributions, Windows, and
+eventually macOS and ARM64. Requiring "SQLite ≥ 3.51.3" is a support burden
+(users would have to build SQLite), a security risk (an old system SQLite would
+silently reintroduce a data-corruption bug), and an unfalsifiable promise (we
+cannot verify the host's SQLite before running). Bundling converts a
+distribution problem into a release-process problem, which we can own and test.
+
+**Trade-off accepted.** We now compile and ship a C library. That means a C
+toolchain in our build, a cross-compilation concern for every target, and a
+supply-chain pin. That is a real cost — and it is smaller than the cost of a user
+running a data-corrupting SQLite because their distro was slow to update.
+
+**Re-verification note.** 3.51.3's own changelog also adds *"Improved resistance
+to database corruption caused by an application breaking Posix advisory locks
+using close()"* — a second fix in the same area. Both are reasons to be on
+3.51.3+, and both reinforce that SQLite needs active tracking, not a once-ever
+version pin.
+
+**Consequences.** One file to back up, and a backup must include `-wal`/`-shm`
+via the SQLite backup API, never a naive file copy. A single-instance lock is
+mandatory. The DB thread model is documented (`08-…` §11). The bundled SQLite
+version is a security-relevant dependency and is tracked in CI.
+
+**Rejected alternatives.** **`sqlx` 0.9 now** — its async model buys little
+against a single-writer engine, and its MSRV is the tightest in the stack. Not
+rejected on merit. **PostgreSQL** — requires a server in a personal install,
+which contradicts the product's core constraint. **An embedded KV store** — a KV
+store cannot express the relational task/schedule/audit model or FTS. **A
+document store** — no referential integrity for the task graph, and no FTS5.
+
+**Revisit conditions.** **Revisit bundling** only if a security advisory in the
+SQLite amalgamation proves impractical to patch quickly, or if a target platform's
+toolchain cannot build it (in which case: pin and verify the system version
+per-platform rather than reverting to "trust the host"). **Revisit `sqlx` when** we need genuine concurrent
+read/write from many async tasks and the blocking model measurably hurts, or
+when the cloud profile needs one repository over SQLite *and* Postgres. In that
+case, the repository layer already exists. **Revisit the engine** only if
+SQLite cannot meet a measured requirement — it has never failed a durability
+claim, but it has one writer, which is a real ceiling we have not yet hit.
+
+---
+
+<a id="adr-0007"></a>
+## ADR-0007 — Task engine: hand-rolled durable task table
+
+**Context.** Tasks must be short, long, scheduled, recurring, paused, cancelled,
+failed, retrying, waiting-for-user, or waiting-for-external-system — and must
+survive app restart, power loss, and reboot. The brief warned against adopting an
+AI framework just because it is AI-related.
+
+**Problem.** Choose an orchestration model.
+
+**Options.** Hand-rolled on SQLite · `apalis` + `apalis-sqlite` · `fang` ·
+Temporal · Restate · DBOS · LangGraph · a bespoke state machine.
+
+**Evidence.**
+
+| Option | Version | Deployment | Verdict |
+|---|---|---|---|
+| `apalis` / `apalis-sqlite` | 0.7.4 / **1.0.0-rc.9** | library + one `.db` | Strong candidate; SQLite backend is **RC**, single maintainer, and its `synchronous` default is **unverified** |
+| `fang` | 0.11.0 | library + SQLite | 2 maintainers; **cron is UTC-only** |
+| `temporalio-sdk` | **1.0.0 (2026-09-04)** | **server + DB** | ⛔ local, ✅ cloud |
+| `restate-sdk` | 0.12.1 | single binary | ⛔ local, ✅ cloud |
+| `dbos` (Rust) | 0.5.0, **1 173 lifetime downloads** | **Postgres only**; docs say "the scheduler is not yet" | ⛔ |
+| `apalis-workflow` | 0.1.0-rc.10 | — | ⛔ beta, in-memory examples |
+| Windmill | — | Postgres + Docker + workers, **AGPL** | ⛔ |
+| Inngest | — | **no Rust SDK** | ⛔ |
+| LangGraph | 1.2.12 | Python | ⛔ (ADR-0024) |
+| `clokwerk` / `job_scheduler` / `tokio-cron-scheduler` | 2020–2022, **no SQLite** | — | ⛔ |
+
+**Decision.** **A hand-rolled durable task table on SQLite**, structured as an
+explicit state machine with atomic claim, leases, heartbeats, an idempotency
+ledger, and a dead-letter state.
+
+> **Amended 2026-09-30:** the *contract* for this engine is now specified
+> independently of this implementation as the twelve normative properties in
+> **[ADR-0029](#adr-0029)**. This ADR chooses the implementation; ADR-0029
+> defines what "correct" means. A future engine (e.g. `apalis`) is substitutable
+> if and only if it passes the ADR-0029 conformance suite.
+
+**Why.** The requirement is *task-queue durability*, not *replay-based durable
+execution*. Nobody needs step-level replay; what is needed is
+`pending → running → done` being transactional — roughly 200–400 lines. Every
+durable-execution platform adds a process, a log format, a determinism
+constraint on workflow code (which fights LLM nondeterminism), and a payload
+codec. For one user on one machine that is pure cost. Owning it also means the
+rows are inspectable with `sqlite3`, which matters when a user asks "why did
+that job not run?".
+
+**Core schema (design, not implementation):**
+
+```
+tasks(id, kind, payload, status, priority, run_after, attempt_count,
+      max_attempts, lease_until, worker_id, last_error,
+      created_at, updated_at, dead_lettered_at)
+schedule_fires(schedule_id, fire_time, status, claimed_at, started_at,
+               finished_at, UNIQUE(schedule_id, fire_time))
+schedules(id, cron_expr, timezone, misfire_policy, catch_up_cap,
+          enabled, last_fired_at)
+task_checkpoints(task_id, step_key, result)
+dedupe(key PRIMARY KEY, result, created_at)
+```
+
+**Three invariants, stated as requirements:**
+
+1. **Every state transition is a single `BEGIN IMMEDIATE` transaction.**
+   `sqlite.org/lang_transaction.html`: *"If the BEGIN IMMEDIATE operation
+   succeeds, then no subsequent operations in that transaction will ever fail
+   with a SQLITE_BUSY error."*
+2. **Claim is atomic** — `UPDATE ... WHERE id = (SELECT ... LIMIT 1) RETURNING *`
+   inside that transaction. Never `SELECT` then `UPDATE`.
+3. **Every external side effect carries a deterministic idempotency key**, and
+   the dedupe row is written in the **same** transaction as the DB write.
+
+**Trade-offs.** We own the bugs. Scheduling, catch-up, DST, and dead-lettering
+are all ours to get right. No third-party roadmap.
+
+**Consequences.** `apalis` is the first thing to reconsider if the hand-rolled
+version grows past ~600 lines of queue logic — but **only after verifying its
+`PRAGMA synchronous` default**, because the whole power-loss guarantee depends
+on it. That verification is an open action, not a decision (Q-OPEN-02).
+
+**Cloud.** In the cloud profile, a single instance still runs its own scheduler.
+The upgrade to Restate (preferred: single binary, exactly-once, `ctx.sleep()`,
+and "durable agents" as a first-class concept) or Temporal is triggered by
+*multi-instance* or *long-running-workflow* needs — **not** by "we are in the
+cloud".
+
+**Rejected alternatives.** See table. `apalis` is rejected *for now* on RC
+status and one unverified setting, not on quality.
+
+**Revisit conditions.** Revisit if the hand-rolled engine exceeds ~600 lines of
+queue logic, or if multi-instance execution is ever required (→ Restate).
+Revisit if a durable-execution library reaches Rust 1.0 with **SQLite** as a
+first-class backend and a documented power-loss guarantee.
+
+---
+
+<a id="adr-0008"></a>
+## ADR-0008 — No vector database
+
+**Context.** The brief warned: *"Avoid infrastructure merely because 'AI
+applications need vector DBs.'"*
+
+**Problem.** Where do embeddings and semantic retrieval live?
+
+**Options.** Qdrant · Milvus · pgvector · Weaviate · `sqlite-vec` · SQLite FTS5
+plus an in-process index · nothing yet.
+
+**Evidence.** `sqlite-vec` **0.1.9 (2026-03-31)**, 1.24 M downloads/30 d —
+popular, but **pre-1.0 and no release in 6 months**. Every server-based vector
+DB adds a service to install, secure, back up, and upgrade.
+
+**Decision.**
+1. **No vector database.** Embeddings, when they exist, are **derived data** in
+   SQLite.
+2. **SQLite FTS5** (BM25) for lexical retrieval **now**.
+3. The vector interface is **abstracted and optional**, off by default.
+4. `sqlite-vec` may be adopted behind that interface **when it reaches 1.0**.
+
+**Why.** An embedding is a *derived* artefact: delete the source, regenerate the
+embedding. Storing derived data in a system that needs its own backups,
+availability guarantees, and trust boundary is a poor trade. FTS5 is bundled,
+mature, needs no service, and — for a personal knowledge base of the size a
+human generates — lexical search is frequently sufficient. `sqlite-vec`'s
+six-month release gap means depending on it now means depending on an abandoned
+project.
+
+**Trade-offs.** Semantic (meaning-based) retrieval is unavailable in v1. This
+will need revisiting as the knowledge base grows — and it should be revisited
+with a measurement, not a feeling: *measure whether FTS5 + reranking fails on
+real queries* before adding infrastructure.
+
+**Consequences.** A retrieval abstraction exists from day one, so swapping the
+backend is cheap. The "no infrastructure" property is preserved.
+
+**Rejected alternatives.** **Qdrant/Milvus/Weaviate** — a server. **pgvector** —
+a Postgres server. All rejected for the same reason as ADR-0006: no daemons in a
+personal install.
+
+**Revisit conditions.** Revisit when measured retrieval quality on real queries
+falls short of acceptable with FTS5 + reranking, **or** when the knowledge base
+exceeds what SQLite handles comfortably. Revisit `sqlite-vec` at 1.0.
+
+---
+
+<a id="adr-0009"></a>
+## ADR-0009 — Capability model: three isolation tiers, no dynamic plugins
+
+**Context.** The brief: *"A crashing optional integration should ideally not
+crash the core"* and *"Do not automatically create a dynamic plugin system."*
+
+**Problem.** Choose an extension mechanism.
+
+**Options.** Rust traits · dynamic libraries · subprocesses · MCP · WASM/WASI ·
+RPC.
+
+**Decision.** **Three tiers.**
+
+| Tier | Mechanism | For | Trust |
+|---|---|---|---|
+| **0** | Rust trait, in-process | Built-ins; hot paths | Core |
+| **1** | Subprocess, JSON-RPC over stdio | User-installed integrations; heavy/fragile native code; **all** GPL/AGPL/NC components | Sandboxed |
+| **2** | MCP remote (Streamable HTTP) | Third-party, untrusted | Untrusted |
+
+**Why.**
+
+1. **A `cdylib` cannot satisfy the requirement.** Rust has no stable plugin ABI
+   (a plugin must be rebuilt against every host version), a segfault kills the
+   host, it shares the address space so it can read every secret, and it shares
+   dependency versions. Cost of subprocess: one ~1–5 ms hop. Benefit: the core
+   can never be killed by a bad integration, and the trust boundary is real.
+2. **Licence forces the boundary.** GPL/AGPL must not be linked into the core
+   binary. This is *why* Piper and eSpeak-NG are subprocesses — the licence, not
+   an aesthetic, puts them there.
+3. **Heavy native code belongs outside.** ONNX Runtime, browser drivers, and
+   model runtimes are exactly the components that segfault.
+
+**Tier rules.** Tier 0 only for built-ins where a panic is a bug we fix, or
+where sub-millisecond latency is required. Everything third-party, untrusted,
+or copyleft is Tier 1+. No capability may invoke another capability.
+
+**WASM/WASI: deferred, with a specific reason.** Not rejected in principle —
+rejected because the capabilities we most need to isolate (filesystem, network,
+**subprocess spawning**, audio, browser driving) are exactly where WASM's
+sandbox is weakest and the Component Model is least mature.
+
+**Trade-offs.** IPC latency (~1–5 ms) and ~5–20 MB per Tier 1 process. A
+capability manifest and a versioned wire contract to maintain. A capability
+cannot be a bare Rust trait if it is out-of-process — so Tier 1/2 need schema
+validation at the boundary, losing compile-time type safety.
+
+**Consequences.** Every capability ships a 10-point contract test suite
+(`07-…` §8) — this is what makes substitutability real rather than aspirational.
+Manifests are data, signed, and treated as untrusted claims.
+
+**Rejected alternatives.** **Dynamic libraries** — see above. **WASM** — see
+above. **A single "plugin" mechanism** — one size fits none; the tiers exist
+because the requirements genuinely differ.
+
+**Revisit conditions.** Revisit WASM when the Component Model is stable **and**
+a real capability exists needing no host resources. Revisit Tier 0 for anything
+currently Tier 1+ if profiling shows the IPC cost matters on a hot path.
+
+---
+
+<a id="adr-0010"></a>
+## ADR-0010 — MCP as an external integration protocol only
+
+**Context.** The brief asks where MCP belongs, and warns: *"MCP must not become
+synonymous with 'trusted code.'"*
+
+**Problem.** Decide MCP's role.
+
+**Options.** MCP as the internal capability protocol · MCP as the external
+integration protocol · MCP everywhere · not at all.
+
+**Evidence.** Spec revision **`2026-07-28`** is current (verified at
+`modelcontextprotocol.io/specification/latest`). Major changes since
+`2025-11-25`:
+
+- **MCP is now stateless.** `initialize`/`notifications/initialized` and
+  `Mcp-Session-Id` are **removed**; each request carries version and capabilities
+  in `_meta`.
+- `server/discover` added for up-front version selection.
+- **MRTR** (Multi Round-Trip Requests) replaces server-initiated requests;
+  `roots/list`, `sampling/createMessage`, `elicitation/create` are no longer
+  server-initiated.
+- **Sampling, Roots, and Logging are deprecated**, with a 12-month minimum window
+  and a public registry. The stated migration for sampling is to *"integrate
+  directly with LLM provider APIs"* — which is what we do.
+- **SSE resumability and message redelivery are removed.**
+- Tasks moved to an **extension** (`io.modelcontextprotocol/tasks`).
+- `tools/list` and friends must return `ttlMs` and `cacheScope`.
+- The spec itself: *"Tools represent arbitrary code execution and must be treated
+  with appropriate caution. … descriptions of tool behavior such as annotations
+  should be considered untrusted, unless obtained from a trusted server."*
+- `rmcp` (Rust SDK) 3.5.0, 2026-09-28 — both new; expect churn.
+
+**Decision.**
+1. **MCP is the protocol for capabilities OpenRayNux does not implement.** It is
+   **not** the internal capability protocol (ADR-0009 handles that).
+2. **MCP servers are untrusted**, always Tier 2 (or Tier 1 for local stdio), never
+   in-process.
+3. **No auto-consent**, ever. Per-tool, per-argument-scope approval, bound to a
+   digest exactly like our own capabilities.
+4. **Per-server kill switch**, independent revocation.
+5. **Client only** in v1. We do not ship an MCP *server* for our own capabilities
+   (deferred — see revisit).
+6. Given SSE resumability was removed, **re-issue lost requests with an
+   idempotency key** (S7) to avoid duplicates.
+
+**Why.** MCP's value is *interoperability* — attaching tools we have never heard
+of. That is exactly the untrusted case, and the spec says so. Conforming the
+internal protocol to MCP would import spec churn (two major revisions in twelve
+months) into the core for no benefit. Statelessness is, notably, *good* for our
+security posture: there is no longer a session object that could be confused for
+a grant.
+
+**Trade-offs.** We maintain two protocols. MCP churn is real. Tool discovery and
+policy must be implemented against a moving spec. The Tasks extension may be
+absent, so long-running third-party work needs a fallback.
+
+**Consequences.** A `mcp` Cargo feature, off by default. The Tasks extension maps
+to our task table (`waiting-for-external-system`), with a fallback when the
+extension is not negotiated. `tools/list` results are cached per `ttlMs`.
+
+**Rejected alternatives.** **MCP as the internal protocol** — churn and a
+lowest-common-denominator constraint on our own contracts. **Shipping an MCP
+server** for our capabilities — genuinely attractive for ecosystem
+interoperability, but it is an *outbound* surface and it is a commitment to a
+moving spec. Deferred, not rejected. **Not using MCP at all** — gives up the main
+reason the ecosystem exists.
+
+**Revisit conditions.** Revisit the server direction when the spec stabilises and
+there is demonstrated user demand for external agents to call OpenRayNux. Revisit
+the Tasks mapping when the extension reaches a stable, widely-implemented state.
+**Track the 12-month deprecation windows** — do not build on deprecated features.
+
+---
+
+<a id="adr-0011"></a>
+## ADR-0011 — Provider-neutral LLM abstraction with capability negotiation
+
+**Context.** The brief: *"Do not couple OpenRayNux to OpenAI, Anthropic,
+OpenRouter, Groq, NVIDIA or any other provider."*
+
+**Problem.** Design an LLM abstraction that is genuinely neutral.
+
+**Options.** A thin HTTP client per provider behind one trait · the lowest
+common denominator · capability negotiation · an existing abstraction crate.
+
+**Evidence.** Cross-provider divergence is real and material:
+
+- **Structured output strictness.** OpenAI's Structured Outputs is on by default
+  for `gpt-4o`+ via `text.format.json_schema.strict`. Anthropic implements it
+  via `output_config.format` with `json_schema` and **strictly validates schema
+  keywords** where tool schemas silently ignore unsupported ones — a Zod
+  `z.number().positive()` → `exclusiveMinimum: 0` yields a **400** on Anthropic
+  but is fine on OpenAI. Vercel AI had to add `sanitizeJsonSchema` for exactly
+  this.
+- **Grammar-size ceilings.** Complex schemas hit
+  *"The compiled grammar is too large"* on Anthropic's GA structured outputs.
+- **Refusals are a separate outcome.** Structured Outputs does not bind the
+  safety layer: *"the API response will include a new field called `refusal`."*
+- Tool-calling schemas differ in what they tolerate.
+- Word-level timestamps: only OpenAI's legacy `whisper-1` still returns them;
+  the newer transcribe models return `json` only.
+
+**Decision.**
+1. A `ModelProvider` trait exposing **capabilities as data**, not as a
+   lowest-common-denominator method set.
+2. `ProviderCapabilities { tools, structured_output, streaming, vision,
+   word_timestamps, max_context, ... }`. Callers **branch on capability**, never
+   on provider name. Provider-name checks in the core are a lint violation.
+3. **A schema sanitiser** emitting a portable JSON Schema subset: `string,
+   number, boolean, integer, object, array, enum, anyOf`; all properties
+   `required`; `additionalProperties: false`; **no `$ref`/`$defs`**; shallow
+   nesting. Sanitised before every send.
+4. **Refusal is a first-class outcome**, not an error.
+5. **Small, purpose-specific schemas** — one "decision" schema and one
+   "extraction" schema, not a monolith.
+6. **Provider calls are a capability**, so they pass through policy, budget, and
+   egress classification. The model never holds a credential (S1).
+
+**Why.** Capability negotiation is the only way to be genuinely neutral: it lets
+us *use* a provider's strengths rather than flattening to the intersection. The
+sanitiser exists because the providers demonstrably disagree, and a 400 from a
+strict provider is a correctness bug, not a provider quirk.
+
+**Trade-offs.** More code than a lowest-common-denominator trait. Capability
+branching means more code paths, hence more tests. The sanitiser will lose
+fidelity on rich schemas — accepted deliberately, because a portable schema that
+works everywhere beats a rich one that 400s.
+
+**Consequences.** Adding a provider is one adapter crate and a capability
+descriptor. No core change. The non-blocking AI evaluation track
+(ADR-0025) exists partly because provider behaviour drifts.
+
+**Rejected alternatives.** **Lowest common denominator** — would forfeit
+structured output and streaming on some providers, making the product worse for
+no gain. **An existing abstraction crate** — each abstracts to *its author's*
+provider set and couples us to that crate's model of the world. **Direct
+provider SDKs in the core** — maximum coupling.
+
+**Revisit conditions.** Revisit if a standards body produces a portable
+structured-output profile that removes the need for our sanitiser. Revisit the
+schema subset if a provider's grammar limits are lifted.
+
+---
+
+<a id="adr-0012"></a>
+## ADR-0012 — Model proposes; deterministic engine disposes
+
+**Context.** The brief's most important safety requirement: *"The LLM must never
+be the authority that grants itself permission."*
+
+**Problem.** Enforce the deterministic/probabilistic boundary structurally, not
+by convention.
+
+**Decision.** Three mechanisms, layered.
+
+1. **Type-level.** The intent layer's only output is `Proposal` — inert data with
+   **no method that reaches an adapter**. Writing the unsafe path requires
+   deliberately constructing an authorised `CapabilityInvocation`, which only the
+   policy layer's constructor produces. It is not *possible* to do this without
+   going through policy.
+2. **Capability-scoped isolation (S1).** The model runs in a context with **no
+   credential handle**, no arbitrary filesystem grant, and network egress
+   restricted to configured provider endpoints. A prompt injection cannot make
+   the model read a secret, because the model has no way to reach one. This is
+   the lesson from Anthropic's own post-mortem: *"any untrusted code that Claude
+   generated was run in the same container as credentials — so a prompt injection
+   only had to convince Claude to read its own environment."*
+3. **Audit before and after.** Authorisation is written *before* the call, the
+   outcome *after*. There is no unlogged path.
+
+**Why.** Convention fails. A code review catches "the model called the tool
+directly" once; a type system catches it always. The distinction matters because
+the failure mode is a prompt injection that works on the day nobody is reviewing.
+
+**Trade-offs.** Some legitimate model-driven actions need more ceremony than a
+prompt would suggest. The `Proposal` type is deliberately not ergonomic to build
+by hand. Capability scoping means the model cannot read a file to decide — the
+task engine must fetch and pass content. That is more code, and it is correct.
+
+**Consequences.** A test asserts the intent-layer context cannot resolve a
+secret. Model output is schema-validated before any use. Every task is
+resumable at every deterministic stage because each is a transaction.
+
+**Rejected alternatives.** **Convention and lint rules** — insufficient for a
+security boundary. **A "safe mode" flag** — off-by-default security fails open in
+practice. **Trusting the model's self-assessment of risk** — the brief's explicit
+prohibition, and obviously wrong.
+
+**Revisit conditions.** None. This decision does not get revisited; it gets
+enforced. If a future design *requires* violating it, that design is wrong.
+
+---
+
+<a id="adr-0013"></a>
+## ADR-0013 — Memory: derived vs authoritative, with an enforced distinction
+
+**Context.** The brief: *"Do not define 'memory' as simply a vector database"*
+and *"Never blindly trust AI-generated memory as authoritative fact."*
+
+**Problem.** Design the memory model.
+
+**Options.** One `memories` table · a vector store · a knowledge graph ·
+separated classes with enforced provenance.
+
+**Decision.** **Separate the classes in the schema, not in documentation.**
+
+| Class | Consistency | Authority | Examples |
+|---|---|---|---|
+| Authoritative state | **Strong** | Yes | Tasks, schedules, user profile, explicit user statements, corrections |
+| User preferences | Strong | Yes | Declared preferences, confirmed corrections |
+| Task state | Strong | Yes | Task rows, checkpoints, audit |
+| Conversation history | Append-only | No | Event log |
+| Documents | Strong (metadata), lazy (content) | Source is authoritative | Imported files |
+| Derived knowledge | Eventual | **Never** | Summaries, extracted entities, inferences |
+| Embeddings | Eventual, regenerable | **Never** | Vectors |
+| Temporary context | None | **Never** | In-flight context |
+| Audit history | Append-only, hash-chained | Yes | Journal |
+
+**Enforcement, not documentation:**
+
+1. Every memory row carries `provenance` (`user` | `model` | `imported` |
+   `derived`), `confidence`, `created_at`, and a **`derived` boolean**.
+2. **A `derived` row can never satisfy an authority check.** This is a query
+   filter in the repository layer, not a UI convention.
+3. **User corrections are authoritative and supersede.** A correction to a derived
+   fact marks the derived item stale and creates an authoritative replacement.
+4. **Every derived item is visible, editable, and deletable**, and a deletion
+   **propagates** to items derived from it.
+5. Derived data inherits the **highest data class** of its sources (ADR
+   `04-…` §6).
+6. Confidence scores from models are **displayed, never enforced**. A 0.99
+   confidence is not authorisation.
+
+**Why.** "Memory" as one concept is how AI systems end up treating a model's
+guess as a fact. The only reliable fix is a schema-level distinction plus a
+repository query that makes the wrong thing impossible to retrieve.
+
+**Trade-offs.** More tables, more code, more joins. Deletion propagation is
+non-trivial (a DAG, so it needs cycle detection and a bounded traversal).
+Eventual consistency for derived data means a stale derived item may briefly
+contradict a corrected authoritative one — accepted, and surfaced in the UI.
+
+**Consequences.** "What does OpenRayNux know about me?" becomes a queryable,
+deletable, exportable answer — which the brief's privacy requirements effectively
+demand. NR-09 is satisfied structurally.
+
+**Rejected alternatives.** **A single `memories` table** — the failure mode this
+decision exists to prevent. **A vector store as memory** — ADR-0008. **A graph
+database** — no requirement drives it.
+
+**Revisit conditions.** Revisit derived-data storage (a graph, a dedicated
+engine) if measured query patterns outgrow SQLite. Revisit the authority filter
+only if a use case genuinely needs model output to be authoritative — which would
+mean the user explicitly confirming it, at which point it is no longer derived.
+
+---
+
+<a id="adr-0014"></a>
+## ADR-0014 — Voice: abstraction first; `sherpa-onnx` default; eSpeak-NG floor
+
+**Context.** The brief: *"Do not select one ASR system yet. Design the
+abstraction first."*
+
+**Problem.** Choose an ASR/TTS architecture without premature commitment.
+
+**Options.** faster-whisper · whisper.cpp · NVIDIA NeMo · sherpa-onnx · cloud ASR.
+For TTS: Piper · Coqui/XTTS · Kokoro · eSpeak-NG · cloud.
+
+**Evidence (all verified 2026-09-30).**
+
+| Engine | Status | Licence | Rust | Streaming |
+|---|---|---|---|---|
+| **`sherpa-onnx` 1.13.8** (2026-09-11) | Active, releases every 1–3 wk | **Apache-2.0** | **First-party, in-tree** | **Real** (`OnlineRecognizer`) |
+| `parakeet-rs` 0.3.8 (2026-09-23) | Very active | MIT/Apache-2.0 | Community (via `ort` **RC**) | Chunked |
+| `whisper.cpp` 1.9.4 + `whisper-rs` 0.16.0 | 54 k★, active | MIT / Unlicense | **Repo archived → Codeberg**; 758 k dl, 6.5 mo stale | Rolling window re-transcription |
+| faster-whisper 1.2.1 (2025-10-31) | **No release in ~11 months** | MIT | `ct2rs` 0.10.1 (low adoption) | **Batch only** |
+| NVIDIA NeMo (`NVIDIA-NeMo/Speech` v3.0.0) | Active | Apache-2.0 (code) | **None** (Python) | Chunked |
+
+| TTS | Status | Licence |
+|---|---|---|
+| **Kokoro-82M** via sherpa-onnx | 82 M params, 8 langs/54 voices, ONNX 82–310 MB | **Apache-2.0** — cleanest in the landscape |
+| Piper (`OHF-Voice/piper1-gpl` 1.8.0) | Active | **GPL-3.0** (was MIT) + GPL espeak-ng; some voices research-only |
+| Coqui TTS 0.22.0 (2023-12-12) | **2 years stale**, Python `<3.12` | **CPML — non-commercial including outputs, viral derivative clause** |
+| **eSpeak-NG** | Ancient, reliable | GPL-3.0 · **~0.001 RTF, ~15 MB RAM** |
+
+Model licences: `parakeet-tdt-0.6b-v3` **CC-BY-4.0** (commercially usable);
+**`canary-1b` is CC-BY-NC-4.0 — non-commercial**; `moonshine-tiny` MIT at
+**34 MB / ~306 MB RAM**. Wake words: **Porcupine's free tier ended 2026-06-30**;
+**openWakeWord weights are CC-BY-NC-SA (non-commercial)**.
+
+**Decision.**
+1. **The abstraction comes first**: `SpeechToText` and `TextToSpeech` traits with
+   a `VoiceSession` supporting streaming, partials, VAD-driven segmentation,
+   barge-in, and cancellation.
+2. **Default local ASR: `sherpa-onnx`** — the only complete, first-party,
+   actively-released Rust speech stack, Apache-2.0, with real streaming.
+3. **Optional engines** behind the same trait: `parakeet-rs` (best WER/RAM) and
+   `whisper.cpp` (widest acceleration). **Cloud ASR** for users who prefer it.
+4. **Default local TTS: Kokoro via sherpa-onnx.** **eSpeak-NG always available as
+   the floor** — GPL-3.0, so it runs as a **subprocess** (ADR-0009), and it never
+   fails.
+5. **Piper only as a subprocess**, never linked (GPL-3.0). **Coqui never.**
+6. **No third-party wake-word engine.** Use always-on VAD plus sherpa-onnx's
+   `KeywordSpotter`. This avoids the licence traps entirely and is where both
+   Deepgram's Flux and LiveKit converged (turn detection, not keyword spotting).
+7. **Models are lazily loaded and unloaded** to protect the idle budget
+   (`05-…` §6).
+8. **Local/cloud is a user choice**, per capability, with the privacy and cost
+   trade-off stated in the UI.
+
+**Why.** `sherpa-onnx` is the only option that is first-party, Apache-2.0,
+actively released, and complete. The abstraction first is what makes the user's
+requirement — *"change ASR implementation without changing the rest of
+OpenRayNux"* — true.
+
+**Trade-offs.** sherpa-onnx is a heavy native build and downloads a prebuilt
+library at build time (must be pinned and checksummed, `08-…` §18). The model zoo
+is Mandarin-first. `parakeet-rs` depends on `ort`, which **has never released 2.0
+stable** (last stable 1.16.3, 2023-11-12) — an accepted, recorded risk.
+`whisper-rs`'s archived repo makes it a vendoring candidate. Cloud ASR leaks
+audio off-device — a real privacy cost that the UI must state.
+
+**Consequences.** Voice is a feature-gated capability with a real resource
+profile, disclosed before enabling. Copyleft stays out of the core binary.
+Model licences are tracked in a registry (`02-…` §4).
+
+**Rejected alternatives.** **faster-whisper** — batch only, so unusable for live
+voice; and no release in 11 months. **NeMo** — no Rust bindings at all.
+**whisper.cpp as default** — more battle-tested, but its "streaming" is
+re-transcribing a rolling window (its own README calls it "a naive example"),
+and the Rust binding is single-maintainer with an archived repo. **Piper
+linked** — GPL-3.0. **Coqui/XTTS** — non-commercial, viral, and 2 years stale.
+
+**Revisit conditions.** Revisit the default if `parakeet-rs` drops its `ort` RC
+dependency, or if sherpa-onnx's release cadence breaks. Revisit TTS if a
+permissively-licensed model clearly beats Kokoro on quality. **Re-evaluate
+`ort` at 2.0 GA.** Vendor `whisper-rs` if we adopt it.
+
+---
+
+<a id="adr-0015"></a>
+## ADR-0015 — Browser automation: HTTP-first, browser opt-in, accessibility-tree grounding
+
+**Context.** The long-term vision is reducing manual navigation. This is also
+the highest-risk capability (TH-07, TH-08).
+
+**Problem.** Choose the browser architecture and the element-grounding method.
+
+**Options.** Playwright (JS/Python) · `playwright-rs` · CDP via `chromiumoxide` ·
+WebDriver BiDi · plain HTTP · visual grounding.
+
+**Evidence.**
+
+- **WebDriver BiDi** is a **W3C Working Draft (2026-09-30)** — *not* a
+  Recommendation. Measured BiDi WPT pass rates: Firefox 99.8 %, Edge 99.0 %,
+  Chrome 97.6 %, **Safari has no coverage at all**. Chrome implements BiDi as a
+  **JavaScript mapper translating BiDi→CDP** in a hidden tab, so on Chrome it
+  cannot exceed CDP. Playwright's own blocker list (`microsoft/playwright#32577`)
+  records **no request/response body access**, no UA/timezone/locale emulation, no
+  download bodies; Playwright-suite pass on BiDi: Chrome 61 %, Firefox 38 %.
+- **CDP is not deprecated** — Chromium's own answer to "will BiDi replace CDP?" is
+  *"No."* But **Chrome 136+ ignores `--remote-debugging-port` against the default
+  data directory** (motivated by cookie theft), and Chromium documents clients as
+  trusted: *"Protocol clients are typically considered trusted, as they can
+  navigate to arbitrary origins and have access to all origin data. … These
+  restrictions are not extended to other types of clients."*
+- **`playwright-rs` 0.19.0** (2026-09-26) is the live crate — **the crate named
+  `playwright` on crates.io is a dead 2022 fork**. It is community-only;
+  Microsoft has said on the record that a Rust binding is out of scope
+  (`microsoft/playwright#18266`). It ships a bundled **Node ~130 MB** and is
+  pre-1.0, single-maintainer.
+- **Grounding accuracy is the decisive number.** ScreenSpot-Pro (professional
+  desktop UIs) — the original paper reports **18.9 %** for existing models; best
+  current reported ≈ **61.6 %**. Consumer web (ScreenSpot-V2) ≈ 94 %. End-to-end
+  GUI agents still fail **more than half** of real tasks (OSWorld 47.5 %).
+- **Production proof of a better approach:** `@playwright/mcp` 0.0.83
+  (2026-09-28) is *snapshot-based on the accessibility tree* — *"far cheaper than
+  DOM dumps or screenshots"*, *"no vision models required"*.
+- **HTTP-first evidence:** ~4× faster, ~8× less RAM, higher success rate in the
+  one measured comparison available, and cleaner failure modes. *(The specific
+  numbers come from a single low-authority source and are therefore **not** used
+  as the argument; the structural arguments — no layout, no paint, no JS
+  execution, no process spawn — stand on their own.)*
+
+**Decision.**
+1. **HTTP-first is the default tier.** Try `reqwest` 0.13.5; escalate to a
+   browser **only on evidence** (a WAF challenge, data present only after JS, or
+   the task requires interaction). Record which tier satisfied each request.
+2. **The browser tier is an opt-in capability**, not a core dependency — it costs
+   ~530 MB and must not be paid by users who never enable it (CR-2).
+3. **A dedicated, non-default browser profile.** Never the user's daily browser.
+   This is now a technical necessity (Chrome 136+), not just hygiene.
+4. **Grounding is accessibility-tree-first** — `getByRole`/accessible name,
+   with stable element refs — and **visual grounding is a fallback only**, never
+   primary. The numbers above make this non-negotiable: a 61.6 % click accuracy
+   on a payment form is unacceptable.
+5. **All consequential actions are gated** with a preview (screenshot +
+   highlighted element + exact normalised parameters) and a **digest-bound,
+   re-verified** approval (S6, S12) — the Loopjacking mitigation.
+6. **Idempotency keys on every form submission** (S7, NR-05), and page-change
+   detection between preview and click.
+7. **No stealth or anti-bot evasion.** Signing requests via Web Bot Auth where a
+   site accepts it is fine; spoofing is not.
+
+**Why.** HTTP-first is faster, lighter, more deterministic, and fails cleanly.
+The browser is the escalation path, not the default. Accessibility-tree grounding
+is both more accurate *and* dramatically cheaper than pixels — the decisive point,
+since a 1-in-3 grounding failure rate would make the capability unsafe.
+Visual grounding is retained only for canvas and custom widgets where there is no
+DOM/ARIA at all.
+
+**Trade-offs.** HTTP-first cannot handle JS-rendered sites, so escalation is
+common on modern sites. The browser tier's 530 MB and Node dependency are real
+costs. `playwright-rs` is pre-1.0 and single-maintainer — a supply-chain risk
+(TH-17) requiring vendoring or a contingency. Accessibility-tree grounding fails
+on sites with bad ARIA, requiring a `data-testid`-style injection fallback. Bot
+detection is an arms race we do not join.
+
+**Consequences.** Automation is a *capability* with a manifest, not a library
+call. The browser process is killable and revocable in one action. Every
+consequential action produces a reviewable artifact. A dedicated profile is
+encrypted at rest, never synced, never committed.
+
+**Rejected alternatives.** **Playwright JS/Python** — wrong language for a
+Rust-first core, and would mean embedding an interpreter. **CDP directly**
+(`chromiumoxide`) — a real fallback, Chromium-only, and it is what
+`playwright-rs` uses anyway. **WebDriver BiDi** — a Working Draft with the gaps
+above; correct to defer. **Visual grounding as primary** — 61.6 % is not safe.
+
+**Revisit conditions.** Revisit BiDi when it reaches Recommendation status and
+Playwright's own blockers are resolved. Revisit the browser driver if
+`playwright-rs` reaches 1.0 or if `rustenium` matures. Re-evaluate grounding if
+professional-UI grounding accuracy exceeds ~95 %. Reconsider HTTP-first default if
+measured escalation rates are so high the browser is always used anyway.
+
+---
+
+<a id="adr-0016"></a>
+## ADR-0016 — Messaging: narrow common denominator; defer WhatsApp; refuse Signal and userbots
+
+**Context.** The brief requires messaging connectivity but warns: *"Do not
+assume every service offers equivalent automation capabilities."*
+
+**Problem.** Decide which platforms, and how to model their differences honestly.
+
+**Options.** Implement all platforms · implement only officially-sanctioned
+ones · build one lowest-common-denominator interface · per-platform interfaces.
+
+**Evidence.** Full detail in `01-…` §5. Decisive constraints:
+
+| Platform | Finding |
+|---|---|
+| **Telegram Bot API** | Official, both directions. **But** ToS §1.5: *"you are prohibited from using, accessing or aggregating data obtained from the Telegram platform to train, fine-tune or otherwise engage in the development, enhancement or deployment of artificial intelligence."* `getUpdates` buffers **24 h** then discards. |
+| **Telegram MTProto** | User accounts via Telethon/GramJS/**teleproto**. Telegram: *"all accounts that log in using unofficial Telegram API clients are automatically put under observation."* GramJS **archived 2026-07-14**; Telethon **archived 2026-02-21**, moved to Codeberg. |
+| **Discord bot** | Official, excellent (Gateway + resume). `MESSAGE_CONTENT` is a **privileged intent**. **Self-bots categorically forbidden** — *"result in an account termination if found."* We may not even *collect* a user's token. `IDENTIFY` capped at 1000/24 h with **automatic token reset**. |
+| **Signal** | **No API exists.** `signal.org/docs/` publishes protocol specs only. `libsignal`: *"Use outside of Signal is unsupported"*, AGPL-3.0. `signal-cli` self-declares: *"signal-cli releases older than three months may not work correctly."* |
+| **WhatsApp Cloud API** | Official, best-documented limits — but **24-hour service window** (approved templates only outside it), mandatory human escalation path, and ToS: *"must not use our Business Services for personal, family, or household purposes."* The **3P Agent** platform is the right mechanism — and is **beta and undocumented**. |
+| **Matrix** | Full official CS API; the **only** platform where real user-account automation is sanctioned. |
+| **Email** | IMAP/SMTP; universal; no push (IDLE or polling). |
+
+**Decision.**
+1. **A narrow common denominator interface** — `send`, `receive`,
+   `capabilities()`, `health()` — where `ProviderCapabilities` carries
+   `can_read_history`, `max_media_bytes`, `supports_reactions`,
+   `supports_threads`, `window_seconds`, and the **rate limits as data** so
+   backoff is correct.
+2. **Per-provider extensions are explicit**, and "this provider cannot do that"
+   is a first-class UI state, not an error.
+3. **Implement:** Telegram (Bot API only), Discord (bot only), Matrix, Email.
+4. **Defer WhatsApp** — the Cloud API is structurally wrong for a personal
+   assistant, and the correct mechanism (3P Agents) is beta and undocumented.
+5. **Refuse Signal.** No API exists; the tooling imposes a permanent quarterly
+   upgrade tax with an unrecoverable-compromise failure mode.
+6. **Refuse all user-account automation** (Telegram MTProto, Discord self-bots,
+   WhatsApp Baileys) — categorically ToS-violating or surveilled, and a
+   permanent-ban risk that would harm the *user's* account.
+7. **A written platform-compliance record (S29) is a release gate** for any
+   messaging integration.
+
+**Why.** This is the clearest case for the brief's own warning. The platforms
+where user-account automation would be most valuable are precisely the ones
+where it would get the user's account banned. Shipping a "read and reply to your
+own Telegram" feature would risk their account for our convenience. The narrow
+denominator is honest: it says what cannot be done rather than pretending
+parity.
+
+**Trade-offs.** The assistant cannot read the user's existing conversations on
+Telegram or Discord — the Bot API only sees chats the user initiated. That
+limits the "message my colleagues" use case significantly. Telegram's AI clause
+(§1.5) needs **legal review** before any inference on message content, which is
+an open legal question, not a technical one. Matrix's user-account support is
+the workaround for the limitation — and a reason it is prioritised.
+
+**Consequences.** A UI that renders capability differences rather than hiding
+them. Rate limits handled generically from `ProviderCapabilities`. Each platform
+adapter is small and independent.
+
+**Rejected alternatives.** **All platforms** — Signal is impossible and the
+userbots are ToS-violating. **Userbots "as opt-in"** — the risk falls on the
+user's account, and "ask the user first" is not a mitigation for termination.
+**One interface pretending parity** — dishonest and will produce bugs.
+
+**Revisit conditions.** Revisit WhatsApp when the 3P Agent platform is GA **and**
+developer-documented. Revisit Signal only if Signal ships an official API.
+Re-evaluate Telegram's §1.5 with legal counsel. Revisit userbots only if a
+platform formally sanctions them for personal use.
+
+---
+
+<a id="adr-0017"></a>
+## ADR-0017 — Updates: no self-updater; snapshot → migrate → verify, with rollback
+
+**Context.** The brief: *"Do not design an auto-updater that can brick the user's
+installation."* A personal system with a single database file is one bad
+migration away from total loss.
+
+**Problem.** Design the update path.
+
+**Options.** In-app auto-updater (Tauri updater) · package-manager only · a
+migrator with mandatory snapshots and rollback · manual.
+
+**Decision.**
+1. **No self-updater in v1.** Updates arrive through the OS package manager
+   (dnf/deb/PackageKit, **Windows MSI**) or by replacing the binary.
+2. **Every migration is preceded by an automatic, verified snapshot.**
+3. **Migrations run at startup, before any other work**, in a transaction, and
+   are **idempotent** and **reversible** within the version boundary.
+4. **A failed migration restores the snapshot and leaves the previous binary
+   working.** The previous binary must always be able to start against the
+   restored data.
+5. **The restore path is tested in CI**, not just written.
+6. **Release binaries are signed** (minisign, Authenticode) and reproducible.
+7. **Compatibility window:** N and N−1 can both read the data. N+1 requires
+   migration. Breaking data-format changes require a major version.
+
+**Why.** The database is the user's data and there is exactly one copy. The
+asymmetry is stark: an auto-updater is a convenience; a bricked install with an
+unrecoverable database is a catastrophic failure. Deferring the self-updater also
+avoids the security exposure of an in-app updater with network write access.
+
+**Trade-offs.** Users must update via the package manager — friction, and on
+Windows the MSI path needs Authenticode to avoid SmartSmartScreen friction. The
+previous binary must be retained, which is disk. Cross-version compatibility
+constrains how fast the schema can move.
+
+**Consequences.** Windows Authenticode procurement starts in **Phase 1** (lead
+time). Migration tests run on a copy of a real previous-version database in CI.
+`10-…` NR-03 (backup/restore) becomes a Phase 2 deliverable, not a later
+polish item.
+
+**Rejected alternatives.** **Tauri updater** — network write access in the app is
+a meaningful attack surface, and a failed update is unrecoverable. Revisit only
+with signed manifests, a verified rollback, and a staged rollout. **Manual
+migration only** — too error-prone for a non-technical user (NFR-13).
+
+**Revisit conditions.** Revisit a self-updater once signatures, staged rollout,
+and automated rollback are implemented *and tested* — as an additive convenience,
+never as the only path.
+
+---
+
+<a id="adr-0018"></a>
+## ADR-0018 — Configuration: 11 layers, schema-versioned, secrets by reference
+
+**Context.** The brief: *"user-focused but not user-locked"* — a second user must
+be able to radically customise OpenRayNux without forking it, and
+personalisation must be *data*, not source changes.
+
+**Problem.** Design the configuration model.
+
+**Options.** A single TOML file · a database table · environment variables ·
+layered files · a remote config service.
+
+**Decision.** **Eleven separately-versioned layers** (`00-…` §7), where layers
+1–8 are **configuration** (strictly layered, later overrides earlier, merge
+explicit and inspectable) and 9–10 are **data** (memory, workflows) and 11 is
+**code** (extensions, a trust decision).
+
+1. Application defaults (immutable at runtime)
+2. Schema/version metadata
+3. User configuration
+4. User profile (identity, locale, timezone, working hours)
+5. Domain configuration
+6. Provider configuration
+7. Capability configuration
+8. **Policy** (permissions, approval thresholds, redaction, budget)
+9. Memory (data)
+10. Workflows (data)
+11. Extensions (code — trust boundary)
+
+**Rules.**
+
+- **TOML + JSON Schema** — human-editable, diffable, reviewable, git-friendly.
+- **Schema-versioned with forward-compatible migrations**, one-way, tested both
+  directions.
+- **Secrets are references, never values.** The config names a `keyring` entry
+  (`{ kind: "keyring", service: "openraynux", user: "anthropic" }`); the
+  `keyring` crate 4.2.0 resolves it.
+- **Import/export of layers 3–10 as one portable, versioned document** — this is
+  how a second user customises radically, and it is a core feature.
+- **Multi-profile from day one**, even though v1 is single-user. Retrofitting
+  tenancy is the classic expensive mistake (NR-04).
+- **Environment variables** may only *override* a small documented set — never
+  carry secrets, never carry structural config.
+- **A disabled capability's keys are rejected, not ignored**, so typos surface
+  immediately.
+- **Every effective configuration is inspectable** — "what is actually in
+  effect, and why" is a first-class question, answered by showing the merged
+  result with per-key provenance.
+
+**Why.** This is the mechanism that makes NFR-08 ("a second user customises
+without forking") structurally true rather than aspirational. A single file
+cannot express per-layer provenance; a database cannot be diffed.
+
+**Trade-offs.** Layering complexity and a merge-precedence puzzle. Schema
+migrations are a permanent maintenance cost. Supporting multi-profile before it
+is needed is speculative — accepted because retrofitting it is far more
+expensive.
+
+**Consequences.** A `config` CLI for dump/diff/validate/export/import. A schema
+lives in the repo and is the source of truth for validation.
+
+**Rejected alternatives.** **A single file** — no provenance, painful layering.
+**A database table** — not diffable, not hand-editable, hostile to support.
+**Environment variables for everything** — untestable, unlayerable, and a
+credential-leak risk. **A remote config service** — a network dependency in the
+local install; violates the core constraint.
+
+**Revisit conditions.** Revisit multi-profile if a cloud multi-tenant mode
+becomes real (it will need proper tenant isolation, not just profiles). Revisit
+the format if TOML's expressiveness blocks a needed structure.
+
+---
+
+<a id="adr-0019"></a>
+## ADR-0019 — Dependency & licence policy: permissive-only in the core binary
+
+**Context.** TH-17 (dependency compromise) and the licence landmines found in
+research: Piper → GPL-3.0, Coqui/XTTS → CPML non-commercial + viral,
+`canary-1b` → CC-BY-NC, openWakeWord weights → CC-BY-NC-SA, signal-cli → GPL-3.0,
+libsignal → AGPL-3.0, Windmill → AGPL-3.0.
+
+**Problem.** Set the dependency and licence policy.
+
+**Decision.**
+1. **The core binary links only permissively-licensed code** — MIT, Apache-2.0,
+   BSD, ISC, Zlib, Unicode-3.0, or the Unlicense.
+2. **Anything GPL/AGPL/NC runs as a separate process** the user installs, or is
+   excluded. Enforced by the capability tier rules (ADR-0009).
+3. **`cargo deny check`** in CI enforces: advisories, licences, duplicate
+   versions, and a curated ban list.
+4. **`cargo audit`** blocks the build on a known advisory; triage within 48 h.
+5. **Model licences are tracked separately** in a registry with a manual review
+   gate — a model file is an artefact with a licence, exactly like a dependency.
+6. **New dependencies require an ADR**, a licence check, and a maintenance check
+   (last release, bus factor, MSRV). Transitive additions are reviewed.
+7. **Minimal `dependabot` breadth.** No auto-merge for anything touching auth,
+   crypto, network, or serialisation.
+8. **`Cargo.lock` committed; `--locked` in CI. Reproducible release builds with a
+   documented, pinned toolchain. SBOM per release. Signed binaries.**
+9. **No build-time downloads from unpinned URLs** — including
+   `sherpa-onnx`'s prebuilt-library download, which must be mirrored, pinned, and
+   checksummed.
+
+**Why.** Licence and supply-chain risk are *design* inputs, not legal
+afterthoughts. The GPL/NC landmines above would each have been discovered late
+and expensively; making the policy structural means they are caught in review.
+Supply-chain integrity is a first-class threat (TH-17) in a product that
+downloads and executes third-party models and browser builds.
+
+**Trade-offs.** Slower dependency adoption. The model-licence registry is manual
+work. Reproducible builds need a pinned toolchain, which is a maintenance
+burden. A ban list needs curating.
+
+**Consequences.** A "copyleft" CI check that fails the build. A model registry
+that must be updated with every model. Release signing is a hard requirement, not
+a nice-to-have.
+
+**Rejected alternatives.** **Permissive-only for the core but no enforcement** —
+the policy would be aspirational. **An allow-all-by-default licence policy** —
+would have admitted `openWakeWord` and `canary-1b`. **Vendoring everything** —
+unmaintainable.
+
+**Revisit conditions.** Revisit a specific dependency when its licence changes
+(watch `sherpa-rs` → archived, `whisper-rs` → archived, Piper → MIT→GPL,
+`ort` → still RC). Revisit the ban list quarterly.
+
+---
+
+<a id="adr-0020"></a>
+## ADR-0020 — Observability: tracing always, OTLP optional, zero telemetry
+
+**Context.** The brief: *"Do not add a heavyweight observability stack to a
+personal local installation"* and *"without requiring a telemetry server."*
+
+**Decision.**
+1. **`tracing` + `tracing-subscriber` always.** Structured, hierarchical, cheap,
+   and the ecosystem standard.
+2. **Redaction at the subscriber layer**, so no call site can leak a secret by
+   forgetting (S9, TH-*). This is a structural property, not a discipline.
+3. **OpenTelemetry is an optional feature** (`otlp`) — a **native exporter only**,
+   no collector, no agent, no daemon.
+4. **Zero telemetry. Ever.** No phone-home, no crash upload, no usage analytics, no
+   update ping. The network budget is **0 bytes while idle**.
+5. **Local diagnostics are a first-class UI**, using `egui` (ADR-0002) — a log
+   viewer, a task inspector, a config diff, and a health dashboard.
+6. **MCP now standardises `traceparent`/`tracestate`/`baggage` in `_meta`**
+   (spec 2026-07-28), so we propagate trace context to MCP servers for free.
+7. **A `--diagnostics` bundle** export the user can attach to an issue: config
+   (redacted), versions, health checks, and a bounded log window.
+
+**Why.** Privacy and the resource budget both point the same way: no collector,
+no daemon, no outbound. Native export keeps the cloud profile genuinely useful
+without imposing anything locally.
+
+**Trade-offs.** No centralised correlation for a personal install — a real loss
+when debugging something that spans days. Mitigated by the append-only session
+event log (which is a product feature anyway, for resumability and memory).
+
+**Consequences.** Logs are the primary debugging tool, so redaction must be
+exhaustively tested. The diagnostics bundle is what replaces "send us your logs"
+in a privacy-respecting product.
+
+**Rejected alternatives.** **A bundled OTel collector** — a daemon. **Any
+telemetry** — a privacy and resource violation, and the brief's prohibition.
+
+**Revisit conditions.** None that would relax the zero-telemetry rule. Revisit
+the local UI if a better diagnostic tool appears.
+
+---
+
+<a id="adr-0021"></a>
+## ADR-0021 — Scheduling: `croner` + `jiff`, with an explicit misfire policy
+
+**Context.** The brief: *"A scheduled task must not silently disappear because
+the application was closed."*
+
+**Problem.** Choose a scheduler and define catch-up semantics.
+
+**Evidence.** The Rust cron ecosystem has largely rotted: `clokwerk` (2022),
+`job_scheduler` (2020), `lifeguard` (2020), `sailor` (2019), `rusty-scheduler`
+(2021) all abandoned; `tokio-cron-scheduler` has not shipped since 2025-10-28 and
+supports **only Postgres/Nats** — no SQLite. `croner` **4.0.0** (2026-08-31) and
+`cron` 0.17.0 are healthy. `croner` is the **only** Rust cron with
+**documented, Vixie-compatible DST semantics**; `jiff` **0.2.37** (2026-09-12,
+73.5 M dl/30 d) has correct DST arithmetic and is a `croner` backend.
+
+`croner`'s documented behaviour:
+
+| Transition | Fixed-time jobs | Interval/wildcard jobs |
+|---|---|---|
+| Spring forward (gap) | Run at the first valid second after the gap | Occurrences **inside the gap are skipped** |
+| Fall back (overlap) | Run **once**, at the first occurrence | Run for **each** occurrence in the duplicated hour |
+
+**Decision.**
+1. **`croner` 4.0 + `jiff` 0.2.37.** No scheduler framework.
+2. **Schedules are persisted**, and every schedule carries a **`timezone`** and a
+   **misfire policy** as data.
+3. **Catch-up is explicit** (the ~30-line algorithm): on startup, enumerate
+   occurrences in `(last_fired_at, now]`, bounded by `catch_up_cap`, and insert
+   into `schedule_fires` with **`UNIQUE(schedule_id, fire_time)`**. The
+   `INSERT OR IGNORE` success *is* the deduplication, guaranteed across crashes
+   because SQLite serialises writes.
+4. **Misfire policies, chosen per schedule and stored explicitly:**
+   `FireAll` · `FireOnce` (collapsed, flagged `catch_up`) · `SkipIfOlder(θ)` ·
+   `FireNextOnly` · `Pause`.
+5. **DST behaviour is documented, not fought.** The `croner` semantics above are
+   written into the docs and asserted in property tests.
+6. **A scheduled task cannot be created without a spend ceiling** (NR-01).
+
+**Why.** `croner` is the only option with DST semantics anyone has written down,
+and DST is exactly where hand-rolled schedulers are wrong. Catch-up is a genuine
+product requirement with no crate providing it, and the `UNIQUE(schedule_id,
+fire_time)` idiom is the correct, crash-safe way to express it — a "guard with a
+unique row per period" pattern.
+
+**Trade-offs.** DST-interval schedules *skip* gap occurrences by design. That is
+almost always right, and it is documented rather than silently surprising. We own
+the catch-up logic, including the bounded-traversal limit.
+
+**Consequences.** DST correctness becomes a tested property. A schedule is fully
+described by data (expr, tz, misfire policy, cap, enabled). A machine being off
+for a week does not silently lose jobs.
+
+**Rejected alternatives.** **`clokwerk`/`job_scheduler`/`tokio-cron-scheduler`** —
+stale, in-memory, or no SQLite. **A framework scheduler (Temporal, Restate)** —
+a server, for a single local process. **UTC-only** (as `fang` does) — a real
+usability bug for a personal assistant that thinks in local time.
+
+**Revisit conditions.** Revisit if `croner` is abandoned. Revisit the catch-up
+cap if a legitimate use case needs unbounded catch-up (we would then need
+per-occurrence idempotency, which is a bigger change).
+
+---
+
+<a id="adr-0022"></a>
+## ADR-0022 — Deployment: one codebase, four profiles
+
+**Decision.** **P1 Desktop · P2 Headless · P3 Cloud · P4 Multi-tenant (not
+v1).** A profile selects adapters and transports; it does not fork the code.
+
+The same JSON-RPC frames travel over a UDS/named pipe in P1/P2 and over HTTPS in
+P3. The daemon binary is identical. SQLite in P1–P3 (single-tenant, one writer);
+Postgres only in P4.
+
+**Why.** The brief requires local Linux, Windows, cloud, and headless, and warns
+that "cross-platform" does not mean "one binary everywhere." The profile model
+makes the differences *configuration* where they can be and *adapter* where they
+must be.
+
+**Trade-offs.** P3 needs real auth (OAuth2/OIDC) and TLS, which is a genuine
+attack surface — mitigated by it being opt-in and off by default. P4 is explicitly
+out of scope and its absence is a scope decision, not an oversight.
+
+**Rejected alternatives.** **Separate binaries per profile** — code drift. **An
+HTTP API in v1** — the brief's warning against fashion-for-fashion's-sake.
+
+**Revisit conditions.** P4 when multi-tenancy is a real requirement — which is
+exactly when NR-04's data model must be validated.
+
+---
+
+<a id="adr-0023"></a>
+## ADR-0023 — Platform: Linux + Windows T-A; ARM64 T-B; macOS T-B
+
+**Decision.**
+
+| Platform | Tier | Rationale |
+|---|---|---|
+| Linux x86_64 | **T-A** | Dev machine; native deps verified (webkit2gtk 2.54.0, appindicator 12.10.1, librsvg 2.62.3, libxdo, SQLite 3.51.2 + headers) |
+| **Windows x86_64** | **T-A** | Explicitly required by the brief. Highest risk: Authenticode, MSVC CI, WebView2, named-pipe semantics, reserved filenames |
+| **Linux aarch64** | **T-B** | Where a personal assistant plausibly runs permanently (a Pi in a cupboard). `sherpa-onnx` ships ARM builds. Cheap now, expensive later |
+| **macOS** | **T-B** | Reachable via Tauri, but untestable for us now. Promise it and we will fail that promise |
+| Windows ARM64 | T-C | DirectML is the only acceleration for some GPUs; ARM64 ONNX is patchy |
+
+**Why not macOS first-class:** the brief names Linux and Windows. First-class
+means tested and supported; we cannot test what we cannot run.
+
+**Why ARM64 is worth early investment:** it is a genuinely plausible deployment
+target for a small always-on assistant, the ML ecosystem already publishes ARM
+builds, and CI for it is cheap *now* and expensive after the codebase hardens.
+
+**Consequences.** Per-OS concerns live in `platform-*` crates, enforced by a CI
+grep gate. Windows-specific work starts in Phase 1 (certificate procurement has
+lead time). Long paths and reserved-filename sanitisation are Phase 1 items, not
+later polish.
+
+**Rejected alternatives.** **macOS as T-A** — untestable. **Linux-only** — the
+brief requires Windows. **ARM64 as T-A** — aarch64 CI cost and a much smaller
+test matrix for little benefit initially.
+
+**Revisit conditions.** Promote macOS to T-A when we can run and test it.
+Promote ARM64 to T-A when a real deployment target exists.
+
+---
+
+<a id="adr-0024"></a>
+## ADR-0024 — Reject agent frameworks; own a thin harness
+
+**Context.** The brief: *"Avoid adopting LangChain/LangGraph/CrewAI/etc. merely
+because they are AI-related."*
+
+**Problem.** Build the orchestration layer, or adopt one?
+
+**Evidence.** Three independent primary sources converge:
+
+- **Anthropic**, *Building effective agents*: *"the most successful
+  implementations **weren't using complex frameworks or specialized
+  libraries**"*; frameworks *"create extra layers of abstraction that can obscure
+  the underlying prompts and responses, making them harder to debug. They can
+  also make it tempting to add complexity when a simpler setup would suffice."*
+  Recommended: *"start by using LLM APIs directly."*
+- **OpenAI**, *A practical guide to building agents*: *"**maximize a single
+  agent's capabilities first** … often a single agent with tools is sufficient."*
+- **LangChain's own team**, *Building LangGraph*: *"we … decided that was
+  **little to no abstraction at all**. Instead, we focused on control and
+  durability."*
+
+And the shape they converged on — Anthropic's *Scaling Managed Agents* (2026-04-08)
+— is **Session / Harness / Sandbox**, which maps exactly onto our task table +
+thin loop + disposable sandbox. Their opening argument is the one that should
+stick: *"**Harnesses encode assumptions that go stale as models improve.**"* — with
+a concrete dated example of a harness workaround (context resets for Sonnet 4.5)
+becoming dead weight on Opus 4.5.
+
+⚠️ A public benchmark claiming LangGraph +28.2 % / LangChain +17.2 % latency
+overhead exists but is **low credibility** (2 commits, single author,
+self-published). It is **not** used as evidence here. The argument rests on the
+primary sources.
+
+**Decision.**
+1. **No agent framework.** No LangChain, LangGraph, CrewAI, AutoGen, PydanticAI,
+   Mastra, or Effect.
+2. **One agent, a thin loop**, ~10–20 well-documented tools, a max-turns cap, and
+   a durable task record around each *run* — not around each reasoning step.
+3. **The harness is built around interfaces, not workarounds** — no behaviour
+   encoded that depends on a specific model's weaknesses.
+4. **The harness is stateless and disposable**; durable state is the append-only
+   session event log, outside the harness and outside the context window.
+5. **Tools are documented with extreme care** — Anthropic: *"We actually spent
+   more time optimizing our tools than the overall prompt."* Absolute paths, clear
+   descriptions, and — as they state — *"It is unacceptable to remove or edit
+   tests because this could lead to missing or buggy functionality."*
+6. **Never provision anything until a step needs it.** Their measured win came
+   from lazy sandbox provisioning (p50 TTFT −60 %, p95 −90 %). So: no model
+   loaded, no browser started, no subprocess spawned until a step actually needs
+   it. Directly serves the resource budget.
+
+**Why.** Three primary sources, including the framework vendor's own team,
+conclude that abstraction is the thing to remove. And the architectural
+justification is stronger than the framework argument: our orchestration *must*
+be deterministic, durable, and policy-governed (ADR-0012), which is precisely
+what a general agent framework abstracts away. A framework would put the
+security boundary in someone else's code.
+
+**Trade-offs.** We own the loop, the tool-calling edge cases, and provider
+quirks. No community-built capability composes with our harness. A growing
+harness codebase over time — mitigated by keeping it thin on purpose.
+
+**Consequences.** A small, testable, provider-agnostic harness. A session event
+log that is a product feature (resumability, memory, debugging) rather than a
+framework internal. Tool design gets the scrutiny it deserves.
+
+**Rejected alternatives.** **LangGraph** — Python, and its own authors conclude
+the abstraction is unwanted. **Effect** — TypeScript only; `effect-rs` is a name
+squat with 32 lifetime downloads and a 404 repository. **Temporal for local
+orchestration** — a server, for a single process.
+
+**Revisit conditions.** Revisit only if we need something a hand-rolled harness
+genuinely cannot do and that a Rust-native, policy-respecting library provides
+*and* can be adopted without moving the security boundary into it.
+
+---
+
+<a id="adr-0025"></a>
+## ADR-0025 — Testing: deterministic gate; AI evaluation on a separate track
+
+**Decision.**
+1. **The blocking CI gate is 100 % deterministic.** No live model, no network.
+2. **A scripted, replayable provider** implementing `ModelProvider` — the
+   mandatory precondition for testing AI-dependent code at all.
+3. **AI-dependent behaviour is asserted on invariants, not content**: "the
+   proposal only references registered capabilities", "no step exceeds HIGH risk
+   without a gate", "the proposal contains no credential path". These hold for
+   *all* model outputs.
+4. **AI evaluation is a separate, non-blocking track**: a golden dataset,
+   distribution metrics, run on a schedule. The headline metric is the
+   **false-approval rate** — a system that is appropriately refusing is safe; a
+   system confidently wrong about permissions is not.
+5. **Property tests** for the security-critical invariants (`08-…` §4.2).
+6. **Failure injection** is a first-class suite, with the master property: *no
+   failure injection ever produces silent data loss or an unauthorised side
+   effect.*
+7. **Real SQLite files**, never `:memory:` for durability tests.
+8. **`cargo nextest`** for the suite; `cargo deny`, `cargo audit`, `cargo vet`
+   as gates.
+
+**Why.** Asserting on model output yields a suite that fails on model updates
+and passes on a bad model — the worst of both. Separating the tracks lets the
+correctness suite be a hard gate while capability is measured honestly.
+
+**Trade-offs.** Two test systems to maintain. Non-blocking AI tests can rot
+silently, mitigated by scheduling and trend comparison. Deterministic CI cannot
+detect "the model got worse" — which is exactly what the evaluation track is
+for.
+
+**Rejected alternatives.** **Asserting exact model output** — brittle and
+meaningless. **Only deterministic tests** — would leave the probabilistic layer
+completely unmeasured. **Live-model CI** — non-reproducible, slow, expensive.
+
+**Revisit conditions.** Revisit the split if deterministic model testing
+(deterministic decoding) becomes available for hosted providers.
+
+---
+
+<a id="adr-0026"></a>
+## ADR-0026 — Windows as the second first-class platform, prepared early
+
+**Context.** The brief requires Windows. Windows-specific work has long lead
+times that are easy to defer and expensive to discover late.
+
+**Problem.** Decide *when* Windows work starts, not whether.
+
+**Decision.** **Windows-specific work starts in Phase 1, not Phase 9.** Phase 1
+deliverables: MSVC toolchain in CI; long-path manifests; reserved-filename
+sanitisation for all derived filenames; the named-pipe transport; a real
+`platform-secrets` DPAPI test. **Authenticode certificate procurement starts in
+Phase 1** because it has external lead time.
+
+**Why.** The lead-time argument is the whole point. A certificate, a Windows
+runner, and a WebView2 bootstrapper cannot be retrofitted in a week, and
+discovering that during a release is how Windows support slips.
+
+**Trade-offs.** Windows CI costs from day one. Some early abstractions are shaped
+by Windows constraints (named pipes, reserved names) that Linux developers find
+annoying. Accepted: shaping by the *harder* platform early is cheaper than
+retrofitting.
+
+**Consequences.** The `platform-*` crate boundary is validated by a real second
+platform, not just by discipline. `NUL`, `CON`, `PRN`, `AUX`, `COM1`–`9`,
+`LPT1`–`9` are sanitised everywhere a filename is derived from user or web
+content. Case-insensitive filesystems are respected: **never derive identity
+from a path** — use content hashes or opaque IDs.
+
+**Rejected alternatives.** **"Cross-platform" as a late concern** — the classic
+cause of a Windows port that is really a rewrite. **Linux-only CI with a
+"should work on Windows" claim** — untested and untrue.
+
+**Revisit conditions.** Revisit the CI breadth if Windows build times dominate
+the pipeline; consider a tiered schedule (per-PR vs nightly) for mature crates.
+
+---
+
+<a id="adr-0027"></a>
+## ADR-0027 — Identity & Actor as a first-class concept
+
+**Context.** Original architecture listed Intent · Task · Policy · Capability ·
+Audit. As the product gains actors, the question of *who* is acting stops being
+implicit.
+
+**Problem.** Eventually many things produce actions:
+
+```
+Human  ·  AI  ·  System  ·  Integration  ·  Scheduled task  ·  External event
+```
+
+Every one of them can trigger a side effect. Without a first-class actor concept,
+authority leaks into the capability layer — which is precisely the confused-deputy
+pattern (TH-04) we are trying to prevent.
+
+**Options.** Implicit (actor as a field nobody checks) · a `user_id` column ·
+a first-class **Actor** value carried on every action · a full identity provider
+in v1.
+
+**Decision.** **A first-class `Actor` value, carried explicitly on every action,
+and resolved at the policy layer — never by the capability.**
+
+```rust
+/// WHO is acting. Not WHAT is acting (that's the capability) and not
+/// WHETHER they may (that's policy).
+pub enum Actor {
+    /// The human owner of this installation. The only actor that can grant
+    /// authority. Step-up authentication re-verifies this.
+    Human { user_id: UserId, via: AuthChannel },
+    /// The model, acting on a human's behalf. NEVER an authority in itself:
+    /// it carries the *delegation* of the Human who initiated the run, and
+    /// nothing more. An AI actor with no human delegation has no authority at all.
+    Ai { delegated_by: UserId, run_id: RunId, model: ModelProvenance },
+    /// The daemon itself, for its own housekeeping (housekeeping, backup,
+    /// migrations, retention). Narrowest scope: NEVER a network-reachable
+    /// identity, and never used for user-visible actions.
+    System { component: SystemComponent },
+    /// A configured integration acting within a grant made by a Human.
+    Integration { capability_id: CapabilityId, granted_by: UserId, grant_id: GrantId },
+    /// A scheduled task, resuming within a grant captured at creation time.
+    Scheduled { schedule_id: ScheduleId, authorised_by: UserId },
+    /// An inbound event from outside (webhook, message, file watch). The
+    /// weakest actor: it can REQUEST work, never GRANT it.
+    External { source: ExternalSource, verified: bool },
+}
+```
+
+**Every `CapabilityInvocation` carries an `Actor`.** Policy evaluates
+`(actor, capability, params, data_classes, task_context)`. There is no path to an
+adapter that omits it — enforced by the type, as in ADR-0012.
+
+**The four questions this makes answerable**, and which the audit log must answer
+for every single action:
+
+1. **Who requested this action?** → `actor`
+2. **On whose authority?** → `actor`'s delegation chain
+   (`Ai { delegated_by }`, `Integration { granted_by }`, `Scheduled { authorised_by }`)
+3. **Under which policy?** → the policy version + decision recorded at call time
+4. **Using which credentials?** → the resolved `secret_ref` and *whose* it is
+   (never a raw secret; the audit records the reference, never the value)
+5. **As part of which task?** → `task_id` + `step_key`
+
+**Non-negotiable rules:**
+
+- **`External` can never grant.** It may request; a `Human` must authorise.
+- **An `Ai` actor's authority is exactly its delegating `Human`'s authority,
+  intersected with the current task's policy.** It is never additive. An AI actor
+  cannot exceed what the human could do directly.
+- **`System` is not network-reachable** and is never used for user-visible actions.
+- **Delegation is explicit and expiring.** A `Grant` carries a scope, an expiry,
+  and a revocation path. No ambient, unbounded delegation.
+- **Actor identity is in the audit record before the call**, not reconstructed
+  afterwards.
+
+**Trade-offs.** A type to thread through every call site — friction, and a
+reviewer-visible cost. Actor resolution adds a lookup to the policy path
+(cached; target < 1 ms, `05-…` §2.3). A full identity provider in v1 would be
+premature; v1 has exactly one `Human` and it is the local user.
+
+**Consequences.** Audit records become genuinely reconstructive rather than
+best-effort. The approval digest (S6) now includes the actor, so an approval
+granted to one actor cannot be used by another. DM interfaces become first-class
+citizens rather than a special case, because a message *is* an `External` actor
+request. Retries and resumption must re-derive the actor and re-check delegation
+expiry — never inherit a stale actor.
+
+**Rejected alternatives.** **Implicit actor** — the confused-deputy failure by
+omission. **A `user_id` column** — answers "which user", not "who requested,
+on whose authority, under which policy"; it cannot express `Ai` vs `System` vs
+`External`, which is exactly the distinction that matters. **A full IdP in v1** —
+premature for a single-user local install; the seam is `AuthChannel` so it can be
+added without touching the actor model.
+
+**Revisit conditions.** Revisit when P4 multi-tenancy becomes real, or when a
+second human user exists — at which point `Human` gains real identity
+resolution and `AuthChannel` grows. Revisit if a "delegated authority" concept
+(e.g. an agent acting *for another agent* under a chain) proves necessary.
+
+---
+
+<a id="adr-0028"></a>
+## ADR-0028 — State as a first-class concept
+
+**Context.** Original architecture had Task as the durability mechanism but no
+explicit answer to "what is the system's authoritative state, and who may read
+and write it."
+
+**Problem.** As state accumulates (tasks, schedules, memory, documents, config,
+audit, policy, credentials, capability health, budgets), the absence of a
+first-class state concept guarantees scattered, inconsistent persistence
+decisions — and inconsistent consistency requirements.
+
+**Options.** Scatter persistence across modules · a state store abstraction over
+SQLite · **a first-class `State` concept with explicitly classified regions**.
+
+**Decision.** **State is a first-class architectural concept with explicitly
+classified regions.** Every piece of state is declared, and its class determines
+its consistency, retention, authority, and who may read it.
+
+| Region | Class | Consistency | Authority | Retention | Written by |
+|---|---|---|---|---|---|
+| **Tasks** (rows, leases, checkpoints) | `critical` | **Strong, synchronous, fsync'd** | Yes | Indefinite | Task engine only |
+| **Schedules + fire ledger** | `critical` | **Strong** | Yes | Indefinite | Task engine only |
+| **Audit journal** | `critical` | **Append-only, hash-chained** | Yes | Configurable, rotated | Policy (pre-call **and** post-call) |
+| **User profile** | `authoritative` | Strong | Yes | Indefinite | Config/Human |
+| **User configuration** | `authoritative` | Strong | Yes | Indefinite | Config/Human |
+| **Policy** | `authoritative` | Strong, version-stamped | Yes | Indefinite | Human only (L5) |
+| **Capability health** | `authoritative` | Eventual | Yes | Rolling | Health checks |
+| **Budget ledger** | `authoritative` | **Strong** — money must not drift | Yes | Indefinite | Policy only |
+| **Dedupe / idempotency ledger** | `critical` | Strong | Yes | ≥ retry horizon | Task engine |
+| **Documents** | `authoritative` (source) | Strong metadata, lazy content | Source is | Per policy | Import/Human |
+| **Preferences** | `derived-authoritative` | Strong | Yes, if user-set | Indefinite | Human |
+| **Summaries, extracted entities, inferences** | `derived` | **Eventual** | **Never** | Regenerable | Intent layer |
+| **Embeddings** | `derived` | Eventual, regenerable | **Never** | Regenerable | Retrieval |
+| **Conversation/event log** | `append-only` | Append-only | No (history) | Configurable | Every layer |
+| **Credentials** | `critical` | **Never in this store** | — | — | `keyring` only, by reference |
+| **Transient context** | `ephemeral` | None | **Never** | Session | Intent layer |
+
+**Non-negotiable invariants:**
+
+1. **`critical` state is written with `synchronous=FULL`** (ADR-0006). Losing a
+   task row is a lost action; losing a summary is not.
+2. **Only the owning layer writes a region.** A region has exactly one writer.
+   Two writers to `critical` state would be a second source of truth.
+3. **`derived` state can never satisfy an authority check** — enforced by a
+   repository query, not a convention (ADR-0013).
+4. **Credentials are never state.** They are `secret_ref` pointers into the
+   OS keyring. No credential value is ever written to this store, ever.
+5. **State is versioned and migratable** (ADR-0017), and a migration is preceded
+   by a verified snapshot.
+6. **Every state transition is observable** — via the audit journal or the event
+   log, never by inspecting a table after the fact.
+7. **Retention is per-region and explicit.** Nothing is deleted by a background
+   janitor without a declared policy, and deletions are audited.
+
+**Trade-offs.** Classification is a real design burden and is easy to get wrong —
+over-classifying as `critical` means paying fsync on non-critical writes;
+under-classifying risks silent data loss. The budget ledger is a good example of
+why this matters: it looks like a counter, but it is *money*, so it is
+`authoritative` with strong consistency, not `derived` with eventual
+consistency. A central registry of regions also means a schema change touches a
+documented list rather than "whatever a module happens to own".
+
+**Consequences.** A `StateRegistry` in code declaring region, class, owner,
+retention, and consistency — the single place to look for "what is authoritative
+here?". This is the artefact that makes the answer to *"which state may the
+model write?"* unambiguous and mechanically checkable. Backup and export become
+region-driven: `critical` + `authoritative` are backed up; `derived` is
+regenerable and can be excluded (which also makes backups small).
+
+**Rejected alternatives.** **Scatter persistence** — guarantees inconsistency.
+**A single "state" abstraction hiding everything** — loses the per-region
+classification that is the entire point, and makes retention undiscussable.
+**Redis / an external state store** — a daemon, and `lifeguard`-style crates
+requiring Redis are already noted as stale.
+
+**Revisit conditions.** Revisit the classification when a new region is added
+(it must be classified before it exists). Revisit `critical` consistency if
+`synchronous=FULL` proves unaffordable on baseline hardware (Q-OPEN-17) — the
+answer would be to demote the *cheapest-to-lose* region, never to weaken the
+task table.
+
+---
+
+<a id="adr-0029"></a>
+## ADR-0029 — Task-engine correctness properties are normative; the implementation is not
+
+**Context.** ADR-0007 chose a hand-rolled durable task engine on SQLite and named
+it the single largest self-owned risk. "Reasonable for a personal daemon" is not
+a specification.
+
+**Problem.** Define what "correct" means for the task engine **independently of
+whether it is hand-rolled, `apalis`, or something else** — so that the
+implementation can be swapped without renegotiating the contract, and so that
+"it works on my machine" is never the acceptance criterion.
+
+**Options.** Specify the implementation · specify the behaviour informally ·
+**specify normative properties that any conforming implementation must satisfy**.
+
+**Decision.** **The following properties are normative.** They are stated
+implementation-independently, are enforced as tests, and any conforming engine
+must satisfy them. The engine chosen in ADR-0007 is one implementation, not the
+specification.
+
+| ID | Normative property |
+|----|--------------------|
+| **TP-1** | **No task silently disappears.** Every task accepted for execution reaches a terminal state (`completed` · `failed` · `cancelled` · `dead_lettered`) or a non-terminal state that is provably still owned. A task must never become unobservable — not by a crash, not by a lease bug, not by a scheduler miss. |
+| **TP-2** | **Exactly-once where required, at-least-once otherwise — and the requirement is explicit per task kind.** A task declared `idempotent: false` with an external side effect is **never** automatically re-executed after an uncertain outcome; it transitions to `needs_verification` and requires human adjudication (Q-OPEN-18). |
+| **TP-3** | **Cancellation is observable.** A cancellation request is durably recorded *before* it is acted upon; the task reaches a terminal `cancelled` state; the effect survives restart; and cancellation latency is bounded per capability (declared `timeout_ms`). A task cannot "half cancel". |
+| **TP-4** | **Restart recovers durable work.** After an unclean shutdown, every task in a non-terminal state is either recovered (lease valid) or returned to the queue / flagged for verification (lease expired). No task is left in `running` with a dead owner. |
+| **TP-5** | **Expired leases cannot execute.** A worker whose lease has expired must not be able to complete or commit work, even if it is still alive and believes it holds the task. Fencing: the claim is re-validated at commit time, not only at acquire time. |
+| **TP-6** | **Retries never inherit approvals.** A retry, resumption, or lease-expiry recovery re-derives the actor (ADR-0027) and re-runs policy. An approval is single-use, expires, and is bound to a specific action digest — never carried forward. |
+| **TP-7** | **Power loss cannot corrupt task state.** After abrupt power loss, the state is either the pre-transaction or post-transaction state, never a torn intermediate. Guaranteed by SQLite WAL + `synchronous=FULL` on the task connection, and verified by kill-at-random-point tests. |
+| **TP-8** | **Scheduling is deterministic under time manipulation.** A clock jump forwards, backwards, or across a DST transition does not cause a task to be lost, duplicated, or executed an unbounded number of times. `UNIQUE(schedule_id, fire_time)` makes a fire exactly-once. |
+| **TP-9** | **Catch-up is bounded and explicit.** A machine that was off for a week does not silently execute a week of backlog. Catch-up obeys the per-schedule misfire policy and `catch_up_cap`, and any collapsed run is flagged `catch_up: true`. |
+| **TP-10** | **Bounded resources.** Every spawn has a concurrency limit. A task that wedges consumes bounded resources and is killed at its deadline. No unbounded fan-out from a workflow. |
+| **TP-11** | **Dead-lettering is terminal and visible.** After `max_attempts`, a failing task moves to `dead_lettered` with its last error, is surfaced to the user, and is never silently retried. Retention is declared. |
+| **TP-12** | **Every side effect is accounted for.** Every externally-visible effect either has a recorded result or leaves the task in a state that says "outcome unknown". There is no path where an effect occurred and nothing records it. |
+
+**How these are verified** (see `08-testing-engineering-standards.md` §4.5):
+
+- **TP-1, 4, 7** — kill-at-N-random-points harness. Property: *no injection ever
+  produces a lost, duplicated, or orphaned task.*
+- **TP-2, 12** — injected outcomes per capability contract test.
+- **TP-3, 10** — cancellation and resource-bound tests.
+- **TP-5** — a "zombie worker" test: force lease expiry, then let the original
+  worker try to commit. It must fail.
+- **TP-6** — a test that a retry after approval expiry is refused by policy.
+- **TP-8, 9** — property tests over DST transitions and clock jumps.
+- **TP-11** — a test that a permanently failing task dead-letters and stops.
+
+**Why properties rather than an implementation.** ADR-0007's contingency is to
+swap in `apalis`. If the contract were the code, the swap is a rewrite. Because
+the contract is these twelve properties, the swap is an implementation change
+gated by a conformance suite. This also makes the engine's risk *auditable*: a
+reviewer checks conformance, not cleverness.
+
+**Trade-offs.** Twelve properties is a real specification burden, and TP-5
+(fencing) in particular is easy to get subtly wrong — it requires re-validating
+at commit, not just at claim, and most naive implementations check only at claim.
+It also constrains implementation freedom. Accepted: this is the code we own and
+the code we will get wrong, and the properties are what make "we will get it
+right" a testable claim rather than a hope.
+
+**Consequences.** The conformance suite is part of the engine's definition of
+done. A future engine must pass all twelve. `apalis` adoption (gated by
+Q-OPEN-02) must demonstrate TP-7 and TP-5 specifically, since those are where a
+generic queue library is least likely to match our semantics.
+
+**Rejected alternatives.** **Specify the implementation** — makes a swap a
+rewrite and hides the actual contract. **Informal behaviour description** — what
+"reasonable" was in ADR-0007. **Adopt a library and inherit its semantics** —
+most libraries target Postgres/Nats durability, and none document
+power-loss-with-`synchronous=NORMAL` behaviour for SQLite; we would be
+*discovering* rather than *specifying* our own safety properties.
+
+**Revisit conditions.** Revisit the *properties* only if a requirement genuinely
+changes (e.g. multi-instance execution would add a distributed-consistency
+property set, at which point Temporal/Restate become candidates again). The
+*implementation* is revisitable at any time that satisfies these twelve.
+
+---
+
+<a id="adr-0030"></a>
+## ADR-0030 — "Disabled" means zero operational cost and zero reachable capability
+
+**Context.** The resource model and the composability requirement both rest on
+"disabled capabilities cost nothing". As originally worded, this set an
+unachievable expectation: that a disabled feature must contribute *literally
+zero bytes* to a binary that may still contain it.
+
+**Problem.** Define what is actually guaranteed, in terms that are both
+**measurable** and **achievable**.
+
+**Options.** "Disabled = zero" (unachievable as literally stated) · "disabled
+costs as little as practical" (unmeasurable) · **two explicit tiers: a
+measurable operational guarantee, plus an opportunistic build-time
+elimination**.
+
+**Decision.** The principle is restated as:
+
+> ### Disabled = zero operational cost and zero reachable capability.
+> Build-time feature elimination, where practical, additionally removes binary
+> and storage cost — but that is an optimisation, never the guarantee.
+
+**Tier 1 — the guarantee. Measured in CI, for every capability:**
+
+A disabled capability:
+
+| # | Property | How measured |
+|---|----------|--------------|
+| 1 | **Cannot execute** | Contract test: invoking it while disabled is refused by the dispatcher (fails closed) |
+| 2 | **Holds no credentials** | No `secret_ref` resolves on its behalf; S1 test covers the invocation path |
+| 3 | **Starts no worker** | No process, thread, or supervisor child; asserted by process/thread count |
+| 4 | **Consumes no model resources** | No model or ONNX runtime is loaded; asserted by handle/RSS inspection |
+| 5 | **Performs no network activity** | No socket opened; verified by a network-namespace or syscall trace in CI |
+| 6 | **Adds no meaningful idle CPU/RAM** | RSS and CPU deltas measured against a committed baseline, within a stated threshold |
+| 7 | **Has no reachable state** | No tables, no rows, no scheduled jobs, no config keys accepted (a disabled capability's keys are *rejected*, surfacing typos) |
+| 8 | **Is unreachable by any interface** | An interface cannot obtain an invocation handle; covered by the protocol test suite |
+
+These eight are **contract-level**, hold regardless of build flags, and are
+enforced by tests rather than by binary inspection.
+
+**Tier 2 — the optimisation. Best-effort, measured but not guaranteed:**
+
+| Property | Mechanism |
+|----------|-----------|
+| No code linked | Cargo feature |
+| No binary size delta | `default` vs `all-features` build, size recorded per release |
+| No install/storage delta | Excluded from the bundle manifest |
+| No startup-time delta | Measured across the feature matrix |
+
+Tier 2 is recorded and regression-tracked so drift is *visible in review*, but a
+dependency that links code regardless of features can violate it without being a
+correctness failure.
+
+**Why two tiers.** Collapsing them produced a promise that cannot be kept
+honestly: with a configurable binary, "zero bytes" is achievable only for
+capabilities behind a Cargo feature, and even then a transitive dependency may
+defeat it. Making that the headline would either (a) set an expectation we will
+break, or (b) be quietly weakened to "we tried". Two tiers let us state a hard
+guarantee about **behaviour and reachability** — the part that is both
+security-relevant and fully within our control — while treating **bytes** as an
+optimisation we measure and improve.
+
+The security framing is the important part. "Cannot execute, holds no
+credentials, starts no worker, performs no network activity" is exactly the set
+of properties that determines the blast radius of a bug in a disabled subsystem.
+Binary size is a resource concern; *reachability* is a security concern. They
+should not share a single, weaker, unactionable sentence.
+
+**Trade-offs.** Tier 2 being non-normative means a regression in binary size is
+not a build failure by default (it is a review signal). Accepted: failing builds
+on third-party linking behaviour would produce alert fatigue, and the security
+properties are the ones that must never regress silently.
+
+**Consequences.** CR-2 is restated in these terms (`00-…` §2.2). The feature
+matrix CI job asserts Tier 1 (contract tests) and records Tier 2 (deltas). A
+capability that cannot satisfy all eight Tier-1 properties cannot be shipped
+disabled, which is a useful forcing function on capability design.
+
+**Rejected alternatives.** **"Disabled = zero"** — unactionable, and conflates a
+security property with a resource optimisation. **"Costs as little as practical"**
+— no threshold, so nothing is ever a failure. **A single blended promise** —
+either too strong to keep or too vague to test.
+
+**Revisit conditions.** Promote Tier 2 to normative if the feature matrix ever
+reaches 100 % compliance across all capabilities and the baseline is stable.
+Re-split if a capability is found where a linked transitive dependency grants
+*reachability* rather than merely bytes — that would be a Tier 1 failure and must
+be treated as a security bug.
