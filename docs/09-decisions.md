@@ -42,6 +42,8 @@ will never be revisited, which is a smell.
 | [0028](#adr-0028) | **State as a first-class concept** | **Accepted (new)** |
 | [0029](#adr-0029) | **Task-engine correctness properties are normative; the implementation is not** | **Accepted (new)** |
 | [0030](#adr-0030) | **"Disabled" means zero operational cost and zero reachable capability** | **Accepted (new)** |
+| [0031](#adr-0031) | **Node toolchain: OpenRayNux-local Node 24.21.0 LTS; global environment untouched** | **Accepted (new)** |
+| [0032](#adr-0032) | **`apalis-sqlite` rejected: `synchronous = OFF` fails TP-7; ADR-0007's contingency is closed** | **Accepted (new)** |
 
 ---
 
@@ -642,6 +644,13 @@ are all ours to get right. No third-party roadmap.
 version grows past ~600 lines of queue logic — but **only after verifying its
 `PRAGMA synchronous` default**, because the whole power-loss guarantee depends
 on it. That verification is an open action, not a decision (Q-OPEN-02).
+
+> **RESOLVED 2026-09-30 (Q-OPEN-02).** The contingency is **CLOSED**.
+> `apalis-sqlite` `1.0.0-rc.9` sets **`PRAGMA synchronous = OFF`** in
+> `SqliteStorage::setup()` (`src/lib.rs:156`) with no configuration knob, and
+> never released a stable. That fails **TP-7** outright and partially fails
+> **TP-5**. See **[ADR-0032](#adr-0032)**. The hand-rolled engine is therefore
+> not merely the default — it is currently the **only** conforming option.
 
 **Cloud.** In the cloud profile, a single instance still runs its own scheduler.
 The upgrade to Restate (preferred: single binary, exactly-once, `ctx.sleep()`,
@@ -2134,3 +2143,201 @@ reaches 100 % compliance across all capabilities and the baseline is stable.
 Re-split if a capability is found where a linked transitive dependency grants
 *reachability* rather than merely bytes — that would be a Tier 1 failure and must
 be treated as a security bug.
+
+
+---
+
+<a id="adr-0031"></a>
+## ADR-0031 — Node toolchain: OpenRayNux-local Node 24.21.0 LTS
+
+> **Accepted 2026-09-30.** Resolves **Q-OPEN-03**, the environment conflict
+> deferred from the preparation phase.
+
+**Context.** The workstation's `node` resolves to **v26.7.0** — the Node *Current*
+line, `lts=false` — because `~/.local/bin/node` is a symlink into the Hermes
+agent's private runtime and shadows Fedora's `nodejs24-24.18.0` at `/usr/bin/node`.
+Node **24.21.0 (LTS codename "Krypton", released 2026-09-07)** is the current LTS
+line. The frontend build needs LTS, and the deferral is now blocking.
+
+**Problem.** Establish an OpenRayNux-local Node 24.21.0 **without** changing the
+global shell environment and **without** disturbing Hermes' Node 26.
+
+**Options.** Change the default `node` (fnm on `PATH`) · run everything on Node 26
+· ignore it and hope · **a project-local pinned runtime, global state untouched**.
+
+**Evidence.**
+
+| Item | Value | Source |
+|---|---|---|
+| Node 24.21.0 | `lts = "Krypton"`, dated 2026-09-07 | `https://nodejs.org/dist/index.json` |
+| Node 26.x | `lts = false` on every release | same |
+| Official tarball SHA-256 | `fd8e59d5…f56cb2d6  node-v24.21.0-linux-x64.tar.xz` | `https://nodejs.org/dist/v24.21.0/SHASUMS256.txt` |
+| Verified | checksum confirmed `OK`; `node --version` → `v24.21.0`; `npm` 11.19.0 | local, 2026-09-30 |
+| pnpm | 12.8.1 works against it | local |
+
+**Decision.**
+
+1. **A project-local Node 24.21.0 runtime** at
+   `.toolchains/node-v24.21.0-linux-x64/`, provisioned from the **official
+   nodejs.org tarball** and **checksum-verified** against the published
+   `SHASUMS256.txt`.
+2. **`.toolchains/` is gitignored** — the *declaration* is committed, the bytes
+   are not. A committed `.node-version` (`24.21.0`) states the requirement and is
+   consumable by any future version manager (fnm, nvm, volta, asdf, mise).
+3. **The global environment is not modified.** Specifically *not* touched: `PATH`,
+   `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.local/bin`, and the Hermes
+   symlink `~/.local/bin/node`. **Verified after provisioning**: `node` still
+   resolves to v26.7.0, and the `PATH` hash is byte-identical to its pre-task
+   value.
+4. **Hermes' Node 26 is untouched** and remains the default for every other tool
+   on this machine. We do not, and will not, repurpose another application's
+   runtime.
+5. **Frontend build invocations use an explicit, non-exported path prefix**, never
+   a shell-init modification. Documented per-command in the Phase 1 contract.
+6. **Register as V-05** in `12-verification-register.md`: re-verify when Krypton
+   leaves maintenance or a new LTS codename appears.
+
+**Why.** The user's requirement — *"keep Hermes' Node 26 untouched and establish
+OpenRayNux-local Node 24.21.0 LTS rather than changing the global shell
+environment"* — is also the architecturally correct answer for three reasons:
+
+1. **It is additive and reversible.** Deleting `.toolchains/` fully reverts it. No
+   other tool on the machine can regress.
+2. **It is reproducible and verifiable.** Checksummed from the official release;
+   anyone can re-derive the exact runtime from `.node-version` plus the recorded
+   hash.
+3. **It sidesteps the whole class of "who owns `node`" conflict** that the global
+   approach would have to resolve — a conflict between two applications with
+   legitimate, incompatible needs. Localising the runtime removes the contention
+   instead of adjudicating it.
+
+**Trade-offs.** ~204 MiB on disk (duplicated across projects that need it). A
+developer must remember the path prefix, or use a `.node-version`-aware manager
+later. The runtime must be re-provisioned per machine (it is gitignored by
+design — committing 200 MiB of Node would be worse than the duplication).
+
+**Consequences.** A documented, one-line way to build the frontend on the correct
+runtime, with no global state changed. No dependency on a version manager being
+installed later. If a version manager is ever adopted, `.node-version` is already
+in place and nothing needs to change.
+
+**Rejected alternatives.** **fnm on `PATH`** — changes global shell behaviour and
+would make Node 24 the default for *every* tool, including Hermes and the
+globally-installed npm CLIs (`claude`, `cline`, `ocr`, `mimo`). That is a
+cross-application change made for one application's benefit. **Run on Node 26** —
+26 is `lts=false`; building a long-lived product on a Current line means a
+forced, un-timed migration later. **Change `~/.local/bin/node`** — actively
+destructive to another application.
+
+**Revisit conditions.** Revisit when Krypton leaves maintenance (V-05), or when
+a version manager is adopted for developer ergonomics — at which point
+`.node-version` is already the input it needs, and `.toolchains/` can be retired.
+
+---
+
+<a id="adr-0032"></a>
+## ADR-0032 — `apalis-sqlite` rejected: `synchronous = OFF` fails TP-7
+
+> **Accepted 2026-09-30.** Resolves **Q-OPEN-02**, and **closes ADR-0007's
+> contingency**.
+
+**Context.** ADR-0007 chose a hand-rolled durable task engine and named
+`apalis` + `apalis-sqlite` as the contingency if it outgrew ~600 lines. That
+contingency was gated on one unverified question: *what `PRAGMA synchronous` does
+`apalis-sqlite` use?*
+
+**Problem.** Answer the question from the source, not from the documentation.
+
+**Evidence — read directly from the published crate.** `apalis-sqlite`
+`1.0.0-rc.9` (2026-09-16), `src/lib.rs:149–166`:
+
+```rust
+/// Perform migrations for storage
+#[cfg(feature = "migrate")]
+pub async fn setup(pool: &SqlitePool) -> Result<(), Error> {
+    sqlx::query("PRAGMA journal_mode = 'WAL';").execute(pool).await?;
+    sqlx::query("PRAGMA temp_store = MEMORY;").execute(pool).await?;
+    sqlx::query("PRAGMA synchronous = OFF;").execute(pool).await?;   // ← line 156
+    sqlx::query("PRAGMA cache_size = 64000;").execute(pool).await?;
+    sqlx::query("PRAGMA journal_size_limit = 67108864;").execute(pool).await?;
+    sqlx::query("PRAGMA optimize;").execute(pool).await?;
+    Self::migrations().run(pool).await.map_err(sqlx::Error::from)?;
+    Ok(())
+}
+```
+
+**Four findings, in order of severity:**
+
+1. **TP-7 fails outright.** `synchronous = OFF` is *weaker* than `NORMAL`.
+   Per `sqlite.org/wal.html`, `OFF` means SQLite continues without syncing once
+   data is handed to the OS: data survives an *application* crash, but **the
+   database may become corrupted if the operating system crashes or the machine
+   loses power**. ADR-0006 requires `synchronous = FULL` on the task connection;
+   TP-7 requires that power loss cannot corrupt task state. **`apalis-sqlite`
+   makes both false by default.**
+2. **There is no configuration knob.** `synchronous` appears exactly once in the
+   entire `src/` tree. `config.rs` exposes `batch_size`, `heartbeat_interval`,
+   `missed_heartbeats`, `queue`, `database_url`, `lock_tasks`,
+   `persist_results` — no durability settings. Correcting it requires a fork.
+3. **The pragma is applied per-pool, not per-connection.** It is issued via
+   `.execute(pool)`, not inside the `after_connect` hook that the crate *does*
+   register (for the update hook, `src/lib.rs:136`). Because `synchronous` is a
+   **per-connection** pragma, applying it once through a pool is at best
+   unreliable and at worst makes durability *inconsistent between connections* —
+   which is worse than a consistent weak setting, because the behaviour is not
+   knowable from configuration. (Recorded as a source reading; the precise
+   `sqlx` pool semantics should be confirmed in a spike if this ever changes.)
+4. **TP-5 is only partially satisfied.** `queries/task/ack.sql`:
+
+   ```sql
+   UPDATE Jobs SET status = j.status, attempts = j.attempt, last_result = j.result, ...
+   FROM j WHERE Jobs.id = j.task_id AND Jobs.lock_by = ?2
+   ```
+
+   This fences on **worker identity** (`lock_by`) but **not on lease expiry**. A
+   zombie worker whose lease has expired and whose task has *not yet been
+   re-claimed* will still find `lock_by` matching — and can still commit. ADR-0029
+   calls out exactly this as the subtle case: *"a worker whose lease has expired
+   must not be able to complete or commit work, even if it is still alive and
+   believes it holds the task."*
+
+**Additionally:** `apalis-sqlite` has **never released a stable version** — all
+14 published versions are pre-releases, newest `1.0.0-rc.9`; `apalis` core's
+newest is `1.0.0-rc.10`. It is effectively single-maintainer.
+
+**In fairness, the design is good.** Orphan re-enqueue
+(`queries/reenqueue_orphaned.rs`), heartbeats with `missed_heartbeats`, priorities,
+delayed jobs, unique jobs, and SQLite **update hooks** for event-driven
+(sub-100 ms) pickup instead of polling are all genuinely well-judged for this
+problem. And the maintenance is active. The rejection is about **one unconfigurable
+line that makes a stated correctness property false**, not about quality.
+
+**Decision.** **`apalis-sqlite` is rejected as the task engine.** ADR-0007's
+hand-rolled engine stands, and its contingency is **closed**. ADR-0029's twelve
+properties are the contract; the hand-rolled engine is the only implementation
+currently known to satisfy all twelve.
+
+**Trade-offs.** We own the queue. That was already the decision; this removes the
+comfort of a fallback, so the ADR-0029 conformance suite and the failure-injection
+harness become load-bearing rather than merely good practice. Accepted — a
+fallback that silently fails TP-7 is worse than no fallback, because it is
+discovered at the worst moment.
+
+**Consequences.** Register as **V-21**. `apalis` may still be evaluated for
+**non-critical** uses (a best-effort notification queue, where
+`synchronous = OFF` is acceptable) — but never for the task table.
+
+**Rejected alternatives.** **Fork `apalis-sqlite` to change the pragma.** A
+one-line fork of a pre-1.0, single-maintainer crate means owning the fork,
+re-basing on every RC, and re-deriving its migrations — at which point we own it
+anyway, with extra steps. **Re-issue `PRAGMA synchronous = FULL` after calling
+`setup()`.** Ordering is racy against sqlx's connection pool, and the pragma
+would still be unset on connections created later; it fights the library rather
+than fixing it. **Use `apalis` with a different backend.** Every other backend is
+a server (Postgres, Redis, SQS, NATS, AMQP), which violates the core
+single-process constraint (ADR-0006, V-24).
+
+**Revisit conditions.** Revisit only if **both**: (a) `apalis-sqlite` exposes a
+documented durability configuration, **and** (b) it passes the ADR-0029
+conformance suite — specifically **TP-7** (power loss) and **TP-5** (lease-expiry
+fencing at commit). A stable 1.0 release alone is **not** sufficient.

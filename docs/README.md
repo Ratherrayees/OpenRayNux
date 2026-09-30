@@ -31,11 +31,13 @@ process owning the user's time, data and integrations, with several surfaces
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | Three isolation tiers, the manifest, the dispatcher, and MCP's place. |
 | **08** | [Testing & Engineering Standards](08-testing-engineering-standards.md) | The testing pyramid, the deterministic-vs-AI split, and project standards. |
 | **10** | [Open Questions](10-open-questions.md) | 21 unresolved items with interim positions. **Three block Phase 0/1.** |
+| **12** | [Verification Register](12-verification-register.md) | **Every claim that can become false over time, with its verification source, review trigger, and consequence of drift.** |
+| **13** | [Phase 1 Contract](13-phase-1-contract.md) | The exact agreement the next phase is measured against: workspace, crate graph, 12 CI gates, exit criteria, and what is explicitly excluded. |
 | **sources.md** | [Sources](sources.md) | Every version claim, with URLs and access dates, plus the method's limits. |
 
 ---
 
-## The 30 decisions at a glance
+## The 32 decisions at a glance
 
 | Area | Decision | ADR |
 |---|---|---|
@@ -69,17 +71,36 @@ process owning the user's time, data and integrations, with several surfaces
 | State | **Classified regions with a single owner** | [0028](09-decisions.md#adr-0028) |
 | Task contract | **12 normative properties, implementation-independent** | [0029](09-decisions.md#adr-0029) |
 | "Disabled" | **Zero operational cost and zero reachable capability** | [0030](09-decisions.md#adr-0030) |
+| Node toolchain | **Project-local Node 24.21.0 LTS; global env untouched** | [0031](09-decisions.md#adr-0031) |
+| `apalis-sqlite` | **Rejected — `synchronous = OFF` fails TP-7** | [0032](09-decisions.md#adr-0032) |
 
 ---
 
 ## Blocking before implementation
 
-| ID | Question | Why it blocks |
-|----|----------|---------------|
-| 🔴 [Q-OPEN-01](10-open-questions.md) | **Telegram ToS §1.5** — does inference on a user's own messages violate the AI-development clause? | Needs legal review. Interim: Telegram is notification-output-only. |
-| 🔴 [Q-OPEN-02](10-open-questions.md) | **`apalis-sqlite`'s `PRAGMA synchronous` default** | If `NORMAL`, the power-loss guarantee fails. Gates ADR-0007's contingency. |
-| 🟡 [Q-OPEN-03](10-open-questions.md) | **Node 26.7.0 (Current) vs Node 24 LTS** | The deferred environment conflict. Blocks the first frontend build. |
-| 🟢 [Q-OPEN-04](10-open-questions.md) | **Two empty workspace directories** | Cosmetic until `git init`; settled — this repository is `~/Projects/OpenSource/OpenRayNux`. |
+| ID | Question | Status |
+|----|----------|--------|
+| ✅ [Q-OPEN-02](10-open-questions.md) | `apalis-sqlite`'s durability pragma | **RESOLVED** — `synchronous = OFF`; rejected. [ADR-0032](09-decisions.md#adr-0032) |
+| ✅ [Q-OPEN-03](10-open-questions.md) | Node 26 vs Node LTS | **RESOLVED** — project-local Node 24.21.0, global env untouched. [ADR-0031](09-decisions.md#adr-0031) |
+| ✅ [Q-OPEN-04](10-open-questions.md) | Two empty workspace directories | **RESOLVED** — this repository is canonical |
+| 🔴 [Q-OPEN-01](10-open-questions.md) | **Telegram ToS §1.5** — legal review | **Open, and deliberately not blocking.** The adapter boundary must be built capable of the notification-only implementation. |
+| 🟡 [Q-OPEN-21](10-open-questions.md) | Do TS6 and `--tsgo` diagnostics agree? | Open; a Phase 6 deliverable |
+| 🟢 [Q-OPEN-17](10-open-questions.md) | Is `synchronous = FULL` affordable? | Open; a Phase 2 measurement |
+
+---
+
+## Next
+
+**[Phase 1 — Foundation Contract](13-phase-1-contract.md)** is written and awaiting
+execution. Its single objective:
+
+> Establish the workspace, the crate graph, the enforced boundaries, and the
+> conformance machinery — with **zero features** working.
+
+Nothing is scaffolded yet. The first crates to be created are `orxnud-domain`,
+`orxnud-protocol`, and the three `orxnud-platform-*` adapters; the highest-value
+deliverable is the **ADR-0029 conformance harness**, written *before* the queue it
+will test.
 
 ---
 

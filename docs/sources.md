@@ -94,7 +94,8 @@ dependency pin must be re-verified at implementation time. This is why
 |---|---|
 | `croner` 4.0.0 (2026-08-31) | https://crates.io/api/v1/crates/croner |
 | `cron` 0.17.0 · `cron-parser` 0.12.0 | https://crates.io/api/v1/crates/cron |
-| `apalis` 0.7.4 · `apalis-sqlite` (1.0.0-rc.9) | https://crates.io/api/v1/crates/apalis |
+| `apalis` 0.7.4 stable / **1.0.0-rc.10 newest** · `apalis-sqlite` **1.0.0-rc.9 (2026-09-16), no stable ever released** (all 14 versions are pre-releases) | https://crates.io/api/v1/crates/apalis |
+| **`apalis-sqlite` source read directly** — `src/lib.rs:149–166` `SqliteStorage::setup()` sets `PRAGMA synchronous = OFF` (line 156) with no config knob; applied via `.execute(pool)` rather than `after_connect`, so a per-connection pragma lands on one connection. `queries/task/ack.sql` fences on `lock_by` identity but **not** on lease expiry. **Verdict: TP-7 fails, TP-5 partial → rejected (ADR-0032, Q-OPEN-02)** | tarball `https://static.crates.io/crates/apalis-sqlite/apalis-sqlite-1.0.0-rc.9.crate`, read 2026-09-30 |
 | `apalis-workflow` 0.1.0-rc.10 | https://crates.io/api/v1/crates/apalis-workflow |
 | `fang` 0.11.0 (2026-07-02) | https://crates.io/api/v1/crates/fang |
 | `temporalio-sdk` **1.0.0 (2026-09-04)** | https://crates.io/api/v1/crates/temporalio-sdk |
@@ -308,5 +309,15 @@ alone.
 | Containers | Podman 5.8.7, Docker 29.8.1 — both pre-existing, **not introduced by this project** |
 | Git | 2.55.0; identity `Rayees <rayiesamin@gmail.com>`; `gpg.format=ssh`, `commit.gpgsign=true`; GitHub HTTPS works via `gh` credential helper; **SSH is not registered** |
 
-**No writes, installs, or services were made to the workstation during this
-research phase.**
+**Toolchain provisioning (2026-09-30, ADR-0031).** Node **v24.21.0** (LTS
+codename **"Krypton"**, 2026-09-07) provisioned **project-locally** at
+`.toolchains/node-v24.21.0-linux-x64/` from the official tarball, SHA-256
+`fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6`, verified
+against `https://nodejs.org/dist/v24.21.0/SHASUMS256.txt` — **checksum `OK`**.
+`PATH`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.local/bin` and the
+Hermes symlink were **not modified**; `node` still resolves to v26.7.0 and the
+`PATH` hash is byte-identical to its pre-task value.
+
+**No application code, no dependencies installed into the project, and no services
+were started at any point.** `apalis-sqlite` was downloaded to `/tmp` and read as
+source only; it is **not** a project dependency.

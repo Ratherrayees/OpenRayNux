@@ -44,6 +44,14 @@ desktop.ini
 .vscode/
 !.vscode/extensions.json
 
+# --- project-local toolchains ------------------------------------------------
+# OpenRayNux pins its own Node runtime here rather than mutating the user's
+# global PATH or shell init (ADR-0031). Provisioned by checksum from the
+# official nodejs.org release; never committed. The *declared* requirement is
+# the committed `.node-version` file, which any version manager can consume.
+/.toolchains/
+/.node-version.local
+
 # --- build output (generic; phase-specific entries added later) --------------
 /target/
 /dist/

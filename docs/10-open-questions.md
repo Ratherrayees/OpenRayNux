@@ -29,10 +29,17 @@ intelligence — which removes it from the "message me things" use case entirely
 and makes it a notification sink. This is a legal question, and it is
 first-order for FR-09.
 
-**Interim position.** Telegram ships as **notification output only** in v1 —
-outbound-only, plus commands *into* the bot. No reading of message content, no
-inference on it. The capability is behind its own toggle and defaults to the
-restricted mode.
+**Interim position (confirmed by review 2026-09-30 — do not block on this).**
+Telegram ships as **notification output only**: outbound-only, plus commands
+*into* the bot. No reading of message content, no inference on it. The
+capability is behind its own toggle and defaults to the restricted mode.
+
+**This question does not block the core architecture**, and must not be
+allowed to. The messaging capability's *contract* is provider-neutral
+(ADR-0016), so the restricted implementation is fully expressible today.
+Phase 1 must therefore build the **adapter boundary capable of the
+notification-only implementation**, and treat broader scope as a separate,
+later review gate.
 
 **What settles it.** Legal counsel, or a written clarification from Telegram.
 **Owner:** project lead. **Blocks:** the Telegram messaging capability's v1 scope.
@@ -43,60 +50,78 @@ maintenance grounds too (ADR-0016).
 
 ---
 
-## Q-OPEN-02 — `apalis-sqlite`'s durability pragma 🔴 **BLOCKING for ADR-0007 contingency**
+## Q-OPEN-02 — `apalis-sqlite`'s durability pragma ✅ **RESOLVED 2026-09-30**
 
 **Question.** What `PRAGMA synchronous` does `apalis-sqlite` use by default, and
 is `journal_mode=WAL` enabled?
 
-**Why it matters.** `sqlite.org/wal.html` is explicit that
-`synchronous=NORMAL` in WAL mode does **not** survive power loss. The brief
-requires surviving power loss. If `apalis-sqlite` defaults to `NORMAL`, it
-cannot be adopted without a patch, and ADR-0007's contingency evaporates.
+**Answer, read directly from the published crate** (`apalis-sqlite` `1.0.0-rc.9`,
+`src/lib.rs:149–166`):
 
-**Interim position.** ADR-0007's primary decision stands: we hand-roll. This
-question only gates the *contingency*.
+```rust
+sqlx::query("PRAGMA journal_mode = 'WAL';").execute(pool).await?;      // WAL: yes
+sqlx::query("PRAGMA temp_store = MEMORY;").execute(pool).await?;
+sqlx::query("PRAGMA synchronous = OFF;").execute(pool).await?;          // ← OFF
+```
 
-**What settles it.** Read the source. Thirty minutes. **Owner:** implementer.
-**Blocks:** the decision to switch to `apalis` if the hand-rolled engine exceeds
-~600 lines.
+- **WAL: yes**, as required.
+- **`synchronous = OFF`** — *weaker* than `NORMAL`. Per `sqlite.org/wal.html`,
+  data survives an application crash but **the database may become corrupted on
+  OS crash or power loss**.
+- **No configuration knob.** `synchronous` appears once in the whole `src/` tree;
+  `config.rs` exposes no durability settings.
+- **Applied per-pool, not per-connection** (a one-shot `.execute(pool)`, not in the
+  `after_connect` hook the crate does register) — and `synchronous` is a
+  per-connection pragma, so durability is at best unreliable and at worst
+  inconsistent between connections.
+- **TP-5 only partial.** `ack.sql` fences on `lock_by` identity but **not on lease
+  expiry**, so a zombie worker whose task has not been re-claimed can still commit.
+- **No stable release has ever shipped** — all 14 versions are pre-releases.
 
----
+**Consequence.** **Rejected.** This fails **TP-7** outright, which is the property
+the brief's power-loss requirement exists to guarantee. ADR-0007's contingency is
+**closed**: the hand-rolled engine is currently the only known conforming
+implementation. See **[ADR-0032](09-decisions.md#adr-0032)**. Registered as V-21.
 
-## Q-OPEN-03 — Node 26 vs the LTS requirement 🟡 **BLOCKING for the first frontend build**
+**What would reopen it.** *Both* a documented durability configuration *and* a
+passing ADR-0029 conformance suite (TP-7 and TP-5 specifically). A stable 1.0
+alone is not enough. `apalis` remains usable for **non-critical** work such as a
+best-effort notification queue.
 
-**Question.** `node` on this workstation resolves to **v26.7.0 (Current line,
-`lts=false`)** via `~/.local/bin/node` → `~/.hermes/node/bin/node`, shadowing
-Fedora's `nodejs24-24.18.0` at `/usr/bin/node`. Node **24.21.0 (LTS codename
-"Krypton", 2026-09-07)** is the current LTS line and is what Vite 8 requires
-(`engines: ^20.19.0 || >=22.12.0` — satisfied by both, but we want LTS).
-**How should Node ownership be resolved?**
+## Q-OPEN-03 — Node 26 vs the LTS requirement ✅ **RESOLVED 2026-09-30**
 
-**Why it matters.** The environment-preparation phase deliberately deferred
-this. It becomes blocking at the first `pnpm install` for the Svelte frontend.
-Deferring it further means building a frontend on an unsupported Node line.
+**Question.** `node` on this workstation resolves to **v26.7.0** (Node *Current*,
+`lts=false`) via `~/.local/bin/node` → `~/.hermes/node/bin/node`, shadowing
+Fedora's `nodejs24-24.18.0` at `/usr/bin/node`. **How should Node ownership be
+resolved?**
 
-**Interim position.** Frontend builds pin Node via a checked-in
-`.node-version` / `package.json` `engines` field, so the *project* declares its
-requirement regardless of what the shell resolves. A developer using the wrong
-Node gets a clear error rather than a mystery. The `pnpm` binary is already
-user-scoped and version-pinned (12.8.1), so it is unaffected by the shell's
-`node`.
+**Resolution — an OpenRayNux-local pinned runtime, global state untouched.**
 
-**Now also required (ADR-0005 rev 2):** the frontend needs a *dual* TypeScript
-install — `typescript@~6` plus `@typescript/native@npm:typescript@7` — so the
-toolchain must be able to resolve npm aliases. That is a `pnpm`/`npm`
-configuration detail, but it means the first frontend setup is not a bare
-`pnpm install`.
+| | |
+|---|---|
+| **Runtime** | `.toolchains/node-v24.21.0-linux-x64/` (project-local, gitignored) |
+| **Source** | official `nodejs.org` tarball for **v24.21.0** (LTS codename **"Krypton"**, 2026-09-07) |
+| **Integrity** | SHA-256 `fd8e59d5…f56cb2d6`, verified against the published `SHASUMS256.txt` — **`OK`** |
+| **Verified** | `node --version` → `v24.21.0`; `npm` 11.19.0; `pnpm --version` → 12.8.1 works against it |
+| **Declaration** | committed `.node-version` = `24.21.0` (consumable by any future version manager) |
+| **Global state** | **unchanged** — `PATH` hash byte-identical to its pre-task value; `~/.bashrc`, `~/.bash_profile`, `~/.profile` mtimes all predate today; `~/.local/bin` untouched; **Hermes still resolves `node` → v26.7.0** |
 
-**Options (user's call, not ours):** install fnm and make Node 24 LTS the
-default (touches an existing tool's environment) · leave the shell alone and
-require an explicit `fnm use` per session · use Fedora's `/usr/bin/node` directly
-via a project-local `.npmrc`/toolchain pin.
+**Why this and not fnm on `PATH`.** Changing the default `node` would make Node 24
+the runtime for *every* tool on the machine — including Hermes and the
+globally-installed npm CLIs. That is a cross-application change made for one
+application's benefit, and it adjudicates a conflict between two applications
+with legitimate, incompatible needs rather than removing the contention. A
+project-local runtime is additive, reversible by deleting one directory, and
+reproducible from `.node-version` plus a published hash.
 
-**What settles it.** A user decision. **Owner:** project lead. **Blocks:**
-Phase 6 (first interface with a frontend).
+**Consequence.** The frontend build has a correct LTS runtime without any global
+change. See **[ADR-0031](09-decisions.md#adr-0031)**. Registered as V-05: re-verify
+when Krypton leaves maintenance or a new LTS codename appears.
 
----
+**Remaining sub-item.** The frontend needs a **dual TypeScript install**
+(`typescript@~6` plus `@typescript/native@npm:typescript@7`, per ADR-0005 rev 2),
+so the toolchain must resolve npm aliases. That is a `pnpm` configuration detail
+and is a Phase 6 deliverable, tracked in **Q-OPEN-21**.
 
 ## Q-OPEN-04 — Duplicate empty workspace directories 🟢 **cosmetic, BLOCKING for `git init`**
 
