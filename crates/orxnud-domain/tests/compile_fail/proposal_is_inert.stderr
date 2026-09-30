@@ -1,0 +1,5 @@
+error[E0599]: no method named `execute` found for struct `Proposal` in the current scope
+  --> tests/compile_fail/proposal_is_inert.rs:27:22
+   |
+27 |     let _ = proposal.execute();
+   |                      ^^^^^^^ method not found in `Proposal`

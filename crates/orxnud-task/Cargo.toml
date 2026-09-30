@@ -1,0 +1,29 @@
+[package]
+name = "orxnud-task"
+description = "OpenRayNux task lifecycle types and the ADR-0029 conformance harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Scheduler dependencies for the TP-8/TP-9 property generators. croner is the
+# only Rust cron with documented Vixie-compatible DST semantics (ADR-0021, V-22).
+croner = { workspace = true }
+jiff = { workspace = true }
+blake3 = { workspace = true }
+tokio = { workspace = true }
+orxnud-domain = { workspace = true }
+orxnud-store = { workspace = true }
+orxnud-policy = { workspace = true }
+orxnud-audit = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+trybuild = { workspace = true }

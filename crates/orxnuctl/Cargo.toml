@@ -1,0 +1,21 @@
+[package]
+name = "orxnuctl"
+description = "OpenRayNux CLI. Depends on orxnud-protocol only (docs-13 §3.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Among *internal* crates, only orxnud-protocol. An interface that could import
+# domain types would eventually reimplement a rule to render a state it
+# disagrees with (docs-03 §2).
+[dependencies]
+clap = { workspace = true }
+serde_json = { workspace = true }
+orxnud-protocol = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

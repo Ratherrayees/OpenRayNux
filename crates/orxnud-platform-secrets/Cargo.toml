@@ -1,0 +1,19 @@
+[package]
+name = "orxnud-platform-secrets"
+description = "OpenRayNux secret-storage platform adapter: Secret Service / DPAPI / Keychain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# One of exactly three crates permitted to contain cfg(target_os) (CI gate G7).
+[dependencies]
+orxnud-domain = { workspace = true }
+keyring = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3.27.0"

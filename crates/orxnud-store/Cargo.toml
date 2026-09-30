@@ -1,0 +1,23 @@
+[package]
+name = "orxnud-store"
+description = "OpenRayNux SQLite persistence: repositories, migrations, backup/restore."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `bundled` compiles SQLite from the pinned amalgamation. The system library is
+# never used: Fedora 44 ships 3.51.2, which is below the 3.51.3 WAL-reset
+# corruption fix (ADR-0006, V-02).
+rusqlite = { workspace = true }
+orxnud-domain = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

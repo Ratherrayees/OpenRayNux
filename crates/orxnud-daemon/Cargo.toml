@@ -1,0 +1,29 @@
+[package]
+name = "orxnud-daemon"
+description = "OpenRayNux composition root: wiring, supervision, lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+orxnud-domain = { workspace = true }
+orxnud-protocol = { workspace = true }
+orxnud-store = { workspace = true }
+orxnud-policy = { workspace = true }
+orxnud-task = { workspace = true }
+orxnud-capability = { workspace = true }
+orxnud-audit = { workspace = true }
+orxnud-config = { workspace = true }
+orxnud-obs = { workspace = true }
+orxnud-platform-fs = { workspace = true }
+orxnud-platform-secrets = { workspace = true }
+orxnud-platform-notify = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

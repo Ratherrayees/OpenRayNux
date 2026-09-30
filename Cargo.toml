@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/orxnud-domain",
+    "crates/orxnud-protocol",
+    "crates/orxnud-store",
+    "crates/orxnud-policy",
+    "crates/orxnud-task",
+    "crates/orxnud-capability",
+    "crates/orxnud-audit",
+    "crates/orxnud-config",
+    "crates/orxnud-obs",
+    "crates/orxnud-daemon",
+    "crates/orxnuctl",
+    "crates/orxnud-platform-fs",
+    "crates/orxnud-platform-secrets",
+    "crates/orxnud-platform-notify",
+]
+
+# The crate graph is fixed by docs/13 §3.1. Adding, removing, or merging a
+# member requires an ADR. `scripts/ci-gates.sh` gate G7 fails if this list
+# and the directory contents disagree.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/openraynux/openraynux"
+authors = ["OpenRayNux contributors"]
+publish = false
+
+# Single source of truth for versions. Verified against crates.io on
+# 2026-09-30; see docs/02-technology-evaluation.md §3.1 and
+# docs/12-verification-register.md (V-04).
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt", "std"] }
+clap = { version = "4.6.7", features = ["derive"] }
+blake3 = "1.8.7"
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+toml = "0.9.8"
+croner = "4.0.0"
+jiff = "0.2.37"
+# One credential-store backend per supported platform family. The backend is
+# chosen at build time here; Phase 2 selects a *runtime* fallback and warns
+# loudly on a headless Linux session with no Secret Service (control S9).
+keyring = { version = "4.2.0", default-features = false, features = [
+  "apple-native-keyring-store",
+  "windows-native-keyring-store",
+  "zbus-secret-service-keyring-store",
+] }
+directories = "6.0.0"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+# Dev-only. Never a normal dependency of a published crate.
+proptest = "1.11.0"
+trybuild = "1.0.121"
+
+# Internal crates
+orxnud-domain = { path = "crates/orxnud-domain" }
+orxnud-protocol = { path = "crates/orxnud-protocol" }
+orxnud-store = { path = "crates/orxnud-store" }
+orxnud-policy = { path = "crates/orxnud-policy" }
+orxnud-task = { path = "crates/orxnud-task" }
+orxnud-capability = { path = "crates/orxnud-capability" }
+orxnud-audit = { path = "crates/orxnud-audit" }
+orxnud-config = { path = "crates/orxnud-config" }
+orxnud-obs = { path = "crates/orxnud-obs" }
+orxnud-platform-fs = { path = "crates/orxnud-platform-fs" }
+orxnud-platform-secrets = { path = "crates/orxnud-platform-secrets" }
+orxnud-platform-notify = { path = "crates/orxnud-platform-notify" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.test]
+# Keep test builds fast; durability tests do their own fsync accounting.
+opt-level = 1

@@ -1,0 +1,19 @@
+# OpenRayNux toolchain pin.
+#
+# Pinned to a specific stable release rather than "stable" so release builds
+# are reproducible (ADR-0019: "Reproducible release builds with a documented,
+# pinned toolchain"). This is a *stable* channel; no nightly is used anywhere
+# in this project (ADR-0001, and the no-nightly rule from environment prep).
+#
+# Components are pinned explicitly so a fresh checkout gets the same
+# lint/format/analyzer surface that CI validated.
+#
+# Verification Register: V-04 (MSRV floor is 1.98.1). Re-verify quarterly and
+# on any dependency bump — `sqlx` needs 1.94 and `egui` 1.95, so the floor has
+# little headroom above the tightest dependency.
+
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-docs"]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+profile = "minimal"
