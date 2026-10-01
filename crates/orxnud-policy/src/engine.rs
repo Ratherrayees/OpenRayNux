@@ -378,6 +378,15 @@ impl PolicyEngine {
         // permits a gated action burns the approval -- including a future caller that
         // does not go through `authorise_for_dispatch`. A replay or a retry is then
         // refused at the next decision (S6: single-use).
+        //
+        // WHEN the burn happens is a deliberate, recorded choice. It is *before*
+        // execution, so a failure in capability resolution or credential acquisition
+        // -- three stages later -- consumes an approval that produced no effect.
+        // That costs the user a re-prompt; burning *after* execution instead would
+        // reopen the replay window single-use exists to close, because two concurrent
+        // dispatches could both pass the check before either burned it. Fail-closed
+        // wins while the semantics are unspecified. V-43 records this for Phase 4/5,
+        // where a reservation distinct from a consumption may be the better model.
         if let Some(record) = approval {
             self.consumed_approvals.insert(record.digest);
         }

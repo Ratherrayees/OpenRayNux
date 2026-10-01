@@ -1,9 +1,20 @@
 # OpenRayNux — Documentation Index
 
-Status: **Phase 2 implementation complete; Windows verification open (V-29).**
-The Linux implementation is complete and verified. The Windows cross-check is unrun
-because this host has no MSVC C toolchain — an open verification item, not a Phase 2
-implementation gap.
+Status: **Phase 3 complete. Windows verification open (V-29).**
+
+```text
+Phase 1  ✅ Foundation
+Phase 2  ✅ Durable execution
+Phase 3  ✅ Governed capability dispatch
+Phase 4  → Process isolation + real execution boundary
+```
+
+The security model is no longer prose: `CapabilityInvocation` is not deserialisable,
+policy is the only crate that can mint one, the dispatcher is the only route to an
+adapter, and credentials resolve after every check that can refuse.
+
+The Windows cross-check is unrun because this host has no MSVC C toolchain — an open
+verification item, not an implementation gap.
 Phase 1 (workspace, crate graph, CI gates, the ADR-0029 conformance harness) and
 Phase 2 (bundled-SQLite storage, the task schema, the production engine and
 scheduler) are both implemented. **No capability is enabled and no feature works** —
