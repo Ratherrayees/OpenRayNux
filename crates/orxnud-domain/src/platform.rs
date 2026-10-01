@@ -55,6 +55,22 @@ impl SecretRef {
         &self.name
     }
 
+    /// A single stable label identifying this credential.
+    ///
+    /// Deliberately **not** `Display`: a `Display` impl is what a caller reaches for
+    /// when interpolating a reference into an error message or a log line, and the
+    /// reference is safe to log, so that is not a leak. What a `Display` impl would
+    /// do is make the *name-only* choice invisible -- `format!("{ref}")` and
+    /// "deliberately label" would look identical at the call site, and a future
+    /// change to `Debug` would then reach audit output unnoticed. A method named
+    /// `label` states what it produces.
+    ///
+    /// Contains no secret: it is a name, a service, and an account.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{}/{}/{}", self.name, self.service, self.account)
+    }
+
     /// The service the entry lives under.
     #[must_use]
     pub fn service(&self) -> &str {

@@ -634,8 +634,25 @@ fn n_workers_sharing_a_file_produce_exactly_one_winner_per_task() {
             let mut e =
                 DurableEngine::new(conn, EngineLimits::documented()).expect("worker engine");
             for _ in 0..4 {
-                if let Ok(Some(row)) = e.claim_task(&format!("w{w}"), NOW) {
-                    claimed.lock().expect("lock").push(row.id.to_string());
+                match e.claim_task(&format!("w{w}"), NOW) {
+                    Ok(Some(row)) => {
+                        claimed.lock().expect("lock").push(row.id.to_string());
+                    }
+                    Ok(None) => {}
+                    // A `SQLITE_BUSY` under six writers is a *retryable* conflict, and
+                    // the test ignored errors, so a claim that lost the race on the
+                    // busy timeout silently vanished. That made this test fail
+                    // intermittently under whole-suite load: fewer than 12 tasks were
+                    // claimed, and the assertion blamed the engine for a scheduling
+                    // artifact.
+                    //
+                    // A real worker retries a retryable conflict, so the fixture now
+                    // does too. `EngineErrorKind::is_retryable` is the existing
+                    // classification, so this does not invent a policy.
+                    Err(e) if e.kind.is_retryable() => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("worker {w} hit a non-retryable error: {e}"),
                 }
             }
         }));

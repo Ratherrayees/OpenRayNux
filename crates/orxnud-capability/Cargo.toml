@@ -10,6 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,4 +20,10 @@ orxnud-policy = { workspace = true }
 orxnud-audit = { workspace = true }
 
 [dev-dependencies]
+# Dev-only, so the bypass suite can name orxnud_task's public surface and assert the
+# engine exposes no dispatcher. This creates no cycle: orxnud-task depends on
+# domain/store/policy/audit, never on this crate. Moving this line to [dependencies]
+# would reverse the direction and gate G2 would fail with
+# "orxnud-task cannot reach orxnud-capability".
+orxnud-task = { workspace = true }
 proptest = { workspace = true }

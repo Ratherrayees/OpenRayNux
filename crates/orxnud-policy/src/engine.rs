@@ -62,6 +62,12 @@ pub struct PolicyEngine {
     capabilities: Vec<CapabilityDeclaration>,
     audit: AuditChain,
     policy_version: String,
+    /// Digests of approvals already honoured, so an approval is single-use (S6).
+    ///
+    /// A `BTreeSet` rather than a `HashSet`: the audit chain and policy output must be
+    /// reproducible across runs, and iteration order leaking into behaviour would make
+    /// a denial depend on hash seeds.
+    consumed_approvals: std::collections::BTreeSet<orxnud_domain::approval::ApprovalDigest>,
 }
 
 impl PolicyEngine {
@@ -74,6 +80,7 @@ impl PolicyEngine {
             capabilities: Vec::new(),
             audit: AuditChain::new(),
             policy_version: policy_version.into(),
+            consumed_approvals: std::collections::BTreeSet::new(),
         }
     }
 
@@ -86,6 +93,22 @@ impl PolicyEngine {
     #[must_use]
     pub fn audit(&self) -> &AuditChain {
         &self.audit
+    }
+
+    /// Marks an approval digest as spent.
+    ///
+    /// Called by [`Self::authorise`] when it permits a gated action. Exposed so a
+    /// caller that obtains an approval through some other route — a UI approval
+    /// dialog, say — can record the consumption in the same place the decision reads
+    /// it, rather than in a second ledger that could drift.
+    pub fn consume_approval(&mut self, digest: orxnud_domain::approval::ApprovalDigest) {
+        self.consumed_approvals.insert(digest);
+    }
+
+    /// Whether an approval digest has already been spent.
+    #[must_use]
+    pub fn approval_is_consumed(&self, digest: &orxnud_domain::approval::ApprovalDigest) -> bool {
+        self.consumed_approvals.contains(digest)
     }
 
     /// The policy version recorded in every audit record.
@@ -232,6 +255,13 @@ impl PolicyEngine {
                     reason: DenialReason::ApprovalDigestMismatch,
                 });
             }
+            // Single-use. See `DenialReason::ApprovalAlreadyUsed`: the digest proves
+            // this is the approved operation, and this proves it has not already run.
+            if self.consumed_approvals.contains(&record.digest) {
+                return Ok(Decision::Deny {
+                    reason: DenialReason::ApprovalAlreadyUsed,
+                });
+            }
             // An approval is honoured only for the human who gave it, so the
             // gate names that human rather than the delegating actor kind.
             let approver = match actor.authority_root() {
@@ -342,6 +372,16 @@ impl PolicyEngine {
             return Ok(decision);
         }
 
+        // --- 3b. Consume the approval, now that the decision is to proceed. ---
+        //
+        // In `authorise` rather than only in the dispatch helper, so every path that
+        // permits a gated action burns the approval -- including a future caller that
+        // does not go through `authorise_for_dispatch`. A replay or a retry is then
+        // refused at the next decision (S6: single-use).
+        if let Some(record) = approval {
+            self.consumed_approvals.insert(record.digest);
+        }
+
         // --- 4. Charge, now that the decision is to proceed. ---
         if declared_cost > 0 {
             // Safe: `permits_all` already returned false for an undeclared
@@ -367,6 +407,81 @@ impl PolicyEngine {
         // naming it.
         let _invocation = CapabilityInvocation::authorise(&seal(), request, actor, context, proof);
         Ok(decision)
+    }
+
+    /// [`Self::authorise`], but **returns** the authorised invocation instead of
+    /// discarding it.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::authorise`] builds the invocation and drops it on the floor, because
+    /// Phase 1 had no dispatcher to hand one to. The dispatcher cannot build one
+    /// itself: `CapabilityInvocation::authorise` demands *this crate's*
+    /// [`PolicySeal`], and gate G2 forbids any other crate from naming it. So the
+    /// only way an invocation can reach the dispatcher is for policy to hand it out
+    /// — which is exactly the shape the boundary is supposed to have.
+    ///
+    /// The alternative — letting the dispatcher construct invocations — would move
+    /// the authority decision's *output* to the caller while leaving the *decision*
+    /// in policy. Two places would then hold authority, and only one of them would be
+    /// audited.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::authorise`], plus:
+    ///
+    /// - [`PolicyError::Denied`] when the decision is not a permit. An invocation is
+    ///   returned **only** for `Allow` and for a satisfied `Gate`. There is no path
+    ///   from a refusal to an invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorise_for_dispatch(
+        &mut self,
+        request: ActionRequest,
+        actor: Actor,
+        context: InvocationContext,
+        target: Option<String>,
+        params: NormalizedParams,
+        approval: Option<&ApprovalRecord>,
+        now_ms: i64,
+    ) -> Result<AuthorisedInvocation, PolicyError> {
+        let decision = self.authorise(
+            request.clone(),
+            actor.clone(),
+            context.clone(),
+            target,
+            params,
+            approval,
+            now_ms,
+        )?;
+        if decision.is_denied() {
+            return Err(PolicyError::Denied {
+                reason: decision.denial().map_or_else(
+                    || "refused without a stated reason".to_owned(),
+                    ToString::to_string,
+                ),
+            });
+        }
+        // `authorise` consumed `request`, `actor` and `context` and returned only a
+        // `Decision`, so clones above were needed to run it at all. The proof is
+        // then re-derived from the decision that `authorise` already computed, rather
+        // than asking policy to decide twice -- a second evaluation could charge the
+        // budget again and append a second audit record for one caller action.
+        let proof = AuthorisationProof::issue(
+            &seal(),
+            self.policy_version.clone(),
+            match &decision {
+                Decision::Gate {
+                    required_digest, ..
+                } => Some(*required_digest),
+                _ => approval.map(|a| a.digest),
+            },
+            decision.risk(),
+        );
+        let invocation = CapabilityInvocation::authorise(&seal(), request, actor, context, proof);
+        Ok(AuthorisedInvocation {
+            invocation,
+            decision,
+        })
     }
 
     /// Writes the pre-call authorisation record, plus a terminal record when the
@@ -447,6 +562,20 @@ pub fn outcome_resolves(outcome: &AuditOutcome) -> bool {
     matches!(outcome, AuditOutcome::Finished { .. })
 }
 
+/// A policy-authorised invocation, plus the decision that produced it.
+///
+/// Returned by [`PolicyEngine::authorise_for_dispatch`]. Carrying the `Decision`
+/// alongside is not redundant: the dispatcher needs the assessed risk for the audit
+/// record, and re-deriving it would mean asking policy a second time about a
+/// decision it has already made and already charged for.
+#[derive(Debug, Clone)]
+pub struct AuthorisedInvocation {
+    /// The authority-bearing invocation. Only this crate can build one.
+    pub invocation: CapabilityInvocation,
+    /// The decision that permitted it.
+    pub decision: Decision,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +607,20 @@ mod tests {
             b,
         )
     }
+    /// A valid, unconsumed approval record.
+    fn approval_record(actor: &Actor, target: &str, issued: i64, expires: i64) -> ApprovalRecord {
+        ApprovalRecord {
+            actor_label: actor.label().to_owned(),
+            capability: cap().to_string(),
+            target: target.to_owned(),
+            params: params(),
+            issued_at_ms: issued,
+            expires_at_ms: expires,
+            risk: RiskClass::High,
+            digest: digest_for(actor, &cap(), Some(target), &params(), issued, expires),
+        }
+    }
+
     fn grant(max: DataClass, expires: i64) -> crate::policy_set::Grant {
         crate::policy_set::Grant {
             id: orxnud_domain::ids::GrantId::new("g-1"),
@@ -503,6 +646,99 @@ mod tests {
     }
     fn low_policy() -> PolicySet {
         PolicySet::deny_all("v1").with_grant(grant(DataClass::Personal, i64::MAX))
+    }
+
+    /// ADR-0027 and control S6: approvals are **single-use**.
+    ///
+    /// This test was written because the bypass suite failed without it, not because
+    /// the digest check looked insufficient. It turned out to be exactly that: the
+    /// digest proved *which* operation was approved, and nothing proved it had not
+    /// already run. A record is a value, and a value can be presented twice.
+    #[test]
+    fn an_approval_is_single_use() {
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let mut e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(1_000));
+        let approval = approval_record(&human(), "alice", 900, 1_000_000);
+
+        // Through `authorise`, not `evaluate` + a manual `consume_approval`: the
+        // property under test is that *authorising* burns the approval, and a test
+        // that calls the setter itself only proves the setter works. That test
+        // variant passed with the consumption line deleted -- which is how this was
+        // caught.
+        e.authorise(
+            request(DataClass::Public, DataClass::Public),
+            human(),
+            InvocationContext::new("k", 1_000, "c"),
+            Some("alice".into()),
+            params(),
+            Some(&approval),
+            1_000,
+        )
+        .expect("the first authorisation must succeed");
+        assert!(
+            e.approval_is_consumed(&approval.digest),
+            "authorise must consume it"
+        );
+
+        let second = e
+            .evaluate(
+                &request(DataClass::Public, DataClass::Public),
+                &human(),
+                Some("alice"),
+                &params(),
+                Some(&approval),
+                1_000,
+            )
+            .expect("evaluate");
+        assert_eq!(
+            second.denial().map(|r| r.code()),
+            Some("approval_already_used"),
+            "a replayed approval must be refused"
+        );
+    }
+
+    /// The refusal must not depend on *which* invocation presents it, or a retry
+    /// under a fresh context would slip through.
+    #[test]
+    fn a_consumed_approval_is_refused_for_any_retry() {
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let mut e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(1_000));
+        let approval = approval_record(&human(), "alice", 900, 1_000_000);
+        e.authorise(
+            request(DataClass::Public, DataClass::Public),
+            human(),
+            InvocationContext::new("k-1", 1_000, "c-1"),
+            Some("alice".into()),
+            params(),
+            Some(&approval),
+            1_000,
+        )
+        .expect("first authorisation");
+
+        // A different step, a different deadline, a different cancellation handle --
+        // none of which change the digest, because the digest is over
+        // (actor, capability, target, params, issued, expires).
+        for step in 0..3u32 {
+            let mut req = request(DataClass::Public, DataClass::Public);
+            req.step = step;
+            let d = e
+                .evaluate(
+                    &req,
+                    &human(),
+                    Some("alice"),
+                    &params(),
+                    Some(&approval),
+                    1_000,
+                )
+                .expect("evaluate");
+            assert_eq!(
+                d.denial().map(|r| r.code()),
+                Some("approval_already_used"),
+                "step {step} must not reuse a consumed approval"
+            );
+        }
     }
 
     #[test]

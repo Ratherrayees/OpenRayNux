@@ -88,6 +88,23 @@ pub enum DenialReason {
     /// not the one that was approved.
     ApprovalDigestMismatch,
 
+    /// **The approval was already used.**
+    ///
+    /// ADR-0027 and control S6 require approvals to be *single-use*. The digest check
+    /// alone does not enforce that: a record is a value, and nothing stopped the same
+    /// value being presented twice.
+    ///
+    /// This was found by a bypass test rather than by reading the code, which is the
+    /// argument for writing bypass tests even where the code looks right: the check
+    /// that existed answered "is this the right operation?", and the property that
+    /// was claimed was "is this the right operation, *once*?". The second question had
+    /// no answer.
+    ///
+    /// Without this, a retry could inherit an approval -- which ADR-0027 forbids
+    /// outright, because a retry is exactly the situation where the user consented to
+    /// something once and it silently became many.
+    ApprovalAlreadyUsed,
+
     /// A spend ceiling would be exceeded.
     BudgetExceeded {
         /// Which ceiling.
@@ -123,6 +140,7 @@ impl DenialReason {
             Self::ActorMayNotGrant { .. } => "actor_may_not_grant",
             Self::UnknownCapability { .. } => "unknown_capability",
             Self::InvalidParams { .. } => "invalid_params",
+            Self::ApprovalAlreadyUsed => "approval_already_used",
             Self::DataClassExceeded { .. } => "data_class_exceeded",
             Self::EgressNotConsented { .. } => "egress_not_consented",
             Self::NoGrant { .. } => "no_grant",
@@ -195,6 +213,18 @@ impl Decision {
         matches!(self, Self::Deny { .. })
     }
 
+    /// The risk a permit carries. `RiskClass::UNKNOWN` for a denial, which is the
+    /// fail-closed value: an action that was refused has no assessed risk, and
+    /// treating the refusal as low-risk would let it be logged as an ordinary
+    /// decision.
+    #[must_use]
+    pub fn risk(&self) -> RiskClass {
+        match self {
+            Self::Allow { risk } | Self::Gate { risk, .. } => *risk,
+            Self::Deny { .. } => RiskClass::UNKNOWN,
+        }
+    }
+
     /// The denial reason, if denied.
     #[must_use]
     pub fn denial(&self) -> Option<&DenialReason> {
@@ -223,6 +253,33 @@ pub enum PolicyError {
     /// A capability's declared schema could not be evaluated.
     #[error("capability schema invalid: {0}")]
     InvalidSchema(String),
+
+    /// Policy reached a decision of *deny*. Surfaced as an error by
+    /// [`crate::PolicyEngine::authorise_for_dispatch`] so that a refusal cannot be
+    /// ignored by a caller who ignores return values.
+    ///
+    /// A distinct variant rather than reusing `Unavailable` or `InvalidSchema`,
+    /// because "we decided no" and "we could not decide" must never be logged the
+    /// same way. Both deny; only one of them is a bug or an outage.
+    #[error("policy denied the invocation: {reason}")]
+    Denied {
+        /// Why, as the enum's serde representation: structured, so a refusal is
+        /// auditable rather than a flat string.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for DenialReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Rendered from the serde form, so the human-readable text and the
+        // machine-readable record cannot drift apart.
+        match serde_json::to_value(self) {
+            Ok(v) => write!(f, "{v}"),
+            // Serialising our own enum cannot fail; if it somehow did, say so
+            // rather than panicking in a denial path.
+            Err(e) => write!(f, "unrenderable denial ({e})"),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,10 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod credential;
+pub mod dispatch;
+pub mod verification;
+
 use std::collections::BTreeMap;
 
 use orxnud_domain::Actor;

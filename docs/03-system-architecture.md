@@ -441,6 +441,33 @@ property of the storage engine.
 **Why policy is inside the dispatcher, not above it.** A layer can be skipped by
 a direct call. A type that only the policy layer can construct cannot.
 
+**Phase 3: how the stages are enforced.** `orxnud-capability/src/dispatch.rs`
+implements the `07-…` §4 order, and the ordering is structural rather than
+conventional:
+
+| Stage | Enforced by | Test |
+|---|---|---|
+| 1 AUTHORITY | `PolicyEngine::evaluate` step 0 — no authority root, no grant | `an_external_actor_is_refused_before_the_adapter_is_resolved` |
+| 2 POLICY | `evaluate`, deny-by-default | `an_unknown_capability_is_refused` |
+| 3 APPROVAL | digest recomputed from the action about to run; **single-use** since V-39 | `an_approval_for_a_different_target_is_refused`, `a_consumed_approval_cannot_authorise_a_second_dispatch` |
+| 4 BUDGET | charged in `authorise` before the permit is recorded | `an_invocation_over_budget_is_refused_before_execution` |
+| 5 CAPABILITY RESOLUTION | dispatcher registry + class check against the implementation | `a_capability_with_no_implementation_is_refused_at_stage_five` |
+| 6 CREDENTIAL RESOLUTION | `CredentialBroker`, after 1–5 | `an_unauthorised_invocation_never_opens_the_secret_store` |
+| 7 EXECUTION | `catch_unwind`, so a faulty adapter cannot kill the daemon | `a_panicking_adapter_does_not_take_down_the_dispatcher` |
+| 8 VERIFICATION | `Verifier` trait, evaluated even when the adapter reports success | `a_misreporting_adapter_is_not_treated_as_success` |
+| 9 AUDIT | `audit_pair` before the call; terminal record belongs to the caller | `the_audit_chain_records_the_authorisation` |
+
+Two properties are worth stating because they are *not* obvious from the stage list:
+
+- **Stages 1–4 run inside `orxnud-policy`, not in the dispatcher.** The dispatcher
+  orchestrates and enforces ordering; policy decides. A dispatcher that reimplemented
+  any of them would be a second authorization system, and the two would eventually
+  disagree.
+- **`authorise_for_dispatch` is the only way an invocation reaches the dispatcher.**
+  `CapabilityInvocation` cannot be deserialised (ADR-0034) and its constructor demands
+  policy's private seal (G2), so policy must hand the invocation out — and that method
+  returns one *only* for a permit. There is no path from a refusal to an invocation.
+
 **Why approval is bound to a digest, not to a session.** This is the mitigation
 for *Loopjacking* — a human approves operation A while the implementation
 executes operation B. The approval record carries

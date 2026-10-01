@@ -296,7 +296,11 @@ capability, not by reading the server's annotations.
 Every capability must pass the same suite. This is what makes "any
 implementation is substitutable" true rather than aspirational.
 
-**Contract tests (all implementations, mandatory):**
+**Contract tests (all implementations, mandatory).**
+*Phase 3 note: implemented as `crates/orxnud-capability/tests/contract.rs`. Points 4
+and 6 are **declaration-only** — sandbox isolation and process residue cannot be
+observed by an in-process fixture, and the harness records them as unproven rather
+than claiming coverage. See V-40.*
 
 1. Invalid params are rejected, not coerced.
 2. Cancellation is honoured within the declared bound.

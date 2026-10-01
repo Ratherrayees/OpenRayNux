@@ -1077,11 +1077,13 @@ dependencies = [
  "orxnud-audit",
  "orxnud-domain",
  "orxnud-policy",
+ "orxnud-task",
  "proptest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

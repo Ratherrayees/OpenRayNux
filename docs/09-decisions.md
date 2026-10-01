@@ -829,6 +829,19 @@ validation at the boundary, losing compile-time type safety.
 (`07-…` §8) — this is what makes substitutability real rather than aspirational.
 Manifests are data, signed, and treated as untrusted claims.
 
+> **Phase 3 record.** The harness exists as `crates/orxnud-capability/tests/contract.rs`,
+> and it is deliberately honest about what it cannot yet prove: **points 4 and 6 are
+> declaration-only.** "No undeclared filesystem or network access" and "a disabled
+> capability leaves no residue" are properties of a real sandbox and a real process
+> respectively. An in-process fixture can observe neither, so the harness records them
+> as `declared_only` with the reason, and a test asserts that exactly points 4 and 6
+> appear there. If a future change promotes them to `proven`, that test fails and
+> someone has to justify it.
+>
+> A contract suite that *claimed* to verify subprocess isolation while running only
+> in-process fixtures would be worse than none, because it would let a reviewer
+> believe the boundary was tested.
+
 **Rejected alternatives.** **Dynamic libraries** — see above. **WASM** — see
 above. **A single "plugin" mechanism** — one size fits none; the tiers exist
 because the requirements genuinely differ.
@@ -1946,6 +1959,24 @@ granted to one actor cannot be used by another. DM interfaces become first-class
 citizens rather than a special case, because a message *is* an `External` actor
 request. Retries and resumption must re-derive the actor and re-check delegation
 expiry — never inherit a stale actor.
+
+> **Phase 3 amendment — single-use was claimed and not enforced.**
+>
+> This section said approvals are *"single-use"*, and until Phase 3 **nothing
+> implemented it**. The digest check answered *"is this the approved operation?"* and
+> nothing answered *"has this approval already been used?"* A record is a value, and
+> a value can be presented twice.
+>
+> Found by a bypass test rather than by reading the code, which is the argument for
+> writing those tests even where the code looks right. `PolicyEngine` now holds a
+> `consumed_approvals` set, and `authorise` burns the digest as part of permitting a
+> gated action (`DenialReason::ApprovalAlreadyUsed`). It lives in `authorise` rather
+> than in the dispatcher so that every path that permits a gated action burns it.
+>
+> The first version of the unit test called `consume_approval` directly — and therefore
+> **passed with the consumption line deleted**, proving only that the setter worked.
+> It now drives `authorise`. Verified with teeth: deleting the one-line insert turns
+> three tests red across two files.
 
 **Rejected alternatives.** **Implicit actor** — the confused-deputy failure by
 omission. **A `user_id` column** — answers "which user", not "who requested,

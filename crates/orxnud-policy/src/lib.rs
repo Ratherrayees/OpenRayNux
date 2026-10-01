@@ -58,7 +58,7 @@ pub mod policy_set;
 pub use budget::{BudgetError, BudgetLedger, Ceiling};
 pub use decision::{Decision, DenialReason, PolicyError};
 pub use digest::{DigestError, digest_for};
-pub use engine::PolicyEngine;
+pub use engine::{AuthorisedInvocation, CapabilityDeclaration, PolicyEngine};
 pub use policy_set::{Grant, PolicySet};
 
 /// This crate's authorisation seal.
