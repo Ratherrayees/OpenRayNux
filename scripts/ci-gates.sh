@@ -98,6 +98,23 @@ manifest_deps() {
   ' "$1"
 }
 
+# Prints a Rust source file with its `#[cfg(test)]` modules removed.
+#
+# Needed because a *test* may legitimately reach for a policy-only symbol (to build
+# a fixture), while a *production* path may not. G2's seal check reads the output
+# of this, so the gate distinguishes "reachable at runtime" from "reachable from a
+# test".
+#
+# The module's closing brace is the first line starting with `}` at column 0; inner
+# braces are indented, which is the rustfmt convention every file here follows.
+strip_cfg_test() {
+  awk '
+    /#\[cfg\(test\)\]/                        { in_test = 1 }
+    in_test          { if ($0 ~ /^\}/) in_test = 0; next }
+    { print }
+  ' "$1"
+}
+
 gate_G1() {
   banner G1
   if cargo fmt --all -- --check; then
@@ -183,6 +200,45 @@ gate_G2() {
       done
     done
   done
+  # --- (d) the policy seal is reachable only from orxnud-policy ---
+  #
+  # ADR-0013 makes `AuthorisationProof` unconstructible except through
+  # `PolicySeal::attest`, which only `orxnud-policy` can name. That is the whole
+  # capability boundary: a capability crate cannot *become* authorised, it can only
+  # ask. A type-level property is only as good as the check that enforces it, and
+  # nothing was checking that -- a manifest gate cannot see symbols.
+  #
+  # So this greps the sealed symbols out of every production source file, after
+  # removing `#[cfg(test)]` modules. Two crates are exempt by design:
+  #   * orxnud-domain, which *defines* them (and orxnud-capability, which depends
+  #     on it, is the trap: naming a seal in production code is the violation);
+  #   * orxnud-policy, which is the only authoriser by definition.
+  # `tests/` is not scanned at all: `compile_fail/` must name them to prove the
+  # seal holds.
+  local sealed='AuthorisationProof|PolicySeal|\.authorise\('
+  local offenders f
+  offenders=""
+  for f in $(find crates -type f -name '*.rs' -path '*/src/*' | sort); do
+    local crate
+    crate="$(printf '%s' "$f" | cut -d/ -f2)"
+    case "$crate" in
+      orxnud-domain|orxnud-policy) continue ;;
+    esac
+    local hits
+    hits="$(strip_cfg_test "$f" | grep -nE "$sealed" || true)"
+    if [ -n "$hits" ]; then
+      offenders="$offenders$f: $hits\n"
+      printf '     %s\n' "$(printf '%s' "$hits" | head -3 | sed 's/^/  /')"
+      printf '     ^ in %s\n' "$f"
+    fi
+  done
+  if [ -n "$offenders" ]; then
+    fail_gate "a policy-seal symbol is reachable outside orxnud-policy in production code"
+    ok_all=0
+  else
+    ok "the policy seal is reachable only from orxnud-policy (production code)"
+  fi
+
   [ "$ok_all" -eq 1 ] && ok "all internal dependency edges point inward"
 }
 

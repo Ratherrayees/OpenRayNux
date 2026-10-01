@@ -42,7 +42,11 @@ publish = false
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# `bundled` pins and compiles SQLite from the amalgamation (ADR-0006 rev 2: never
+# link the host's library). `backup` adds the online-backup API, which ADR-0017
+# requires for the pre-migration snapshot -- a naive file copy of a WAL database
+# is not a backup.
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 # A build-dependency only: it makes `DEP_SQLITE3_INCLUDE` available to
 # `orxnud-store`'s build script, which parses the bundled `sqlite3.h` to
 # assert the linked version at compile time. Never linked into the library.

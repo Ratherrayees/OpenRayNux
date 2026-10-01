@@ -129,17 +129,17 @@ pub enum StoreError {
     #[error(transparent)]
     Pragma(#[from] PragmaError),
 
-    /// A migration failed.
+    /// A migration failed. Boxed for the same reason as `TaskRepoError::Sqlite`.
     #[error(transparent)]
-    Migration(#[from] crate::migration::MigrationError),
+    Migration(Box<crate::migration::MigrationError>),
 
     /// An underlying SQLite error.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    /// A repository-level failure.
+    /// A repository-level failure. Boxed for the same reason as `Migration`.
     #[error(transparent)]
-    Repository(#[from] crate::repository::RepositoryError),
+    Repository(Box<crate::repository::RepositoryError>),
 
     /// Filesystem failure.
     #[error("i/o error at {path}: {source}")]
@@ -233,6 +233,18 @@ const _: () = const_assert_min_sqlite();
 pub struct Store {
     conn: Connection,
     version: SqliteVersion,
+}
+
+impl From<crate::migration::MigrationError> for StoreError {
+    fn from(e: crate::migration::MigrationError) -> Self {
+        Self::Migration(Box::new(e))
+    }
+}
+
+impl From<crate::repository::RepositoryError> for StoreError {
+    fn from(e: crate::repository::RepositoryError) -> Self {
+        Self::Repository(Box::new(e))
+    }
 }
 
 impl Store {

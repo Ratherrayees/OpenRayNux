@@ -553,6 +553,37 @@ which contradicts the product's core constraint. **An embedded KV store** — a 
 store cannot express the relational task/schedule/audit model or FTS. **A
 document store** — no referential integrity for the task graph, and no FTS5.
 
+### Phase 2 verification record (added 2026-09-30)
+
+The policy above is now **enforced and measured**, not just written down.
+
+| Requirement | How it is enforced | Evidence |
+|---|---|---|
+| Bundled, never the system library | `rusqlite` with `bundled`; `DEP_SQLITE3_INCLUDE` is what the `backup`/version machinery reads | `Cargo.toml`, `crates/orxnud-store/build.rs` |
+| Assert `>= 3.51.3` at **compile time** | `build.rs` parses `SQLITE_VERSION_NUMBER` out of the header `libsqlite3-sys` actually compiles and emits it as a `rustc-env`; `const_assert_min_sqlite` asserts on *that*, not on a constant we wrote | `crates/orxnud-store/build.rs`, `sqlite.rs` |
+| `journal_mode = WAL` + `synchronous = FULL` | Applied **and read back** on *every* connection, in `Store::open` | `pragma.rs::verify` |
+| Never `synchronous = OFF` | `Pragma::verify` refuses it; a test reproduces ADR-0032's exact failure and proves verification catches it | `crates/orxnud-task/tests/durability.rs::a_weakened_durability_setting_is_caught_by_verification` |
+| Not linked to a system SQLite ≥ 3.51.3 | The minimum is enforced at build time, so a `pkg-config` build against 3.51.2 fails the build rather than warning | V-02, and the failure message in `build.rs` |
+| Is `FULL` affordable? | **Measured**: ~2.3 ms/commit vs ~0.2 ms for `NORMAL` (7.3×–14.3× over four runs) | V-30, V-35 |
+
+Two findings from this verification that the ADR did not anticipate:
+
+1. **`SQLITE_DEFAULT_SYNCHRONOUS` is already FULL** in the bundled build, and
+   `rusqlite` enables foreign keys on open. So "we forgot to set it" is not the
+   failure mode — **someone weakening it** is, which is precisely what ADR-0032
+   found in `apalis-sqlite`. Verification is therefore load-bearing rather than
+   decorative, and `WAL` is the only default that genuinely has to be set (and once
+   set it is persistent).
+2. **Durability cannot be measured on tmpfs.** `fsync` is a no-op there, so the
+   first run of the measurement harness reported `synchronous = FULL` and `= NORMAL`
+   as *identical*. The harness now refuses to run on a memory-backed filesystem.
+   See V-31.
+3. **The headroom is real but not generous.** A fenced commit measures 2.2–3.4 ms
+   against a < 5 ms budget, so 30–55% remains — and the ratio against `NORMAL`
+   swings between 7.3× and 14.3× between runs, because the `NORMAL` baseline is a
+   fraction of a millisecond and dominated by disk scheduling. The durable figure is
+   the magnitude; the ratio is a range. See V-35.
+
 **Revisit conditions.** **Revisit bundling** only if a security advisory in the
 SQLite amalgamation proves impractical to patch quickly, or if a target platform's
 toolchain cannot build it (in which case: pin and verify the system version
@@ -660,6 +691,33 @@ cloud".
 
 **Rejected alternatives.** See table. `apalis` is rejected *for now* on RC
 status and one unverified setting, not on quality.
+
+### Phase 2 record (added 2026-09-30)
+
+The engine exists and passes the ADR-0029 conformance suite **unchanged**
+(V-32). Four things about it that the design above did not say, and that a future
+swapping engine would need to know:
+
+1. **A `Failed` task must be requeued, not left terminal.** `TaskState::Failed`
+   is terminal in the state machine *and* documented as "within the retry budget".
+   Taken literally, "terminal" wins and no retry ever happens — which satisfies
+   TP-11 vacuously. The engine therefore requeues a `Failed` task whose budget
+   remains, and dead-letters only at the budget. See amendment A-004.
+2. **The retry delay is a parameter of the committing call**, not a repository
+   constant, because TP-11 drives the state machine without moving a clock. A
+   fixed backoff would make its retry unclaimable.
+3. **The fence must evaluate identity *and* liveness before legality.** A worker
+   whose task was cancelled must be told "you do not hold this", not "illegal
+   transition" — it did nothing wrong, and the second message sends the reader
+   looking for a bug in the caller.
+4. **The catch-up window convention belongs to the harness**, not the engine. See
+   amendment A-002.
+
+**Line count.** Queue logic is ~1 000 lines including the SQL, the repositories,
+the scheduler, and their tests — over the ~600-line threshold at which this ADR
+says to reconsider `apalis`. That reconsideration was already **closed** by
+ADR-0032 on the merits (`synchronous = OFF`), not on size, so the threshold being
+crossed does not reopen it. Recorded rather than quietly ignored.
 
 **Revisit conditions.** Revisit if the hand-rolled engine exceeds ~600 lines of
 queue logic, or if multi-instance execution is ever required (→ Restate).
@@ -2035,6 +2093,26 @@ at commit, not just at claim, and most naive implementations check only at claim
 It also constrains implementation freedom. Accepted: this is the code we own and
 the code we will get wrong, and the properties are what make "we will get it
 right" a testable claim rather than a hope.
+
+### Phase 2 record (added 2026-09-30)
+
+The suite is no longer hypothetical. A production SQLite engine
+(`orxnud_task::DurableEngine`) passes all twelve properties **with the harness
+unmodified** (V-32), from a second test binary, against real files with WAL and
+`synchronous = FULL`.
+
+Two things the properties turned out to require that the ADR did not state:
+
+* **A `Failed` task must be requeued**, or TP-11 is satisfied by an engine that
+  never retries. Amendment A-004.
+* **`recover` means *restart*, not *expiry*.** TP-4 is only meaningful if recovery
+  reclaims a lease that had not expired, because a restart orphans every lease the
+  previous process held. An engine that reclaims only expired leases strands work
+  forever.
+
+The properties were **not** weakened to accommodate the implementation. Where the
+implementation and the harness disagreed, the harness won and the implementation
+changed (amendment A-002 is the worked example).
 
 **Consequences.** The conformance suite is part of the engine's definition of
 done. A future engine must pass all twelve. `apalis` adoption (gated by

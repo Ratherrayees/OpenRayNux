@@ -1115,6 +1115,7 @@ dependencies = [
  "proptest",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

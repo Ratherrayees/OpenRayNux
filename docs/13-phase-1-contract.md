@@ -1,8 +1,11 @@
 # 13 — Phase 1 Implementation Contract
 
-Status: **Draft v0.1** · This is the *contract* for the next phase. **No code has
-been written.** It is the agreement that the next phase is measured against, and
-the boundary that keeps the next phase from becoming architecture-by-drift.
+Status: **Delivered** · Executed as Phase 1 (commit `2f331ed`), with Phase 2 built
+on top of it. This document remains the record of what Phase 1 promised: the
+workspace, the crate graph, the twelve gates, and the ADR-0029 conformance
+machinery. Where the implementation corrected the contract, the correction is
+recorded in `12-verification-register.md` (amendments A-001 … A-004) rather than
+quietly folded in here.
 
 ---
 

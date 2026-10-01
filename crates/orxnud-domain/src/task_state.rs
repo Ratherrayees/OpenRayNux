@@ -40,6 +40,30 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// The persisted spelling. Matches serde's `kebab-case`.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Query => "query",
+            Self::ScheduledFire => "scheduled-fire",
+            Self::Housekeeping => "housekeeping",
+        }
+    }
+
+    /// Parses the persisted spelling, refusing anything unrecognised.
+    #[must_use]
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        [
+            Self::Workflow,
+            Self::Query,
+            Self::ScheduledFire,
+            Self::Housekeeping,
+        ]
+        .into_iter()
+        .find(|k| k.as_wire_str() == s)
+    }
+
     /// Whether repeating this task is safe without human adjudication.
     ///
     /// `false` for `Workflow`, because a workflow may contain an irreversible
@@ -90,6 +114,55 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// Every state, in declaration order.
+    ///
+    /// The single source of truth for anything that must enumerate the vocabulary:
+    /// the `tasks.state` CHECK constraint, the TP-7 power-loss verifier, and
+    /// round-trip tests. Three hand-written lists of ten strings would drift, and
+    /// the drift would be invisible -- a row the state machine considers
+    /// impossible would pass a database constraint.
+    pub const ALL: [Self; 10] = [
+        Self::Pending,
+        Self::Running,
+        Self::WaitingForUser,
+        Self::WaitingForExternal,
+        Self::Paused,
+        Self::Cancelled,
+        Self::Completed,
+        Self::Failed,
+        Self::DeadLettered,
+        Self::NeedsVerification,
+    ];
+
+    /// The persisted spelling. Matches serde's `kebab-case` and the SQL CHECK.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::WaitingForUser => "waiting-for-user",
+            Self::WaitingForExternal => "waiting-for-external",
+            Self::Paused => "paused",
+            Self::Cancelled => "cancelled",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::DeadLettered => "dead-lettered",
+            Self::NeedsVerification => "needs-verification",
+        }
+    }
+
+    /// Parses the persisted spelling.
+    ///
+    /// Returns `None` for anything unrecognised. A database row is untrusted
+    /// input (docs-04: "serialised task input treated as untrusted data"), so an
+    /// unknown state is a **refusal**, never a fallback to `Pending`. Defaulting
+    /// an unrecognised row to claimable would be a way to resurrect a task that
+    /// had been deliberately made terminal.
+    #[must_use]
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|st| st.as_wire_str() == s)
+    }
+
     /// Whether no further transition is possible without human intervention.
     #[must_use]
     pub fn is_terminal(self) -> bool {
@@ -190,6 +263,41 @@ pub enum MisfirePolicy {
     Pause,
 }
 
+impl MisfirePolicy {
+    /// The persisted spelling of the policy, without its threshold.
+    ///
+    /// `SkipIfOlderMinutes` persists as the policy `"skip-if-older"` plus a
+    /// separate `misfire_minutes` column, so the SQL CHECK can require the
+    /// threshold exactly when the policy needs one.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::FireAll => "fire-all",
+            Self::FireOnce => "fire-once",
+            Self::FireNextOnly => "fire-next-only",
+            Self::SkipIfOlderMinutes(_) => "skip-if-older",
+            Self::Pause => "pause",
+        }
+    }
+
+    /// Parses the policy spelling with its threshold.
+    ///
+    /// A threshold supplied for a policy that ignores it is a **refusal** rather
+    /// than a discarded value: the alternative is a schedule that says one thing
+    /// in one column and another in the next.
+    #[must_use]
+    pub fn from_wire_str(policy: &str, minutes: Option<u32>) -> Option<Self> {
+        match policy {
+            "fire-all" if minutes.is_none() => Some(Self::FireAll),
+            "fire-once" if minutes.is_none() => Some(Self::FireOnce),
+            "fire-next-only" if minutes.is_none() => Some(Self::FireNextOnly),
+            "pause" if minutes.is_none() => Some(Self::Pause),
+            "skip-if-older" => minutes.map(Self::SkipIfOlderMinutes),
+            _ => None,
+        }
+    }
+}
+
 /// A recurring schedule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleSpec {
@@ -284,6 +392,84 @@ pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_state_vocabulary_round_trips_through_its_persisted_spelling() {
+        // Every state must survive a trip through the database. A state with no
+        // wire spelling could not be stored at all, and one whose spelling
+        // collides with another's would make two states indistinguishable on disk.
+        let mut seen = std::collections::BTreeSet::new();
+        for state in TaskState::ALL {
+            let wire = state.as_wire_str();
+            assert!(seen.insert(wire), "duplicate wire spelling: {wire}");
+            assert_eq!(
+                TaskState::from_wire_str(wire),
+                Some(state),
+                "{state:?} does not round-trip"
+            );
+        }
+        assert_eq!(seen.len(), TaskState::ALL.len());
+    }
+
+    #[test]
+    fn an_unrecognised_persisted_state_is_refused_rather_than_defaulted() {
+        // The dangerous default would be `Pending`: it is the only claimable
+        // state, so defaulting an unknown row to it would resurrect a task that
+        // had deliberately been made terminal.
+        for bogus in ["", "thinking", "PENDING", "done", "needs verification", "0"] {
+            assert_eq!(
+                TaskState::from_wire_str(bogus),
+                None,
+                "{bogus:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn every_wire_spelling_is_kebab_case() {
+        // It has to match serde's rename, or a row written by one path and read by
+        // the other would disagree.
+        for state in TaskState::ALL {
+            let w = state.as_wire_str();
+            assert!(!w.contains('_'), "{w} is snake_case, not kebab-case");
+            assert!(!w.contains(' '), "{w} contains a space");
+        }
+        for kind in [
+            TaskKind::Workflow,
+            TaskKind::Query,
+            TaskKind::ScheduledFire,
+            TaskKind::Housekeeping,
+        ] {
+            assert!(!kind.as_wire_str().contains('_'));
+            assert_eq!(TaskKind::from_wire_str(kind.as_wire_str()), Some(kind));
+        }
+        assert_eq!(TaskKind::from_wire_str("nope"), None);
+    }
+
+    #[test]
+    fn the_misfire_threshold_is_accepted_only_by_the_policy_that_uses_it() {
+        for p in [
+            MisfirePolicy::FireAll,
+            MisfirePolicy::FireOnce,
+            MisfirePolicy::FireNextOnly,
+            MisfirePolicy::Pause,
+        ] {
+            assert_eq!(MisfirePolicy::from_wire_str(p.as_wire_str(), None), Some(p));
+            assert_eq!(
+                MisfirePolicy::from_wire_str(p.as_wire_str(), Some(60)),
+                None,
+                "{} must refuse a threshold it ignores",
+                p.as_wire_str()
+            );
+        }
+        let s = MisfirePolicy::SkipIfOlderMinutes(60);
+        assert_eq!(
+            MisfirePolicy::from_wire_str("skip-if-older", Some(60)),
+            Some(s)
+        );
+        assert_eq!(MisfirePolicy::from_wire_str("skip-if-older", None), None);
+        assert_eq!(MisfirePolicy::from_wire_str("nonsense", None), None);
+    }
+
     use super::*;
     use proptest::prelude::*;
 

@@ -1,7 +1,11 @@
 # OpenRayNux — Documentation Index
 
-Status: **Phase 0 — architecture complete, repository initialised.**
-No application code exists. Last research/verification date: **2026-09-30**.
+Status: **Phase 2 — persistence and the durable task engine complete.**
+Phase 1 (workspace, crate graph, CI gates, the ADR-0029 conformance harness) and
+Phase 2 (bundled-SQLite storage, the task schema, the production engine and
+scheduler) are both implemented. **No capability is enabled and no feature works** —
+that remains the invariant of Phases 0–2. Last research/verification date:
+**2026-09-30**.
 
 OpenRayNux is a local-first personal AI operating layer: one long-lived Rust
 process owning the user's time, data and integrations, with several surfaces
@@ -30,9 +34,10 @@ process owning the user's time, data and integrations, with several surfaces
 | **06** | [Deployment & Platform Model](06-deployment-platform-model.md) | Four deployment profiles, the platform support matrix, and what actually differs per OS. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | Three isolation tiers, the manifest, the dispatcher, and MCP's place. |
 | **08** | [Testing & Engineering Standards](08-testing-engineering-standards.md) | The testing pyramid, the deterministic-vs-AI split, and project standards. |
-| **10** | [Open Questions](10-open-questions.md) | 21 unresolved items with interim positions. **Three block Phase 0/1.** |
+| **10** | [Open Questions](10-open-questions.md) | Open items with interim positions. **Q-OPEN-17 resolved** by Phase 2 measurement: `synchronous=FULL` is affordable. |
 | **12** | [Verification Register](12-verification-register.md) | **Every claim that can become false over time, with its verification source, review trigger, and consequence of drift.** |
-| **13** | [Phase 1 Contract](13-phase-1-contract.md) | The exact agreement the next phase is measured against: workspace, crate graph, 12 CI gates, exit criteria, and what is explicitly excluded. |
+| **13** | [Phase 1 Contract](13-phase-1-contract.md) | The agreement Phase 1 was measured against: workspace, crate graph, 12 CI gates, exit criteria, and what is explicitly excluded. |
+| **14** | [Phase 2 Contract & Delivery Record](14-phase-2-contract.md) | Persistence, the durable engine and scheduler, the 12 properties passing against an unmodified harness, real crash injection, measured `synchronous=FULL` cost, and what Phase 2 found. |
 | **sources.md** | [Sources](sources.md) | Every version claim, with URLs and access dates, plus the method's limits. |
 
 ---
@@ -85,28 +90,39 @@ process owning the user's time, data and integrations, with several surfaces
 | ✅ [Q-OPEN-04](10-open-questions.md) | Two empty workspace directories | **RESOLVED** — this repository is canonical |
 | 🔴 [Q-OPEN-01](10-open-questions.md) | **Telegram ToS §1.5** — legal review | **Open, and deliberately not blocking.** The adapter boundary must be built capable of the notification-only implementation. |
 | 🟡 [Q-OPEN-21](10-open-questions.md) | Do TS6 and `--tsgo` diagnostics agree? | Open; a Phase 6 deliverable |
-| 🟢 [Q-OPEN-17](10-open-questions.md) | Is `synchronous = FULL` affordable? | Open; a Phase 2 measurement |
+| ✅ [Q-OPEN-17](10-open-questions.md) | Is `synchronous = FULL` affordable? | **RESOLVED** — measured at ~2.3 ms/commit (7–14× `NORMAL`); default stays `FULL`. [V-30](12-verification-register.md) |
 
 ---
 
 ## Next
 
-**[Phase 1 — Foundation Contract](13-phase-1-contract.md)** is written and awaiting
-execution. Its single objective:
+**Phase 3** is not yet contracted. What exists today:
 
-> Establish the workspace, the crate graph, the enforced boundaries, and the
-> conformance machinery — with **zero features** working.
+- `crates/orxnud-store` — bundled SQLite, the Phase 2 task schema, the
+  repositories, and the snapshot-protected migration runner (ADR-0006, ADR-0017).
+- `crates/orxnud-task` — `DurableEngine` and `Scheduler`, passing all twelve
+  ADR-0029 properties against the Phase 1 harness unchanged (ADR-0029, V-32).
+- `crates/orxnud-daemon` — `TaskService`, the production startup: snapshot-protected
+  migration, reclaim of the previous run's leases, and a refusal to start if either
+  fails. See [`14-phase-2-contract.md`](14-phase-2-contract.md) §8b for the fresh-install
+  bug that only this wiring could find.
+- `scripts/ci-gates.sh` — the twelve gates, runnable locally and in CI.
 
-Nothing is scaffolded yet. The first crates to be created are `orxnud-domain`,
-`orxnud-protocol`, and the three `orxnud-platform-*` adapters; the highest-value
-deliverable is the **ADR-0029 conformance harness**, written *before* the queue it
-will test.
+Still absent by design: any capability (Phase 4+), any interface (Phase 6), and any
+domain model. `docs/13-phase-1-contract.md` remains the record of what Phase 1
+promised and delivered.
 
 ---
 
 ## What does not exist yet
 
-No application code. No crates. No `Cargo.toml`, `package.json`, or
-`tauri.conf.json`. No database, no schema, no migrations. No services. No
-dependencies installed. No CI. This repository currently contains **only this
-documentation**.
+No capability is registered, and none is reachable: `CapabilityRegistry` is empty
+and `CapabilityInvocation` cannot be constructed outside `orxnud-policy`. No
+interface exists beyond `orxnuctl --version` and `doctor`. No domain model, no
+provider integration, no MCP surface, no Tauri or Svelte project. The task engine
+stores and transitions tasks; it performs no work, because performing work is a
+capability and capabilities are Phase 4+.
+
+What *does* exist is the foundation those phases need: pinned and verified SQLite,
+a versioned schema with a tested migration and rollback path, a durable task engine
+that satisfies its normative contract, and twelve CI gates.

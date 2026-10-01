@@ -37,6 +37,14 @@ pub struct StateRegion {
     pub owner: &'static str,
     /// Retention policy, in words. Descriptive, but required to be explicit.
     pub retention: &'static str,
+    /// The column that identifies a row, used by the authority filter to enumerate
+    /// what it consulted.
+    ///
+    /// Declared rather than assumed. `schema_meta` is keyed by `version`, not
+    /// `id`, and a filter that hard-coded `id` would simply fail on it -- which is
+    /// how an authority check ends up not running on the one table that records
+    /// whether a migration ran.
+    pub key_column: &'static str,
 }
 
 impl StateRegion {
@@ -115,6 +123,98 @@ impl RegionRegistry {
     }
 }
 
+/// The regions the Phase 2 task layer declares.
+///
+/// ADR-0028's table, transcribed. Every region gets an entry *before* it exists —
+/// the ADR's revisit condition is explicit that a new region "must be classified
+/// before it exists", and this function is where that happens.
+///
+/// # Ownership
+///
+/// Every region below names `orxnud-task` as its single owner. ADR-0028 invariant 2
+/// is "only the owning layer writes a region", and these tables are all reached
+/// through [`crate::task_repo::TaskRepository`], which lives in a different crate
+/// from any writer that could otherwise touch them. The store *holds* the SQL; the
+/// engine *owns* the region. Those are different things and conflating them is how a
+/// second writer appears.
+pub fn task_layer_regions() -> Vec<StateRegion> {
+    vec![
+        StateRegion {
+            name: "schema_meta",
+            class: StateClass::Critical,
+            owner: "orxnud-store",
+            retention: "indefinite",
+            key_column: "version",
+        },
+        StateRegion {
+            name: "tasks",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "indefinite; terminal rows retained until a declared janitor runs",
+            key_column: "id",
+        },
+        StateRegion {
+            name: "task_attempts",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "as `tasks`",
+            key_column: "id",
+        },
+        StateRegion {
+            name: "task_effects",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "at least the retry horizon (ADR-0028)",
+            key_column: "id",
+        },
+        StateRegion {
+            name: "task_approvals",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "at least the approval expiry, then pruned",
+            key_column: "id",
+        },
+        StateRegion {
+            name: "task_events",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "indefinite, append-only, rotated by declared policy",
+            key_column: "id",
+        },
+        StateRegion {
+            name: "schedules",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "indefinite",
+            key_column: "id",
+        },
+        StateRegion {
+            name: "schedule_fires",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "indefinite; the dedup ledger must outlive any retry window",
+            key_column: "id",
+        },
+    ]
+}
+
+/// The registry with every Phase 2 region declared.
+///
+/// # Panics
+///
+/// If two regions share a name, which would mean the declarations above have
+/// collided. That is a programming error in this function, caught at first use.
+#[must_use]
+pub fn task_layer_registry() -> RegionRegistry {
+    let mut reg = RegionRegistry::empty();
+    for r in task_layer_regions() {
+        // Duplicate names here would silently shadow one region's classification,
+        // which is the exact failure the registry exists to prevent.
+        assert!(reg.declare(r).is_ok(), "duplicate region declaration");
+    }
+    reg
+}
+
 impl Default for RegionRegistry {
     fn default() -> Self {
         Self::empty()
@@ -132,6 +232,7 @@ mod tests {
             class,
             owner: "orxnud-test",
             retention: "indefinite",
+            key_column: "id",
         }
     }
 
@@ -188,6 +289,100 @@ mod tests {
             .expect("declare");
         let critical: Vec<&str> = reg.critical_regions().iter().map(|r| r.name).collect();
         assert_eq!(critical, vec!["schedules", "tasks"]);
+    }
+
+    #[test]
+    fn every_phase_two_task_region_is_declared_and_critical() {
+        // ADR-0028's table: tasks, schedules, the fire ledger, the dedupe ledger,
+        // and the audit/event log are all `critical`. Anything else would mean
+        // paying fsync for nothing or, worse, not paying it for something.
+        let reg = task_layer_registry();
+        let regions = reg.all();
+        assert_eq!(regions.len(), 8);
+        for r in &regions {
+            assert_eq!(r.class, StateClass::Critical, "{} is not critical", r.name);
+        }
+        let names: Vec<&str> = regions.iter().map(|r| r.name).collect();
+        for required in [
+            "tasks",
+            "task_attempts",
+            "task_effects",
+            "task_approvals",
+            "task_events",
+            "schedules",
+            "schedule_fires",
+        ] {
+            assert!(names.contains(&required), "{required} is undeclared");
+        }
+    }
+
+    #[test]
+    fn every_phase_two_region_names_exactly_one_owner_and_it_is_the_engine() {
+        // ADR-0028 invariant 2. `schema_meta` is the exception: the store owns it,
+        // because the store is what runs migrations.
+        let reg = task_layer_registry();
+        for r in reg.all() {
+            assert!(!r.owner.is_empty(), "{} has no owner", r.name);
+            let expected = if r.name == "schema_meta" {
+                "orxnud-store"
+            } else {
+                "orxnud-task"
+            };
+            assert_eq!(r.owner, expected, "{} has the wrong owner", r.name);
+        }
+    }
+
+    #[test]
+    fn no_phase_two_region_is_writable_by_the_intent_layer() {
+        // Every one of these regions is `critical`, and ADR-0028 invariant 3 says
+        // derived data can never satisfy authority -- which begins with the model
+        // not being able to write them.
+        let reg = task_layer_registry();
+        for r in reg.all() {
+            assert!(
+                !reg.intent_layer_may_write(r.name),
+                "{} is model-writable",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_phase_two_region_declares_a_retention_policy() {
+        // ADR-0028 invariant 7: retention is per-region and explicit. An empty
+        // string would be a retention policy nobody decided.
+        for r in task_layer_regions() {
+            assert!(
+                !r.retention.trim().is_empty(),
+                "{} has no retention policy",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_registry_has_no_duplicate_names() {
+        let names: Vec<&str> = task_layer_regions().iter().map(|r| r.name).collect();
+        let before = names.len();
+        let mut deduped = names.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), before, "duplicate region name: {names:?}");
+    }
+
+    #[test]
+    fn no_region_is_named_for_a_credential() {
+        // ADR-0028 invariant 4: credentials are never state.
+        for r in task_layer_regions() {
+            let lower = r.name.to_lowercase();
+            for needle in ["credential", "secret", "password", "token", "key"] {
+                assert!(
+                    !lower.contains(needle),
+                    "{} looks like a credential region",
+                    r.name
+                );
+            }
+        }
     }
 
     #[test]

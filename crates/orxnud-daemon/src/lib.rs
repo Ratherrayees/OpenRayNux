@@ -1,12 +1,15 @@
 //! Composition root, lifecycle, and single-instance enforcement.
 //!
-//! # Phase 1 composes and starts nothing
+//! # What is composed, and what is still absent
 //!
 //! [`Daemon::start`] builds every subsystem and reports that it did. It opens no
-//! socket, spawns no process, and starts no task worker — `docs/13-phase-1-contract.md`
-//! §8 prohibits a second writer, any server, and any daemon. What exists is the
-//! *wiring* and the *state machine* for starting and stopping, so that Phase 2
-//! adds behaviour behind a lifecycle that already works.
+//! socket and spawns no process, and no capability is enabled — Phase 0-2 prohibit
+//! a server and any working feature.
+//!
+//! What *is* operational is the task layer, in [`task_service`]: it opens the
+//! database, migrates it, reclaims the previous run's leases, and refuses to start
+//! if any of that fails. That is the part a user would lose work without, so it is
+//! the part that runs rather than merely being wired.
 //!
 //! # Why the lifecycle is a state machine
 //!
@@ -26,6 +29,8 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod task_service;
 
 use orxnud_audit::AuditChain;
 use orxnud_capability::{CapabilityRegistry, Dispatcher};

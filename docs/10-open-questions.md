@@ -333,18 +333,47 @@ limits, the answer becomes "workers". **Owner:** implementer, Phase 4.
 
 ---
 
-## Q-OPEN-17 — Is the 60 MB idle-RSS target realistic with `synchronous=FULL`? 🟡
+## Q-OPEN-17 — Is `synchronous = FULL` affordable? ✅ RESOLVED 2026-09-30
 
 **Question.** ADR-0006 requires `synchronous=FULL` for power-loss durability,
 which costs an fsync per transaction. Does that threaten the transition-latency
-target (< 5 ms) or the idle budget?
+target (< 5 ms)?
 
-**Interim position.** Measure it in Phase 2. On an SSD an fsync is ~0.1–1 ms, so
-it should be fine; on spinning disk it would not be. If baseline hardware
-includes rotational storage, a documented `NORMAL` mode with a loud warning is
-acceptable — the *default* stays `FULL`.
+**Answer, measured** (V-30; `crates/orxnud-task/tests/measurements.rs`, btrfs over
+LUKS, SQLite 3.53.2 bundled, Rust 1.98.1):
 
-**What settles it.** The Phase 2 benchmark harness. **Owner:** implementer.
+| Operation | `synchronous = FULL` | `synchronous = NORMAL` |
+|---|---|---|
+| `enqueue` (one fsynced commit) | **~2.3 ms** | ~0.2–0.3 ms |
+| `claim` (fenced, work available) | 2.6–2.9 ms | — |
+| `complete` (fenced commit) | 2.2–3.4 ms | — |
+| `recover` (500 orphaned leases, bulk) | 54–78 µs/op | — |
+| idle scheduler pass + wakeup query | 16–26 µs/op | — |
+
+**Verdict.** Affordable, with roughly 30–55% headroom against the < 5 ms budget —
+about 430 state transitions per second, far above what one user generates.
+
+**The ratio is a range, not a number.** Four runs gave 7.3×, 12.0×, 13.2× and
+14.3×, because the `NORMAL` baseline is a fraction of a millisecond and therefore
+dominated by disk scheduling noise. The reliable figure is the magnitude
+(~2.3 ms per commit); quoting a single ratio would imply a precision the
+measurement does not have.
+
+**Decision: the default stays `FULL`.** ADR-0008's revisit condition is explicit
+that the answer would be to *"demote the cheapest-to-lose region, never weaken the
+task table"* — and the task table is the region that matters. A `NORMAL` mode
+exists and is tested (`Pragma::derived`); selecting it for the task connection
+requires an ADR and a loud warning, and it does not survive power loss.
+
+**A trap worth recording (V-31).** The first run of this measurement put its
+databases in `/tmp`, which is **tmpfs** on this host, where `fsync` costs 3 µs
+because it does nothing. That run reported `FULL` and `NORMAL` as **identical**. It
+would have "shown" that `FULL` is free, and quoting that as a result would have been the
+more dangerous error of the two. The harness now refuses to measure
+durability on a memory-backed filesystem, and says which variable to set.
+
+**Caveat.** btrfs-over-LUKS is a pessimistic case: the numbers will be materially
+better on an unencrypted SSD and materially worse on rotational storage.
 
 ---
 

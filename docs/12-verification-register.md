@@ -62,6 +62,14 @@ phase gate).
 | **V-23** | **The Rust task-scheduler ecosystem's viable options are `croner` and `cron` only** | `crates.io/api/v1/crates/{croner,cron,clokwerk,job_scheduler,tokio-cron-scheduler}` | **quarterly** | 2026-09-30 | **Medium.** If `croner` is abandoned we have no documented-DST alternative. |
 | **V-24** | **PostgreSQL, Redis, Kafka and Kubernetes are absent from the personal install** | `rpm -q`; the deployment profile definition | **release:** assert the dependency manifest contains none | 2026-09-30 | **Medium.** This is the property that makes the product lightweight; drift is silent and cumulative. |
 | **V-25** | **Core-only idle RSS < 60 MB; core-only binary < 40 MB; core-only cold start < 150 ms** | **No external source. Measured by our own benchmark harness.** | **milestone:** CI on every commit; re-baseline per release | *target, unmeasured* | **High.** These are the budgets that make the lightweight promise honest. A regression is invisible without measurement. |
+| **V-30** | **`synchronous = FULL` costs ~8–14× `NORMAL` per commit on this machine: ~2.3 ms vs ~0.2 ms** | `crates/orxnud-task/tests/measurements.rs::insertion_throughput_with_synchronous_full_is_usable`, on btrfs-over-LUKS, Rust 1.98.1, SQLite 3.53.2 bundled | **milestone:** re-measure per release; **event:** a storage or filesystem change | 2026-09-30 | **High.** This settles **Q-OPEN-17**. The ratio varies run to run (7.3×–14.3× observed over four runs) because the `NORMAL` baseline is small and disk-scheduling-noisy, so the **magnitude** (~2.3 ms) is the reliable figure and the ratio is a range, not a number. FULL is affordable for a personal daemon at roughly 430 state transitions/second, which is far above what one user generates — but it is *not* affordable as a default for anything batch. Measured on an encrypted btrfs volume, which is a pessimistic case; an SSD without encryption would be materially faster. The transition-latency budget in docs-05 is < 5 ms and a fenced commit measures 2.2–3.4 ms, so the headroom is roughly 30–55% and not comfortable. See V-35. **Default stays FULL** (ADR-0006 invariant 1). The `NORMAL` mode exists and is tested, and choosing it requires an ADR, because ADR-0008's revisit condition says *"demote the cheapest-to-lose region, never weaken the task table."* |
+| **V-31** | **Durability cannot be measured on tmpfs: `fsync` is a no-op there** | `/tmp` is `tmpfs` on this host; measured `fsync`-only cost 3 µs vs ~2.3 ms on btrfs. `measurements.rs` first reported FULL and NORMAL as **1.0× identical** | `fs.stat -f -c %T`, `/proc/mounts`, and the ratio in the same test | **release:** any harness that measures durability must assert its filesystem | 2026-09-30 | **High.** This is the failure mode where a measurement *confirms the wrong thing*: on tmpfs the harness would have "shown" that `synchronous = FULL` is free, which is the opposite of the truth. `measurements.rs` now refuses to run on a memory-backed filesystem and names `ORXNUD_MEASURE_DIR` as the override. Any future durability benchmark must do the same. |
+| **V-32** | **The Phase 2 engine passes all twelve ADR-0029 properties against the *unmodified* Phase 1 harness** | `cargo test -p orxnud-task --test conformance_production`; `crates/orxnud-task/tests/conformance_production.rs` calls the same `run_suite` the trivial fixture uses | **milestone:** every change to `conformance::properties` or `conformance::schedule` | 2026-09-30 | **Critical.** ADR-0029's whole claim is that the contract is implementation-independent. Verified by: the harness was not edited; the suite is called from a second test binary with a different engine; and a deliberately broken engine is asserted to produce a *non-clean* report, so the suite is known to have teeth against this engine rather than merely agreeing with it. |
+
+| **V-33** | **A fresh install could not start; only production wiring found it** | `orxnud-daemon/src/task_service.rs::open` was the first caller of `MigrationRunner::migrate`; `Backup::verify` rejected the snapshot of an unmigrated database | `orxnud-store/src/migration.rs::migrating_a_brand_new_database_succeeds`, and `Backup::verify_against_source` | **release:** any change to the migration or backup entry point | 2026-09-30 | **High.** Every Phase 2 migration test drove `MigrationRunner::run`, which trusts its caller's snapshot claim and never takes one — so the snapshot path had no coverage until startup used it. It failed on a brand-new database: `Backup::verify` rejected a snapshot with no `schema_meta`, on the sound grounds that restoring it would erase a user's data, which is the wrong target when there is no data yet. The first migration could not run, so the daemon could not start on any machine where OpenRayNux had never run. Emptyness is now judged relative to the source. The lesson recorded for its own sake: **a helper used only by production code has no test coverage until production calls it.** |
+| **V-34** | **The "verified snapshot has data" guard was documentation, not code** | `Backup::verify` computed `total_rows` and returned it; nothing compared it. `BackupError::Empty` now refuses a snapshot whose `schema_meta` exists but is empty | `orxnud-store/src/backup.rs`, `an_emptied_snapshot_of_a_real_database_is_still_rejected` | **release:** any change to snapshot verification | 2026-09-30 | **High.** The comment claimed "a row count, so *verified* means *has the data we expected*" — and the code did not do it. Found while fixing V-33, in the same function, because the fresh-install fix made the emptiness question unavoidable. Two guards, both now enforced and both tested in both directions: absent `schema_meta` is refused, and present-but-empty is refused, while an empty snapshot of an equally empty source is accepted. |
+| **V-35** | **`synchronous = FULL` costs ~2.3 ms per state transition, consuming 45–70% of the < 5 ms budget** | Re-measure per release; the headroom is thin enough that a slower disk makes the budget the binding constraint | `crates/orxnud-task/tests/measurements.rs` | **milestone:** if a transition p99 exceeds 5 ms, this is the first thing to re-examine — and ADR-0008 requires the decision to demote a cheaper region rather than weaken the task table | 2026-09-30 | **High.** See V-30 for the measurement. Recorded separately because the *risk* is distinct from the *number*: A fenced commit measures 2.2–3.4 ms across runs, so the budget is not generous, so this belongs on the re-measure list rather than being considered settled. |
+
 | **V-27** | **`cargo-deny` 0.20 removed `[licenses] deny`** — the copyleft prohibition is now expressed by the *absence* of copyleft from `[licenses] allow` | `cargo deny check licenses` on this tree; the tool's own error output (`error[deprecated]`) | **release:** re-read the tool's config schema | 2026-09-30 | **Medium.** ADR-0006/ADR-0019 forbid GPL/AGPL/NC. If a future `deny.toml` reintroduces a `deny` key, cargo-deny will *error* rather than silently ignore it — the failure is loud, but only if someone reads it. `scripts/ci-gates.sh` G8 fails on any cargo-deny error. |
 | **V-28** | **The twelve Phase 1 gates actually pass on this tree** | `scripts/ci-gates.sh` (exit 0), run locally against Rust 1.98.1 | **milestone:** every commit in CI; **event:** a toolchain or dependency bump | 2026-09-30 | **High.** The gates are the Phase 1 deliverable (docs-13 §5). A gate that silently stops running is worse than a gate that fails, so G12 skips loudly when no release tag exists rather than passing vacuously. |
 | **V-29** | **The Windows check is blocked on this host by a missing MSVC C toolchain, not by a code defect** | `cargo check -p orxnud-store --target x86_64-pc-windows-msvc` → `cc-rs: failed to find tool "lib.exe"` | **release:** the Windows nightly lane reports the result | 2026-09-30 | **Medium.** 7 of 14 crates — including all three platform adapters, `orxnud-domain`, `orxnud-protocol`, `orxnud-config`, `orxnud-obs`, `orxnuctl` — check clean for MSVC today. The other 7 are blocked transitively by `libsqlite3-sys` and `blake3`, which need `cl.exe`/`lib.exe`. **No Rust-level error was observed for any crate.** The Windows claim is therefore *unverified*, not *failing*; it is a Phase 1 exit criterion (docs-13 §9) and stays open until the nightly runner reports. |
@@ -74,6 +82,67 @@ phase gate).
 
 Recorded per operating rule 5: wrongness is worth recording, because it is how
 this register improves.
+
+### A-002 — the catch-up window's upper bound
+
+**What ADR-0021 says:** the catch-up window is `(last_fired_at, now]` — closed at
+the top, so an occurrence due exactly *now* fires.
+
+**What the Phase 1 harness does:** `conformance::schedule::occurrences` takes a
+window that is **open at both ends**, and pins that in `the_window_is_half_open`.
+
+**Both are correct.** They are windows with different conventions, and the
+conflict only appeared when Phase 2 built a scheduler on top: with the harness's
+convention, a schedule created an hour before the pass produced **zero** fires,
+because the occurrence at exactly `now` was excluded.
+
+**Resolution:** the harness is the specification and was **not** modified. The
+scheduler translates, passing `now_ms + 1` as the upper bound, which makes the
+enumeration exactly `(last_fired, now]` at millisecond resolution. Two Phase 1
+assertions pin the open-ended behaviour, which is the signature of a deliberate
+convention rather than an oversight. Recorded here because a future change to
+`occurrences` would silently break every catch-up path.
+
+**Evidence:** `scheduler.rs::process_one` and its module documentation; the
+regression test `a_due_occurrence_creates_exactly_one_task` fails without the
+translation.
+
+### A-003 — TP-7's child-process entry point is a per-binary requirement
+
+**What the harness does:** `power_loss::spawn_victim` re-executes `current_exe()`
+with `--exact victim_entry_point --ignored`.
+
+**The problem:** Phase 2 added a *second* test binary that runs the suite, and it
+had no such entry point. TP-7 reported *"victim 0 never signalled readiness"* — a
+30-second timeout, not an error.
+
+**Resolution:** each test binary that runs the suite exposes a three-line shim
+calling `conformance::power_loss::victim_entry_point`. The victim itself still
+lives once, in the library. The harness, its properties, and its assertions were
+not touched. A test in `conformance_production.rs` asserts the Phase 1 fixture file
+still defines its own, because the only symptom of a rename would be a timeout.
+
+**Why this is an amendment and not a weakening:** the duplicated code is a shim,
+not a property. No assertion changed; a second engine now passes the same suite.
+
+### A-004 — `complete(Failed)` must requeue, or TP-11 passes vacuously
+
+**The bug, found by writing the fixture before the tests:** marking a `Failed` task
+terminal made *"within the retry budget"* mean *"no retry"*. A task that failed
+once transiently was permanently dead, and TP-11 would have been satisfied by an
+engine that never retried at all — the loop would break on `Claim::Empty` and find
+the task in `Failed`, which TP-11 accepts.
+
+**Resolution:** a `Failed` task whose budget remains returns to `pending` with a
+`run_after_ms` set from an explicit `retry_delay_ms`, and only becomes
+`dead_lettered` at the budget. TP-11 now exercises three real attempts and
+dead-letters, which is the property ADR-0029 actually describes.
+
+**Consequence for the scheduler/clock:** the retry delay is a *parameter*, not a
+constant baked into the repository, because a fixed backoff would leave TP-11's
+retry unclaimable without moving a clock the harness does not own. The conformance
+path passes `Some(0)`; production passes `None`, which uses
+`EngineLimits::retry_backoff_ms`.
 
 ### A-001 — `orxnud-domain`'s dependency list
 

@@ -9,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Deterministic crash injection *inside* a repository transaction. Off by default,
+# not a default feature, and not enabled by any release profile. See src/faults.rs
+# for why a hook is the only way to test mid-transaction atomicity, and
+# tests/fault_feature_is_not_shipped.rs for the check that it stays off.
+fault-injection = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
