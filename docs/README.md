@@ -7,7 +7,7 @@ Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
 Phase 4a  ✅ Process isolation
-Phase 4b  ⚠️ V-50/V-54/V-55/V-56 complete / V-46 open (mechanism + governed path PROVEN, cgroup.kill teeth NOT_PROVEN) / V-29 open
+Phase 4b  ⚠️ V-50/V-54/V-55/V-56 complete / V-46 mechanism + governed path PROVEN, cgroup.kill redundant (ADR-0036) / V-29 open
 ```
 
 Remaining Phase 4b work, as two bounded tracks:
@@ -15,7 +15,7 @@ Remaining Phase 4b work, as two bounded tracks:
 ```text
 4b-Linux    V-46 cgroup mechanism       [done — PROVEN, mutation-verified]
             V-46 governed-path adoption   [done — PROVEN, mutation-verified]
-            V-46 cgroup.kill teeth         [open  — NOT_PROVEN on Linux]
+            V-46 cgroup.kill teeth         [closed — redundant on Linux, ADR-0036]
             resource-policy finalisation  [done — V-56]
             V-54 fallback mutation         [done — MUTATION-VERIFIED]
 
@@ -29,10 +29,10 @@ capabilities only through the sandbox, with no in-process route and no unsandbox
 fallback (V-51). **V-46 open, two halves** -- the cgroup *mechanism* is proven and
 mutation-verified, and the *governed path* now uses it: the runner owns a dedicated
 child, writes ceilings before spawning, joins the supervisor via a cgroup `exec` wrapper
-and verifies membership from `cgroup.procs`, failing closed if it cannot. What remains
-NOT_PROVEN on Linux is whether `cgroup.kill` adds anything the PID namespace does not
-already provide -- `--unshare-pid --die-with-parent` reaps descendants either way -- so
-that claim is recorded as redundant containment rather than as teeth. **V-29 open** --
+and verifies membership from `cgroup.procs`, failing closed if it cannot. ADR-0036 records that
+`cgroup.kill` is a deliberate redundant backstop on this path rather than a load-bearing
+mechanism: `--unshare-pid --die-with-parent` already reaps descendants, so the governed
+test cannot separate them and no artificial mutation will be built to try. **V-29 open** --
 no Windows evidence.
 
 **Recorded, not changed:** the stage order is `CREDENTIAL -> SANDBOX`, so a
