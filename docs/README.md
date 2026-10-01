@@ -6,7 +6,8 @@ Status: **Phase 3 complete. Windows verification open (V-29).**
 Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
-Phase 4  → Process isolation + real execution boundary
+Phase 4a ✅ Process isolation (verified guarantees)
+Phase 4b ⏳ cgroup resource ceilings, Windows Job Objects (needs a delegated env)
 ```
 
 The security model is no longer prose: `CapabilityInvocation` is not deserialisable,
@@ -116,6 +117,12 @@ process owning the user's time, data and integrations, with several surfaces
   repositories, and the snapshot-protected migration runner (ADR-0006, ADR-0017).
 - `crates/orxnud-task` — `DurableEngine` and `Scheduler`, passing all twelve
   ADR-0029 properties against the Phase 1 harness unchanged (ADR-0029, V-32).
+- `crates/orxnud-platform-sandbox` — the Tier-1 execution boundary: a portable
+  contract (`what` isolation is required) and a `bubblewrap` backend (`how` on Linux).
+  Environment, filesystem, network, output, timeout, descriptor hygiene and
+  process-tree containment are **proven with real subprocesses**; OS-enforced resource
+  ceilings are **not** and are refused rather than downgraded. See
+  [`14-phase-2-contract.md`](14-phase-2-contract.md) and ADR-0035.
 - `crates/orxnud-daemon` — `TaskService`, the production startup: snapshot-protected
   migration, reclaim of the previous run's leases, and a refusal to start if either
   fails. See [`14-phase-2-contract.md`](14-phase-2-contract.md) §8b for the fresh-install

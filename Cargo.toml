@@ -18,6 +18,7 @@ members = [
     "crates/orxnud-daemon",
     "crates/orxnuctl",
     "crates/orxnud-platform-fs",
+    "crates/orxnud-platform-sandbox",
     "crates/orxnud-platform-secrets",
     "crates/orxnud-platform-notify",
 ]
@@ -87,6 +88,7 @@ orxnud-audit = { path = "crates/orxnud-audit" }
 orxnud-config = { path = "crates/orxnud-config" }
 orxnud-obs = { path = "crates/orxnud-obs" }
 orxnud-platform-fs = { path = "crates/orxnud-platform-fs" }
+orxnud-platform-sandbox = { path = "crates/orxnud-platform-sandbox" }
 orxnud-platform-secrets = { path = "crates/orxnud-platform-secrets" }
 orxnud-platform-notify = { path = "crates/orxnud-platform-notify" }
 

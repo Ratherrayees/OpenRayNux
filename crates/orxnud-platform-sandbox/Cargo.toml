@@ -1,0 +1,15 @@
+[package]
+name = "orxnud-platform-sandbox"
+description = "Subprocess execution boundary: the portable contract and its per-OS implementations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The contract lives here rather than in orxnud-domain because a sandbox is an OS
+# facility, not a domain concept: the portable core asks for isolation, and this
+# crate supplies it per platform. Keeping the contract beside the backends is what
+# stops `bubblewrap`, namespaces, and Job Objects leaking into business logic.
+thiserror = { workspace = true }
+
+[dev-dependencies]

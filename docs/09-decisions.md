@@ -2646,3 +2646,110 @@ authorised* invocation across a process boundary — and then the correct answer
 send the `CapabilityRequest` plus a reference to the authorisation record, and
 re-authorise on arrival. Forwarding authority across a trust boundary should never be
 the design.
+
+
+---
+
+<a id="adr-0035"></a>
+## ADR-0035 — Tier-1 execution: PID namespace plus `PDEATHSIG`, and what it does not do
+
+> **Accepted 2026-09-30.** Phase 4a. `orxnud-platform-sandbox`.
+
+**Context.** ADR-0009 assigns third-party, untrusted and copyleft capabilities to
+Tier 1 — a subprocess, so that a segfault in a native dependency cannot kill the core.
+Phase 3 left ADR-0009's contract points 4 and 6 (`no undeclared filesystem or network
+access`, `a disabled capability leaves no residue`) as `declared_only`, because an
+in-process fixture can observe neither. Both are claims about *processes*.
+
+**Problem.** What mechanism actually provides isolation here, and — the part that
+mattered most — what does it *not* provide?
+
+**Decision.** A portable contract (`crates/orxnud-platform-sandbox/src/contract.rs`)
+expressing **what** is required, with `bubblewrap` supplying it on Linux.
+
+### Three guarantees, deliberately separate
+
+| Guarantee | Linux | Windows | Phase 4a status |
+|---|---|---|---|
+| **Visibility** — what exists at all | PID + mount + net namespaces | Job Object / AppContainer | PROVEN |
+| **Tree lifetime** — a detached descendant cannot outlive the execution | `--unshare-pid` + `--die-with-parent` | Job Object kill-on-close | PROVEN |
+| **Resource ceilings** — hard memory/CPU/PID limits | cgroup v2 controllers | Job Object limits | **NOT PROVEN** |
+
+Conflating these is what made the phase look blocked. A PID namespace gives visibility,
+not lifetime; a parent-death signal gives the direct child, not the subtree.
+
+### Why `--unshare-pid --die-with-parent` *is* tree containment
+
+This is the opposite of the first analysis, and the correction is the most useful
+finding in the phase.
+
+An earlier measurement reported that a detached, `SIGTERM`-ignoring grandchild
+**escaped** all three of `--unshare-pid --die-with-parent`, `--unshare-pid`, and
+`--die-with-parent`. **That was a measurement error.** Liveness was checked by looking
+for the grandchild's PID in the host's `/proc`, but the helper had reported the PID it
+saw **inside** its new namespace — and on the host, `3` is an unrelated process. The
+check found a live `/proc/3` and concluded the grandchild had escaped.
+
+Corrected measurement, watching the grandchild's on-disk heartbeat *advance*:
+
+```text
+--unshare-pid --die-with-parent  -> CONTAINED   (5 of 5, SIGTERM and SIGKILL)
+--unshare-pid only              -> ESCAPED
+--die-with-parent only          -> ESCAPED
+neither                         -> ESCAPED
+```
+
+The mechanism: `bwrap`'s forked child becomes **PID 1 of a new PID namespace**, and the
+kernel guarantees that when a namespace's init dies, every remaining process in it is
+sent `SIGKILL`. `PDEATHSIG` supplies the trigger when `bwrap` is signalled, and the
+namespace supplies the reach. A detached grandchild cannot opt out — leaving a PID
+namespace needs privileges the sandboxed process does not have.
+
+**Condition:** the supervisor must signal **`bwrap`**, never the inner process.
+Signalling the child would kill its parent without firing `PDEATHSIG`, leaving the
+namespace init alive. A refactor that "helpfully" signalled the child would silently
+break containment.
+
+**Rejected: `cgroup.kill` as the Phase 4a mechanism.** It is the stronger answer — it
+walks the cgroup, so it needs no namespace and handles concurrent forks — and
+`cgroup.kill` *is* writable here. It is not used because the resource controllers beside
+it are not, so adopting cgroups for lifetime alone would give a second mechanism to
+maintain for no additional guarantee. It becomes the right choice in Phase 4b.
+
+**Rejected: hand-rolled namespaces.** Needs `unsafe`; gate G4 forbids it. `bwrap` also
+gets the ordering right (namespaces unshare before mounts, so the child never sees a
+half-built root) and handles `setuid` restoration.
+
+### Fail-closed, not fail-open
+
+`TreeLifetime` and `Resource` default to **`Required`**. On a host that cannot provide
+them, `SandboxSpec::run` returns `Refused(GuaranteeUnavailable)` rather than running a
+weaker sandbox. A caller may opt out explicitly with
+`accepting_best_effort_containment`, and then `ExecutionResult::unproven` records what
+was not provided — so an audit record can say "this ran without subtree kill" instead of
+implying otherwise. Relaxing containment is visible in a diff because the method name
+says so.
+
+### What this does **not** provide
+
+- **Resource ceilings.** `memory.max`, `pids.max` and `cpu.max` are unwritable in this
+  user session — the controllers are listed in `cgroup.controllers` and every write is
+  refused. Requested by default, refused in practice. Phase 4b.
+- **`bind` denial.** A network namespace blocks connectivity but **not** `bind(2)`. A
+  helper can bind a socket inside its namespace; it is unreachable from outside, which
+  is the property that matters. Asserting that `bind` must fail would have demanded a
+  weaker sandbox.
+- **Windows.** Nothing implemented, nothing claimed. Job Objects are the intended
+  mechanism for both tree kill and resource limits, and AppContainer for filesystem,
+  registry, network and process restriction. Unverified (V-29).
+- **Cloud.** Documented only: same process contract, platform-specific backend;
+  microVMs where the isolation requirement exceeds what containers can promise.
+
+**Consequences.** Contract points 4 and 6 of ADR-0009's 10-point suite can move from
+`declared_only` to evidence-backed, with the residual gaps named above. ADR-0017's
+"snapshot → migrate → verify" is unaffected: this is execution, not migration.
+
+**Revisit conditions.** Revisit the mechanism when a host delegates cgroup controllers
+(Phase 4b), at which point `cgroup.kill` replaces the namespace approach for tree
+lifetime. Revisit the contract if a capability legitimately needs weaker containment —
+by relaxing that one spec, not by changing the default.
