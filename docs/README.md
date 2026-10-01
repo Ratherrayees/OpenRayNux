@@ -7,13 +7,14 @@ Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
 Phase 4a  ✅ Process isolation
-Phase 4b  ⚠️ V-50 complete / V-46 partial / V-29 open
+Phase 4b  ⚠️ V-50 complete / V-46 mechanism proven, governed path NOT_PROVEN / V-29 open
 ```
 
 Remaining Phase 4b work, as two bounded tracks:
 
 ```text
-4b-Linux    V-46 end-to-end cgroup enforcement
+4b-Linux    V-46 cgroup mechanism       [done — PROVEN, mutation-verified]
+            V-46 governed-path adoption   [open  — NOT_PROVEN]
             resource-policy finalisation  [done — V-56]
             V-54 fallback mutation         [done — MUTATION-VERIFIED]
 
@@ -24,9 +25,16 @@ Remaining Phase 4b work, as two bounded tracks:
 
 Phase 4b progress: **V-50 complete** -- the governed dispatcher now executes Tier-1
 capabilities only through the sandbox, with no in-process route and no unsandboxed
-fallback (V-51). **V-46 partial** -- cgroup controls are writable in a delegated
-container and `cgroup.kill` subtree termination is proven; end-to-end memory/pids/cpu
-enforcement is not yet (V-52). **V-29 open** -- no Windows evidence.
+fallback (V-51). **V-46 partial** -- the cgroup *mechanism* is proven on a delegated
+host: a real process is adopted into a dedicated child and the kernel observably
+enforces `memory.max`, `pids.max` and `cpu.max`, while `cgroup.kill` terminates
+descendants a signal cannot reach. What remains **not proven** is the end-to-end
+*governed path*: `BwrapRunner` still reports `Resource::Observed` and never creates or
+adopts a cgroup, so `Dispatcher -> sandbox -> subprocess` does not pass through one.
+A governed dispatch requiring a memory ceiling was measured refusing on a host that
+can enforce one, which is precisely the gap. Also fixed in this step: the discovery
+race, where probe and execution cgroup names were constants and concurrent callers
+deleted each other's directories. **V-29 open** -- no Windows evidence.
 
 Phase 4b has three objectives: wire the sandbox into the Phase 3 dispatcher so the
 governed path actually uses it (V-50), prove hard resource ceilings where cgroup

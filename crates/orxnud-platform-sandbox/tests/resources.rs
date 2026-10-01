@@ -285,11 +285,26 @@ fn the_sandbox_runner_reports_resource_availability() {
         );
         println!("  bwrap absent in this environment; visibility reported as unavailable");
     }
-    // Resources are false here; the assertion documents it without pretending
-    // otherwise if a future host changes.
-    assert_eq!(
+    // Two different questions, previously conflated into one equality.
+    //
+    // `have.resources` answers "does this runner *apply* resource limits?" -- it does not
+    // (`linux.rs` still reports `Resource::Observed`), so it must be false.
+    //
+    // `enforcement_environment().can_enforce()` answers "can this *host* enforce them?"
+    // That is now true here. Asserting the two were equal passed only while both were
+    // false, i.e. while the host could not enforce either; the moment delegation arrived
+    // the assertion failed and was reporting a real capability gap as a test defect.
+    //
+    // The runner claiming `true` while applying nothing is the defect that must never
+    // happen, so that is what is asserted. Wiring the runner to a dedicated cgroup is
+    // tracked as V-46's next step.
+    assert!(
+        !have.resources,
+        "the runner must not claim resource enforcement it does not perform"
+    );
+    println!(
+        "  runner applies resources: {} | host can enforce: {}",
         have.resources,
-        enforcement_environment().can_enforce(),
-        "the runner must not claim resources it cannot enforce"
+        enforcement_environment().can_enforce()
     );
 }

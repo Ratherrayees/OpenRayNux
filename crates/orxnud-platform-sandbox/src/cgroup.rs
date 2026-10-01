@@ -157,6 +157,13 @@ pub struct CgroupV2 {
     pub base: PathBuf,
     /// What the host permits.
     pub availability: CgroupAvailability,
+    /// Whether this process created `path` and is therefore responsible for removing it.
+    ///
+    /// `discover()` also returns a handle, and *its* `path` is the base -- a directory
+    /// this process must never touch. Cleanup is gated on this flag, because a `Drop`
+    /// that ran on a discovered handle would write `cgroup.kill` to the whole session
+    /// cgroup and then try to `rmdir` it.
+    owns_path: bool,
 }
 
 impl CgroupV2 {
@@ -179,33 +186,30 @@ impl CgroupV2 {
     /// failure mode that matters is whether *we* may write.
     #[must_use]
     pub fn discover() -> Self {
-        let availability = Self::probe();
+        let (base, availability) = Self::support();
         Self {
             path: PathBuf::new(),
-            base: PathBuf::new(),
+            base,
             availability,
+            owns_path: false,
         }
     }
 
-    fn probe() -> CgroupAvailability {
-        let Some(base) = own_cgroup() else {
-            return CgroupAvailability::default();
-        };
-        let probe = base.join("orxnud-resource-probe");
-        let Ok(()) = std::fs::create_dir(&probe) else {
-            return CgroupAvailability::default();
-        };
-        let write = |f: &str, v: &str| std::fs::write(probe.join(f), v).is_ok();
-        let availability = CgroupAvailability {
-            can_create: true,
-            memory: write("memory.max", "67108864"),
-            swap: write("memory.swap.max", "0"),
-            processes: write("pids.max", "64"),
-            cpu: write("cpu.max", "50000 100000"),
-            group_kill: write("cgroup.kill", "1"),
-        };
-        let _ = std::fs::remove_dir(&probe);
-        availability
+    /// The environment's standing, without collapsing distinct failures.
+    ///
+    /// The brief's distinction matters operationally: "there is no cgroup v2" and
+    /// "there is one but nothing is delegated to me" need different responses, and a
+    /// single "unavailable" would hide a fixable misconfiguration.
+    #[must_use]
+    pub fn support() -> (PathBuf, CgroupAvailability) {
+        // Distinguish "no cgroup v2 at all" from "one exists but is undelegated".
+        if !Path::new("/sys/fs/cgroup")
+            .join("cgroup.controllers")
+            .exists()
+        {
+            return (PathBuf::new(), CgroupAvailability::default());
+        }
+        delegated_base().unwrap_or_else(|| (PathBuf::new(), CgroupAvailability::default()))
     }
 
     /// Creates a **dedicated child** cgroup, with `controls` applied.
@@ -230,13 +234,22 @@ impl CgroupV2 {
     /// The controls this host cannot enforce, named. **Fail-closed**: a caller that
     /// asked for a memory ceiling is not handed a cgroup without one.
     pub fn create(&self, name: &str, controls: &[ResourceControl]) -> Result<Self, ResourceMiss> {
-        let base = own_cgroup().ok_or(ResourceMiss {
-            controls: controls.iter().map(|c| c.label()).collect(),
-            reason: "this host has no cgroup v2 hierarchy".to_owned(),
-        })?;
-        let path = base.join(format!("orxnud-{name}"));
-        let _ = std::fs::remove_dir(&path);
-        std::fs::create_dir_all(&path).map_err(|e| ResourceMiss {
+        let (base, _) = Self::support();
+        if base.as_os_str().is_empty() {
+            return Err(ResourceMiss {
+                controls: controls.iter().copied().map(|c| c.label()).collect(),
+                reason: "no cgroup v2 base is both creatable and delegated to this process"
+                    .to_owned(),
+            });
+        }
+        // Unique per invocation: see `unique_suffix`. Two concurrent executions must
+        // never share a cgroup, or they would share limits and each would delete the
+        // other's directory while the other was still running in it.
+        let path = base.join(format!("orxnud-{name}-{}", unique_suffix()));
+        // Deliberately `create_dir`, not `create_dir_all` over a `remove_dir`. Clearing
+        // a pre-existing path first is what let a concurrent caller destroy a cgroup
+        // that another process was still a member of.
+        std::fs::create_dir(&path).map_err(|e| ResourceMiss {
             controls: controls.iter().copied().map(|c| c.label()).collect(),
             reason: format!("cannot create {}: {e}", path.display()),
         })?;
@@ -268,6 +281,7 @@ impl CgroupV2 {
             path,
             base,
             availability: self.availability,
+            owns_path: true,
         })
     }
 
@@ -314,8 +328,52 @@ impl CgroupV2 {
 
     /// Removes the cgroup. Best effort: a cgroup with live members cannot be removed,
     /// and forcing it would need `cgroup.kill` anyway.
-    pub fn remove(self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+    pub fn remove(mut self) {
+        // The work happens here, and `owns_path` is cleared so `Drop` does not repeat it.
+        // Forgetting the handle instead would have made `remove()` a silent no-op, which
+        // is how 48 cgroups leaked in a 6-way concurrent run before it was caught.
+        let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
+        remove_cgroup_dir(&self.path);
+        self.owns_path = false;
+    }
+}
+
+/// Removes a cgroup directory, retrying while the kernel finishes releasing it.
+///
+/// # Why `remove_dir` and not `remove_dir_all`
+///
+/// A cgroup directory contains kernel-managed control files that **cannot be unlinked**,
+/// so `remove_dir_all` fails on the first one and leaves the cgroup behind. The correct
+/// call is `rmdir`, which succeeds once the cgroup is empty.
+///
+/// Empty is not immediate, though: a process that has been killed can take a moment to be
+/// reaped from `cgroup.procs`. Hence the bounded retry. This is not a retry to paper over
+/// a race -- the outcome is deterministic once the kernel catches up -- and it is bounded
+/// so a genuinely stuck cgroup cannot hang a caller.
+fn remove_cgroup_dir(path: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match std::fs::remove_dir(path) {
+            Ok(()) => return true,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+impl Drop for CgroupV2 {
+    /// Guarantees cleanup on the failure path too.
+    ///
+    /// A test that panics between `create` and `remove` used to leave its cgroup behind
+    /// permanently, and every later run inherited the pile. Members are killed first so a
+    /// failed test cannot leave descendants running either.
+    fn drop(&mut self) {
+        if self.owns_path && !self.path.as_os_str().is_empty() {
+            let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
+            remove_cgroup_dir(&self.path);
+        }
     }
 }
 
@@ -335,20 +393,13 @@ fn write_control(path: &Path, control: ResourceControl) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// The nearest cgroup v2 directory this process may create children in.
+/// Every directory that could serve as a cgroup base, nearest first.
 ///
-/// Tries the process's own cgroup first, then the hierarchy root. The fallback is
-/// not a convenience: a container run with `--cgroupns=host` reports its own cgroup as
-/// the docker scope it runs in, and that scope accepts no subdirectories even though
-/// the controllers are writable at the root. Probing only the own path therefore
-/// reported "no delegation" in an environment that *does* delegate -- the opposite of
-/// the truth, and worse than not probing at all.
-///
-/// Verified rather than assumed: with the fallback the same container reports every
-/// control writable, and `cgroup.kill` terminates a member's descendants.
-fn own_cgroup() -> Option<PathBuf> {
-    let root = Path::new("/sys/fs/cgroup");
-    let mut candidates: Vec<PathBuf> = Vec::new();
+/// Own cgroup, then each ancestor, then the hierarchy root. The root is a valid base
+/// when delegation reaches it; it is only ever a **parent**, never the execution's home.
+fn candidate_bases() -> Vec<PathBuf> {
+    let root = Path::new("/sys/fs/cgroup").to_path_buf();
+    let mut out: Vec<PathBuf> = Vec::new();
     if let Ok(text) = std::fs::read_to_string("/proc/self/cgroup")
         && let Some(line) = text.lines().find(|l| l.starts_with("0::"))
     {
@@ -356,17 +407,107 @@ fn own_cgroup() -> Option<PathBuf> {
             .trim_start_matches("0::")
             .trim()
             .trim_start_matches('/');
+        let mut cur = root.clone();
         if !rel.is_empty() {
-            candidates.push(root.join(rel));
+            for seg in rel.split('/') {
+                if seg.is_empty() {
+                    continue;
+                }
+                cur = cur.join(seg);
+                out.push(cur.clone());
+            }
         }
     }
-    candidates.push(root.to_path_buf());
-    candidates.into_iter().find(|c| {
-        std::fs::create_dir(c.join(".orxnud-writable-probe")).is_ok_and(|()| {
-            let _ = std::fs::remove_dir(c.join(".orxnud-writable-probe"));
-            true
+    out.push(root);
+    out.dedup();
+    out
+}
+
+/// Probes one candidate base by creating a child cgroup and attempting each write.
+///
+/// # Creation alone is not delegation
+///
+/// A directory can be perfectly creatable and have **no controllers delegated to
+/// it**. The container case is exactly that: `/sys/fs/cgroup/system.slice/docker-<id>.scope`
+/// accepts `mkdir` and refuses `memory.max`, because the controllers sit at the root and
+/// were never delegated down. Selecting a base on creatability alone therefore picks a
+/// base where nothing can be enforced -- and reports "delegated" for an environment that
+/// is not (V-57).
+///
+/// So the probe is the *write*. That is also the only probe that answers the question
+/// that matters: "can I enforce a limit here?"
+fn probe_base(base: &Path) -> (bool, CgroupAvailability) {
+    let child = base.join(probe_dir_name());
+    // A leftover from a previous run is not an error; it also means we already know
+    // the base is creatable. With a name unique to this invocation, an existing
+    // directory can only be our own stale one, so it is safe to keep writing into it.
+    let created = std::fs::create_dir(&child).is_ok();
+    if !created && !child.exists() {
+        return (false, CgroupAvailability::default());
+    }
+    let write = |f: &str, v: &str| std::fs::write(child.join(f), v).is_ok();
+    let availability = CgroupAvailability {
+        can_create: true,
+        memory: write("memory.max", "67108864"),
+        swap: write("memory.swap.max", "0"),
+        processes: write("pids.max", "64"),
+        cpu: write("cpu.max", "50000 100000"),
+        group_kill: write("cgroup.kill", "1"),
+    };
+    remove_cgroup_dir(&child);
+    (true, availability)
+}
+
+/// A probe directory name unique to this invocation.
+///
+/// # Why the name must be unique
+///
+/// The probe directory used to be a fixed `.orxnud-probe`. `discover()` runs it against
+/// every candidate base, and any number of callers may run concurrently -- which they do
+/// by default under `cargo test`, where test binaries execute in parallel and each
+/// binary discovers independently.
+///
+/// With a shared name the sequence is not atomic: caller **A** creates the directory,
+/// caller **B** fails `create_dir` and proceeds because the directory *exists*, then
+/// **A** finishes and removes it -- and **B**'s remaining writes now fail with `ENOENT`.
+/// The symptom was an intermittent `ResourceMiss { controls: ["cpu"] }` on a host that
+/// does delegate `cpu`, appearing only under parallel execution.
+///
+/// A per-invocation name removes the interleaving entirely: no two probes can ever hold
+/// the same directory, so one caller can never delete another's. This is correct
+/// regardless of test ordering, which is the property that matters -- a retry loop would
+/// only have hidden it.
+fn probe_dir_name() -> String {
+    format!(".orxnud-probe-{}", unique_suffix())
+}
+
+/// A suffix unique to this process and this call.
+///
+/// Within a process the counter is exact. Across processes the pid makes it unique for
+/// every concurrent run, and a pid can only be reused after its previous owner has
+/// exited -- by which point its cgroups are gone. This is what makes discovery and
+/// execution correct *independently of ordering*: nothing is shared, so nothing can be
+/// deleted out from under a concurrent caller.
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The first base where a child cgroup can be created **and** controllers written.
+fn delegated_base() -> Option<(PathBuf, CgroupAvailability)> {
+    candidate_bases()
+        .into_iter()
+        .map(|base| {
+            let (created, availability) = probe_base(&base);
+            (base, created, availability)
         })
-    })
+        .find(|(_, created, a)| *created && (a.memory || a.processes || a.cpu))
+        .map(|(base, _, availability)| (base, availability))
 }
 
 /// What the enforcement tests should conclude on this host.
@@ -485,26 +626,44 @@ mod tests {
     }
 
     #[test]
-    fn requesting_an_unavailable_control_fails_closed() {
-        // The invariant: a capability that requires a ceiling is refused rather than
-        // run without one.
+    fn a_control_is_either_enforced_or_refused_and_never_silently_skipped() {
+        // The invariant, stated so it holds on *every* host.
+        //
+        // This test used to assert the host refuses, on the strength of an earlier
+        // probe nested under `app.slice/ptyxis-spawn-*.scope`. That scope accepts no
+        // controllers; its **parent** `user@1000.service` does. Discovery now walks
+        // ancestors and probes by writing, so the development host turns out to be
+        // delegated after all (V-57).
+        //
+        // Asserting a fixed outcome would re-break on a host change; asserting the
+        // *rule* tests the property that must never change.
         let cg = CgroupV2::discover();
-        let err = cg
-            .create(
-                "fail-closed-test",
-                &[ResourceControl::Memory {
-                    bytes: 64 * 1024 * 1024,
-                }],
-            )
-            .expect_err("must refuse when undelegated");
-        assert!(
-            !err.controls.is_empty(),
-            "the refusal must name the control"
-        );
-        assert!(
-            err.reason.contains("delegat") || err.reason.contains("create"),
-            "{}",
-            err.reason
-        );
+        match cg.create(
+            "fail-closed-test",
+            &[ResourceControl::Memory {
+                bytes: 64 * 1024 * 1024,
+            }],
+        ) {
+            Ok(cgroup) => {
+                assert!(
+                    cg.availability.memory,
+                    "a cgroup carrying a memory ceiling needs the controller"
+                );
+                let limit =
+                    std::fs::read_to_string(cgroup.path.join("memory.max")).unwrap_or_default();
+                assert_eq!(
+                    limit.trim(),
+                    (64 * 1024 * 1024).to_string(),
+                    "a returned cgroup must actually carry the requested ceiling"
+                );
+                cgroup.remove();
+            }
+            Err(miss) => {
+                assert!(
+                    !miss.controls.is_empty(),
+                    "a refusal must name the control it could not enforce"
+                );
+            }
+        }
     }
 }
