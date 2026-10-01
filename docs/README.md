@@ -14,8 +14,8 @@ Remaining Phase 4b work, as two bounded tracks:
 
 ```text
 4b-Linux    V-46 end-to-end cgroup enforcement
-            V-54 the fallback mutation (structurally argued today, not mutation-proven)
             resource-policy finalisation  [done — V-56]
+            V-54 fallback mutation         [done — MUTATION-VERIFIED]
 
 4b-Windows  V-29 a real Windows runner
             Job Object process-tree and resource tests
