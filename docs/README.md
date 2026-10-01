@@ -18,7 +18,8 @@ Remaining Phase 4b work, as two bounded tracks:
             resource-policy finalisation  [done — V-56]
             V-54 fallback mutation         [done — MUTATION-VERIFIED]
 
-4b-Windows  V-29 a real Windows runner
+4b-Windows  V-29 MSVC compile cross-check    [done — 9/15 crates, mutation-verified]
+            V-29 Windows behaviour test lane  [done — wired into CI, first run pending]
             Job Object process-tree and resource tests
             a Windows execution backend
 ```
@@ -34,7 +35,24 @@ adopts a cgroup, so `Dispatcher -> sandbox -> subprocess` does not pass through 
 A governed dispatch requiring a memory ceiling was measured refusing on a host that
 can enforce one, which is precisely the gap. Also fixed in this step: the discovery
 race, where probe and execution cgroup names were constants and concurrent callers
-deleted each other's directories. **V-29 open** -- no Windows evidence.
+deleted each other's directories.
+
+**V-29 partly closed, and split into what is and is not proven.** The portable core no
+longer names a Linux mechanism: `orxnud-capability` asks the sandbox crate for *the
+host's* backend, and that crate selects `BwrapRunner` on Linux and a **refusing**
+`UnsupportedRunner` everywhere else. Nine of fifteen crates -- every platform adapter,
+`orxnud-domain`, `orxnud-protocol`, `orxnud-config`, `orxnud-obs`, `orxnuctl` -- check
+clean for MSVC, and a type error planted in the Windows-only arm fails the MSVC build
+and not the Linux build, so that arm is compiled rather than dead. The remaining six
+are blocked on this host by a missing MSVC C toolchain (`libsqlite3-sys`), not by any
+Rust-level error. Two real defects were fixed on the way: a Tier-1 program was tested
+for absoluteness with `starts_with('/')`, which would have refused *every* Windows
+program, and `SandboxSpec`'s default working directory was a literal POSIX root in the
+portable contract. **Still NOT PROVEN: Windows isolation.** No Job Object or
+AppContainer backend exists, so a Tier-1 execution on Windows is refused outright --
+deliberately, because an unsandboxed Tier-1 subprocess is worse than no capability at
+all. A second CI lane now runs the platform-neutral suites on Windows as tests rather
+than only compiling them.
 
 Phase 4b has three objectives: wire the sandbox into the Phase 3 dispatcher so the
 governed path actually uses it (V-50), prove hard resource ceilings where cgroup
@@ -45,7 +63,8 @@ The security model is no longer prose: `CapabilityInvocation` is not deserialisa
 policy is the only crate that can mint one, the dispatcher is the only route to an
 adapter, and credentials resolve after every check that can refuse.
 
-The Windows cross-check is unrun because this host has no MSVC C toolchain — an open
+The Windows cross-check is partial: the crates behind bundled SQLite cannot be
+cross-checked from this host, which has no MSVC C toolchain. That is an open
 verification item, not an implementation gap.
 Phase 1 (workspace, crate graph, CI gates, the ADR-0029 conformance harness) and
 Phase 2 (bundled-SQLite storage, the task schema, the production engine and

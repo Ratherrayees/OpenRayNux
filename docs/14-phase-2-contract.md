@@ -302,11 +302,14 @@ outside `orxnud-policy`, so the absence is mechanical rather than asserted.
 
 All Phase 2 implementation exit criteria are met.
 
-The Windows `cargo check` remains unrun, blocked by the absence of an MSVC C
-toolchain on this host (`cc-rs: failed to find tool "lib.exe"`). V-29 is carried
-forward unchanged from Phase 1 and is **not** claimed. Nothing in this document
-depends on it: the storage and engine layers are platform-independent, and the
-platform boundary is enforced by gate G3 rather than by a successful Windows build.
+The Windows `cargo check` remains partial, blocked for the six crates behind
+bundled SQLite by the absence of an MSVC C toolchain on this host
+(`cc-rs: failed to find tool "lib.exe"`). The other nine crates -- including
+`orxnud-store`'s own platform-independent peers `orxnud-task`, `orxnud-policy` and
+`orxnud-daemon` apart from their SQLite dependency -- check clean for MSVC. V-29 is
+carried forward and is **not** claimed. Nothing in this document depends on it: the
+storage and engine layers are platform-independent, and the platform boundary is
+enforced by gate G3 rather than by a successful Windows build.
 
 ### Next-phase entry condition
 

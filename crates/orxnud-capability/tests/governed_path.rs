@@ -25,7 +25,7 @@ use orxnud_capability::dispatch::{
     AdapterBundle, CapabilityAdapter, DispatchError, ExecutionBackend, ExecutionContract,
     ExecutionReport, ExecutionTier, SandboxPlan, SandboxRefusal,
 };
-use orxnud_capability::subprocess::BwrapExecutionBackend;
+use orxnud_capability::subprocess::SandboxExecutionBackend;
 use orxnud_capability::verification::{
     ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
 };
@@ -250,7 +250,7 @@ impl Verifier for ReportVerifier {
 /// An execution backend that counts executions, so a refusal can be detected as
 /// "nothing ran" rather than inferred from timing.
 struct CountingBackend {
-    inner: Arc<BwrapExecutionBackend>,
+    inner: Arc<SandboxExecutionBackend>,
     calls: AtomicUsize,
     seen: Mutex<Vec<ExecutionContract>>,
 }
@@ -258,7 +258,7 @@ struct CountingBackend {
 impl CountingBackend {
     fn new() -> Self {
         Self {
-            inner: Arc::new(BwrapExecutionBackend::new()),
+            inner: Arc::new(SandboxExecutionBackend::new()),
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
         }
@@ -648,7 +648,7 @@ fn a_governed_filesystem_probe_is_denied() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -685,7 +685,7 @@ fn a_governed_network_probe_is_denied() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -719,7 +719,7 @@ fn a_governed_environment_probe_sees_no_secret() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -774,7 +774,7 @@ fn a_governed_descendant_spawn_is_contained() {
         }) as Arc<dyn AdapterBundle>,
     );
     let mut d2 = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
-        .with_execution(Arc::new(BwrapExecutionBackend::new()));
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     d2.dispatch(
         request(),
@@ -816,7 +816,7 @@ fn a_governed_hang_is_stopped_at_the_deadline() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let started = std::time::Instant::now();
     let outcome = d2
@@ -857,7 +857,7 @@ fn a_governed_flood_is_bounded() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(

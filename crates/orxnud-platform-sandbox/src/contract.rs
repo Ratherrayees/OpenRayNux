@@ -267,13 +267,19 @@ impl SandboxSpec {
     ///
     /// The builder methods only ever *add* explicit grants, so a forgotten setting
     /// produces a more restricted capability rather than a less restricted one.
+    ///
+    /// `working_dir` defaults to the platform's root separator — `/` on Linux, `\` on
+    /// Windows. Not a hard-coded `"/"`: this module is the *portable* half of the
+    /// boundary and is compiled for every target, so a literal POSIX root would be a
+    /// Linux assumption in the one file that must not contain one (gate G3). On Linux
+    /// the value is byte-identical to the previous literal.
     #[must_use]
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
-            working_dir: PathBuf::from("/"),
+            working_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             fs: FsPolicy::default(),
             network: NetworkPolicy::None,
             limits: ResourceLimits::default(),
@@ -576,7 +582,7 @@ impl AvailableGuarantees {
         if spec.requires.visibility == Visibility::Namespaced && !self.visibility {
             return Err(SandboxUnavailable::GuaranteeUnavailable {
                 guarantee: "namespace isolation",
-                detail: "no PID/mount namespace support available".to_owned(),
+                detail: "no PID/mount namespace or AppContainer isolation available".to_owned(),
             });
         }
         Ok(())
