@@ -1,6 +1,9 @@
 # OpenRayNux — Documentation Index
 
-Status: **Phase 2 — persistence and the durable task engine complete.**
+Status: **Phase 2 implementation complete; Windows verification open (V-29).**
+The Linux implementation is complete and verified. The Windows cross-check is unrun
+because this host has no MSVC C toolchain — an open verification item, not a Phase 2
+implementation gap.
 Phase 1 (workspace, crate graph, CI gates, the ADR-0029 conformance harness) and
 Phase 2 (bundled-SQLite storage, the task schema, the production engine and
 scheduler) are both implemented. **No capability is enabled and no feature works** —

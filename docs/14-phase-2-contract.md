@@ -1,6 +1,18 @@
 # 14 — Phase 2 Contract and Delivery Record
 
-Status: **Delivered.** Phase 2 made the deterministic task layer operational:
+Status:
+
+```text
+Phase 2 implementation: COMPLETE
+Windows verification:   OPEN (V-29)
+```
+
+These are separate. The Linux implementation is complete and verified; the Windows
+cross-check is unrun because this host has no MSVC C toolchain. V-29 is an open
+verification item, **not** a Phase 2 implementation gap, and it is not recorded as
+one.
+
+Phase 2 made the deterministic task layer operational:
 persistent storage, the production task repository, the durable engine, the
 scheduler, and crash/restart recovery — with all twelve ADR-0029 properties passing
 against the **unmodified** Phase 1 harness.
@@ -288,6 +300,37 @@ outside `orxnud-policy`, so the absence is mechanical rather than asserted.
 
 ## 11. Status
 
-All Phase 2 exit criteria are met **except** the Windows `cargo check`, which
-remains blocked by the absence of an MSVC C toolchain on this host — see V-29,
-carried forward unchanged from Phase 1 and **not** claimed here.
+All Phase 2 implementation exit criteria are met.
+
+The Windows `cargo check` remains unrun, blocked by the absence of an MSVC C
+toolchain on this host (`cc-rs: failed to find tool "lib.exe"`). V-29 is carried
+forward unchanged from Phase 1 and is **not** claimed. Nothing in this document
+depends on it: the storage and engine layers are platform-independent, and the
+platform boundary is enforced by gate G3 rather than by a successful Windows build.
+
+### Next-phase entry condition
+
+The task engine is now the most security-sensitive subsystem in the repository, so
+before any capability is registered, the chain
+
+```text
+Actor → authority → policy → approval → dispatch → execution → verification → audit
+```
+
+must have no bypass path from external input to a side effect. **Verified as of this
+commit:** there is none, and the absence is mechanical rather than editorial —
+
+- `orxnud-task` depends on `orxnud-domain`, `orxnud-store`, `orxnud-policy`, and
+  `orxnud-audit`. It does not depend on `orxnud-capability`, and no task-layer source
+  names `Dispatcher`, `CapabilityRegistry`, or `CapabilityInvocation`.
+- Gate G2 enforces that dependency edge in both directions, so the capability crate
+  cannot be reached from the engine without failing the build.
+- Gate G2 also greps `AuthorisationProof`, `PolicySeal`, and `.authorise(` out of every
+  crate's production sources, so a task cannot construct its own authorisation even
+  if it could name policy.
+
+`DurableEngine::reserve_effect` records *that* an external call was intended and
+whether its outcome is known. It does not make calls: reserving an effect is a ledger
+write, and nothing in Phase 2 performs the effect. The dispatch and execution legs of
+the chain are Phase 4+, which is where this property has to be re-checked rather than
+assumed to have carried forward.
