@@ -7,7 +7,19 @@ Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
 Phase 4a  ✅ Process isolation
-Phase 4b  ⏳ Hard resource ceilings + Windows evidence
+Phase 4b  ⚠️ V-50 complete / V-46 partial / V-29 open
+```
+
+Remaining Phase 4b work, as two bounded tracks:
+
+```text
+4b-Linux    V-46 end-to-end cgroup enforcement
+            V-54 the fallback mutation (structurally argued today, not mutation-proven)
+            resource-policy finalisation  [done — V-56]
+
+4b-Windows  V-29 a real Windows runner
+            Job Object process-tree and resource tests
+            a Windows execution backend
 ```
 
 Phase 4b progress: **V-50 complete** -- the governed dispatcher now executes Tier-1

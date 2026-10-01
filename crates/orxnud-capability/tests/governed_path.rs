@@ -195,7 +195,7 @@ impl AdapterBundle for HelperBundle {
             // The helper is well behaved; it observes rather than demands resource
             // ceilings. A capability that could exhaust the host would demand them and
             // be refused on a host that cannot provide them (V-46).
-            require_resource_ceilings: false,
+            resources: orxnud_capability::dispatch::ResourcePolicy::default(),
         })
     }
 }

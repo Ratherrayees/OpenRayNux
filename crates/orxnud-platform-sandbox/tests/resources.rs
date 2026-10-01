@@ -193,6 +193,48 @@ fn a_capability_requiring_ceilings_is_refused_on_an_undelegated_host() {
     }
 }
 
+#[test]
+fn an_execution_lands_in_a_dedicated_child_cgroup() {
+    // The safety property behind "falls back to the hierarchy root".
+    //
+    // The phrase is only safe because the base is a *parent*: limits are written to a
+    // child, and only processes adopted into that child are affected. Writing
+    // `memory.max` or `pids.max` on the shared base would throttle or kill unrelated
+    // processes OpenRayNux does not own, so this asserts the structure rather than
+    // trusting the wording.
+    let cg = CgroupV2::discover();
+    let Ok(handle) = cg.create("dedicated-child-test", &[]) else {
+        // No delegation here, so no cgroup exists and nothing could be misplaced.
+        return;
+    };
+    assert!(
+        handle.is_dedicated_child(),
+        "the execution cgroup must be strictly below its base, got {:?} under {:?}",
+        handle.path,
+        handle.base
+    );
+    assert_ne!(
+        handle.path, handle.base,
+        "an execution must never be placed directly into the shared base"
+    );
+    // And the controls, when written, go to the child.
+    if cg.availability.memory {
+        let limit = std::fs::read_to_string(handle.path.join("memory.max")).unwrap_or_default();
+        assert!(
+            limit.trim().is_empty() || limit.trim() == "max",
+            "a fresh dedicated child must not inherit a limit; got {limit:?}"
+        );
+        assert!(
+            !handle.base.join("memory.max").exists()
+                || std::fs::read_to_string(handle.base.join("memory.max"))
+                    .map(|v| v.trim() == "max" || v.trim().is_empty())
+                    .unwrap_or(true),
+            "the shared base must not have been given a memory limit"
+        );
+    }
+    handle.remove();
+}
+
 /// Whether bubblewrap is on `PATH`.
 fn which_bwrap() -> bool {
     std::process::Command::new("bwrap")

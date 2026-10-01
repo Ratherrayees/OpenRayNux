@@ -135,15 +135,24 @@ fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal>
         .with_deadline(std::time::Duration::from_millis(contract.deadline_ms))
         .with_output_cap(contract.output_cap_bytes);
 
-    // Containment is always required; it is what the sandbox *is*. Resource ceilings
-    // are per capability, because demanding them unconditionally would refuse every
-    // Tier-1 dispatch on a host without delegated cgroups -- a sandbox that never
-    // runs invites someone to weaken the default later.
+    // Containment is always required; it is what the sandbox *is*.
     spec.requires.tree_lifetime = TreeLifetime::Required;
-    spec.requires.resources = if contract.require_resource_ceilings {
-        Resource::Required
-    } else {
+
+    // The resource rule, applied deterministically from the contract rather than
+    // inferred from whatever the host happens to offer:
+    //
+    //     capability requires control X  +  X cannot be established  ->  REFUSE
+    //     capability requires nothing    +  budget unenforceable    ->  PROCEED, record gap
+    //
+    // Any required control makes the whole request `Required`, because the sandbox
+    // crate models resource enforcement as one switch. That is a deliberate
+    // coarsening: a capability needing only `pids.max` is refused on a host offering
+    // `pids.max` but not `memory.max`. Coarse and safe beats fine and surprising, and
+    // the refusal names what was missing.
+    spec.requires.resources = if contract.resources.required.is_empty() {
         Resource::Observed
+    } else {
+        Resource::Required
     };
     Ok(spec)
 }
@@ -283,7 +292,7 @@ mod tests {
             network: false,
             deadline_ms: 5_000,
             output_cap_bytes: 64 * 1024,
-            require_resource_ceilings: false,
+            resources: crate::dispatch::ResourcePolicy::default(),
         }
     }
 

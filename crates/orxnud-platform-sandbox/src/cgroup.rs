@@ -148,10 +148,27 @@ impl CgroupAvailability {
 /// A cgroup v2 subtree this process may manage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupV2 {
-    /// The directory this handle owns.
+    /// The directory this handle owns — always a **dedicated child**, never the base.
     pub path: PathBuf,
+    /// The parent this handle was created under.
+    ///
+    /// Retained so "is the execution in a dedicated child?" is answerable from the
+    /// handle rather than inferred. See [`CgroupV2::is_dedicated_child`].
+    pub base: PathBuf,
     /// What the host permits.
     pub availability: CgroupAvailability,
+}
+
+impl CgroupV2 {
+    /// Whether this handle's directory is strictly below its base.
+    ///
+    /// The mechanical form of the safety property: a limit written to `self.path` can
+    /// only affect processes that were adopted into it, and never the base's other
+    /// members.
+    #[must_use]
+    pub fn is_dedicated_child(&self) -> bool {
+        self.path != self.base && self.path.starts_with(&self.base)
+    }
 }
 
 impl CgroupV2 {
@@ -165,6 +182,7 @@ impl CgroupV2 {
         let availability = Self::probe();
         Self {
             path: PathBuf::new(),
+            base: PathBuf::new(),
             availability,
         }
     }
@@ -190,7 +208,22 @@ impl CgroupV2 {
         availability
     }
 
-    /// Creates a cgroup of our own, with `controls` applied.
+    /// Creates a **dedicated child** cgroup, with `controls` applied.
+    ///
+    /// # "Dedicated child" is the whole safety property
+    ///
+    /// [`own_cgroup`] may resolve to the cgroup hierarchy root, when the process's own
+    /// cgroup is not creatable in (a container scope, for instance). That fallback is
+    /// safe **only** because this function never writes a control to the base: it always
+    /// creates `base/orxnud-<name>` and puts the limits and the process in *that*.
+    ///
+    /// Putting an execution directly into the shared root would mean writing
+    /// `memory.max` or `pids.max` where unrelated processes live, so a resource limit
+    /// could throttle or kill something OpenRayNux does not own. That must never
+    /// happen, and [`CgroupV2::create`] is the only place a cgroup is made.
+    ///
+    /// Asserted by `resources.rs::an_execution_lands_in_a_dedicated_child_cgroup`,
+    /// which checks that the returned directory is strictly *below* the base.
     ///
     /// # Errors
     ///
@@ -233,6 +266,7 @@ impl CgroupV2 {
 
         Ok(Self {
             path,
+            base,
             availability: self.availability,
         })
     }

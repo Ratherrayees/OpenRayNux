@@ -252,7 +252,7 @@ pub trait CapabilityAdapter: Send + Sync {
 /// network grant, a deadline. Nothing here names bubblewrap, a namespace, a cgroup, or
 /// a Job Object — those are the backend's business, and leaking them into a portable
 /// crate is what gate G3 exists to prevent (ADR-0035).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionContract {
     /// The capability being run.
     pub capability: CapabilityId,
@@ -278,18 +278,83 @@ pub struct ExecutionContract {
     pub deadline_ms: u64,
     /// Per-stream output cap.
     pub output_cap_bytes: u64,
-    /// Whether OS-enforced resource ceilings are **required**.
+    /// Which resource controls must be established, and what this invocation may use.
+    pub resources: ResourcePolicy,
+}
+
+/// Which resource controls must be established, and what this invocation may use.
+///
+/// # Requirement is not budget
+///
+/// The two are related and are deliberately separate fields, because conflating them
+/// produces both a security hole and a usability bug:
+///
+/// ```text
+/// requirement = "this capability must have memory isolation, or it does not run"
+/// budget      = "this invocation may use 64 MiB"
+/// ```
+///
+/// A requirement is a **precondition**: if the host cannot establish it the dispatch is
+/// **refused** and nothing runs. A budget is a **ceiling for one invocation**: when the
+/// host cannot enforce it the budget is still recorded, the shortfall reported, and the
+/// invocation proceeds.
+///
+/// The rule is deterministic and lives here, in the contract, rather than being inferred
+/// by the dispatcher from what happens to be available:
+///
+/// ```text
+/// capability requires control X  +  X cannot be established  ->  REFUSE
+/// capability requires nothing    +  budget X unenforceable   ->  PROCEED, record gap
+/// ```
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResourcePolicy {
+    /// Controls that must be established, or the dispatch is refused.
     ///
-    /// Per capability rather than a blanket default: `true` means the dispatch is
-    /// *refused* when the host cannot enforce ceilings. Defaulting it to `true` would
-    /// refuse every Tier-1 capability on a host without delegated cgroups -- fail-closed
-    /// in form, a sandbox that never runs in practice, and pressure to weaken the
+    /// Per capability and explicit. A blanket "everything is required" would refuse
+    /// every Tier-1 capability on a host without delegated cgroups -- fail-closed in
+    /// form, a sandbox that never runs in practice, and steady pressure to weaken the
     /// default later.
-    ///
-    /// A capability that cannot safely exceed a limit sets this `true` and is refused
-    /// rather than run unbounded; one that can sets `false` and gets supervisor-side
-    /// observation, recorded in `ExecutionResult::unproven`.
-    pub require_resource_ceilings: bool,
+    pub required: Vec<ResourceRequirement>,
+    /// Soft ceilings for this invocation.
+    pub budget: ResourceBudget,
+}
+
+/// One control a capability needs established before it may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRequirement {
+    /// `memory.max`.
+    Memory,
+    /// `pids.max`.
+    Processes,
+    /// `cpu.max`.
+    Cpu,
+}
+
+impl ResourceRequirement {
+    /// A stable label, for refusals and audit records.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Processes => "processes",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+/// Soft ceilings for one invocation.
+///
+/// Recorded and, where the host can, enforced. A shortfall is reported rather than
+/// silently dropped, so an audit record distinguishes "ran within its budget" from
+/// "ran, and the budget was not enforced".
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ResourceBudget {
+    /// Memory this invocation expects to use, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Processes this invocation expects to create.
+    pub processes: Option<u64>,
+    /// CPU this invocation expects, in fractional cores.
+    pub cpu_cores: Option<f64>,
 }
 
 /// The result a backend returns for a Tier-1 execution.
@@ -401,6 +466,56 @@ fn redact(s: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod resource_rule_tests {
+    use super::{ResourceBudget, ResourcePolicy, ResourceRequirement};
+
+    #[test]
+    fn a_requirement_is_not_a_budget() {
+        // The distinction the contract encodes. Conflating them produces either a
+        // security hole (a budget treated as a gate) or a permanent refusal (a
+        // requirement satisfied only by observation).
+        let requiring = ResourcePolicy {
+            required: vec![ResourceRequirement::Memory],
+            budget: ResourceBudget {
+                memory_bytes: Some(64 * 1024 * 1024),
+                ..ResourceBudget::default()
+            },
+        };
+        assert_eq!(
+            requiring.required.len(),
+            1,
+            "a requirement is a precondition"
+        );
+        assert_eq!(
+            requiring.budget.memory_bytes,
+            Some(64 * 1024 * 1024),
+            "a budget is a per-invocation ceiling and is independent of it"
+        );
+
+        let budgeting_only = ResourcePolicy {
+            required: vec![],
+            budget: requiring.budget,
+        };
+        assert!(budgeting_only.required.is_empty());
+        assert_ne!(
+            budgeting_only.required, requiring.required,
+            "the same budget with and without a requirement must differ in gating"
+        );
+    }
+
+    #[test]
+    fn requirements_are_named_for_refusals() {
+        for r in [
+            ResourceRequirement::Memory,
+            ResourceRequirement::Processes,
+            ResourceRequirement::Cpu,
+        ] {
+            assert!(!r.label().is_empty(), "a refusal must name the control");
+        }
+    }
+}
+
 /// Which isolation tier an implementation requires.
 ///
 /// Two values, and no third. A tier that meant "best effort" would be a bypass with a
@@ -435,7 +550,7 @@ pub struct SandboxRefusal {
 /// Separate from [`CapabilityAdapter`] because only Tier-1 adapters have one, and
 /// requiring every Tier-0 adapter to answer "which program do you run?" would be a
 /// lie for an in-process implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SandboxPlan {
     /// Absolute path to the executable.
     pub program: String,
@@ -455,12 +570,8 @@ pub struct SandboxPlan {
     pub deadline_ms: u64,
     /// Per-stream output cap.
     pub output_cap_bytes: u64,
-    /// Whether OS-enforced resource ceilings are required.
-    ///
-    /// See [`ExecutionContract::require_resource_ceilings`] for why this is per
-    /// capability. `false` means "observed, not enforced", and the difference is
-    /// recorded in the audit trail.
-    pub require_resource_ceilings: bool,
+    /// Which controls must be established, and what this invocation may use.
+    pub resources: ResourcePolicy,
 }
 
 /// Verification strategy, looked up alongside the adapter.
@@ -679,7 +790,7 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             network: sandboxed.network,
             deadline_ms: sandboxed.deadline_ms,
             output_cap_bytes: sandboxed.output_cap_bytes,
-            require_resource_ceilings: sandboxed.require_resource_ceilings,
+            resources: sandboxed.resources.clone(),
         })
     }
 
