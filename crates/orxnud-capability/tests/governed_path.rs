@@ -993,7 +993,11 @@ mod v46 {
     ///
     /// Runs on its own thread because the dispatch blocks until the payload exits, and
     /// the payload is only in the cgroup while it is running.
-    fn watch(seconds: u64) -> (std::thread::JoinHandle<Observed>, Arc<AtomicBool>, CgroupV2) {
+    fn watch(
+        seconds: u64,
+        ceiling: &str,
+    ) -> (std::thread::JoinHandle<Observed>, Arc<AtomicBool>, CgroupV2) {
+        let ceiling = ceiling.to_owned();
         let base = CgroupV2::discover();
         let base_path = base.base.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1025,16 +1029,30 @@ mod v46 {
                     if p != base_path && p.starts_with(&base_path) {
                         o.strictly_below_base = true;
                     }
+                    let mut is_mine = o.my_path.as_deref() == Some(p.as_path());
                     if let Ok(m) = std::fs::read_to_string(p.join("memory.max")) {
                         let v = m.trim().to_owned();
                         // Identify *our* execution by a ceiling unique to this test.
                         // Scoping by pid is not enough: `cargo test` runs the tests in this
                         // binary in parallel threads of one process, so sibling tests share
                         // the pid prefix and their in-flight cgroups read as our leak.
-                        if v == MY_CEILING && o.my_path.is_none() {
+                        if v == ceiling && o.my_path.is_none() {
                             o.my_path = Some(p.clone());
+                            is_mine = true;
                         }
                         o.memory_max.push(v);
+                    }
+                    // Every measurement below is scoped to *our* cgroup.
+                    //
+                    // Reading them from all of our process's cgroups was wrong: the tests
+                    // in this module run in parallel threads of one process, so a sibling
+                    // test's in-flight cgroup was contributing its memory ceiling,
+                    // counters and peak to ours. That produced a 16 MiB ceiling being
+                    // reported as having held 26 MB -- the sibling's 32 MiB cgroup, not
+                    // ours. The failure looked like the ceiling was not enforced, which is
+                    // the one conclusion this observer exists to rule out.
+                    if !is_mine {
+                        continue;
                     }
                     // Enforcement evidence, read from the kernel rather than from the
                     // helper.
@@ -1090,9 +1108,6 @@ mod v46 {
         });
         (handle, stop, base)
     }
-
-    /// A memory ceiling used by exactly one test, so "our" cgroup is identifiable.
-    const MY_CEILING: &str = "50331648";
 
     fn available() -> bool {
         let av = CgroupV2::discover().availability;
@@ -1156,6 +1171,9 @@ mod v46 {
             println!("  host does not delegate memory+pids+cpu; reported, not skipped");
             return;
         }
+        // A ceiling used by exactly this test, so the observer can identify this
+        // execution's cgroup among the ones its parallel siblings create.
+        const MY_CEILING: &str = "50331648";
         let required = ResourcePolicy {
             required: vec![ResourceRequirement::Memory],
             budget: ResourceBudget {
@@ -1172,7 +1190,7 @@ mod v46 {
         let secrets = FakeSecrets::new();
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
             .with_execution(Arc::new(BwrapExecutionBackend::new()));
-        let (watcher, stop, _base) = watch(25);
+        let (watcher, stop, _base) = watch(25, MY_CEILING);
         let outcome = d
             .dispatch(
                 request(),
@@ -1464,7 +1482,7 @@ mod v46 {
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
             .with_execution(Arc::new(BwrapExecutionBackend::new()));
 
-        let (watcher, stop, base) = watch(30);
+        let (watcher, stop, base) = watch(30, "268435456");
         let outcome = d
             .dispatch(
                 request(),
@@ -1546,6 +1564,7 @@ mod v46 {
             return;
         }
         const CEILING: u64 = 16 * 1024 * 1024;
+        let mine = "16777216";
         let required = ResourcePolicy {
             required: vec![ResourceRequirement::Memory],
             budget: ResourceBudget {
@@ -1574,7 +1593,7 @@ mod v46 {
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
             .with_execution(Arc::new(BwrapExecutionBackend::new()));
 
-        let (watcher, stop, _base) = watch(25);
+        let (watcher, stop, _base) = watch(25, mine);
         let outcome = d
             .dispatch(
                 request(),
@@ -1638,5 +1657,265 @@ mod v46 {
             "the cgroup held {} bytes against a {CEILING}-byte ceiling",
             o.peak_memory_current
         );
+    }
+
+    // ------------------------------------------- V-46: placement precedes execution
+
+    /// The payload must be inside the governed cgroup *before* it executes meaningful work,
+    /// not merely at some point afterwards.
+    ///
+    /// # Why this is not the same as "membership is verified"
+    ///
+    /// Verifying membership from `cgroup.procs` after the fact is necessary but not
+    /// sufficient. It proves the process *is* a member; it cannot prove it was not already
+    /// doing unconstrained work before joining. The two properties differ, and only the
+    /// second one is what a ceiling means:
+    ///
+    /// ```text
+    ///   "the process eventually joined"      !=  "the process was constrained first"
+    /// ```
+    ///
+    /// # The evidence
+    ///
+    /// The helper's *first* action on entry is to allocate and touch memory
+    /// (`mem-hog` in `hostile_helper.rs`). The observer reads the execution cgroup's own
+    /// `memory.events`. If the payload had executed any of those instructions before
+    /// placement, those pages would be charged to the cgroup it started in instead, and
+    /// this cgroup's `max` counter would stay at zero.
+    ///
+    /// A non-zero `max` is therefore positive evidence that placement happened first.
+    /// Measured on this host while developing the test: **103** refused allocations
+    /// recorded against the execution cgroup from a payload whose first act was to
+    /// allocate, against a 32 MiB ceiling.
+    ///
+    /// # What this does not prove
+    ///
+    /// It does not make the window *zero*. The join is performed by a shell that writes its
+    /// own pid and then `exec`s `bwrap`, so instructions execute between `fork` and that
+    /// write. Those are the shell's, not the payload's, and the payload does not exist yet
+    /// -- `bwrap` has not been exec'd. The claim being tested is the one that matters: **no
+    /// attacker-controlled instruction runs before placement**, because the attacker's code
+    /// has not started.
+    /// What the helper reports is the deterministic signal, because it does not depend on
+    /// the observer winning a sampling race.
+    ///
+    /// The helper allocates and touches `TOUCH_BUDGET_MIB` (64 MiB) and then reports how
+    /// far it got. Against a 32 MiB ceiling it cannot finish, so `touched 64 MiB` is
+    /// absent — and it can only be absent if the pages were charged to the ceiling's
+    /// cgroup, since an unconstrained payload would simply have allocated them.
+    ///
+    /// The counters are corroboration rather than the assertion, and deliberately so: an
+    /// earlier version of this test asserted on them and failed intermittently under
+    /// whole-workspace parallelism, because a short-lived cgroup can be created and
+    /// destroyed between two 3 ms polls. That is a property of the sampler, not of the
+    /// enforcement, and asserting it tested the wrong thing — the same reason the
+    /// neighbouring test above reports its counters instead of requiring them.
+    #[test]
+    fn the_payload_is_constrained_before_it_executes_work() {
+        if !available() {
+            println!("  host does not delegate memory control; reported, not skipped");
+            return;
+        }
+        const CEILING: u64 = 32 * 1024 * 1024;
+        let mine = "33554432";
+        let required = ResourcePolicy {
+            required: vec![ResourceRequirement::Memory],
+            budget: ResourceBudget {
+                memory_bytes: Some(CEILING),
+                processes: Some(16),
+                cpu_cores: Some(0.5),
+            },
+        };
+        // `mem-hog` allocates and touches on its first instruction; 64 MiB is well above
+        // the ceiling, so the kernel must intervene. The helper is bounded (TOUCH_BUDGET_MIB)
+        // so a failed experiment costs a rounding error rather than the host.
+        let mut adapter = Tier1HelperAdapter::running("mem-hog");
+        adapter.env.insert("ORXNUD_ARG1".into(), "64".into());
+        let id = cap();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        m.insert(
+            id.clone(),
+            Arc::new(PolicyBundle {
+                adapter,
+                resources: required.clone(),
+                grant_rw: Vec::new(),
+                deadline_ms: 20_000,
+            }),
+        );
+        let mut engine = policy(0, 1_000);
+        let secrets = FakeSecrets::new();
+        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
+            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+
+        let (watcher, stop, _base) = watch(25, mine);
+        let outcome = d
+            .dispatch(
+                request(),
+                human(),
+                context(),
+                None,
+                params(),
+                None,
+                None,
+                NOW,
+            )
+            .expect("dispatch");
+        stop.store(true, Ordering::SeqCst);
+        let o = watcher.join().expect("observer");
+
+        let charged = o.memory_refusals + o.memory_oom + o.memory_oom_kill;
+        let text = format!("{:?}", outcome.execution);
+        println!(
+            "  ceiling {CEILING}; payload's first act was to allocate: max={} oom={} \
+             oom_kill={}",
+            o.memory_refusals, o.memory_oom, o.memory_oom_kill
+        );
+        assert!(
+            o.memory_max.iter().any(|m| m == &CEILING.to_string()),
+            "the ceiling must be on the execution cgroup: {:?}",
+            o.memory_max
+        );
+        // The deterministic claim: the payload asked for 64 MiB and could not report
+        // having got it. Those pages had to be charged against this cgroup's ceiling,
+        // which is only possible if placement preceded the allocation.
+        assert!(
+            !text.contains("touched 64 MiB"),
+            "the payload reported retaining its full 64 MiB against a {CEILING}-byte \
+             ceiling, so its first allocation was not charged to this cgroup: {text}"
+        );
+        // Corroboration, when the sampler caught the window.
+        if charged > 0 {
+            println!("  kernel intervention recorded against the execution cgroup: {charged}");
+        } else {
+            println!("  intervention counters not sampled (window too short); outcome used");
+        }
+    }
+
+    // ------------------------------------------- V-46: limit validation end to end
+
+    /// A budget the kernel cannot express must be refused by the governed path, before any
+    /// cgroup is created and before any process exists.
+    ///
+    /// The important one is `memory_bytes: u64::MAX`. `memory.max` is signed in the
+    /// kernel, so that value is stored as the literal string `max` -- verified on this host
+    /// by writing it and reading it back. A capability declaring an enormous memory budget
+    /// would therefore be handed an **uncapped** workload while the contract claimed a
+    /// ceiling, with nothing anywhere recording that the limit was not applied. That is
+    /// "failed enforcement reported as successful enforcement", reached through the real
+    /// dispatcher.
+    ///
+    /// The load-bearing assertion is that the runner is never reached, which is stronger
+    /// than checking a refusal message: the cgroup is created *inside* `run`, so a zero
+    /// count proves no cgroup was created and no subprocess spawned.
+    #[test]
+    fn an_unexpressible_budget_is_refused_before_any_cgroup_or_process_exists() {
+        for (label, resources) in unexpressible_budgets() {
+            let backend = Arc::new(BwrapExecutionBackend::new());
+            let id = cap();
+            let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+            m.insert(id.clone(), bundle(resources.clone()));
+
+            let mut engine = policy(0, 1_000);
+            let secrets = FakeSecrets::new();
+            let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
+                .with_execution(backend);
+
+            match d.dispatch(
+                request(),
+                human(),
+                context(),
+                None,
+                params(),
+                None,
+                None,
+                NOW,
+            ) {
+                Err(DispatchError::SandboxRefused(r)) => {
+                    // The refusal must come from *validation*, which is what proves it
+                    // happened before any cgroup existed. A validation refusal names the
+                    // offending value and the range the kernel accepts. A refusal that
+                    // mentioned a cgroup path instead would have come from the kernel or
+                    // from discovery, which can only happen after a cgroup exists.
+                    //
+                    // Checking the refusal's provenance, rather than watching the shared
+                    // base, is deliberate: a watcher there also counts the cgroups of
+                    // sibling tests running in parallel in this same process, and an earlier
+                    // version of this assertion failed that way while the implementation
+                    // was correct.
+                    assert!(
+                        r.reason.contains("outside the range")
+                            || r.reason.contains("cannot host a payload"),
+                        "{label}: expected a validation refusal naming the value, got: {}",
+                        r.reason
+                    );
+                    assert!(
+                        !r.reason.contains("/sys/fs/cgroup"),
+                        "{label}: a validation refusal must not report a cgroup path, which \
+                         would mean it came after a cgroup was created: {}",
+                        r.reason
+                    );
+                }
+                Err(other) => panic!("{label}: expected a sandbox refusal, got {other:?}"),
+                Ok(outcome) => panic!(
+                    "{label}: must be refused, but it produced an outcome: {outcome:?}. An \
+                     unexpressible budget that runs is failed enforcement reported as success"
+                ),
+            }
+        }
+    }
+
+    /// Budgets that are well-formed in their Rust types but meaningless as ceilings.
+    ///
+    /// Each was measured on this host: the kernel either stores it as `max` (no limit at
+    /// all) or accepts a value that cannot host the payload. Every one of them is
+    /// *representable* in the type that carries it, which is precisely why they reached the
+    /// kernel before validation existed.
+    fn unexpressible_budgets() -> Vec<(&'static str, ResourcePolicy)> {
+        vec![
+            (
+                "memory budget of u64::MAX, which the kernel stores as `max`",
+                ResourcePolicy {
+                    required: vec![ResourceRequirement::Memory],
+                    budget: ResourceBudget {
+                        memory_bytes: Some(u64::MAX),
+                        processes: Some(8),
+                        cpu_cores: Some(0.5),
+                    },
+                },
+            ),
+            (
+                "zero process budget, which admits no payload and not even the supervisor",
+                ResourcePolicy {
+                    required: vec![ResourceRequirement::Processes],
+                    budget: ResourceBudget {
+                        memory_bytes: Some(64 * 1024 * 1024),
+                        processes: Some(0),
+                        cpu_cores: Some(0.5),
+                    },
+                },
+            ),
+            (
+                "CPU budget of NaN, used to be dropped silently so no CPU ceiling applied",
+                ResourcePolicy {
+                    required: vec![ResourceRequirement::Cpu],
+                    budget: ResourceBudget {
+                        memory_bytes: Some(64 * 1024 * 1024),
+                        processes: Some(8),
+                        cpu_cores: Some(f64::NAN),
+                    },
+                },
+            ),
+            (
+                "CPU budget of infinity, which saturates to u64::MAX and becomes unlimited",
+                ResourcePolicy {
+                    required: vec![ResourceRequirement::Cpu],
+                    budget: ResourceBudget {
+                        memory_bytes: Some(64 * 1024 * 1024),
+                        processes: Some(8),
+                        cpu_cores: Some(f64::INFINITY),
+                    },
+                },
+            ),
+        ]
     }
 }

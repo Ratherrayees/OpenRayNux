@@ -228,7 +228,51 @@ impl SandboxRunner for BwrapRunner {
         // running without the limits that were required for it. Creation succeeding
         // and a later control write failing is treated as total failure: a partially
         // configured cgroup is not a weaker sandbox, it is a broken one.
-        let controls = controls_for(spec);
+        //
+        // The translation from the spec's portable limits to cgroup controls happens
+        // first, and it is fallible. An inexpressible limit is a refusal, not a shorter
+        // control list -- a dropped control would be an unestablished required guarantee
+        // with nothing to show for it.
+        let controls = match controls_for(spec) {
+            Ok(v) => v,
+            Err(e) => {
+                // Before any cgroup is created and before any process exists.
+                return Ok(ExecutionResult {
+                    status: ExecutionStatus::Refused(e),
+                    stdout: CapturedStream::empty(),
+                    stderr: CapturedStream::empty(),
+                    elapsed: Duration::ZERO,
+                    unproven: Vec::new(),
+                });
+            }
+        };
+        // `Resource::Required` with nothing to enforce is not a satisfiable request.
+        //
+        // This is a fail-open that measurement found: a spec that *requires* OS-enforced
+        // ceilings but names none passed `available.check` (which asks whether the host
+        // *can* enforce, not whether anything was asked for), created no cgroup, ran the
+        // payload unbounded, and reported `unproven: []` -- a required guarantee
+        // silently absent, with no record anywhere that it was missing.
+        //
+        // Which of the two is wrong depends on intent, and the honest reading of
+        // "required" is that it demands *something*. So it is refused as incoherent
+        // rather than executed unbounded. A caller who means "no particular ceiling,
+        // just make sure you could" asks for [`Resource::Observed`], which is what that
+        // value is for.
+        if controls.is_empty() && spec.requires.resources == Resource::Required {
+            return Ok(ExecutionResult {
+                status: ExecutionStatus::Refused(SandboxUnavailable::Invalid(
+                    "OS-enforced resource ceilings are required but no ceiling was named; \
+                     a required guarantee with nothing to enforce would run the payload \
+                     unbounded"
+                        .to_owned(),
+                )),
+                stdout: CapturedStream::empty(),
+                stderr: CapturedStream::empty(),
+                elapsed: Duration::ZERO,
+                unproven: Vec::new(),
+            });
+        }
         let mut owned: Option<CgroupV2> = None;
         if !controls.is_empty() {
             match CgroupV2::discover().create("exec", &controls) {
@@ -626,29 +670,87 @@ fn spawn_supervisor(
         .spawn()
 }
 
-fn controls_for(spec: &SandboxSpec) -> Vec<ResourceControl> {
+/// The cgroup v2 control file that expresses each limit this module can enforce.
+///
+/// # No control is optional
+///
+/// The brief's rule — *a requested control is established or the execution is refused* —
+/// means this returns an error rather than a shorter list. The previous version pushed
+/// whatever it could and dropped the rest, which is how a `cpu_cores` of `NaN` produced a
+/// cgroup with no `cpu.max` at all while the contract said CPU was required: `NaN > 0.0`
+/// is false, the `if let` never fired, and the omission was invisible. A silently dropped
+/// control is a required guarantee quietly not provided.
+///
+/// # `cpu_cores` is converted here, and only here
+///
+/// The portable contract speaks in fractional cores; `cpu.max` speaks in a quota of
+/// microseconds per period. Nothing else in the crate performs that conversion, so there
+/// is exactly one place where the two units can be confused.
+///
+/// # Errors
+///
+/// [`SandboxUnavailable::Invalid`] naming the limit that could not be expressed. The
+/// [`crate::cgroup::LimitInvalid`] detail is carried through so the caller sees the
+/// offending number and the range the kernel accepts.
+fn controls_for(spec: &SandboxSpec) -> Result<Vec<ResourceControl>, SandboxUnavailable> {
     let mut v = Vec::new();
     if let Some(b) = spec.limits.memory_bytes {
+        // Validate before pushing, so a `u64::MAX` budget is refused here -- where the
+        // caller can still be told which number was wrong -- rather than becoming a
+        // `memory.max` of `max`, which is how a memory ceiling quietly becomes no ceiling.
+        ResourceControl::Memory { bytes: b }
+            .validate()
+            .map_err(|e| SandboxUnavailable::Invalid(e.to_string()))?;
         v.push(ResourceControl::Memory { bytes: b });
-        // A memory ceiling evaded by swapping is not a memory ceiling, so the
-        // budget is pinned to zero alongside it.
+        // A memory ceiling evaded by swapping is not a memory ceiling, so the budget is
+        // pinned to zero alongside it. `0` is a valid, meaningful `memory.swap.max`, so
+        // this one is not a validation concern -- only a policy one.
+        ResourceControl::Swap { bytes: 0 }
+            .validate()
+            .map_err(|e| SandboxUnavailable::Invalid(e.to_string()))?;
         v.push(ResourceControl::Swap { bytes: 0 });
     }
     if let Some(p) = spec.limits.max_processes {
+        ResourceControl::Processes { max: p }
+            .validate()
+            .map_err(|e| SandboxUnavailable::Invalid(e.to_string()))?;
         v.push(ResourceControl::Processes { max: p });
     }
-    if let Some(c) = spec.limits.cpu_cores
-        && c > 0.0
-    {
-        // `cpu.max` is `<quota> <period>` in microseconds; the period is a kernel
-        // convention, the quota is the capability's request.
+    if let Some(c) = spec.limits.cpu_cores {
+        // An explicit conversion, with the rounding stated rather than inherited from
+        // `as u64`'s truncation-toward-zero.
+        //
+        // `as u64` on an `f64` saturates, which is why the `f64::INFINITY` and `1e300`
+        // cases used to produce a quota of `u64::MAX` -- a value the kernel stores as
+        // `max`, i.e. *unlimited*, so an absurd request silently became no request at all.
+        // Converting through a checked helper and letting [`ResourceControl::validate`]
+        // judge the result means every one of `NaN`, `inf`, a negative value, zero and a
+        // saturating magnitude is refused with a message naming it.
+        //
+        // The period is the CFS default of 100 ms, inside the kernel's accepted
+        // `1000..=1000000` us range (verified). The quota is rounded to the nearest
+        // microsecond and then floored at one period-millisecond, which is the CFS
+        // bandwidth granularity: anything finer is not expressible, and rounding it to
+        // the nearest representable value would *widen* a very small budget by up to
+        // 1000x -- a ceiling quietly becoming a looser one.
         const PERIOD_US: u64 = 100_000;
-        v.push(ResourceControl::Cpu {
-            quota_us: (c * PERIOD_US as f64) as u64,
+        let scaled = c * PERIOD_US as f64;
+        let quota_us = if scaled.is_finite() && scaled >= 0.0 {
+            scaled.round() as u64
+        } else {
+            // Non-finite or negative cannot be ordered against the kernel's range at all,
+            // so it is refused by validation rather than coerced here.
+            u64::MAX
+        };
+        let cpu = ResourceControl::Cpu {
+            quota_us,
             period_us: PERIOD_US,
-        });
+        };
+        cpu.validate()
+            .map_err(|e| SandboxUnavailable::Invalid(e.to_string()))?;
+        v.push(cpu);
     }
-    v
+    Ok(v)
 }
 
 fn build_command(spec: &SandboxSpec) -> Result<(Vec<String>, String), SandboxUnavailable> {
@@ -947,5 +1049,202 @@ mod tests {
                 result.unproven
             );
         }
+    }
+
+    // ------------------------------------------------------- V-46: limit validation
+
+    #[test]
+    fn required_ceilings_with_nothing_to_enforce_are_refused_not_run_unbounded() {
+        // The fail-open that measurement found, and the worst of the set.
+        //
+        // Before this, `spec.requires.resources = Required` with every limit unset
+        // produced a cgroup-free run that reported `Exited(0)` and `unproven: []`. A
+        // required guarantee was silently absent with nothing recorded anywhere that it
+        // was missing -- the run looked clean while enforcing nothing at all.
+        //
+        // Refused as incoherent, and refused *before* any process exists.
+        let mut spec = SandboxSpec::new("/bin/true");
+        spec.requires.resources = Resource::Required;
+        let result = BwrapRunner::new().run(&spec).expect("run returns a result");
+        match result.status {
+            ExecutionStatus::Refused(SandboxUnavailable::Invalid(why)) => {
+                assert!(
+                    why.contains("no ceiling was named"),
+                    "the refusal must name the incoherence: {why}"
+                );
+            }
+            other => panic!(
+                "a required guarantee with nothing to enforce must be refused, got {other:?} \
+                 -- an unbounded run reporting success is the fail-open this closes"
+            ),
+        }
+        assert_eq!(
+            result.elapsed,
+            Duration::ZERO,
+            "the refusal must not have waited"
+        );
+        assert!(result.stdout.bytes.is_empty(), "nothing may have run");
+    }
+
+    #[test]
+    fn an_observed_request_with_no_ceilings_is_permitted() {
+        // The other side of the same rule, so the refusal cannot be a blanket ban.
+        //
+        // `Observed` means "make sure you could enforce these, and I accept best effort" --
+        // with no ceiling named there is nothing to enforce and nothing to report.
+        let mut spec = SandboxSpec::new("/bin/true");
+        spec.requires.resources = Resource::Observed;
+        let result = BwrapRunner::new().run(&spec).expect("run");
+        assert!(
+            !matches!(result.status, ExecutionStatus::Refused(_)),
+            "an observed request with no ceilings is coherent: {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn a_nan_or_infinite_cpu_budget_is_refused_rather_than_dropped_or_widened() {
+        // The silent-drop defect, pinned.
+        //
+        // `NaN > 0.0` is false, so the old `if let ... && c > 0.0` never fired and the CPU
+        // control vanished: a *required* CPU ceiling ran with no CPU ceiling, silently.
+        // `f64::INFINITY` was worse in the other direction -- `as u64` saturates, so the
+        // quota became `u64::MAX`, which the kernel stores as `max`, i.e. *unlimited*.
+        // Both now refuse, and both refuse before a cgroup exists.
+        for cores in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            let mut spec = SandboxSpec::new("/bin/true");
+            spec.requires.resources = Resource::Required;
+            spec.limits.cpu_cores = Some(cores);
+            let err = controls_for(&spec).expect_err(&format!(
+                "cpu_cores={cores} must be refused, not silently dropped"
+            ));
+            assert!(
+                matches!(err, SandboxUnavailable::Invalid(_)),
+                "an unusable budget is an invalid configuration, got {err:?}"
+            );
+            let result = BwrapRunner::new().run(&spec).expect("run returns a result");
+            assert!(
+                matches!(result.status, ExecutionStatus::Refused(_)),
+                "cpu_cores={cores} must not run: {:?}",
+                result.status
+            );
+            assert_eq!(
+                result.elapsed,
+                Duration::ZERO,
+                "cpu_cores={cores} must be refused before any process exists"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlimited_memory_budget_is_refused_rather_than_becoming_no_limit() {
+        // `memory.max` is signed in the kernel, so `u64::MAX` is stored as the literal
+        // `max`: verified by write-then-read on this host. A capability asking for an
+        // enormous memory budget would otherwise get an uncapped workload while believing
+        // it was bounded.
+        let mut spec = SandboxSpec::new("/bin/true");
+        spec.requires.resources = Resource::Required;
+        spec.limits.memory_bytes = Some(u64::MAX);
+        let err = controls_for(&spec).expect_err("u64::MAX is not a memory ceiling");
+        assert!(err.to_string().contains("memory"), "{err}");
+
+        let result = BwrapRunner::new().run(&spec).expect("run returns a result");
+        assert!(
+            matches!(result.status, ExecutionStatus::Refused(_)),
+            "an uncapped memory request must not run as though it were capped: {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn a_zero_process_budget_is_refused_before_a_cgroup_is_created() {
+        // `pids.max = 0` is accepted by the kernel and admits no process at all,
+        // including the payload. Honouring it would surface much later, as a supervisor
+        // that failed to join, with no mention of the number responsible.
+        let mut spec = SandboxSpec::new("/bin/true");
+        spec.requires.resources = Resource::Required;
+        spec.limits.max_processes = Some(0);
+        let err = controls_for(&spec).expect_err("0 processes admits no payload");
+        assert!(err.to_string().contains("processes"), "{err}");
+        let result = BwrapRunner::new().run(&spec).expect("run returns a result");
+        assert!(
+            matches!(result.status, ExecutionStatus::Refused(_)),
+            "{:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn fractional_cores_convert_to_the_exact_microsecond_quota() {
+        // The unit conversion, stated and tested.
+        //
+        // The portable contract speaks fractional cores; `cpu.max` speaks a quota of
+        // microseconds per period. Half a core at the 100 ms CFS period is 50 000 us.
+        // Asserting the rendered value is what makes the conversion auditable: a change
+        // of period, or a switch to `round` vs truncation, moves these numbers.
+        let quota = |cores: f64| -> String {
+            let mut spec = SandboxSpec::new("/bin/true");
+            spec.limits.cpu_cores = Some(cores);
+            controls_for(&spec)
+                .expect("expressible")
+                .into_iter()
+                .find(|c| c.file() == "cpu.max")
+                .expect("a cpu control")
+                .value()
+        };
+        assert_eq!(quota(0.5), "50000 100000");
+        assert_eq!(quota(1.0), "100000 100000");
+        assert_eq!(quota(0.25), "25000 100000");
+        assert_eq!(quota(2.0), "200000 100000");
+        // A value too fine to express is refused rather than rounded *up* to the
+        // granularity, which would widen a very small budget by up to 1000x.
+        assert!(
+            controls_for(&{
+                let mut s = SandboxSpec::new("/bin/true");
+                s.limits.cpu_cores = Some(0.000001);
+                s
+            })
+            .is_err(),
+            "a millionth of a core is below the CFS granularity and must be refused, not \
+             rounded up to something looser"
+        );
+    }
+
+    #[test]
+    fn a_memory_ceiling_implies_no_swap() {
+        // A memory ceiling evaded by swapping is not a memory ceiling, so swap is pinned
+        // to zero alongside it. Asserted because it is a policy the platform adds on the
+        // caller's behalf: a capability that asked only for memory gets a swap decision
+        // too, and that should be visible rather than incidental.
+        let mut spec = SandboxSpec::new("/bin/true");
+        spec.limits.memory_bytes = Some(32 * 1024 * 1024);
+        let controls = controls_for(&spec).expect("memory is expressible");
+        let files: Vec<&str> = controls.iter().map(|c| c.file()).collect();
+        assert!(
+            files.contains(&"memory.max") && files.contains(&"memory.swap.max"),
+            "a memory ceiling must pin swap as well: {files:?}"
+        );
+        let swap = controls
+            .iter()
+            .find(|c| c.file() == "memory.swap.max")
+            .unwrap();
+        assert_eq!(
+            swap.value(),
+            "0",
+            "swap must be forbidden, not merely bounded"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_limits_at_all_produces_no_controls() {
+        // The distinction the refusal above depends on: "no ceilings named" must be
+        // distinguishable from "ceilings named", or the refusal would be unfalsifiable.
+        let spec = SandboxSpec::new("/bin/true");
+        assert!(
+            controls_for(&spec)
+                .expect("an empty set is not an error")
+                .is_empty(),
+            "a spec that names no ceiling must yield no control"
+        );
     }
 }

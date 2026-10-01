@@ -305,11 +305,13 @@ observed by an in-process fixture.*
 `crates/orxnud-platform-sandbox/tests/isolation.rs`, using real subprocesses under a
 real sandbox: undeclared filesystem and network access are refused, a disabled
 capability starts no process, and a hung or flooding helper is bounded. Point 4 is
-`PROVEN`; point 6 is `PROVEN` for process residue but still `NOT_PROVEN` for resource
-ceilings, because this host delegates no cgroup controllers (V-46). The Phase 3 harness
-still reports 4 and 6 as `declared_only`, and that is intentional: it is an
-in-process harness and must not claim what only the subprocess tests can establish.
-See ADR-0035.
+`PROVEN`; point 6 is `PROVEN` for process residue, and since Phase 4b also for resource
+ceilings on a host that delegates the cgroup controllers (V-46). Delegation is a property
+of the host rather than of the code: where the controllers are unavailable the same tests
+report `NOT_PROVEN` and a capability requiring ceilings is **refused** rather than
+downgraded. The Phase 3 harness still reports 4 and 6 as `declared_only`, and that is
+intentional: it is an in-process harness and must not claim what only the subprocess tests
+can establish. See ADR-0035.
 
 1. Invalid params are rejected, not coerced.
 2. Cancellation is honoured within the declared bound.

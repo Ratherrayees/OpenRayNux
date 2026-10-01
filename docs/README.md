@@ -7,7 +7,7 @@ Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
 Phase 4a  ✅ Process isolation
-Phase 4b  ⚠️ V-50/V-54/V-55/V-56 complete / V-46 mechanism + governed path PROVEN, cgroup.kill redundant (ADR-0036) / V-29 open
+Phase 4b  ⚠️ V-50/V-54/V-55/V-56 complete / V-46 mechanism + governed path + limit validation PROVEN, cgroup.kill redundant (ADR-0036) / V-29 open
 ```
 
 Remaining Phase 4b work, as two bounded tracks:
@@ -16,6 +16,7 @@ Remaining Phase 4b work, as two bounded tracks:
 4b-Linux    V-46 cgroup mechanism       [done — PROVEN, mutation-verified]
             V-46 governed-path adoption   [done — PROVEN, mutation-verified]
             V-46 cgroup.kill teeth         [closed — redundant on Linux, ADR-0036]
+            V-46 limit validation          [done — PROVEN, mutation-verified]
             resource-policy finalisation  [done — V-56]
             V-54 fallback mutation         [done — MUTATION-VERIFIED]
 
@@ -26,10 +27,13 @@ Remaining Phase 4b work, as two bounded tracks:
 
 Phase 4b progress: **V-50 complete** -- the governed dispatcher now executes Tier-1
 capabilities only through the sandbox, with no in-process route and no unsandboxed
-fallback (V-51). **V-46 open, two halves** -- the cgroup *mechanism* is proven and
-mutation-verified, and the *governed path* now uses it: the runner owns a dedicated
-child, writes ceilings before spawning, joins the supervisor via a cgroup `exec` wrapper
-and verifies membership from `cgroup.procs`, failing closed if it cannot. ADR-0036 records that
+fallback (V-51). **V-46 open, three halves** -- the cgroup *mechanism* is proven and
+mutation-verified; the *governed path* uses it (the runner owns a dedicated child, writes
+ceilings before spawning, joins the supervisor via a cgroup `exec` wrapper and verifies
+membership from `cgroup.procs`, failing closed if it cannot); and *limit validation* closes
+six measured fail-open paths, the sharpest being that `memory.max` is signed in the kernel,
+so `u64::MAX` is stored as `max` -- a requested ceiling silently becoming **unlimited**.
+Placement is now also shown to precede execution, not merely to be verified afterwards. ADR-0036 records that
 `cgroup.kill` is a deliberate redundant backstop on this path rather than a load-bearing
 mechanism: `--unshare-pid --die-with-parent` already reaps descendants, so the governed
 test cannot separate them and no artificial mutation will be built to try. **V-29 open** --
@@ -39,6 +43,14 @@ no Windows evidence.
 required-resource refusal necessarily follows credential resolution. The guaranteed
 invariant is that the backend is never invoked, so no subprocess exists and no
 credential material reaches any environment. Reversing the order is a separate ADR.
+
+**Recorded, not changed:** cgroup delegation is a property of the *host*, so several files
+previously asserting "this host delegates nothing" were wrong for a different host.
+Delegation is now measured and reported, never assumed -- `scripts/run-resource-tests.sh`
+prints the own-cgroup path instead of a remembered verdict. The validation bounds
+(`pids.max <= 4194304`, the largest finite `cpu.max` quota) were measured on one host and
+are encoded as constants, so a host with different limits would fail closed and need them
+re-measured. Deriving them at runtime is the proper fix and is a separate piece of work.
 
 Phase 4b has three objectives: wire the sandbox into the Phase 3 dispatcher so the
 governed path actually uses it (V-50), prove hard resource ceilings where cgroup

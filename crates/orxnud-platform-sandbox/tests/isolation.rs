@@ -508,6 +508,14 @@ fn a_spec_with_nothing_granted_starts_no_process_for_an_ungranted_capability() {
     // is reached.
     let mut spec = closed_spec("env-dump");
     spec.requires.resources = Resource::Required;
+    // A ceiling is *named*, so the refusal below can only be about this host's delegation.
+    //
+    // Leaving it unset was the previous arrangement, and it was weaker than it looked:
+    // `Required` with nothing to enforce is incoherent on its own terms and is now
+    // refused as such (V-46), so the test would have passed for a reason unrelated to
+    // delegation. Naming a real ceiling keeps the assertion testing what it is for --
+    // whether this host can establish a required ceiling -- on every host.
+    spec.limits.memory_bytes = Some(64 * 1024 * 1024);
     // The "refused" half of this test used to rest on this host having no writable cgroup
     // controllers. That is a host property, not a property of the runner, and it stopped
     // being true once the runner was wired to a dedicated cgroup -- after which the test

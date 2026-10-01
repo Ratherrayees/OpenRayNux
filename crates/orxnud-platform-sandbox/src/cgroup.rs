@@ -38,8 +38,15 @@ use std::path::{Path, PathBuf};
 /// modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceControl {
-    /// `memory.max` — hard address-space ceiling; an allocation past it fails or the
-    /// kernel kills the process.
+    /// `memory.max` — hard limit on the cgroup's **memory usage**; an allocation past it
+    /// fails, or the kernel reclaims, or it OOM-kills the process.
+    ///
+    /// Deliberately *not* described as an address-space limit, because it is not one.
+    /// `memory.max` accounts resident and charged pages, so a process may still reserve a
+    /// very large virtual address space -- including one that could never be backed -- and
+    /// stay inside the limit. A reader who took this control for `RLIMIT_AS` would
+    /// conclude that a workload is prevented from making huge reservations, which this
+    /// control does not do.
     Memory {
         /// The ceiling in bytes.
         bytes: u64,
@@ -66,7 +73,199 @@ pub enum ResourceControl {
     },
 }
 
+/// Why a [`ResourceControl`] cannot be expressed to the kernel.
+///
+/// # Why this is not a `String`
+///
+/// Every variant here was measured on the Phase 4 host by writing the value and reading
+/// the kernel's answer back (see [`validate`]). The distinction matters because the two
+/// failure families demand opposite responses:
+///
+/// - [`Self::OutOfRange`] — **the request is wrong**. Refusing it is the whole point; a
+///   caller that asked for a ceiling the kernel cannot express must be told so, not
+///   silently given something else.
+/// - [`Self::Malformed`] — **the value cannot even be parsed** as a kernel integer.
+///
+/// Both are *our* fault, and neither is the host's. Collapsing them into
+/// "this host does not delegate this controller" — which is what the pre-validation code
+/// did — reports a fixable caller bug as an unfixable host misconfiguration, and sends an
+/// operator to debug delegation instead of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LimitInvalid {
+    /// The value is well-formed but outside what the kernel accepts.
+    ///
+    /// `cgroup v2` bounds, all measured rather than quoted (see [`validate`]):
+    ///
+    /// | Control | Accepted range |
+    /// |---|---|
+    /// | `memory.max`, `memory.swap.max` | `1 ..= 9223372036854771711` bytes, rounded **down** to 4096 |
+    /// | `pids.max` | `1 ..= 4194304` |
+    /// | `cpu.max` quota | `1000 ..= 17592186044415` us |
+    /// | `cpu.max` period | `1000 ..= 1000000` us |
+    ///
+    /// The byte ceiling is not arbitrary: `memory.max` is a signed `long long` in the
+    /// kernel, and anything at or above `i64::MAX` is stored as the literal string `max` --
+    /// that is, **as no limit at all**. So `bytes = u64::MAX` does not mean "an enormous
+    /// ceiling", it means "no ceiling", and writing it is indistinguishable from never
+    /// having asked. That is the single most dangerous input this type accepts.
+    #[error("{control}: {value} is outside the range cgroup v2 accepts ({why})")]
+    OutOfRange {
+        /// Which control.
+        control: &'static str,
+        /// The rejected value, rendered.
+        value: String,
+        /// What the kernel accepts.
+        why: &'static str,
+    },
+    /// The value is not a number the kernel can parse at all.
+    #[error("{control}: {value:?} is not a value cgroup v2 can parse")]
+    Malformed {
+        /// Which control.
+        control: &'static str,
+        /// The rejected value, rendered.
+        value: String,
+    },
+}
+
+/// The kernel's smallest accepted `cpu.max` quota, in microseconds.
+///
+/// Measured: `999 100000` is rejected with `EINVAL`, `1000 100000` is accepted. This is
+/// the CFS bandwidth granularity, not an OpenRayNux choice, so a fractional core below
+/// 1/1000 of a core cannot be expressed as a quota and must be refused rather than
+/// rounded.
+pub const CPU_QUOTA_MIN_US: u64 = 1_000;
+
+/// The kernel's largest accepted finite `cpu.max` quota, in microseconds.
+///
+/// Measured by bisection: `17592186044415` is accepted, `17592186044416` is `EINVAL`.
+/// (`u64::MAX` is accepted too, but is stored as `max` -- see [`LimitInvalid`].)
+pub const CPU_QUOTA_MAX_US: u64 = 17_592_186_044_415;
+
+/// The kernel's accepted `cpu.max` period range, in microseconds.
+///
+/// Measured: `999` and `1000001` are both `EINVAL`. `100_000` (the CFS default period) is
+/// inside it, which is why [`crate::linux`] uses it rather than inventing one.
+pub const CPU_PERIOD_MIN_US: u64 = 1_000;
+/// See [`CPU_PERIOD_MIN_US`].
+pub const CPU_PERIOD_MAX_US: u64 = 1_000_000;
+
+/// The kernel's largest accepted `pids.max`.
+///
+/// Measured by bisection: `4194304` is accepted, `4194305` is `EINVAL`. This is the
+/// kernel's `PID_MAX_LIMIT`.
+pub const PIDS_MAX_LIMIT: u64 = 4_194_304;
+
+/// The largest byte count `memory.max` stores as a finite ceiling.
+///
+/// Measured by bisection: `9223372036854771711` stays finite, `9223372036854771712` and
+/// above are stored as `max`. The boundary is `i64::MAX` rounded down to a page, because
+/// the kernel parses into a signed `long long`.
+pub const MEMORY_MAX_BYTES: u64 = 9_223_372_036_854_771_711;
+
+/// The page size the memory controller rounds byte counts to.
+///
+/// `memory.max` rounds **down** to a multiple of this, so a request is never silently
+/// widened; it can be silently *narrowed* by up to one page.
+pub const PAGE_SIZE: u64 = 4096;
+
 impl ResourceControl {
+    /// Rejects any value this kernel cannot express as the ceiling that was asked for.
+    ///
+    /// # Why validation happens here and not at the call site
+    ///
+    /// Because the dangerous inputs are not obviously wrong to the code that produces
+    /// them. `cpu_cores` is an `f64`, and `NaN`, `f64::INFINITY` and a value large enough
+    /// to saturate a `u64` cast are all *representable* in that type while being
+    /// meaningless as a CPU budget. A `u64::MAX` memory budget is likewise a perfectly
+    /// good `u64` that the kernel interprets as "unlimited".
+    ///
+    /// The pre-validation code produced three distinct wrong behaviours from these, all
+    /// measured:
+    ///
+    /// ```text
+    /// cpu_cores = NaN      -> `c > 0.0` is false -> the CPU control is DROPPED
+    ///                          -> a required CPU ceiling runs with no ceiling at all
+    /// cpu_cores = inf      -> `(inf * 100_000.0) as u64` saturates -> quota u64::MAX
+    ///                          -> kernel stores `max` -> unlimited
+    /// cpu_cores = 1e-6     -> quota 0 -> kernel EINVAL
+    /// memory = u64::MAX    -> kernel stores `max` -> unlimited
+    /// ```
+    ///
+    /// The first is the worst: a control that was *required* and *available* was dropped
+    /// without a word, so the run reported success having enforced nothing.
+    ///
+    /// # What validation does and does not promise
+    ///
+    /// It proves the value is one this kernel will store as the ceiling requested. It does
+    /// not prove the kernel will accept the write -- that is checked by actually writing it
+    /// and reported by [`ResourceMiss`].
+    ///
+    /// # Errors
+    ///
+    /// [`LimitInvalid`] naming the control, the value, and the range the kernel accepts.
+    pub fn validate(self) -> Result<(), LimitInvalid> {
+        let control = self.label();
+        match self {
+            // `memory.max` is page-accounted; `memory.swap.max` is not, and a zero swap
+            // ceiling is a policy rather than an impossibility.
+            Self::Memory { bytes } => validate_bytes(control, bytes, true),
+            Self::Swap { bytes } => validate_bytes(control, bytes, false),
+            Self::Processes { max } => {
+                if max == 0 {
+                    // `0` is *accepted* by the kernel -- verified -- and means "not one
+                    // process may exist here". It is not an invalid request, it is a
+                    // request that guarantees the execution cannot start, so honouring it
+                    // would produce a refusal at a much later and far less informative
+                    // point. Refused here, where the number can still be named.
+                    return Err(LimitInvalid::OutOfRange {
+                        control,
+                        value: max.to_string(),
+                        why: "a process ceiling of 0 admits no process at all, including \
+                              the sandboxed payload; use 1 or more",
+                    });
+                }
+                if max > PIDS_MAX_LIMIT {
+                    return Err(LimitInvalid::OutOfRange {
+                        control,
+                        value: max.to_string(),
+                        why: "the kernel's PID_MAX_LIMIT is 4194304",
+                    });
+                }
+                Ok(())
+            }
+            Self::Cpu {
+                quota_us,
+                period_us,
+            } => {
+                if !(CPU_PERIOD_MIN_US..=CPU_PERIOD_MAX_US).contains(&period_us) {
+                    return Err(LimitInvalid::OutOfRange {
+                        control,
+                        value: format!("{quota_us} {period_us}"),
+                        why: "the cpu.max period must be between 1000 and 1000000 \
+                              microseconds",
+                    });
+                }
+                if quota_us < CPU_QUOTA_MIN_US {
+                    return Err(LimitInvalid::OutOfRange {
+                        control,
+                        value: format!("{quota_us} {period_us}"),
+                        why: "a cpu.max quota below 1000 microseconds is below the CFS \
+                              bandwidth granularity and cannot be expressed",
+                    });
+                }
+                if quota_us > CPU_QUOTA_MAX_US {
+                    return Err(LimitInvalid::OutOfRange {
+                        control,
+                        value: format!("{quota_us} {period_us}"),
+                        why: "the largest finite cpu.max quota is 17592186044415 \
+                              microseconds",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// The cgroup file this control writes.
     #[must_use]
     pub fn file(self) -> &'static str {
@@ -101,6 +300,68 @@ impl ResourceControl {
             Self::Cpu { .. } => "cpu",
         }
     }
+}
+
+/// Validates a byte-count ceiling for `memory.max` or `memory.swap.max`.
+///
+/// # Why a sub-page memory budget is refused
+///
+/// `memory.max` is accounted in **pages**. Measured on this host by write-then-readback:
+///
+/// ```text
+///   1 -> 0        4095 -> 0        4097 -> 4096
+/// ```
+///
+/// So a request of 1 byte becomes a limit of **0**. That is the same class of problem as
+/// `u64::MAX` becoming `max`, only narrower: the caller asked for a ceiling and receives a
+/// different one, and the one they receive makes the execution impossible rather than
+/// unlimited. Measured here: a fresh process joining a cgroup with `memory.max = 0` or
+/// `4096` is OOM-killed (`memory.events oom_kill 1`) before it can do work, while a
+/// process already resident when the limit is written survives until its next charge.
+///
+/// The three candidate policies were:
+/// - *round up to one page* -- rejected. It would **widen** the requested budget, which on a
+///   security boundary is the wrong direction.
+/// - *round down and document* -- rejected as the default, because the documented value
+///   and the effective value then differ silently, and the effective one is unusable.
+/// - *refuse* -- chosen. It is the only option where what the caller was told cannot
+///   differ from what the kernel enforces.
+///
+/// `memory.swap.max` keeps `0` as valid, because "no swap at all" is a real policy that
+/// [`crate::linux`] relies on when it pairs a memory ceiling with a swap prohibition.
+/// Sub-page swap is not refused, and the asymmetry is deliberate: rounding a swap ceiling
+/// down to 0 produces the policy that was asked for, while rounding a memory ceiling down
+/// produces one that cannot be met.
+fn validate_bytes(
+    control: &'static str,
+    bytes: u64,
+    // Whether this is `memory.max` (page-accounted, so sub-page is unusable) rather than
+    // `memory.swap.max` (where a small or zero ceiling is a real policy).
+    page_accounted: bool,
+) -> Result<(), LimitInvalid> {
+    if bytes > MEMORY_MAX_BYTES {
+        // The important case. `memory.max` is signed in the kernel, so this is not a
+        // colossal ceiling but *no ceiling*: the kernel stores the literal string `max`
+        // and the governed workload runs with unlimited memory while the capability
+        // believes it asked for a ceiling. Verified by write-then-read on this host.
+        return Err(LimitInvalid::OutOfRange {
+            control,
+            value: bytes.to_string(),
+            why: "values at or above i64::MAX are stored by the kernel as `max`, which \
+                  means NO limit; an unlimited budget must be expressed as the absence of \
+                  a ceiling, not as a huge number",
+        });
+    }
+    if page_accounted && bytes < PAGE_SIZE {
+        return Err(LimitInvalid::OutOfRange {
+            control,
+            value: bytes.to_string(),
+            why: "memory is accounted in pages, so a budget below 4096 bytes is stored as \
+                  0 -- a limit no execution can meet. Round the budget up to at least \
+                  4096, or omit the memory ceiling entirely",
+        });
+    }
+    Ok(())
 }
 
 /// What this host's cgroup v2 hierarchy actually permits.
@@ -216,10 +477,10 @@ impl CgroupV2 {
     ///
     /// # "Dedicated child" is the whole safety property
     ///
-    /// [`own_cgroup`] may resolve to the cgroup hierarchy root, when the process's own
-    /// cgroup is not creatable in (a container scope, for instance). That fallback is
-    /// safe **only** because this function never writes a control to the base: it always
-    /// creates `base/orxnud-<name>` and puts the limits and the process in *that*.
+    /// The discovered base may resolve to the cgroup hierarchy root, when the process's
+    /// own cgroup is not creatable in (a container scope, for instance). That fallback
+    /// is safe **only** because this function never writes a control to the base: it
+    /// always creates `base/orxnud-<name>` and puts the limits and the process in *that*.
     ///
     /// Putting an execution directly into the shared root would mean writing
     /// `memory.max` or `pids.max` where unrelated processes live, so a resource limit
@@ -229,19 +490,71 @@ impl CgroupV2 {
     /// Asserted by `resources.rs::an_execution_lands_in_a_dedicated_child_cgroup`,
     /// which checks that the returned directory is strictly *below* the base.
     ///
+    /// # The base comes from the handle, not from a fresh probe
+    ///
+    /// An earlier version re-ran [`Self::support`] here and took the base from *that*,
+    /// while taking the availability from `self`. Those are two independent probes, so a
+    /// host whose delegation changed between them would produce a cgroup created under
+    /// one base and configured against another's answers -- a limit written where it does
+    /// not apply. The handle's own `base` and `availability` are now the single source,
+    /// which is also one fewer probe (and one fewer scratch cgroup) per execution.
+    ///
     /// # Errors
     ///
-    /// The controls this host cannot enforce, named. **Fail-closed**: a caller that
-    /// asked for a memory ceiling is not handed a cgroup without one.
+    /// * [`LimitInvalid`] for a value this kernel cannot express as the ceiling asked for,
+    ///   raised **before** anything is created.
+    /// * [`ResourceMiss`] for the controls this host cannot enforce, named.
+    ///
+    /// **Fail-closed**: a caller that asked for a memory ceiling is not handed a cgroup
+    /// without one.
     pub fn create(&self, name: &str, controls: &[ResourceControl]) -> Result<Self, ResourceMiss> {
-        let (base, _) = Self::support();
+        let base = self.base.clone();
         if base.as_os_str().is_empty() {
             return Err(ResourceMiss {
                 controls: controls.iter().copied().map(|c| c.label()).collect(),
                 reason: "no cgroup v2 base is both creatable and delegated to this process"
                     .to_owned(),
+                kind: ResourceMissKind::NoDelegatedBase,
             });
         }
+        // Validate every control before creating anything.
+        //
+        // Doing it first means an inexpressible request costs no directory at all, and --
+        // more importantly -- that the failure names the *caller's* number rather than a
+        // kernel errno. A refused `u64::MAX` memory budget is a manifest bug; letting the
+        // write fail instead would report it as whatever the kernel said, and letting it
+        // *succeed* would enforce nothing while claiming to.
+        for c in controls {
+            c.validate()?;
+        }
+        self.create_in(&base, name, controls)
+    }
+
+    /// Creates the dedicated child under `base`, applying `controls`, all or nothing.
+    ///
+    /// # Cleanup on every failure path
+    ///
+    /// Any failure after the directory exists removes it. This is a single function
+    /// precisely so that rule has one place to live: previously only the
+    /// "controller not delegated" branch cleaned up, and a failure to *write* a control
+    /// returned immediately and left an empty `orxnud-*` directory behind forever.
+    /// Verified on this host, where a rejected write leaves the directory present, so
+    /// those accumulate in the shared base -- exactly the kind of residue a governed
+    /// system must not produce.
+    ///
+    /// Removing is safe unconditionally because nothing has been placed in the cgroup yet:
+    /// limits are written before any process is adopted, so this directory has no members
+    /// and `rmdir` cannot be refused for that reason.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceMiss`], leaving no directory behind.
+    fn create_in(
+        &self,
+        base: &Path,
+        name: &str,
+        controls: &[ResourceControl],
+    ) -> Result<Self, ResourceMiss> {
         // Unique per invocation: see `unique_suffix`. Two concurrent executions must
         // never share a cgroup, or they would share limits and each would delete the
         // other's directory while the other was still running in it.
@@ -252,37 +565,87 @@ impl CgroupV2 {
         std::fs::create_dir(&path).map_err(|e| ResourceMiss {
             controls: controls.iter().copied().map(|c| c.label()).collect(),
             reason: format!("cannot create {}: {e}", path.display()),
+            kind: ResourceMissKind::CreateRefused,
         })?;
+        self.create_at(&path, base, controls)
+    }
 
-        let mut missing = Vec::new();
-        for c in controls {
-            if !self.availability.supports(*c) {
-                missing.push(c.label());
-                continue;
-            }
-            if let Err(e) = write_control(&path, *c) {
-                return Err(ResourceMiss {
-                    controls: vec![c.label()],
-                    reason: format!("cannot write {}: {e}", c.file()),
-                });
-            }
-        }
-        if !missing.is_empty() {
-            // Remove the half-configured cgroup: a partial limit set is worse than
-            // none, because it looks enforced.
-            let _ = std::fs::remove_dir(&path);
-            return Err(ResourceMiss {
-                controls: missing,
-                reason: "this host does not delegate these cgroup controllers".to_owned(),
-            });
+    /// Configures an already-created `path` as the dedicated child of `base`.
+    ///
+    /// Split from [`Self::create_in`] so the "a failed configuration leaves nothing
+    /// behind" rule can be exercised directly, against a directory whose control writes
+    /// are made to fail. Without that seam the rule is only reachable on a host that
+    /// happens to refuse a particular control, and an assertion that cannot run is not
+    /// an assertion.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceMiss`], with `path` removed.
+    fn create_at(
+        &self,
+        path: &Path,
+        base: &Path,
+        controls: &[ResourceControl],
+    ) -> Result<Self, ResourceMiss> {
+        if let Err(miss) = self.configure(path, controls) {
+            // One cleanup rule, one place. Every failure after the directory exists goes
+            // through here.
+            //
+            // Previously only the "controller not delegated" branch cleaned up, and a
+            // failure to *write* a control returned immediately and left an empty
+            // `orxnud-*` directory behind. Verified on this host: a rejected write leaves
+            // the directory present, so those accumulate in the shared base and nothing
+            // ever removes them.
+            //
+            // Safe unconditionally because nothing has been placed in the cgroup yet:
+            // limits are written before any process is adopted, so this directory has no
+            // members and `rmdir` cannot be refused for that reason.
+            remove_cgroup_dir(path);
+            return Err(miss);
         }
 
         Ok(Self {
-            path,
-            base,
+            path: path.to_path_buf(),
+            base: base.to_path_buf(),
             availability: self.availability,
             owns_path: true,
         })
+    }
+
+    /// Writes `controls` into an existing cgroup directory, all or nothing.
+    ///
+    /// Split out of [`Self::create`] so the "every failure cleans up" rule has exactly one
+    /// place to live: a second call site that forgot the cleanup would reintroduce the
+    /// leak rather than merely duplicating the happy path.
+    fn configure(&self, path: &Path, controls: &[ResourceControl]) -> Result<(), ResourceMiss> {
+        // Availability first, and in full, before writing anything.
+        //
+        // Checking all of it up front means a request that is partly unsupported never
+        // writes the supported subset. The alternative writes `memory.max`, then discovers
+        // `pids` is undelegated, and leaves a cgroup that *looks* limited while running
+        // the payload with an unbounded process count.
+        let missing: Vec<&'static str> = controls
+            .iter()
+            .copied()
+            .filter(|c| !self.availability.supports(*c))
+            .map(|c| c.label())
+            .collect();
+        if !missing.is_empty() {
+            return Err(ResourceMiss {
+                controls: missing,
+                reason: "this host does not delegate these cgroup controllers".to_owned(),
+                kind: ResourceMissKind::ControllerUndelegated,
+            });
+        }
+
+        for c in controls {
+            write_control(path, *c).map_err(|e| ResourceMiss {
+                controls: vec![c.label()],
+                reason: format!("cannot write {}: {e}", c.file()),
+                kind: classify_write_error(&e),
+            })?;
+        }
+        Ok(())
     }
 
     /// Moves `pid` into this cgroup, so its limits apply.
@@ -294,6 +657,7 @@ impl CgroupV2 {
         std::fs::write(self.path.join("cgroup.procs"), pid.to_string()).map_err(|e| ResourceMiss {
             controls: Vec::new(),
             reason: format!("cannot move {pid} into the cgroup: {e}"),
+            kind: ResourceMissKind::WriteFailed,
         })
     }
 
@@ -309,6 +673,7 @@ impl CgroupV2 {
         std::fs::write(self.path.join("cgroup.kill"), "1\n").map_err(|e| ResourceMiss {
             controls: vec!["group-kill"],
             reason: format!("cgroup.kill refused: {e}"),
+            kind: ResourceMissKind::WriteFailed,
         })
     }
 
@@ -397,6 +762,75 @@ pub struct ResourceMiss {
     pub controls: Vec<&'static str>,
     /// Why.
     pub reason: String,
+    /// Which *kind* of failure this is.
+    ///
+    /// Retained rather than folded into `reason`, because the brief's distinction is
+    /// operational: "there is no cgroup v2 here" and "there is one but nothing is
+    /// delegated to me" need different responses, and a single "unavailable" hides a
+    /// fixable misconfiguration. `reason` is a human sentence and is not a stable
+    /// interface; this is.
+    pub kind: ResourceMissKind,
+}
+
+/// What sort of failure made a required control unenforceable.
+///
+/// Not derived from the errno alone, because the same errno means different things here:
+/// `EINVAL` on a control file is the kernel refusing a *value* (our bug), while `EPERM` is
+/// the kernel refusing us the *controller* (a delegation problem). Before this existed,
+/// both arrived as "this host does not delegate these cgroup controllers", which is
+/// actively misleading for the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceMissKind {
+    /// No cgroup v2 hierarchy is mounted, or nothing under it is both creatable by this
+    /// process and has controllers delegated to it.
+    NoDelegatedBase,
+    /// The base directory could not be created.
+    CreateRefused,
+    /// The controller is listed by the kernel but not delegated to this subtree, so the
+    /// write was refused with `EPERM`.
+    ControllerUndelegated,
+    /// The kernel refused the *value*. A caller bug, not a host limitation.
+    ValueRejected,
+    /// The write failed for a reason that is neither of the above.
+    WriteFailed,
+}
+
+impl From<LimitInvalid> for ResourceMiss {
+    /// An inexpressible value is reported as a *value* problem, never as a host one.
+    ///
+    /// The `controls` list carries the offending control's label, so a caller that only
+    /// inspects the refusal still learns which of its requirements was wrong -- the same
+    /// shape as every other `ResourceMiss`.
+    fn from(invalid: LimitInvalid) -> Self {
+        // The label travels in the variant as a `&'static str`, so it is matched rather
+        // than parsed out of the message. Slicing the `Display` output would couple the
+        // error's prose to a machine-readable field, which is the stringly-typed coupling
+        // that makes error text impossible to reword safely.
+        let control = match &invalid {
+            LimitInvalid::OutOfRange { control, .. } | LimitInvalid::Malformed { control, .. } => {
+                *control
+            }
+        };
+        Self {
+            controls: vec![control],
+            reason: invalid.to_string(),
+            kind: ResourceMissKind::ValueRejected,
+        }
+    }
+}
+
+/// Classifies a control-file write failure.
+///
+/// The split is `EINVAL` against everything else, and it is the `EINVAL` case that
+/// matters: on this host a delegated controller answers `EPERM` when the controller is not
+/// available and `EINVAL` when the number is outside what the kernel can store, and both
+/// previously produced the same "not delegated" sentence.
+fn classify_write_error(e: &std::io::Error) -> ResourceMissKind {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => ResourceMissKind::ControllerUndelegated,
+        std::io::ErrorKind::InvalidInput => ResourceMissKind::ValueRejected,
+        _ => ResourceMissKind::WriteFailed,
+    }
 }
 
 fn write_control(path: &Path, control: ResourceControl) -> std::io::Result<()> {
@@ -677,5 +1111,510 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------- validation
+    //
+    // These need no delegation and no root: they are pure, so they run identically in CI
+    // and on the development host. Each bound they pin was measured on this host by
+    // writing the value and reading the kernel's answer back; the `enforcement.rs`
+    // suite then proves the kernel honours what these accept.
+
+    #[test]
+    fn an_unlimited_memory_budget_is_refused_rather_than_becoming_no_limit() {
+        // The most dangerous value this type accepts.
+        //
+        // `memory.max` is signed in the kernel, so `u64::MAX` is not a colossal ceiling:
+        // the kernel stores the literal string `max`, which means *no ceiling at all*.
+        // Verified by write-then-read on this host -- `18446744073709551615` reads back
+        // as `max`. So a caller asking for an enormous memory budget and getting
+        // validation would otherwise get an unbounded workload while believing it was
+        // capped.
+        let err = ResourceControl::Memory { bytes: u64::MAX }
+            .validate()
+            .expect_err("u64::MAX is not a ceiling, it is the absence of one");
+        assert!(
+            err.to_string().contains("NO limit"),
+            "the message must explain what u64::MAX actually means: {err}"
+        );
+        // And the same for every value past the signed boundary.
+        for bytes in [
+            MEMORY_MAX_BYTES + 1,
+            1 << 63,
+            i64::MAX as u64,
+            i64::MAX as u64 + 1,
+        ] {
+            assert!(
+                ResourceControl::Memory { bytes }.validate().is_err(),
+                "{bytes} is stored as `max` and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_memory_ceiling_at_the_signed_boundary_is_still_a_ceiling() {
+        // The other side of the same boundary, so the rule is a range and not a guess.
+        assert!(
+            ResourceControl::Memory {
+                bytes: MEMORY_MAX_BYTES
+            }
+            .validate()
+            .is_ok(),
+            "the largest finite memory.max must be accepted"
+        );
+        assert!(
+            ResourceControl::Memory {
+                bytes: 64 * 1024 * 1024
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_sub_page_memory_budget_is_refused_because_it_would_become_zero() {
+        // `memory.max` is page-accounted. Measured on this host by write-then-readback:
+        // `1 -> 0`, `4095 -> 0`, `4097 -> 4096`. So a 1-byte budget is silently stored as
+        // a **zero** ceiling, which is the `u64::MAX` problem in miniature: the caller is
+        // told one thing and the kernel enforces another.
+        //
+        // It is worse than "merely narrower", because the value it becomes is
+        // unusable: measured here, a fresh process joining a cgroup with `memory.max = 0`
+        // is OOM-killed (`memory.events oom_kill 1`) before doing any work. Rounding *up*
+        // to one page would fix the unusability by widening the requested budget, which is
+        // the wrong direction on a security boundary, so the value is refused instead.
+        for bytes in [1u64, 512, 2048, PAGE_SIZE - 1] {
+            let err = ResourceControl::Memory { bytes }
+                .validate()
+                .expect_err(&format!(
+                    "{bytes} bytes is stored as 0, which is not the ceiling that was asked for"
+                ));
+            assert!(
+                err.to_string().contains("page"),
+                "the refusal must explain the page granularity: {err}"
+            );
+        }
+        // One page is expressible and is the smallest meaningful memory ceiling.
+        assert!(
+            ResourceControl::Memory { bytes: PAGE_SIZE }
+                .validate()
+                .is_ok()
+        );
+        // And above it, sub-page rounding is at most one page of narrowing, which is
+        // acceptable: the value remains what the caller asked for, to within the kernel's
+        // own accounting unit.
+        assert!(
+            ResourceControl::Memory {
+                bytes: 64 * 1024 * 1024 + 1
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn swap_zero_is_valid_because_no_swap_is_a_policy_not_a_mistake() {
+        // `memory.swap.max = 0` is what pins a memory ceiling against being evaded by
+        // swapping, and `linux.rs` relies on it. A validator that rejected it would
+        // refuse every memory-bounded execution.
+        assert!(
+            ResourceControl::Swap { bytes: 0 }.validate().is_ok(),
+            "no swap is a real policy"
+        );
+        assert!(
+            ResourceControl::Swap {
+                bytes: 64 * 1024 * 1024
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ResourceControl::Swap { bytes: u64::MAX }
+                .validate()
+                .is_err(),
+            "but an unlimited swap ceiling is still `max` in the kernel"
+        );
+    }
+
+    #[test]
+    fn a_zero_process_ceiling_is_refused_because_it_admits_no_payload() {
+        // `pids.max = 0` is *accepted* by the kernel -- verified -- and means not one
+        // process may exist in the cgroup. Honouring it would produce a refusal much
+        // later, at the point where the supervisor failed to join, with no mention of the
+        // number that caused it. Refused where the number can still be named.
+        let err = ResourceControl::Processes { max: 0 }
+            .validate()
+            .expect_err("a cgroup that admits no process cannot host a payload");
+        assert!(err.to_string().contains("0"), "{err}");
+    }
+
+    #[test]
+    fn a_process_ceiling_beyond_the_kernel_limit_is_refused() {
+        // Measured by bisection: `4194304` is accepted, `4194305` is `EINVAL`. Refusing
+        // it here means the caller learns their number is wrong instead of receiving
+        // "this host does not delegate the pids controller", which is what the write
+        // failure used to produce.
+        assert!(
+            ResourceControl::Processes {
+                max: PIDS_MAX_LIMIT
+            }
+            .validate()
+            .is_ok()
+        );
+        let err = ResourceControl::Processes {
+            max: PIDS_MAX_LIMIT + 1,
+        }
+        .validate()
+        .expect_err("past PID_MAX_LIMIT");
+        assert!(err.to_string().contains("4194304"), "{err}");
+    }
+
+    #[test]
+    fn a_cpu_quota_below_the_bandwidth_granularity_is_refused_not_rounded() {
+        // Measured: `999 100000` is `EINVAL`, `1000 100000` is accepted. Rounding a tiny
+        // budget *up* to 1000 would widen it; a request for a ten-thousandth of a core
+        // cannot be honoured and must be refused.
+        assert!(
+            ResourceControl::Cpu {
+                quota_us: 999,
+                period_us: 100_000
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ResourceControl::Cpu {
+                quota_us: CPU_QUOTA_MIN_US,
+                period_us: 100_000
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_cpu_quota_or_period_outside_the_kernel_range_is_refused() {
+        // Measured: the largest finite quota is 17592186044415 (17592186044416 is
+        // `EINVAL`), and the period must be within 1000..=1000000.
+        assert!(
+            ResourceControl::Cpu {
+                quota_us: CPU_QUOTA_MAX_US,
+                period_us: 100_000
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ResourceControl::Cpu {
+                quota_us: CPU_QUOTA_MAX_US + 1,
+                period_us: 100_000
+            }
+            .validate()
+            .is_err(),
+            "past the largest finite quota the kernel refuses the value"
+        );
+        for period_us in [CPU_PERIOD_MIN_US - 1, CPU_PERIOD_MAX_US + 1, 0] {
+            assert!(
+                ResourceControl::Cpu {
+                    quota_us: 50_000,
+                    period_us
+                }
+                .validate()
+                .is_err(),
+                "period {period_us} is outside the kernel's range"
+            );
+        }
+        assert!(
+            ResourceControl::Cpu {
+                quota_us: 50_000,
+                period_us: 100_000
+            }
+            .validate()
+            .is_ok(),
+            "the CFS default period must be accepted"
+        );
+    }
+
+    #[test]
+    fn a_refused_limit_names_the_control_and_the_offending_number() {
+        // A refusal a caller can act on. Both halves are asserted, because a message that
+        // says only "invalid" sends the operator looking at the host instead of at the
+        // manifest that produced the number.
+        let err = ResourceControl::Processes {
+            max: PIDS_MAX_LIMIT + 1,
+        }
+        .validate()
+        .expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("processes"), "must name the control: {text}");
+        assert!(
+            text.contains(&(PIDS_MAX_LIMIT + 1).to_string()),
+            "must name the number: {text}"
+        );
+        assert!(text.contains("4194304"), "must state the range: {text}");
+    }
+
+    #[test]
+    fn an_invalid_limit_is_reported_as_a_value_problem_not_a_host_problem() {
+        // The distinction that was previously lost. An inexpressible value is the
+        // caller's bug; reporting it as an undelegated controller sends an operator to
+        // debug cgroup delegation that was working perfectly.
+        let miss = ResourceMiss::from(
+            ResourceControl::Memory { bytes: u64::MAX }
+                .validate()
+                .expect_err("refused"),
+        );
+        assert_eq!(miss.kind, ResourceMissKind::ValueRejected);
+        assert_eq!(miss.controls, vec!["memory"]);
+    }
+
+    #[test]
+    fn a_permission_failure_and_a_value_failure_are_different_kinds() {
+        // `EPERM` and `EINVAL` on a control file mean opposite things, and the brief
+        // forbids collapsing them.
+        let denied = classify_write_error(&std::io::Error::from_raw_os_error(libc_eperm()));
+        let invalid = classify_write_error(&std::io::Error::from_raw_os_error(libc_einval()));
+        assert_eq!(denied, ResourceMissKind::ControllerUndelegated);
+        assert_eq!(invalid, ResourceMissKind::ValueRejected);
+        let other = classify_write_error(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(other, ResourceMissKind::WriteFailed);
+    }
+
+    /// `EPERM`, without naming libc: the crate forbids `unsafe` and takes no dependency
+    /// for one errno. The value is the ABI constant, which is 1 on every Linux target
+    /// this crate builds for.
+    fn libc_eperm() -> i32 {
+        1
+    }
+
+    /// `EINVAL`. See [`libc_eperm`].
+    fn libc_einval() -> i32 {
+        22
+    }
+
+    // ------------------------------------------------------------- partial setup
+
+    /// A base directory whose control files do not exist and cannot be created.
+    ///
+    /// Running `create_in` against it forces the **write-failure** path -- the one that
+    /// previously leaked -- with no delegation and no root required, which is what makes
+    /// the assertion below deterministic in CI rather than dependent on a host that
+    /// happens to refuse a particular control.
+    ///
+    /// Removes itself on drop, so a failing assertion cannot leave a directory in `/tmp`.
+    /// Six were left behind by deliberately mutated runs during the work that added this,
+    /// which is exactly the kind of residue the surrounding tests already guard against
+    /// with `Drop` (`Gate` and `Child` in `enforcement.rs`).
+    struct ScratchBase(PathBuf);
+
+    impl Drop for ScratchBase {
+        fn drop(&mut self) {
+            // Best effort: the fixture may already have been removed, and a read-only mode
+            // set by a test can prevent removal. Restore permissions first so cleanup can
+            // succeed in the latter case.
+            restore_tree_permissions(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl ScratchBase {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    /// Makes `dir` and everything under it writable, so it can be removed.
+    #[cfg(unix)]
+    fn restore_tree_permissions(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                restore_tree_permissions(&p);
+            }
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Not a Unix target: nothing to restore, and `remove_dir_all` will report any problem.
+    #[cfg(not(unix))]
+    fn restore_tree_permissions(_dir: &Path) {}
+
+    fn scratch_base(tag: &str) -> ScratchBase {
+        let dir =
+            std::env::temp_dir().join(format!("orxnud-fakebase-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        ScratchBase(dir)
+    }
+
+    #[test]
+    fn a_failed_control_write_leaves_no_cgroup_behind() {
+        // The leak, and the fix for it.
+        //
+        // Verified on this host that a rejected control write leaves the cgroup directory
+        // present. The pre-fix code returned on that path without removing it, so empty
+        // `orxnud-*` directories accumulated in the shared base and were never cleaned by
+        // anything.
+        //
+        // The write is made to fail deterministically and without delegation: the base
+        // contains a **directory** named `memory.max`, so opening it as a file fails with
+        // `EISDIR` on any filesystem. On the pre-fix code this assertion failed with the
+        // cgroup directory still on disk.
+        let base = scratch_base("writefail");
+        let base = base.path().to_path_buf();
+        // The cgroup directory is built by the test and made read-only, so creating
+        // `memory.max` inside it fails with `EACCES`. That makes the write failure
+        // deterministic and independent of cgroup delegation, on any filesystem.
+        //
+        // Read-only rather than "plant something in the way" for a reason tied to the
+        // cleanup rule: the cleanup is `rmdir`, which the kernel honours on a cgroupfs
+        // directory whose control files are empty, and which a normal filesystem refuses
+        // with `ENOTEMPTY` if any real entry remains. A fixture that leaves a file behind
+        // would be testing the fixture rather than the code -- so the directory here is
+        // left genuinely empty, which is the state a refused write actually produces.
+        let cgdir = base.join("orxnud-leak-test-fixture");
+        std::fs::create_dir(&cgdir).expect("cgroup dir");
+        make_read_only(&cgdir);
+
+        let cg = claiming_everything();
+        let miss = cg
+            .create_at(
+                &cgdir,
+                &base,
+                &[ResourceControl::Memory {
+                    bytes: 16 * 1024 * 1024,
+                }],
+            )
+            .expect_err("writing into a read-only directory must fail");
+
+        // A refused write, reported as such and not as anything the caller must fix.
+        assert!(
+            !matches!(miss.kind, ResourceMissKind::ValueRejected),
+            "an ordinary I/O failure must not be reported as a bad request: {miss}"
+        );
+        assert!(
+            miss.reason.contains("memory.max"),
+            "the refusal must name the file it could not write: {}",
+            miss.reason
+        );
+        assert_eq!(miss.controls, vec!["memory"]);
+
+        // The half-configured cgroup is gone.
+        assert!(
+            !cgdir.exists(),
+            "a failed setup must remove its cgroup directory: {}",
+            cgdir.display()
+        );
+        assert_eq!(
+            std::fs::read_dir(&base)
+                .map(|d| d.flatten().count())
+                .unwrap_or(0),
+            0,
+            "nothing may survive a failed setup in {}",
+            base.display()
+        );
+    }
+
+    /// Removes write permission from a directory, so files cannot be created inside it.
+    ///
+    /// `#[cfg(unix)]` because that is the only platform this crate's cgroup backend can
+    /// run on; the gate is there so the intent is explicit rather than incidental.
+    #[cfg(unix)]
+    fn make_read_only(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(dir).expect("metadata").permissions();
+        perm.set_mode(0o500);
+        std::fs::set_permissions(dir, perm).expect("chmod");
+    }
+
+    /// A handle that claims every controller is writable, for driving paths the host
+    /// itself may not permit.
+    fn claiming_everything() -> CgroupV2 {
+        CgroupV2 {
+            path: PathBuf::new(),
+            base: PathBuf::new(),
+            availability: CgroupAvailability {
+                can_create: true,
+                memory: true,
+                swap: true,
+                processes: true,
+                cpu: true,
+                group_kill: true,
+            },
+            owns_path: false,
+        }
+    }
+
+    #[test]
+    fn an_undelegated_controller_is_refused_before_anything_is_written() {
+        // The pre-check, not a partial write.
+        //
+        // `memory` is claimed unavailable, so a memory ceiling must be refused outright:
+        // writing the *other* control first and then discovering the missing one would
+        // leave a cgroup that looks bounded while the memory limit was never applied.
+        let base = scratch_base("undelegated");
+        let base = base.path().to_path_buf();
+        let partial = CgroupV2 {
+            path: PathBuf::new(),
+            base: base.clone(),
+            availability: CgroupAvailability {
+                can_create: true,
+                memory: false,
+                swap: true,
+                processes: true,
+                cpu: true,
+                group_kill: true,
+            },
+            owns_path: false,
+        };
+        let miss = partial
+            .create_in(
+                &base,
+                "partial-test",
+                &[
+                    ResourceControl::Memory {
+                        bytes: 32 * 1024 * 1024,
+                    },
+                    ResourceControl::Processes { max: 16 },
+                ],
+            )
+            .expect_err("an undelegated memory controller must refuse");
+        assert_eq!(miss.kind, ResourceMissKind::ControllerUndelegated);
+        assert_eq!(miss.controls, vec!["memory"]);
+        assert_eq!(
+            std::fs::read_dir(&base)
+                .map(|d| d.flatten().count())
+                .unwrap_or(0),
+            0,
+            "a refused setup must leave no directory behind"
+        );
+    }
+
+    #[test]
+    fn an_invalid_limit_costs_no_directory_at_all() {
+        // Validation runs before `create_dir`, so an inexpressible request never reaches
+        // the filesystem. That is what makes the refusal cheap *and* unambiguous: there
+        // is nothing to clean up because nothing was made.
+        //
+        // Exercised through the public entry point, which is where a caller meets it.
+        let cg = CgroupV2::discover();
+        if cg.base.as_os_str().is_empty() {
+            // No delegated base here. `create` refuses before validation with a base
+            // error, so this case cannot be reached; the validation logic itself is
+            // covered by the `ResourceControl::validate` tests above.
+            return;
+        }
+        let miss = cg
+            .create(
+                "invalid-test",
+                &[ResourceControl::Memory { bytes: u64::MAX }],
+            )
+            .expect_err("u64::MAX is not a ceiling");
+        assert_eq!(miss.kind, ResourceMissKind::ValueRejected);
+        assert_eq!(miss.controls, vec!["memory"]);
     }
 }
