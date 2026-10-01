@@ -2419,3 +2419,64 @@ single-process constraint (ADR-0006, V-24).
 documented durability configuration, **and** (b) it passes the ADR-0029
 conformance suite — specifically **TP-7** (power loss) and **TP-5** (lease-expiry
 fencing at commit). A stable 1.0 release alone is **not** sufficient.
+
+---
+
+<a id="adr-0033"></a>
+## ADR-0033 — `orxnud-task` and `orxnud-capability` are distinct layers
+
+> **Accepted 2026-09-30.** Documentation and CI correction. No architectural
+> redesign; the crate graph is unchanged.
+
+**Context.** `docs/03` §7.1 lists the core crates as a flat table, and gate G2's
+layer list grouped them:
+
+```sh
+"orxnud-task|orxnud-capability"
+```
+
+That `|` group was chosen to mean "these two are peers, both above `orxnud-policy`".
+The gate enforced the right thing — the inward check permits only strictly-earlier
+layers, so `orxnud-task → orxnud-capability` has always been rejected — but the
+*presentation* implied the edge was permitted.
+
+**Why that mattered, concretely.** The Phase 2 record states the engine cannot
+reach a capability. To check that, a reader had to run gate G2 and read a failure
+message, or reason about the layer semantics. For the single most important
+security property in the repository, "legible by reading the list" is not good
+enough. A reader who assumes the `|` group means mutual permission will draw the
+wrong graph, and the wrong graph is what gets built.
+
+**Decision.** Separate entries, plus a named assertion.
+
+```sh
+"orxnud-task"
+"orxnud-capability"
+```
+
+and, as its own gate check that fails by name:
+
+- `orxnud-task` **must not** depend on `orxnud-capability`.
+- The reverse direction is **deliberately not asserted.**
+
+**Why not assert the reverse.** An earlier draft of this gate also required
+`orxnud-capability → orxnud-task`, on the theory that a capability runs as a task
+step. `orxnud-capability` does not depend on `orxnud-task` today. Whether the
+dispatcher should call into the task engine, or `orxnud-daemon` should compose both
+and pass a task context in, is an open design question — and asserting it would smuggle
+a design choice into a documentation correction, making the gate fail for the wrong
+reason. The forbidden direction is a boundary fact; the permitted one is not yet a
+decision.
+
+**Consequences.** The intended direction is now obvious on its face:
+
+```text
+orxnud-task  -X->  orxnud-capability
+```
+
+Verified by injecting the forbidden edge and observing gate G2 fail with
+`orxnud-task depends on orxnud-capability, which is not inward`, then observing
+`ok  orxnud-task cannot reach orxnud-capability` on the restored tree.
+
+**Revisit conditions.** Revisit when the dispatcher's task-integration direction is
+decided (Phase 3), at which point the reverse edge may be asserted if it exists.

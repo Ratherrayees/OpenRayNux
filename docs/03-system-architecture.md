@@ -376,8 +376,8 @@ the recovery path understands. See ADR-0007 for the state machine.
 | `orxnud-domain` | Pure domain types and invariants. Zero I/O, zero async. |
 | `orxnud-store` | SQLite repositories, migrations, backup/restore. Owns the DB. |
 | `orxnud-policy` | Permissions, risk classification, approval binding, egress control, budget. **Fails closed.** |
-| `orxnud-task` | Task table, state machine, scheduler, leases, idempotency, dead-letter. |
-| `orxnud-capability` | Registry, contracts, dispatcher, sandbox policy. |
+| `orxnud-task` | Task table, state machine, scheduler, leases, idempotency, dead-letter. **Must never be able to reach `orxnud-capability`.** |
+| `orxnud-capability` | Registry, contracts, dispatcher, sandbox policy. Sits above `orxnud-task` in the graph; the direction *between* these two is open, the reverse edge is forbidden. |
 | `orxnud-audit` | Append-only, tamper-evident journal. |
 | `orxnud-config` | Layered configuration + schema versioning + migration. |
 | `orxnud-obs` | `tracing` wiring, redaction, optional OTLP exporter. |

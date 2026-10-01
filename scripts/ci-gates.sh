@@ -132,6 +132,20 @@ gate_G1() {
 #   b. `orxnuctl` may depend on `orxnud-protocol` and nothing else internal.
 #   c. Internal dependency edges point inward: a crate never names a crate that
 #      already depends on it.
+#
+# (d) `orxnud-task` and `orxnud-capability` are separate layers on purpose, even
+#     though both sit above `orxnud-policy`. They were one `|`-grouped entry until
+#     Phase 3, which read as though `orxnud-task -> orxnud-capability` were permitted.
+#     It never was -- the inward check only allows strictly-earlier layers -- but a
+#     reader checking whether the task engine can reach a capability had to run the
+#     gate rather than read the list. The dependency direction is now obvious on its
+#     face:
+#
+#         orxnud-task        -X-> orxnud-capability   (the engine cannot reach one)
+#
+#     The task engine is the most security-sensitive subsystem in the repository, so
+#     "the engine has no edge to any capability" must be legible without executing
+#     anything. See docs/09 ADR-0033.
 gate_G2() {
   banner G2
   local ok_all=1
@@ -175,7 +189,8 @@ gate_G2() {
     "orxnud-protocol|orxnud-store|orxnud-obs|orxnud-config|orxnud-platform-fs|orxnud-platform-secrets|orxnud-platform-notify"
     "orxnud-audit"
     "orxnud-policy"
-    "orxnud-task|orxnud-capability"
+    "orxnud-task"
+    "orxnud-capability"
     "orxnud-daemon"
     "orxnuctl"
   )
@@ -238,6 +253,31 @@ gate_G2() {
   else
     ok "the policy seal is reachable only from orxnud-policy (production code)"
   fi
+
+  # --- (e) the task engine cannot reach a capability ---
+  #
+  # The inward check above already implies this. Asserting it separately anyway,
+  # because this single fact is the one Phase 3 depends on: if the engine could name
+  # a capability, then AUTHORITY -- stage 1 of the dispatcher -- would be validating
+  # a value the engine itself minted, and every stage after it would be decorative.
+  # A property worth naming is worth a check that fails by name.
+  if manifest_deps crates/orxnud-task/Cargo.toml | grep -qx 'orxnud-capability'; then
+    fail_gate "orxnud-task depends on orxnud-capability: the task engine must not be able to reach a capability"
+    ok_all=0
+  else
+    ok "orxnud-task cannot reach orxnud-capability"
+  fi
+
+  # The reverse direction is deliberately NOT asserted.
+  #
+  # An earlier version of this check also demanded `orxnud-capability ->
+  # orxnud-task` on the theory that a capability runs as a task step. That is an
+  # architectural decision, not a boundary fact, and `orxnud-capability` does not
+  # depend on `orxnud-task` today. Whether the dispatcher should call into the task
+  # engine, or the daemon should compose both and pass a task context in, is open.
+  # Asserting it here would smuggle a design choice into a documentation commit and
+  # make the graph fail for the wrong reason. The one property that must hold today
+  # is the forbidden direction above.
 
   [ "$ok_all" -eq 1 ] && ok "all internal dependency edges point inward"
 }
