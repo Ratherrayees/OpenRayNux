@@ -37,9 +37,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod cgroup;
 pub mod contract;
 pub mod linux;
 
+pub use cgroup::{
+    CgroupAvailability, CgroupV2, EnforcementEnvironment, ResourceControl, ResourceMiss,
+};
 pub use contract::{
     AvailableGuarantees, CapturedStream, ExecutionResult, ExecutionStatus, FsPolicy,
     IsolationRequirements, NetworkPolicy, Resource, ResourceLimits, SandboxRunner, SandboxSpec,

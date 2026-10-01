@@ -22,6 +22,14 @@
 /// The environment variable carrying the helper's mode and parameters.
 const HELPER_MODE_VAR: &str = "ORXNUD_HOSTILE_HELPER";
 
+/// Where the descendant-spawning helper writes its heartbeat.
+///
+/// A parameter rather than a hard-coded `/tmp` path, because `/tmp` inside the sandbox
+/// is a **private tmpfs**: a grandchild writing there is invisible to the host, so a
+/// containment test that looks at `/tmp` would see nothing and conclude "contained"
+/// for the wrong reason. The caller grants a host-visible directory and passes it here.
+const MARKER_VAR: &str = "ORXNUD_DESCENDANT_MARKER";
+
 /// What the helper reports back.
 struct Report {
     ok: bool,
@@ -252,21 +260,42 @@ fn cred_path_probe() -> Report {
 /// the `SIG_IGN`s make a graceful request pointless, so only kernel-level enforcement
 /// can stop it.
 fn spawn_descendant() -> Report {
-    let mut cmd = std::process::Command::new("/usr/bin/python3");
-    cmd.arg("-c").arg(
-        r#"
+    let marker =
+        std::env::var(MARKER_VAR).unwrap_or_else(|_| "/tmp/orxnud-descendant-alive".into());
+    // Injected as a literal in the child's source. Quoted, because it is a path the
+    // caller chose and this helper is the adversary -- an unquoted path would be a
+    // command-injection hole in the *test fixture*.
+    let quoted = marker.replace('\\', "\\\\").replace('\'', "\\'");
+    let script = r#"
 import signal, time, os, sys
 for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
     try: signal.signal(s, signal.SIG_IGN)
     except Exception: pass
-open('/tmp/orxnud-descendant-alive','w').write(str(os.getpid()))
+path = sys.argv[1]
 while True:
-    with open('/tmp/orxnud-descendant-alive','w') as f: f.write(str(os.getpid()))
+    with open(path, 'w') as f: f.write(str(os.getpid()))
     time.sleep(0.15)
-"#,
-    );
+"#;
+    let mut cmd = std::process::Command::new("/usr/bin/python3");
+    cmd.arg("-c").arg(script).arg(&quoted);
     match cmd.spawn() {
-        Ok(_) => Report::pass("grandchild spawned and detached"),
+        Ok(_) => {
+            // Wait for the grandchild to prove it is alive.
+            //
+            // Without this the helper returns immediately, the test binary exits, and
+            // the namespace is torn down before the grandchild has written anything --
+            // so a containment test sees no marker and concludes "contained" for the
+            // wrong reason. The marker must exist *before* the parent dies, or the
+            // test is measuring nothing.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !std::path::Path::new(&marker).exists() {
+                if std::time::Instant::now() > deadline {
+                    return Report::fail("the grandchild never established its marker");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Report::pass(format!("grandchild alive, marker={marker}"))
+        }
         Err(e) => Report::fail(format!("could not spawn: {e}")),
     }
 }

@@ -17,6 +17,7 @@
 
 #![allow(dead_code)] // each fixture is used by a different test binary
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -441,4 +442,43 @@ impl CapabilityAdapter for MutatingAdapter {
             detail: "the effect partially occurred before the failure".into(),
         })
     }
+}
+
+// ------------------------------------------------------------------ phase 4b
+
+/// The hostile helper binary, re-executed inside the sandbox.
+///
+/// `orxnud-platform-sandbox`'s own test binary, located in this crate's build
+/// directory. It is a test binary rather than a shipped `bin`, so the adversary
+/// cannot become a product artefact.
+#[must_use]
+pub fn helper_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let dir = exe.parent().expect("deps directory");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("read deps directory")
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("hostile_helper-"))
+        })
+        .collect();
+    found.sort();
+    assert!(
+        !found.is_empty(),
+        "no hostile_helper-* binary in {}; run `cargo test --no-run` first",
+        dir.display()
+    );
+    found.remove(0)
+}
+
+/// The directory the helper lives in, which the sandbox must be granted read-only.
+///
+/// A real capability would be installed somewhere the sandbox already expects, so
+/// this is a property of the fixture rather than of the design.
+#[must_use]
+pub fn sandbox_helpers_dir() -> PathBuf {
+    helper_path().parent().expect("dir").to_path_buf()
 }

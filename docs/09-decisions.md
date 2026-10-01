@@ -2768,6 +2768,24 @@ Relaxation exists, is named (`accepting_best_effort_containment()`), appears in 
 and lands in `ExecutionResult::unproven` so an audit record states the gap. Recorded as
 V-49.
 
+### Phase 4b: the governed path now consumes it
+
+`Dispatcher::dispatch` gained an execution branch keyed on `CapabilityAdapter::tier()`.
+A `Subprocess` adapter is invoked **only** through `ExecutionBackend::execute`; there
+is no in-process route and no unsandboxed fallback (V-51, V-50 closed).
+
+Three properties are structural rather than conventional:
+
+1. **`tier()` is on the adapter, not the declaration.** A declaration claiming Tier 0
+   while the implementation spawns a process would be exactly the bypass this phase
+   exists to close, and the adapter is the thing that knows how it runs.
+2. **`with_execution` is the only way to enable subprocess execution.** There is
+   deliberately no setter taking a program and arguments, because that *is* the
+   `dispatcher -> direct subprocess` bypass.
+3. **`ExecutionReport` has no `sandboxed: bool`.** A result that exists came from a
+   sandbox, because `Err` is how a refusal is expressed. A boolean would permit `Ok`
+   with `sandboxed: false` -- the unsandboxed fallback in all but name.
+
 ### The gap Phase 4b must close
 
 `orxnud-platform-sandbox` currently has **no consumer**. The governed path

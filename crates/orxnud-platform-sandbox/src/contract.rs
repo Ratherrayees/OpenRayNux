@@ -381,7 +381,17 @@ pub enum ExecutionStatus {
     /// The supervisor could not establish the requested sandbox.
     Refused(SandboxUnavailable),
     /// The process could not be started at all.
+    ///
+    /// Distinct from a process that was killed: **nothing ran**. A caller retrying a
+    /// spawn failure is retrying something that never began.
     SpawnFailed(String),
+    /// The process was terminated by a signal.
+    ///
+    /// Phase 4b addition. `Exited(n)` already covers a normal exit, but a capability
+    /// killed by `SIGKILL` — including one killed by the kernel for exceeding a
+    /// resource ceiling — has no exit code, and folding that into `SpawnFailed` would
+    /// claim nothing ran when something did.
+    Killed,
 }
 
 /// Whether a stream was complete, or truncated at the cap.
@@ -425,6 +435,34 @@ impl ExecutionResult {
         matches!(self.status, ExecutionStatus::Exited(0))
     }
 
+    /// Whether a process was started at all.
+    ///
+    /// False for a refusal and for a spawn failure. The security-relevant question:
+    /// "did anything run?" is not the same as "did it succeed?".
+    #[must_use]
+    pub fn did_start(&self) -> bool {
+        !matches!(
+            self.status,
+            ExecutionStatus::SpawnFailed(_) | ExecutionStatus::Refused(_)
+        )
+    }
+
+    /// Whether the process ran but did not report success.
+    ///
+    /// True for every terminal state that is not a clean exit and not "never started",
+    /// which is what a caller needs in order to decide the effect's truth is unknown
+    /// rather than negative (TP-12).
+    #[must_use]
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(
+            self.status,
+            ExecutionStatus::TimedOut
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::OutputExceeded { .. }
+                | ExecutionStatus::Killed
+        )
+    }
+
     /// A short, redacted summary suitable for an audit record.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -437,6 +475,7 @@ impl ExecutionResult {
             }
             ExecutionStatus::Refused(e) => format!("refused: {e}"),
             ExecutionStatus::SpawnFailed(e) => format!("spawn failed: {e}"),
+            ExecutionStatus::Killed => "killed by a signal".to_owned(),
         };
         format!(
             "{status} in {}ms, stdout {}B{}, stderr {}B{}",
@@ -461,7 +500,11 @@ impl ExecutionResult {
 ///
 /// The portable half of the execution boundary. Every method is a *requirement*; the
 /// platform backend either satisfies it or returns [`SandboxUnavailable`].
-pub trait SandboxRunner {
+///
+/// `Send + Sync` because a supervisor is shared: one daemon runs dispatches from a
+/// worker pool, and a runner that could only be owned by one thread would force a
+/// supervisor per thread — which is how supervisor state ends up duplicated.
+pub trait SandboxRunner: Send + Sync {
     /// Runs `spec` to completion, honouring its deadline and output caps.
     ///
     /// # Errors

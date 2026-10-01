@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use orxnud_domain::Actor;
 use orxnud_domain::approval::{ApprovalDigest, ApprovalRecord, NormalizedParams};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::{ActionRequest, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, CapabilityInvocation, InvocationContext};
 use orxnud_domain::platform::{SecretRef, SecretsContract};
 use orxnud_policy::{PolicyEngine, PolicyError};
 
@@ -66,6 +66,13 @@ pub enum DispatchError {
     /// Authority, policy, approval or budget refused. The policy crate's own error,
     /// kept verbatim so the reason is never flattened into "denied".
     Policy(PolicyError),
+
+    /// A Tier-1 capability could not be sandboxed, so nothing ran.
+    ///
+    /// Distinct from [`Self::Execution`] and [`Self::Failed`] on purpose: nothing was
+    /// executed, so retrying the *capability* cannot help, and reporting it as an
+    /// execution failure would suggest the adapter ran and failed.
+    SandboxRefused(SandboxRefusal),
 
     /// The capability is declared but has no registered implementation.
     ///
@@ -125,6 +132,17 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Policy(e) => write!(f, "policy refused: {e}"),
+            Self::SandboxRefused(r) => write!(
+                f,
+                "{refused} was refused: {reason} (missing: {missing})",
+                refused = r.capability,
+                reason = r.reason,
+                missing = if r.missing.is_empty() {
+                    "none".to_owned()
+                } else {
+                    r.missing.join(", ")
+                },
+            ),
             Self::NoImplementation(c) => write!(f, "{c} is declared but has no implementation"),
             Self::Disabled(c) => write!(f, "{c} is disabled"),
             Self::ClassEscalation {
@@ -184,12 +202,30 @@ impl DispatchOutcome {
 }
 
 /// A registered capability implementation.
+///
+/// # `tier` is load-bearing
+///
+/// A Tier-1 capability **must** be sandboxed, and the dispatcher refuses to invoke one
+/// that cannot be (V-50, ADR-0035). The tier is a method on the adapter rather than a
+/// field on the declaration because the adapter is the thing that knows how it runs:
+/// a declaration claiming Tier 0 while the implementation spawns a subprocess would
+/// be exactly the bypass Phase 4b exists to close.
 pub trait CapabilityAdapter: Send + Sync {
     /// The id this adapter implements.
     fn capability_id(&self) -> &CapabilityId;
 
     /// The highest data class this adapter may handle.
     fn declared_class(&self) -> orxnud_domain::enums::DataClass;
+
+    /// Which isolation tier this implementation requires.
+    ///
+    /// `InProcess` is Tier 0: a Rust trait call in this address space, where a panic
+    /// is a bug we fix. `Subprocess` is Tier 1 and **requires** a sandbox: the
+    /// dispatcher will refuse to invoke it unless an execution backend is present and
+    /// the requested guarantees can be established.
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::InProcess
+    }
 
     /// Runs the capability.
     ///
@@ -210,10 +246,235 @@ pub trait CapabilityAdapter: Send + Sync {
     ) -> Result<ExecutionOutcome, String>;
 }
 
+/// What a Tier-1 capability needs from its sandbox.
+///
+/// Deliberately expressed in *capability* terms, not OS terms: a filesystem grant, a
+/// network grant, a deadline. Nothing here names bubblewrap, a namespace, a cgroup, or
+/// a Job Object — those are the backend's business, and leaking them into a portable
+/// crate is what gate G3 exists to prevent (ADR-0035).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionContract {
+    /// The capability being run.
+    pub capability: CapabilityId,
+    /// The program to execute. Absolute; never a shell string.
+    pub program: String,
+    /// Arguments, passed as a vector.
+    pub args: Vec<String>,
+    /// Environment variables the child may see. **Empty means none.**
+    ///
+    /// A credential is never placed here. Credentials travel through the
+    /// [`crate::credential::CredentialHandle`] parameter instead, so a leaked
+    /// environment cannot leak one — see V-50's credential section.
+    pub env: BTreeMap<String, String>,
+    /// Working directory inside the sandbox.
+    pub working_dir: String,
+    /// Read-write paths.
+    pub grant_rw: Vec<String>,
+    /// Read-only paths.
+    pub grant_ro: Vec<String>,
+    /// Whether the child may use the network at all.
+    pub network: bool,
+    /// Wall-clock deadline.
+    pub deadline_ms: u64,
+    /// Per-stream output cap.
+    pub output_cap_bytes: u64,
+    /// Whether OS-enforced resource ceilings are **required**.
+    ///
+    /// Per capability rather than a blanket default: `true` means the dispatch is
+    /// *refused* when the host cannot enforce ceilings. Defaulting it to `true` would
+    /// refuse every Tier-1 capability on a host without delegated cgroups -- fail-closed
+    /// in form, a sandbox that never runs in practice, and pressure to weaken the
+    /// default later.
+    ///
+    /// A capability that cannot safely exceed a limit sets this `true` and is refused
+    /// rather than run unbounded; one that can sets `false` and gets supervisor-side
+    /// observation, recorded in `ExecutionResult::unproven`.
+    pub require_resource_ceilings: bool,
+}
+
+/// The result a backend returns for a Tier-1 execution.
+///
+/// `sandboxed` is not a field: a result that exists at all came from a sandbox, because
+/// [`Self::execute`] returning `Err` is how a refusal is expressed. A boolean would
+/// allow `Ok` with `sandboxed: false`, which is precisely the unsandboxed fallback this
+/// phase forbids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionReport {
+    /// Exit code, when the process ran and exited.
+    pub exit_code: Option<i32>,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+    /// How it ended, in backend terms.
+    pub status: ExecutionOutcomeKind,
+}
+
+/// How a sandboxed execution ended, before verification interprets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutcomeKind {
+    /// Exited on its own with this code.
+    Exited(i32),
+    /// Stopped at the deadline.
+    TimedOut,
+    /// Stopped because cancellation was requested.
+    Cancelled,
+    /// Stopped because an output cap was reached.
+    OutputCapped,
+    /// The process died from a signal.
+    Killed,
+}
+
+/// Runs a Tier-1 capability inside a sandbox.
+///
+/// # The invariant this trait exists to enforce
+///
+/// A Tier-1 capability cannot execute outside a sandbox, and there is exactly one way
+/// to run one: through this trait. `Dispatcher::dispatch` refuses a Tier-1 adapter
+/// when no executor is configured, so the absence of a sandbox produces a refusal
+/// rather than an in-process call or an unsandboxed subprocess.
+///
+/// Implementations must **fail closed**: if the requested guarantees cannot be
+/// established, return `Err`. A backend that cannot provide isolation must not
+/// approximate it.
+pub trait ExecutionBackend: Send + Sync {
+    /// Runs `contract` inside a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// A refusal. Nothing was executed, and the caller must not retry the capability
+    /// as though it had.
+    fn execute(&self, contract: &ExecutionContract) -> Result<ExecutionReport, SandboxRefusal>;
+
+    /// Whether this backend can establish the guarantees the contract needs.
+    ///
+    /// Consulted *before* execution so the dispatcher can refuse early, but the
+    /// backend remains the authority: a `true` here does not permit a later `Err`.
+    fn can_fulfil(&self, contract: &ExecutionContract) -> bool;
+}
+
+/// Maps a backend report onto the existing execution outcome model.
+///
+/// The mapping is the security-relevant part: a sandbox that *refused* never reaches
+/// here, so anything arriving is something that actually ran. A `TimedOut` or
+/// `OutputCapped` maps to `Unknown` rather than `Failed`, because "the process did not
+/// report" and "the process reported failure" are different (TP-12), and only the
+/// second one means nothing happened.
+fn outcome_from_report(report: ExecutionReport) -> ExecutionOutcome {
+    match report.status {
+        ExecutionOutcomeKind::Exited(0) => ExecutionOutcome::Succeeded {
+            output: Some(report.stdout),
+        },
+        ExecutionOutcomeKind::Exited(code) => ExecutionOutcome::Failed {
+            detail: format!("exit {code}: {}", redact(&report.stderr)),
+        },
+        ExecutionOutcomeKind::TimedOut => ExecutionOutcome::Unknown {
+            detail: "the sandbox stopped the capability at its deadline".to_owned(),
+        },
+        ExecutionOutcomeKind::Cancelled => ExecutionOutcome::Unknown {
+            detail: "the capability was cancelled".to_owned(),
+        },
+        ExecutionOutcomeKind::OutputCapped => ExecutionOutcome::Unknown {
+            detail: "the capability exceeded its output cap, so its report is incomplete"
+                .to_owned(),
+        },
+        ExecutionOutcomeKind::Killed => ExecutionOutcome::Unknown {
+            detail: "the capability was killed by a signal".to_owned(),
+        },
+    }
+}
+
+/// Trims and bounds a child's stderr before it reaches an audit record.
+///
+/// A hostile helper controls this text, so it must not be able to flood the audit
+/// journal or smuggle a newline that breaks a record's framing.
+fn redact(s: &str) -> String {
+    const MAX: usize = 512;
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.len() <= MAX {
+        cleaned
+    } else {
+        format!("{}…[{} bytes total]", &cleaned[..MAX], cleaned.len())
+    }
+}
+
+/// Which isolation tier an implementation requires.
+///
+/// Two values, and no third. A tier that meant "best effort" would be a bypass with a
+/// name, so the only way to be less isolated than Tier 1 is to declare Tier 0 — which
+/// means in-process, where the sandbox does not apply because there is no process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionTier {
+    /// Tier 0: in-process. A Rust trait call; a panic is caught by the dispatcher.
+    InProcess,
+    /// Tier 1: a sandboxed subprocess. **Cannot be invoked without a sandbox.**
+    Subprocess,
+}
+
+/// A refusal to invoke a Tier-1 capability because no sandbox could be established.
+///
+/// Its own type rather than a `DispatchError` variant so it cannot be confused with a
+/// *capability* failing. A sandbox refusal means nothing ran; an adapter error means
+/// something ran and failed. Collapsing them would let a caller retry a refusal as
+/// though retrying could help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxRefusal {
+    /// Which capability was refused.
+    pub capability: CapabilityId,
+    /// Why, in the backend's words.
+    pub reason: String,
+    /// Guarantees that were not established.
+    pub missing: Vec<&'static str>,
+}
+
+/// What a Tier-1 adapter wants from its sandbox, in portable terms.
+///
+/// Separate from [`CapabilityAdapter`] because only Tier-1 adapters have one, and
+/// requiring every Tier-0 adapter to answer "which program do you run?" would be a
+/// lie for an in-process implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPlan {
+    /// Absolute path to the executable.
+    pub program: String,
+    /// Arguments.
+    pub args: Vec<String>,
+    /// Environment the child may see. Empty means none.
+    pub env: BTreeMap<String, String>,
+    /// Working directory.
+    pub working_dir: String,
+    /// Read-write grants.
+    pub grant_rw: Vec<String>,
+    /// Read-only grants.
+    pub grant_ro: Vec<String>,
+    /// Whether the network is granted.
+    pub network: bool,
+    /// Deadline in milliseconds.
+    pub deadline_ms: u64,
+    /// Per-stream output cap.
+    pub output_cap_bytes: u64,
+    /// Whether OS-enforced resource ceilings are required.
+    ///
+    /// See [`ExecutionContract::require_resource_ceilings`] for why this is per
+    /// capability. `false` means "observed, not enforced", and the difference is
+    /// recorded in the audit trail.
+    pub require_resource_ceilings: bool,
+}
+
 /// Verification strategy, looked up alongside the adapter.
 pub trait AdapterBundle {
     /// The adapter.
     fn adapter(&self) -> &dyn CapabilityAdapter;
+
+    /// The sandbox plan, for a Tier-1 adapter.
+    ///
+    /// `None` for Tier 0, and for a Tier-1 adapter it is a configuration error the
+    /// dispatcher refuses rather than guessing.
+    fn sandbox_plan(&self) -> Option<SandboxPlan> {
+        None
+    }
 
     /// How to verify its effects.
     fn verifier(&self) -> &dyn Verifier;
@@ -241,6 +502,8 @@ pub enum Refusal {
     Credential(CredentialError),
     /// An adapter re-entered the dispatcher.
     Reentrant(CapabilityId),
+    /// A Tier-1 capability had no usable sandbox.
+    Sandbox(SandboxRefusal),
 }
 
 impl Refusal {
@@ -254,6 +517,7 @@ impl Refusal {
             Self::ClassEscalation { .. } => "class_escalation",
             Self::Credential(_) => "credential_unavailable",
             Self::Reentrant(_) => "reentrant_dispatch",
+            Self::Sandbox(_) => "sandbox_refused",
         }
     }
 }
@@ -321,6 +585,12 @@ pub struct Dispatcher<'p, S: SecretsContract> {
     secrets: &'p S,
     bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>,
     reentrancy: ReentrancyGuard,
+    /// The only route to a Tier-1 process.
+    ///
+    /// `None` means no sandbox is configured, and a Tier-1 capability is then
+    /// **refused**. That is the fail-closed default: a missing sandbox must not become
+    /// an in-process call, and must not become an unsandboxed subprocess (V-49, V-50).
+    execution: Option<Arc<dyn ExecutionBackend>>,
 }
 
 impl<'p, S: SecretsContract> Dispatcher<'p, S> {
@@ -336,7 +606,81 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             secrets,
             bundles,
             reentrancy: ReentrancyGuard::default(),
+            execution: None,
         }
+    }
+
+    /// Installs the execution backend that Tier-1 capabilities will use.
+    ///
+    /// The only way to make subprocess execution possible. There is deliberately no
+    /// setter that takes a program and arguments directly, because that would be the
+    /// `dispatcher -> direct subprocess` bypass Phase 4b forbids.
+    #[must_use]
+    pub fn with_execution(mut self, backend: Arc<dyn ExecutionBackend>) -> Self {
+        self.execution = Some(backend);
+        self
+    }
+
+    /// Whether a sandbox is configured.
+    #[must_use]
+    pub fn has_execution_backend(&self) -> bool {
+        self.execution.is_some()
+    }
+
+    /// How many records the audit chain holds.
+    ///
+    /// Exposed so a caller can assert that a governed execution left a trace, which
+    /// is the difference between "it ran" and "it ran and can be reconstructed".
+    #[must_use]
+    pub fn audit_len(&self) -> usize {
+        self.policy.audit().len()
+    }
+
+    /// Builds the execution contract for a Tier-1 capability.
+    ///
+    /// # The credential is deliberately absent
+    ///
+    /// The contract carries no credential, and no `SecretRef`. A contract is data that
+    /// will be logged, audited, and serialised for diagnostics; putting a secret or
+    /// even its reference in it would create three new leak paths. The credential
+    /// travels as the [`crate::credential::CredentialHandle`] passed to the backend's
+    /// own channel, which is why `ExecutionBackend::execute` takes only a contract and
+    /// the handle is threaded separately in the sandbox backend.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError::InvalidInput`] when the adapter declared no program, which a
+    /// Tier-1 adapter without a program is a configuration error rather than a
+    /// runtime failure.
+    fn contract_for(
+        &self,
+        _invocation: &CapabilityInvocation,
+        capability: &CapabilityId,
+    ) -> Result<ExecutionContract, DispatchError> {
+        let bundle = self
+            .bundles
+            .get(capability)
+            .ok_or_else(|| DispatchError::NoImplementation(capability.clone()))?;
+        let sandboxed = bundle.sandbox_plan().ok_or_else(|| {
+            DispatchError::SandboxRefused(SandboxRefusal {
+                capability: capability.clone(),
+                reason: "the adapter is Tier-1 but declares no sandbox plan".to_owned(),
+                missing: vec!["a sandbox plan"],
+            })
+        })?;
+        Ok(ExecutionContract {
+            capability: capability.clone(),
+            program: sandboxed.program,
+            args: sandboxed.args,
+            env: sandboxed.env,
+            working_dir: sandboxed.working_dir,
+            grant_rw: sandboxed.grant_rw,
+            grant_ro: sandboxed.grant_ro,
+            network: sandboxed.network,
+            deadline_ms: sandboxed.deadline_ms,
+            output_cap_bytes: sandboxed.output_cap_bytes,
+            require_resource_ceilings: sandboxed.require_resource_ceilings,
+        })
     }
 
     /// Registers an implementation. Duplicate ids are refused, because two
@@ -442,30 +786,82 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
         };
 
         // --- stage 7: EXECUTION ---
-        self.reentrancy.enter(&capability).map_err(|e| match e {
-            DispatchError::Reentrant(_) => e,
-            other => other,
-        })?;
+        //
+        // Two routes, and the tier decides which. Tier 0 is an in-process trait call;
+        // Tier 1 goes through the execution backend and can do nothing else. There is
+        // no third route, and no fallback from Tier 1 to Tier 0 -- that absence is the
+        // invariant (V-50).
+        let execution = match adapter.tier() {
+            ExecutionTier::Subprocess => {
+                // Refused *before* the contract is built, so no process is created and
+                // nothing about the capability leaks. Note this happens after stage 6,
+                // which is deliberate: credential resolution is cheap and side-effect
+                // free, and a refusal here must not be able to read a secret. The
+                // contract check below happens before the backend is asked to run.
+                let Some(backend) = self.execution.clone() else {
+                    return Err(DispatchError::SandboxRefused(SandboxRefusal {
+                        capability: capability.clone(),
+                        reason: "no execution backend is configured, so a Tier-1 \
+                                 capability cannot be sandboxed"
+                            .to_owned(),
+                        missing: vec!["a sandbox execution backend"],
+                    }));
+                };
+                let contract = self.contract_for(&invocation, &capability)?;
+                if !backend.can_fulfil(&contract) {
+                    return Err(DispatchError::SandboxRefused(SandboxRefusal {
+                        capability: capability.clone(),
+                        reason: "the execution backend cannot establish the required \
+                                 sandbox guarantees"
+                            .to_owned(),
+                        missing: vec!["the requested sandbox guarantees"],
+                    }));
+                }
+                self.reentrancy.enter(&capability)?;
+                let report = {
+                    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend.execute(&contract)
+                    }));
+                    self.reentrancy.leave();
+                    match caught {
+                        Err(_) => {
+                            // A backend that panics must not be treated as success,
+                            // and must not be retried as though the capability failed.
+                            return Err(DispatchError::SandboxRefused(SandboxRefusal {
+                                capability: capability.clone(),
+                                reason: "the execution backend panicked".to_owned(),
+                                missing: vec!["a functioning execution backend"],
+                            }));
+                        }
+                        Ok(Ok(r)) => r,
+                        Ok(Err(refusal)) => {
+                            return Err(DispatchError::SandboxRefused(refusal));
+                        }
+                    }
+                };
+                outcome_from_report(report)
+            }
+            ExecutionTier::InProcess => {
+                self.reentrancy.enter(&capability)?;
+                // The guard is released by `catch_unwind`'s drop path even on a panic,
+                // so a faulty adapter cannot wedge the dispatcher for its lifetime.
+                let view = invocation.dispatch_view();
+                let credential = credential.as_ref();
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    adapter.invoke(&view, credential)
+                }));
+                self.reentrancy.leave();
 
-        // The guard is released by `catch_unwind`'s drop path even on a panic, so a
-        // faulty adapter cannot wedge the dispatcher for the process lifetime.
-        let view = invocation.dispatch_view();
-        let execution = {
-            let credential = credential.as_ref();
-            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                adapter.invoke(&view, credential)
-            }));
-            self.reentrancy.leave();
-
-            match caught {
-                // A panicking adapter is a bug in the adapter, and ADR-0009 requires
-                // that it not take down the host. Reported as an execution failure,
-                // never as a permission failure.
-                Err(_) => ExecutionOutcome::Unknown {
-                    detail: format!("{} panicked during execution", capability),
-                },
-                Ok(Err(e)) => ExecutionOutcome::Failed { detail: e },
-                Ok(Ok(outcome)) => outcome,
+                match caught {
+                    // A panicking adapter is a bug in the adapter, and ADR-0009
+                    // requires that it not take down the host. Reported as an execution
+                    // failure, never as a permission failure.
+                    Err(_) => ExecutionOutcome::Unknown {
+                        detail: format!("{} panicked during execution", capability),
+                    },
+                    Ok(Err(e)) => ExecutionOutcome::Failed { detail: e },
+                    Ok(Ok(outcome)) => outcome,
+                }
             }
         };
 

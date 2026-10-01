@@ -280,6 +280,24 @@ gate_G2() {
   # make the graph fail for the wrong reason. The one property that must hold today
   # is the forbidden direction above.
 
+  # --- (f) only the sandbox crate may spawn a capability process ---
+  #
+  # Phase 4b's central invariant (V-50/V-51): a Tier-1 capability executes only
+  # through `ExecutionBackend`, whose implementation lives in the sandbox crate. A
+  # `Command::new` anywhere in `orxnud-capability` would be a second, unaudited
+  # execution route -- and `orxnud-task` may not even reach that crate, so it could
+  # not be caught by the seal grep or by review alone.
+  local spawners
+  spawners="$(grep -RIn 'Command::new\|process::Command' crates/orxnud-capability/src \
+    --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!|\*|/\*)' || true)"
+  if [ -n "$spawners" ]; then
+    printf '%s\n' "$spawners" | sed 's/^/     /'
+    fail_gate "orxnud-capability spawns a process directly; Tier-1 execution must go through ExecutionBackend"
+    ok_all=0
+  else
+    ok "only the sandbox crate spawns capability processes"
+  fi
+
   [ "$ok_all" -eq 1 ] && ok "all internal dependency edges point inward"
 }
 

@@ -35,6 +35,7 @@
 
 pub mod credential;
 pub mod dispatch;
+pub mod subprocess;
 pub mod verification;
 
 use std::collections::BTreeMap;

@@ -7,8 +7,14 @@ Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
 Phase 4a  ✅ Process isolation
-Phase 4b  ⏳ Hard resource ceilings + Windows + integration
+Phase 4b  ⏳ Hard resource ceilings + Windows evidence
 ```
+
+Phase 4b progress: **V-50 complete** -- the governed dispatcher now executes Tier-1
+capabilities only through the sandbox, with no in-process route and no unsandboxed
+fallback (V-51). **V-46 partial** -- cgroup controls are writable in a delegated
+container and `cgroup.kill` subtree termination is proven; end-to-end memory/pids/cpu
+enforcement is not yet (V-52). **V-29 open** -- no Windows evidence.
 
 Phase 4b has three objectives: wire the sandbox into the Phase 3 dispatcher so the
 governed path actually uses it (V-50), prove hard resource ceilings where cgroup

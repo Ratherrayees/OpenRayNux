@@ -18,6 +18,9 @@ tokio = { workspace = true }
 orxnud-domain = { workspace = true }
 orxnud-policy = { workspace = true }
 orxnud-audit = { workspace = true }
+# The execution backend: the only place a Tier-1 subprocess can be started. The
+# dependency is inward (capability sits above platform-*), so G2 permits it.
+orxnud-platform-sandbox = { workspace = true }
 
 [dev-dependencies]
 # Dev-only, so the bypass suite can name orxnud_task's public surface and assert the
