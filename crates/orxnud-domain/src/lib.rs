@@ -51,8 +51,8 @@ pub use ids::{
 };
 pub use intent::{IntentKind, Proposal, ProposedStep};
 pub use invocation::{
-    ActionRequest, AuthorisationProof, CapabilityInvocation, DispatchView, InvocationContext,
-    PolicySeal,
+    ActionRequest, AuthorisationProof, CapabilityInvocation, CapabilityRequest, DispatchView,
+    InvocationContext, PolicySeal,
 };
 pub use platform::{FsContract, NotificationRequest, NotifyContract, SecretRef, SecretsContract};
 pub use task_state::{MisfirePolicy, ScheduleFire, ScheduleSpec, TaskKind, TaskState, TaskStatus};

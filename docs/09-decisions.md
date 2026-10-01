@@ -195,6 +195,11 @@ kernel.
 pipe (Windows)** as the primary local transport. The same frames travel over
 HTTPS via `axum` **only** in the cloud profile.
 
+> **Amended by ADR-0034.** The frames on this transport carry `CapabilityRequest`,
+> **not** `CapabilityInvocation`. An inbound frame is untrusted data; policy
+> re-authorises it from scratch on arrival. `CapabilityInvocation` is an internal,
+> authority-bearing type and is not a wire type in any profile.
+
 **Why.** Four reasons, in order of weight:
 
 1. **One protocol stack.** Local clients, the MCP client, and the remote API
@@ -995,6 +1000,12 @@ by convention.
    deliberately constructing an authorised `CapabilityInvocation`, which only the
    policy layer's constructor produces. It is not *possible* to do this without
    going through policy.
+
+   > **Amended by ADR-0034.** This claim was **false** as written. `CapabilityInvocation`
+   > also derived `Deserialize`, and a derived `Deserialize` writes private fields
+   > without calling any constructor — so it bypassed `PolicySeal`,
+   > `AuthorisationProof`, and policy entirely. Phase 3 proved the bypass
+   > exploitable before building anything on it. See ADR-0034.
 2. **Capability-scoped isolation (S1).** The model runs in a context with **no
    credential handle**, no arbitrary filesystem grant, and network egress
    restricted to configured provider endpoints. A prompt injection cannot make
@@ -2480,3 +2491,127 @@ Verified by injecting the forbidden edge and observing gate G2 fail with
 
 **Revisit conditions.** Revisit when the dispatcher's task-integration direction is
 decided (Phase 3), at which point the reverse edge may be asserted if it exists.
+
+
+---
+
+<a id="adr-0034"></a>
+## ADR-0034 — `CapabilityInvocation` is not deserialisable; ingress uses `CapabilityRequest`
+
+> **Accepted 2026-09-30.** Closes the Phase 3 precondition. Amendment to ADR-0003
+> and ADR-0012.
+
+**Context.** The architecture's central structural claim is that policy cannot be
+bypassed because the type that reaches an adapter has exactly one constructor, and
+that constructor needs a `PolicySeal` and an `AuthorisationProof`:
+
+```text
+External → interface → Proposal → ActionRequest → [POLICY] → CapabilityInvocation → adapter
+```
+
+ADR-0012 stated the consequence as *"It is not possible to do this without going
+through policy."*
+
+**The problem.** `CapabilityInvocation` derived **both** `Serialize` and
+`Deserialize`, with private fields:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityInvocation { /* private fields */ }
+```
+
+A derived `Deserialize` is a **second constructor**. It writes the private fields
+directly, so the seal, the proof, and policy evaluation are all bypassed — the exact
+thing the private fields existed to prevent.
+
+**Evidence: it was exploitable, not merely untidy.** Before implementing anything in
+Phase 3, a standalone crate outside the workspace was built against `orxnud-domain`
+and minted an authorised invocation from a JSON literal:
+
+```rust
+let forged: CapabilityInvocation = serde_json::from_str(json).expect("forged");
+```
+
+```text
+FORGED OK -> CapabilityId("send-email") risk=Low policy_version=forged
+           params={"to":"attacker@evil.test"}
+```
+
+No policy evaluation. No `AuthorisationProof`. No `PolicySeal`. No human. The caller
+asserted its own `assessed_risk: "low"` and `policy_version: "forged"`, and the type
+accepted both.
+
+This is worth stating plainly: it was found by *building the Phase 3 dispatcher and
+asking what would happen to each stage*, not by reading the code. The dispatcher was
+not written, because stage 1 (AUTHORITY) would have validated a fabricated actor and
+stage 6 (CREDENTIAL RESOLUTION) would have handed real credentials to it.
+
+**Decision.** Two types with different trust levels, and the boundary is the
+*difference between them*:
+
+| Type | Means | Deserialize? |
+|---|---|---|
+| `CapabilityRequest` | "someone asked for this" | **yes** — it is the inbound type |
+| `ActionRequest` | "validated against the capability's schema" | yes |
+| `CapabilityInvocation` | "OpenRayNux authorised this exact action" | **no** |
+
+```text
+External / CLI / GUI / TUI / Voice / DM / API / Scheduled / Integration
+        │
+        ▼
+CapabilityRequest          (untrusted; carries no authority)
+        │
+        ▼
+validation + normalisation
+        │
+        ▼
+Policy → Authority → Approval → Budget
+        │
+        ▼
+CapabilityInvocation      (authority-bearing; only policy can construct)
+        │
+        ▼
+Dispatcher → Execution
+```
+
+`CapabilityRequest` deliberately has **no** field for `assessed_risk`,
+`policy_version`, approval digest, credential handle, `PolicySeal`, or
+`AuthorisationProof`. Those are derived by trusted deterministic code during
+authorisation; a caller-settable field would be a caller-lieable field.
+
+**Why `Serialize` stays on the invocation.** The two are not symmetric. Serialising
+an authority-bearing value *out* is a disclosure risk that a caller must consciously
+own (audit records, hashing). Deserialising one *in* is an authorisation bypass that
+no caller should be able to perform at all. Only one of those is a boundary.
+
+**Also: the invocation is not a persistence type.** Audit and task rows must use
+explicitly designed structures, not a serialised `CapabilityInvocation`. Otherwise a
+future developer restores the same trust confusion through the storage layer, which
+is the same bug wearing a different hat.
+
+**Consequences.**
+
+- ADR-0003 amended: JSON-RPC frames carry `CapabilityRequest`, never
+  `CapabilityInvocation`. An inbound frame is untrusted data that policy
+  re-authorises from scratch on arrival.
+- ADR-0012 amended: its type-level claim now holds, and says what makes it hold.
+- Every ingress — CLI, GUI, TUI, voice, DM, API, scheduled, integration — converges
+  on `CapabilityRequest`. One untrusted representation, one authorisation pipeline.
+- `tests/compile_fail/invocation_cannot_be_deserialised.rs` pins the absence, with a
+  recorded `.stderr`, so re-adding the derive fails the build. Verified with teeth:
+  re-adding `Deserialize` turns that test red.
+
+**Rejected alternatives.**
+
+- **Keep `Deserialize` but validate on the way in.** Rejected: one type would then
+  serve two trust levels, and the validity of a deserialised invocation would depend
+  on which constructor produced it — not knowable from the value.
+- **Add a `verify_after_deserialisation` method.** Same problem in a worse shape: it
+  makes the safe path a runtime check the caller can forget, which is the documentary
+  enforcement this ADR exists to replace.
+
+**Revisit conditions.** Revisit only if an interface must forward an *already
+authorised* invocation across a process boundary — and then the correct answer is to
+send the `CapabilityRequest` plus a reference to the authorisation record, and
+re-authorise on arrival. Forwarding authority across a trust boundary should never be
+the design.

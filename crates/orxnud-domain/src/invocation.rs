@@ -221,6 +221,66 @@ impl PolicySeal {
     }
 }
 
+/// An **untrusted inbound request** to invoke a capability.
+///
+/// # What this type means
+///
+/// > "Someone asked for this."
+///
+/// It is the only capability-shaped type that is allowed to come *in* from outside
+/// the process: JSON-RPC frames, the CLI, a GUI, a TUI, a voice transcript, a DM, an
+/// API call, a scheduled event, an external integration. Every one of those ingress
+/// paths converges here, and every one of them is untrusted.
+///
+/// # What it deliberately does not carry
+///
+/// No `assessed_risk`, no `policy_version`, no approval digest, no credential
+/// handle, no [`PolicySeal`], no [`AuthorisationProof`]. Those are *derived by trusted
+/// deterministic code* during authorisation. A field here that a caller could set
+/// would be a field the caller could lie about.
+///
+/// # The distinction this type exists to make
+///
+/// ```text
+/// CapabilityRequest  == "someone asked for this"
+/// ActionRequest      == "validated against the capability's schema"
+/// CapabilityInvocation == "OpenRayNux authorised this exact action to execute"
+/// ```
+///
+/// Only the last one can reach an adapter. Getting these confused is how a
+/// system ends up treating a *request* as an *authorisation*, which is the confused
+/// deputy of ADR-0027 (TH-04) wearing a different hat.
+///
+/// Note the deliberate difference from [`ActionRequest`]: that type is bound to a
+/// specific task and run, because it comes from *deterministic validation of a plan*
+/// inside the daemon. This type knows nothing about tasks — it is what arrives before
+/// any plan exists. Converting one into the other is a step of the authorisation
+/// pipeline, not a field copy.
+///
+/// [`ActionRequest::authorise`] is not a method on this type precisely because
+/// authorisation needs an actor, a policy evaluation and a proof, none of which exist
+/// at ingress.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityRequest {
+    /// Which capability the caller wants.
+    pub capability: CapabilityId,
+    /// The thing being acted on, as an opaque string.
+    ///
+    /// Opaque here on purpose: normalisation against a capability's schema happens in
+    /// validation, so the digest that an approval binds to is computed from *validated*
+    /// parameters and not from whatever the caller happened to send.
+    pub target: String,
+    /// The parameters, as sent. Unvalidated and unnormalised.
+    pub parameters: serde_json::Value,
+    /// A caller-supplied correlation handle, for logging and rate-limiting.
+    ///
+    /// Not an idempotency key. Idempotency keys are *derived* from
+    /// `(task, step, attempt_class)` so a retry reuses one and a different action
+    /// cannot collide with it; a caller-supplied key would let a caller choose to
+    /// collide.
+    pub request_id: RequestId,
+}
+
 /// A **policy-authorised** request to invoke a capability.
 ///
 /// Fields are private. The only constructor is [`Self::authorise`], which
@@ -229,7 +289,37 @@ impl PolicySeal {
 /// A capability adapter never sees this type's `actor` field: the dispatcher
 /// strips it. That is deliberate — a capability that learns its caller becomes
 /// a confused deputy (ADR-0027, control S8).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// # This type is NOT `Deserialize`, and that is load-bearing
+///
+/// A derived `Deserialize` is a *second, unrestricted constructor*. It writes the
+/// private fields without going through [`Self::authorise`], so it bypasses
+/// [`PolicySeal`], [`AuthorisationProof`], and policy evaluation entirely — which is
+/// exactly what the private fields were there to prevent.
+///
+/// This was not theoretical. Before Phase 3, this type derived both `Serialize` and
+/// `Deserialize`, and a standalone crate could mint an authorised invocation from a
+/// JSON literal, asserting its own `assessed_risk: low` and `policy_version`:
+///
+/// ```text
+/// FORGED OK -> CapabilityId("send-email") risk=Low policy_version=forged
+///            params={"to":"attacker@evil.test"}
+/// ```
+///
+/// No policy. No proof. No seal. No human.
+///
+/// `serde` is a mechanism for constructing a value from external data, and private
+/// fields do not make a derived deserializer an authority boundary. The architectural
+/// claim in ADR-0012 — "it is not *possible* to do this without going through policy" —
+/// was false for this type until the derive was removed.
+///
+/// Inbound data uses [`CapabilityRequest`], which is a *request* and carries no
+/// authority to lose. See ADR-0034.
+///
+/// `Serialize` remains, for audit records and for hashing: serialising an
+/// authority-bearing value *out* is a disclosure risk the caller must own, whereas
+/// deserialising one *in* is an authorisation bypass. Those are not symmetric.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CapabilityInvocation {
     task: TaskId,
     step: u32,
@@ -384,6 +474,84 @@ mod tests {
             serde_json::json!({"x": 1}),
             a,
             b,
+        )
+    }
+
+    fn request_dto() -> CapabilityRequest {
+        CapabilityRequest {
+            capability: CapabilityId::new("send-email"),
+            target: "user@example.test".to_string(),
+            parameters: serde_json::json!({"subject": "hi"}),
+            request_id: RequestId::new("req-1"),
+        }
+    }
+
+    /// The inbound DTO is a *request*, and deserialising one is not an escape.
+    ///
+    /// The counterpart to `invocation_cannot_be_deserialised`: this type is
+    /// *supposed* to come in from outside, so `Deserialize` here is the feature
+    /// working rather than a hole. Stating it explicitly is what makes the
+    /// asymmetry legible -- one of the two capability-shaped types accepts
+    /// external data, and the one that carries authority does not.
+    #[test]
+    fn an_untrusted_request_deserialises_because_it_carries_no_authority() {
+        let json = serde_json::to_string(&request_dto()).expect("serialise");
+        let back: CapabilityRequest = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back, request_dto());
+    }
+
+    /// A request cannot claim a risk assessment or a policy version.
+    ///
+    /// There is nowhere to put them, and that is the point: those are derived by
+    /// policy, not asserted by a caller. A request that *could* carry them would
+    /// be a request that could lie about them.
+    #[test]
+    fn an_untrusted_request_has_no_field_for_risk_or_policy_version() {
+        let v = serde_json::to_value(request_dto()).expect("to value");
+        for forbidden in [
+            "assessed_risk",
+            "policy_version",
+            "actor",
+            "approval",
+            "credential",
+            "seal",
+            "proof",
+        ] {
+            assert!(
+                !v.as_object().is_some_and(|o| o.contains_key(forbidden)),
+                "CapabilityRequest must not carry {forbidden}: {v}"
+            );
+        }
+    }
+
+    /// The DTO is not convertible into an invocation by any route.
+    ///
+    /// Authorisation goes through validation and policy, which produce an
+    /// `ActionRequest` and an `AuthorisationProof` respectively. There is no
+    /// `From<CapabilityRequest>` and no `CapabilityRequest::authorise`, so the
+    /// compiler refuses the shortcut a future author would otherwise reach for.
+    #[test]
+    fn a_request_cannot_become_an_invocation() {
+        // Compiles only because `CapabilityRequest` and `CapabilityInvocation` are
+        // unrelated types. If someone adds `From<&CapabilityRequest>` for
+        // `CapabilityInvocation`, this stops compiling.
+        assert_unrelated(&request_dto(), &authorised());
+    }
+
+    /// Takes a reference to each of two types, to assert they are unrelated.
+    fn assert_unrelated<A, B>(_: &A, _: &B) {}
+
+    /// A real, policy-authorised invocation.
+    fn authorised() -> CapabilityInvocation {
+        CapabilityInvocation::authorise(
+            &PolicySeal::attest("test"),
+            request(DataClass::Public, DataClass::Public),
+            Actor::Human {
+                user: UserId::new("u"),
+                via: AuthChannel::LocalInteractive,
+            },
+            InvocationContext::new("k", 1_000, "c"),
+            proof(),
         )
     }
 
