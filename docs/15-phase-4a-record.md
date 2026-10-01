@@ -12,6 +12,11 @@ Phase 4a turned ADR-0009's two `declared_only` isolation properties into
 **process-level evidence**, and corrected a Phase 3 blocker that turned out to be a
 measurement error rather than a missing mechanism.
 
+**Known gap, deliberately recorded (V-50):** the sandbox is not yet reachable from the
+Phase 3 dispatcher. Nothing is registered and nothing runs unsandboxed, so there is no
+active exposure — but Phase 4a proves a boundary that no execution path yet enforces.
+Closing that is Phase 4b's first objective.
+
 ---
 
 ## 1. The correction
@@ -45,9 +50,12 @@ distinguish a live process from a stale artefact. `os.path.exists` and a fixed P
 fail that; an advancing heartbeat does not. Same shape as V-31, where a tmpfs
 benchmark confirmed the wrong thing.
 
-**Condition, stated plainly:** the supervisor must signal **`bwrap`**, never the inner
-process. Signalling the child kills its parent without firing `PDEATHSIG`, leaving the
-namespace init alive.
+**Scope of this result — do not widen it.** It is not "bubblewrap guarantees arbitrary
+descendant termination". It is a property of *this* topology: `--unshare-pid` **and**
+`--die-with-parent` together, the supervisor signalling `bwrap`, no `--share-pid`, and
+`bwrap`'s forked child as namespace PID 1. The other three rows of the matrix do not
+contain. Changing a namespace flag invalidates the claim until `isolation.rs` is re-run.
+V-45 carries the same scope.
 
 ---
 

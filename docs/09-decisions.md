@@ -2705,10 +2705,21 @@ sent `SIGKILL`. `PDEATHSIG` supplies the trigger when `bwrap` is signalled, and 
 namespace supplies the reach. A detached grandchild cannot opt out — leaving a PID
 namespace needs privileges the sandboxed process does not have.
 
-**Condition:** the supervisor must signal **`bwrap`**, never the inner process.
-Signalling the child would kill its parent without firing `PDEATHSIG`, leaving the
-namespace init alive. A refactor that "helpfully" signalled the child would silently
-break containment.
+**Conditions, all of which the claim depends on.** The guarantee is a property of
+*this topology*, not of bubblewrap:
+
+1. `--unshare-pid` **and** `--die-with-parent` together. Either alone does not contain
+   — that is the other three rows of the matrix above.
+2. The supervisor signals **`bwrap`**, never the inner process. Signalling the child
+   kills its parent without firing `PDEATHSIG`, leaving the namespace init alive.
+3. No `--share-pid`, no privilege retained, and `bwrap`'s own forked child is PID 1 of
+   the namespace.
+
+Stated as a rule: **this is not "bubblewrap guarantees arbitrary descendant
+termination", it is "the OpenRayNux sandbox configuration contains a detached
+descendant, and changing a namespace flag invalidates the claim until
+`isolation.rs` is re-run."** The verification register (V-45) carries the same scope,
+so a later reader cannot widen the claim from the ADR alone.
 
 **Rejected: `cgroup.kill` as the Phase 4a mechanism.** It is the stronger answer — it
 walks the cgroup, so it needs no namespace and handles concurrent forks — and
@@ -2744,6 +2755,32 @@ says so.
   registry, network and process restriction. Unverified (V-29).
 - **Cloud.** Documented only: same process contract, platform-specific backend;
   microVMs where the isolation requirement exceeds what containers can promise.
+
+### The invariant this must preserve
+
+> Every Tier-1 execution request is **rejected** when a required sandbox guarantee
+> cannot be established. There is no "best effort" fallback to unsandboxed execution.
+
+`bwrap` absent yields `MechanismUnavailable`; an unavailable guarantee yields
+`Refused(GuaranteeUnavailable)` — both **before** any process is spawned. An
+unsandboxed capability has no isolation at all, which is worse than no capability.
+Relaxation exists, is named (`accepting_best_effort_containment()`), appears in a diff,
+and lands in `ExecutionResult::unproven` so an audit record states the gap. Recorded as
+V-49.
+
+### The gap Phase 4b must close
+
+`orxnud-platform-sandbox` currently has **no consumer**. The governed path
+
+```text
+Dispatcher → execution contract → sandbox supervisor → Tier-1 subprocess
+           → result → Verification → Audit
+```
+
+does not exist, so Phase 4a proves a boundary that nothing enforces yet. Nothing is
+registered and nothing runs unsandboxed, so there is no active exposure — the risk is
+architectural drift, and V-50 records it. Phase 4b must wire it with synthetic adapters
+only, and prove no bypass exists.
 
 **Consequences.** Contract points 4 and 6 of ADR-0009's 10-point suite can move from
 `declared_only` to evidence-backed, with the residual gaps named above. ADR-0017's

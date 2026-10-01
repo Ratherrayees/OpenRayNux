@@ -6,9 +6,14 @@ Status: **Phase 3 complete. Windows verification open (V-29).**
 Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
-Phase 4a ✅ Process isolation (verified guarantees)
-Phase 4b ⏳ cgroup resource ceilings, Windows Job Objects (needs a delegated env)
+Phase 4a  ✅ Process isolation
+Phase 4b  ⏳ Hard resource ceilings + Windows + integration
 ```
+
+Phase 4b has three objectives: wire the sandbox into the Phase 3 dispatcher so the
+governed path actually uses it (V-50), prove hard resource ceilings where cgroup
+delegation exists (V-46), and obtain Windows evidence for Job Objects / AppContainer
+rather than documenting them (V-29).
 
 The security model is no longer prose: `CapabilityInvocation` is not deserialisable,
 policy is the only crate that can mint one, the dispatcher is the only route to an
