@@ -507,23 +507,48 @@ fn a_spec_with_nothing_granted_starts_no_process_for_an_ungranted_capability() {
     // leak. Detected by construction -- `run` returns a refusal before `Command::spawn`
     // is reached.
     let mut spec = closed_spec("env-dump");
-    spec.requires.resources = Resource::Required; // refused on this host
+    spec.requires.resources = Resource::Required;
+    // The "refused" half of this test used to rest on this host having no writable cgroup
+    // controllers. That is a host property, not a property of the runner, and it stopped
+    // being true once the runner was wired to a dedicated cgroup -- after which the test
+    // began failing against a runner that was behaving correctly.
+    //
+    // What must hold on *every* host is the fail-closed rule. So the assertion follows the
+    // ground truth: where the controllers are unwritable a required ceiling must be
+    // refused, and where they are writable it must be honoured. Neither branch hardcodes
+    // which host this is.
+    let enforceable = runner().available_guarantees().resources;
     let result = run_helper(&spec);
-    match result.status {
-        orxnud_platform_sandbox::contract::ExecutionStatus::Refused(
-            SandboxUnavailable::GuaranteeUnavailable { guarantee, .. },
-        ) => assert_eq!(guarantee, "OS-enforced resource ceilings"),
-        other => panic!("a refused spec must not run: {other:?}"),
+    if enforceable {
+        assert!(
+            !matches!(
+                result.status,
+                orxnud_platform_sandbox::contract::ExecutionStatus::Refused(_)
+            ),
+            "a satisfiable required ceiling must not be refused: {:?}",
+            result.status
+        );
+    } else {
+        match result.status {
+            orxnud_platform_sandbox::contract::ExecutionStatus::Refused(
+                SandboxUnavailable::GuaranteeUnavailable { guarantee, .. },
+            ) => assert_eq!(guarantee, "OS-enforced resource ceilings"),
+            other => panic!("a refused spec must not run: {other:?}"),
+        }
     }
-    assert!(
-        result.stdout.bytes.is_empty(),
-        "a refused execution produced output"
-    );
-    assert_eq!(
-        result.elapsed,
-        Duration::ZERO,
-        "a refusal must not have waited"
-    );
+    if !enforceable {
+        // Only meaningful on the refusal branch: an honoured ceiling does run, and
+        // producing output is the correct behaviour there.
+        assert!(
+            result.stdout.bytes.is_empty(),
+            "a refused execution produced output"
+        );
+        assert_eq!(
+            result.elapsed,
+            Duration::ZERO,
+            "a refusal must not have waited"
+        );
+    }
 }
 
 #[test]
@@ -535,9 +560,16 @@ fn the_runner_reports_honestly_what_it_can_provide() {
         "bwrap is installed; visibility must be available"
     );
     assert!(have.tree_lifetime, "PID namespace containment is available");
-    assert!(
-        !have.resources,
-        "this host has no writable cgroup controllers; the runner must not claim otherwise"
+    // Resource availability is asserted against the hierarchy rather than against a
+    // hardcoded `false`. The original assertion encoded "this host has no writable cgroup
+    // controllers" as a constant, which made the test a change detector: it reported a
+    // host change as a runner defect. What must never happen is a mismatch between what
+    // the runner claims and what it can do.
+    let av = orxnud_platform_sandbox::cgroup::CgroupV2::discover().availability;
+    assert_eq!(
+        have.resources,
+        av.memory || av.processes || av.cpu,
+        "the runner must report exactly the resource enforcement the host permits"
     );
 }
 

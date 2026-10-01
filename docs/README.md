@@ -7,14 +7,15 @@ Phase 1  ✅ Foundation
 Phase 2  ✅ Durable execution
 Phase 3  ✅ Governed capability dispatch
 Phase 4a  ✅ Process isolation
-Phase 4b  ⚠️ V-50 complete / V-46 mechanism proven, governed path NOT_PROVEN / V-29 open
+Phase 4b  ⚠️ V-50/V-54/V-55/V-56 complete / V-46 open (mechanism + governed path PROVEN, cgroup.kill teeth NOT_PROVEN) / V-29 open
 ```
 
 Remaining Phase 4b work, as two bounded tracks:
 
 ```text
 4b-Linux    V-46 cgroup mechanism       [done — PROVEN, mutation-verified]
-            V-46 governed-path adoption   [open  — NOT_PROVEN]
+            V-46 governed-path adoption   [done — PROVEN, mutation-verified]
+            V-46 cgroup.kill teeth         [open  — NOT_PROVEN on Linux]
             resource-policy finalisation  [done — V-56]
             V-54 fallback mutation         [done — MUTATION-VERIFIED]
 
@@ -25,16 +26,19 @@ Remaining Phase 4b work, as two bounded tracks:
 
 Phase 4b progress: **V-50 complete** -- the governed dispatcher now executes Tier-1
 capabilities only through the sandbox, with no in-process route and no unsandboxed
-fallback (V-51). **V-46 partial** -- the cgroup *mechanism* is proven on a delegated
-host: a real process is adopted into a dedicated child and the kernel observably
-enforces `memory.max`, `pids.max` and `cpu.max`, while `cgroup.kill` terminates
-descendants a signal cannot reach. What remains **not proven** is the end-to-end
-*governed path*: `BwrapRunner` still reports `Resource::Observed` and never creates or
-adopts a cgroup, so `Dispatcher -> sandbox -> subprocess` does not pass through one.
-A governed dispatch requiring a memory ceiling was measured refusing on a host that
-can enforce one, which is precisely the gap. Also fixed in this step: the discovery
-race, where probe and execution cgroup names were constants and concurrent callers
-deleted each other's directories. **V-29 open** -- no Windows evidence.
+fallback (V-51). **V-46 open, two halves** -- the cgroup *mechanism* is proven and
+mutation-verified, and the *governed path* now uses it: the runner owns a dedicated
+child, writes ceilings before spawning, joins the supervisor via a cgroup `exec` wrapper
+and verifies membership from `cgroup.procs`, failing closed if it cannot. What remains
+NOT_PROVEN on Linux is whether `cgroup.kill` adds anything the PID namespace does not
+already provide -- `--unshare-pid --die-with-parent` reaps descendants either way -- so
+that claim is recorded as redundant containment rather than as teeth. **V-29 open** --
+no Windows evidence.
+
+**Recorded, not changed:** the stage order is `CREDENTIAL -> SANDBOX`, so a
+required-resource refusal necessarily follows credential resolution. The guaranteed
+invariant is that the backend is never invoked, so no subprocess exists and no
+credential material reaches any environment. Reversing the order is a separate ADR.
 
 Phase 4b has three objectives: wire the sandbox into the Phase 3 dispatcher so the
 governed path actually uses it (V-50), prove hard resource ceilings where cgroup

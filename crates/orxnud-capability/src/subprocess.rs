@@ -30,8 +30,7 @@ use orxnud_platform_sandbox::contract::{
 use orxnud_platform_sandbox::linux::BwrapRunner;
 
 use crate::dispatch::{
-    ExecutionBackend, ExecutionContract, ExecutionOutcomeKind, ExecutionReport,
-    ResourceRequirement, SandboxRefusal,
+    ExecutionBackend, ExecutionContract, ExecutionOutcomeKind, ExecutionReport, SandboxRefusal,
 };
 
 /// The environment variable the backend uses to pass a credential to a Tier-1 child.
@@ -61,11 +60,6 @@ use crate::dispatch::{
 /// 2. **The variable name is a constant, not a capability's choice**, so a malicious
 ///    manifest cannot ask for a variable the dispatcher would refuse to set.
 pub const CREDENTIAL_ENV: &str = "ORXNUD_TIER1_CREDENTIAL";
-
-/// Applied when a capability requires a control but names no budget for it.
-const DEFAULT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_PROCESSES: u64 = 64;
-const DEFAULT_CPU_CORES: f64 = 1.0;
 
 /// An [`ExecutionBackend`] over a real Linux sandbox.
 ///
@@ -144,29 +138,14 @@ fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal>
     // The contract's budget becomes the spec's portable limits. No cgroup path, no
     // controller name, no kernel API crosses this boundary: the capability layer states
     // what it needs, and the platform decides how (or whether) to provide it.
+    //
+    // A required control with no budget is *not* filled in here. The backend enforces
+    // policy; it does not create it. `ResourcePolicy::validate` has already refused that
+    // case before the contract was built, so a `None` reaching this point would be a bug
+    // rather than a policy decision.
     spec.limits.memory_bytes = contract.resources.budget.memory_bytes;
     spec.limits.max_processes = contract.resources.budget.processes;
     spec.limits.cpu_cores = contract.resources.budget.cpu_cores;
-
-    // A *required* control with no budget value still has to produce a ceiling, or the
-    // platform would have nothing to write and the execution would run unconstrained
-    // while the contract claimed the control was required. Defaults are therefore
-    // applied per required control, and deliberately generous rather than tight: this
-    // closes the hole without surprising a legitimate capability.
-    for required in &contract.resources.required {
-        match required {
-            ResourceRequirement::Memory if spec.limits.memory_bytes.is_none() => {
-                spec.limits.memory_bytes = Some(DEFAULT_MEMORY_BYTES);
-            }
-            ResourceRequirement::Processes if spec.limits.max_processes.is_none() => {
-                spec.limits.max_processes = Some(DEFAULT_PROCESSES);
-            }
-            ResourceRequirement::Cpu if spec.limits.cpu_cores.is_none() => {
-                spec.limits.cpu_cores = Some(DEFAULT_CPU_CORES);
-            }
-            _ => {}
-        }
-    }
 
     // Containment is always required; it is what the sandbox *is*.
     spec.requires.tree_lifetime = TreeLifetime::Required;

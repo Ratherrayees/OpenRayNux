@@ -319,6 +319,52 @@ pub struct ResourcePolicy {
     pub budget: ResourceBudget,
 }
 
+impl ResourcePolicy {
+    /// Checks that every *required* control has a concrete ceiling.
+    ///
+    /// # Why this is validation and not a default
+    ///
+    /// V-56 separates a **requirement** (a prerequisite for safe execution) from a
+    /// **budget** (a concrete per-invocation ceiling). Collapsing them is tempting and
+    /// wrong: a requirement with no budget has nothing to enforce, so honouring it means
+    /// inventing a number.
+    ///
+    /// The backend must enforce policy, not create it. An earlier version of this
+    /// integration filled the gap with a `DEFAULT_*` in `subprocess.rs` -- 512 MiB, 64
+    /// processes, 1 core -- which quietly moved a resource decision out of the capability
+    /// and the policy engine and into the execution layer, with nothing recording that a
+    /// default had been applied. A default resource *profile* may be a legitimate future
+    /// decision, but it belongs in policy and configuration where it is visible, not
+    /// hidden in a backend.
+    ///
+    /// So an incomplete policy is refused here, before a process exists. A budget for a
+    /// control that is merely `budget` (not required) is unaffected: an unenforceable
+    /// non-required budget still proceeds and records its gap (V-56).
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyIncomplete`] naming every required control that has no budget.
+    pub fn validate(&self) -> Result<(), PolicyIncomplete> {
+        let b = self.budget;
+        let mut missing = Vec::new();
+        for r in &self.required {
+            let absent = match r {
+                ResourceRequirement::Memory => b.memory_bytes.is_none(),
+                ResourceRequirement::Processes => b.processes.is_none(),
+                ResourceRequirement::Cpu => b.cpu_cores.is_none(),
+            };
+            if absent {
+                missing.push(r.label());
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(PolicyIncomplete { missing })
+        }
+    }
+}
+
 /// One control a capability needs established before it may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceRequirement {
@@ -341,6 +387,29 @@ impl ResourceRequirement {
         }
     }
 }
+
+/// Why a [`ResourcePolicy`] cannot be executed as written.
+///
+/// Returned by [`ResourcePolicy::validate`] before anything is spawned, so an incomplete
+/// policy is a refusal rather than a surprise at the platform layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyIncomplete {
+    /// Controls that were declared required but given no concrete ceiling.
+    pub missing: Vec<&'static str>,
+}
+
+impl std::fmt::Display for PolicyIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "required control(s) {:?} declared with no budget, so there is no ceiling to \
+             enforce",
+            self.missing
+        )
+    }
+}
+
+impl std::error::Error for PolicyIncomplete {}
 
 /// Soft ceilings for one invocation.
 ///
@@ -918,6 +987,28 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
                         missing: vec!["a sandbox execution backend"],
                     }));
                 };
+                // Policy completeness is checked here, ahead of the backend, so an
+                // incomplete policy costs no subprocess and no execution side effect.
+                // `contract_for` reads the same plan, so this cannot disagree with it.
+                let plan_resources = self
+                    .bundles
+                    .get(&capability)
+                    .and_then(|b| b.sandbox_plan())
+                    .map(|p| p.resources)
+                    .ok_or_else(|| {
+                        DispatchError::SandboxRefused(SandboxRefusal {
+                            capability: capability.clone(),
+                            reason: "the adapter is Tier-1 but declares no sandbox plan".to_owned(),
+                            missing: vec!["a sandbox plan"],
+                        })
+                    })?;
+                if let Err(incomplete) = plan_resources.validate() {
+                    return Err(DispatchError::SandboxRefused(SandboxRefusal {
+                        capability: capability.clone(),
+                        reason: format!("incomplete resource policy: {incomplete}"),
+                        missing: incomplete.missing,
+                    }));
+                }
                 let contract = self.contract_for(&invocation, &capability)?;
                 if !backend.can_fulfil(&contract) {
                     return Err(DispatchError::SandboxRefused(SandboxRefusal {

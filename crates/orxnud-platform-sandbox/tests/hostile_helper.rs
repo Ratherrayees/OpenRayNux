@@ -344,72 +344,50 @@ fn hang() -> Report {
     }
 }
 
-/// Allocates and *touches* memory until the kernel refuses.
+/// Allocates and *touches* memory up to a fixed, small bound.
 ///
-/// The touching matters. `bytearray(n)` alone can be satisfied by untouched zero pages,
-/// so a helper that only allocated would appear to succeed inside a ceiling that is
-/// working perfectly. This one writes to every page, so `memory.max` produces a refusal
-/// the helper can observe and report.
+/// # Bounded on purpose
 ///
-/// Reported, never panicked: a helper that is OOM-killed cannot report anything, and the
-/// caller needs to distinguish "refused and stopped" from "ran unbounded".
+/// This helper was originally unbounded: it allocated until the allocator refused,
+/// reasoning that a `memory.max` ceiling would always stop it first. That reasoning is
+/// exactly what a mutation invalidates. Two mutation experiments that removed the cgroup
+/// turned this into a whole-machine allocation and drove the host into swap exhaustion,
+/// freezing the machine both times.
 ///
-/// # Hard host-side bound
+/// So the workload bounds itself at [`TOUCH_BUDGET_MIB`] -- small enough that running it
+/// unenforced costs a rounding error, and large enough to press a tiny ceiling so the
+/// kernel's refusal accounting becomes visible in `memory.events`.
 ///
-/// `HARD_CAP_MIB` is not a politeness limit; it is what makes this helper safe to run.
-///
-/// The first version asked for 4096 MiB and stopped only when the allocator refused. That
-/// is correct *while a ceiling is enforced* and catastrophic when one is not: a mutation
-/// that removed the cgroup left this helper allocating against the whole machine, and the
-/// test run drove the host into swap exhaustion and froze the system. An unbounded
-/// adversary is only safe to run when the thing under test is what bounds it, which is
-/// exactly the assumption a mutation invalidates.
-///
-/// So the helper bounds itself at the same 256 MiB the proven mechanism workload uses.
-/// Against a 64 MiB ceiling the kernel kills it far below the
-/// cap, so the enforcement evidence is unchanged; with no ceiling it stops at the cap and
-/// reports, so a failed experiment costs a bounded amount of memory and says so.
-const HARD_CAP_MIB: u64 = 256;
+/// The touching is what makes it meaningful: `vec![0u8; n]` can be satisfied by untouched
+/// zero pages, so a helper that merely allocated would appear to succeed inside a ceiling
+/// that is working perfectly.
+const TOUCH_BUDGET_MIB: u64 = 64;
 
+/// Allocates and touches `TOUCH_BUDGET_MIB`, reporting how far it got.
+///
+/// Reports rather than panics, and does not loop until refused. Enforcement is read from
+/// the cgroup's `memory.events`, not from this helper's exit status: `memory.max` may
+/// refuse, reclaim, or OOM-kill, and a killed helper cannot report anything. Demanding a
+/// specific outcome here would demand a specific mechanism rather than a correct one.
 fn mem_hog(target_mib: Option<u64>) -> Report {
-    let target = target_mib.unwrap_or(HARD_CAP_MIB).min(HARD_CAP_MIB) * 1024 * 1024;
-    let mut held: Vec<Vec<u8>> = Vec::new();
-    let mut refused = 0u64;
-    while (held.len() as u64) * 1024 * 1024 < target {
+    let target = target_mib.unwrap_or(TOUCH_BUDGET_MIB).min(TOUCH_BUDGET_MIB);
+    // Pages are *retained*, not dropped each iteration. An earlier version allocated and
+    // discarded inside the loop, so peak resident usage was ~1 MiB and a 16 MiB ceiling was
+    // never pressed at all -- the workload passed under a ceiling it never met, which is
+    // the same vacuity as no enforcement at all.
+    let mut held: Vec<Vec<u8>> = Vec::with_capacity(target as usize);
+    for n in 0..target {
         let mut page = vec![0u8; 1024 * 1024];
-        // Touch every 4 KiB so the pages are actually resident and charged.
+        // Touch every 4 KiB so the pages are resident and actually charged.
         for i in (0..page.len()).step_by(4096) {
-            page[i] = (i % 251) as u8;
+            page[i] = (n % 251) as u8;
         }
         held.push(page);
     }
-    // If we are still here, try until something refuses -- or until the hard cap, so an
-    // unenforced run cannot run away.
-    loop {
-        if (held.len() as u64) * 8 * 1024 * 1024 >= HARD_CAP_MIB * 1024 * 1024 {
-            refused = 0;
-            break;
-        }
-        let mut page = match vec![0u8; 8 * 1024 * 1024].try_reserve_exact(1) {
-            Ok(_) => vec![0u8; 8 * 1024 * 1024],
-            Err(_) => {
-                refused += 1;
-                if refused > 64 {
-                    break;
-                }
-                continue;
-            }
-        };
-        for i in (0..page.len()).step_by(4096) {
-            page[i] = 1;
-        }
-        held.push(page);
-    }
-    Report::pass(format!(
-        "held {} MiB after {} refusals",
-        (held.len() as u64) * 1024 * 1024 / (1024 * 1024),
-        refused
-    ))
+    let touched = held.len() as u64;
+    // Keep them alive until here so the peak is observable.
+    std::hint::black_box(&held);
+    Report::pass(format!("touched {touched} MiB"))
 }
 
 /// Forks `count` children that outlive this process, bounded.

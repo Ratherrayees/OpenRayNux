@@ -462,7 +462,10 @@ pub fn helper_path() -> PathBuf {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("hostile_helper-"))
+                // Exclude the `.d` dependency file, which shares the prefix and can be
+                // newer than the binary. Selecting it yields a "helper" that is not
+                // executable, and bwrap reports a confusing `execvp ...: Permission denied`.
+                .is_some_and(|n| n.starts_with("hostile_helper-") && !n.ends_with(".d"))
         })
         .collect();
     assert!(
