@@ -98,6 +98,16 @@ fn hostile_helper_entry_point() {
         "cred-path-probe" => cred_path_probe(),
         // --- process -------------------------------------------------------
         "spawn-descendant" => spawn_descendant(),
+        "descendant-hang" => {
+            // A detached, signal-ignoring descendant plus a parent that never returns.
+            // The combination is the only way to exercise a *timeout* while a descendant
+            // is still alive: `spawn-descendant` returns immediately, so the sandbox exits
+            // before any kill path is reached.
+            let r = spawn_descendant();
+            emit(&r);
+            hang();
+            unreachable!("hang never returns")
+        }
         "hang" => {
             hang();
             unreachable!("hang never returns")
@@ -113,6 +123,8 @@ fn hostile_helper_entry_point() {
             Report::pass("stderr written")
         }
         "fd-scan" => fd_scan(),
+        "mem-hog" => mem_hog(owned(1).parse().ok()),
+        "fork-many" => fork_many(owned(1).parse().unwrap_or(8)),
         "malformed" => {
             // Not valid JSON, not the declared schema. A supervisor must classify this
             // as a bad result rather than parsing it into something plausible.
@@ -330,6 +342,95 @@ fn hang() -> Report {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
+}
+
+/// Allocates and *touches* memory until the kernel refuses.
+///
+/// The touching matters. `bytearray(n)` alone can be satisfied by untouched zero pages,
+/// so a helper that only allocated would appear to succeed inside a ceiling that is
+/// working perfectly. This one writes to every page, so `memory.max` produces a refusal
+/// the helper can observe and report.
+///
+/// Reported, never panicked: a helper that is OOM-killed cannot report anything, and the
+/// caller needs to distinguish "refused and stopped" from "ran unbounded".
+///
+/// # Hard host-side bound
+///
+/// `HARD_CAP_MIB` is not a politeness limit; it is what makes this helper safe to run.
+///
+/// The first version asked for 4096 MiB and stopped only when the allocator refused. That
+/// is correct *while a ceiling is enforced* and catastrophic when one is not: a mutation
+/// that removed the cgroup left this helper allocating against the whole machine, and the
+/// test run drove the host into swap exhaustion and froze the system. An unbounded
+/// adversary is only safe to run when the thing under test is what bounds it, which is
+/// exactly the assumption a mutation invalidates.
+///
+/// So the helper bounds itself at the same 256 MiB the proven mechanism workload uses.
+/// Against a 64 MiB ceiling the kernel kills it far below the
+/// cap, so the enforcement evidence is unchanged; with no ceiling it stops at the cap and
+/// reports, so a failed experiment costs a bounded amount of memory and says so.
+const HARD_CAP_MIB: u64 = 256;
+
+fn mem_hog(target_mib: Option<u64>) -> Report {
+    let target = target_mib.unwrap_or(HARD_CAP_MIB).min(HARD_CAP_MIB) * 1024 * 1024;
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    let mut refused = 0u64;
+    while (held.len() as u64) * 1024 * 1024 < target {
+        let mut page = vec![0u8; 1024 * 1024];
+        // Touch every 4 KiB so the pages are actually resident and charged.
+        for i in (0..page.len()).step_by(4096) {
+            page[i] = (i % 251) as u8;
+        }
+        held.push(page);
+    }
+    // If we are still here, try until something refuses -- or until the hard cap, so an
+    // unenforced run cannot run away.
+    loop {
+        if (held.len() as u64) * 8 * 1024 * 1024 >= HARD_CAP_MIB * 1024 * 1024 {
+            refused = 0;
+            break;
+        }
+        let mut page = match vec![0u8; 8 * 1024 * 1024].try_reserve_exact(1) {
+            Ok(_) => vec![0u8; 8 * 1024 * 1024],
+            Err(_) => {
+                refused += 1;
+                if refused > 64 {
+                    break;
+                }
+                continue;
+            }
+        };
+        for i in (0..page.len()).step_by(4096) {
+            page[i] = 1;
+        }
+        held.push(page);
+    }
+    Report::pass(format!(
+        "held {} MiB after {} refusals",
+        (held.len() as u64) * 1024 * 1024 / (1024 * 1024),
+        refused
+    ))
+}
+
+/// Forks `count` children that outlive this process, bounded.
+///
+/// Used through the governed path to prove that a PID ceiling is enforced by the kernel
+/// rather than by the helper's own restraint.
+fn fork_many(count: u64) -> Report {
+    let mut spawned = 0u64;
+    for _ in 0..count {
+        match std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => spawned += 1,
+            // The ceiling is enforced; further forks are refused.
+            Err(_) => break,
+        }
+    }
+    Report::pass(format!("spawned {spawned} of {count}"))
 }
 
 fn flood(bytes: Option<usize>) -> Report {

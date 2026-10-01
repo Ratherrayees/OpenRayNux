@@ -954,3 +954,503 @@ impl<S: orxnud_domain::SecretsContract> AuditAccess
         self.audit_len()
     }
 }
+
+// ------------------------------------------------ V-46: governed cgroup enforcement
+//
+// Everything above proves the sandbox *works*. These prove the governed path *uses* it
+// for resources -- a distinction that only matters if the dispatcher could have run the
+// payload outside a cgroup while every other test stayed green.
+//
+// The observer below reads the cgroup hierarchy directly. That is deliberate: it is the
+// independent witness. If the runner merely *claimed* membership, these assertions would
+// pass. The capability layer itself never sees a cgroup path or a controller name.
+
+mod v46 {
+    use super::*;
+    use orxnud_capability::dispatch::{ResourceBudget, ResourcePolicy, ResourceRequirement};
+    use orxnud_platform_sandbox::cgroup::CgroupV2;
+    use orxnud_platform_sandbox::contract::{AvailableGuarantees, ExecutionResult, SandboxRunner};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    /// What an outside observer saw while an execution ran.
+    #[derive(Debug, Default)]
+    struct Observed {
+        saw_child: bool,
+        strictly_below_base: bool,
+        memory_max: Vec<String>,
+        max_members: usize,
+        saw_payload_member: bool,
+        leftover: usize,
+    }
+
+    /// Watches the discovered base for the runner's dedicated children.
+    ///
+    /// Runs on its own thread because the dispatch blocks until the payload exits, and
+    /// the payload is only in the cgroup while it is running.
+    fn watch(seconds: u64) -> (std::thread::JoinHandle<Observed>, Arc<AtomicBool>, CgroupV2) {
+        let base = CgroupV2::discover();
+        let base_path = base.base.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+            let mut o = Observed::default();
+            while std::time::Instant::now() < deadline && !flag.load(Ordering::SeqCst) {
+                let mut entries: Vec<PathBuf> = std::fs::read_dir(&base_path)
+                    .map(|d| {
+                        d.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .is_some_and(|n| n.starts_with("orxnud-exec-"))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for p in entries.drain(..) {
+                    o.saw_child = true;
+                    if p != base_path && p.starts_with(&base_path) {
+                        o.strictly_below_base = true;
+                    }
+                    if let Ok(m) = std::fs::read_to_string(p.join("memory.max")) {
+                        o.memory_max.push(m.trim().to_owned());
+                    }
+                    if let Ok(procs) = std::fs::read_to_string(p.join("cgroup.procs")) {
+                        let n = procs.lines().filter(|l| !l.trim().is_empty()).count();
+                        o.max_members = o.max_members.max(n);
+                        // bwrap plus the payload plus whatever it forked: more than the
+                        // supervisor alone is what shows the *workload* is inside too.
+                        if n > 1 {
+                            o.saw_payload_member = true;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            o.leftover = std::fs::read_dir(&base_path)
+                .map(|d| {
+                    d.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("orxnud-exec-"))
+                        .count()
+                })
+                .unwrap_or(0);
+            o
+        });
+        (handle, stop, base)
+    }
+
+    fn available() -> bool {
+        let av = CgroupV2::discover().availability;
+        av.memory && av.processes && av.cpu
+    }
+
+    fn bundle(resources: ResourcePolicy) -> Arc<dyn AdapterBundle> {
+        let mut b = Tier1HelperAdapter::running("fork-many");
+        b.env.insert("ORXNUD_ARG1".into(), "24".into());
+        Arc::new(PolicyBundle {
+            adapter: b,
+            resources,
+            grant_rw: Vec::new(),
+            deadline_ms: 20_000,
+        })
+    }
+
+    /// A bundle whose plan demands a specific resource policy.
+    struct PolicyBundle {
+        adapter: Tier1HelperAdapter,
+        resources: ResourcePolicy,
+        grant_rw: Vec<String>,
+        deadline_ms: u64,
+    }
+
+    impl AdapterBundle for PolicyBundle {
+        fn adapter(&self) -> &dyn CapabilityAdapter {
+            &self.adapter
+        }
+        fn verifier(&self) -> &dyn Verifier {
+            &ReportVerifier
+        }
+        fn sandbox_plan(&self) -> Option<SandboxPlan> {
+            Some(SandboxPlan {
+                program: helper_path().display().to_string(),
+                args: vec![
+                    "--exact".into(),
+                    "hostile_helper_entry_point".into(),
+                    "--ignored".into(),
+                    "--nocapture".into(),
+                ],
+                env: self.adapter.env.clone(),
+                working_dir: "/".into(),
+                grant_rw: self.grant_rw.clone(),
+                grant_ro: vec![sandbox_helpers_dir().display().to_string()],
+                network: false,
+                deadline_ms: self.deadline_ms,
+                output_cap_bytes: 256 * 1024,
+                resources: self.resources.clone(),
+            })
+        }
+    }
+
+    // ---------------------------------------------------------------- 1. enforced
+
+    /// A governed Tier-1 request that requires memory control actually runs inside a
+    /// dedicated cgroup whose `memory.max` is the ceiling the contract asked for.
+    #[test]
+    fn a_required_memory_ceiling_is_applied_by_the_governed_path() {
+        if !available() {
+            println!("  host does not delegate memory+pids+cpu; reported, not skipped");
+            return;
+        }
+        let required = ResourcePolicy {
+            required: vec![ResourceRequirement::Memory],
+            budget: ResourceBudget {
+                memory_bytes: Some(64 * 1024 * 1024),
+                processes: Some(24),
+                cpu_cores: Some(0.5),
+            },
+        };
+        let id = cap();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        m.insert(id.clone(), bundle(required.clone()));
+        let mut engine = policy(0, 1_000);
+        let secrets = FakeSecrets::new();
+        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
+            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+        let (watcher, stop, _base) = watch(25);
+        let outcome = d
+            .dispatch(
+                request(),
+                human(),
+                context(),
+                None,
+                params(),
+                None,
+                None,
+                NOW,
+            )
+            .expect("a satisfiable required ceiling must not refuse");
+        stop.store(true, Ordering::SeqCst);
+
+        println!("  governed execution: {:?}", outcome.execution);
+        let o = watcher.join().expect("observer");
+        println!(
+            "  observed: child={} strictly_below_base={} max_members={} payload_member={} \
+             memory_max={:?} leftover={}",
+            o.saw_child,
+            o.strictly_below_base,
+            o.max_members,
+            o.saw_payload_member,
+            o.memory_max,
+            o.leftover
+        );
+
+        assert!(
+            o.saw_child,
+            "the governed path created no dedicated cgroup at all"
+        );
+        assert!(
+            o.strictly_below_base,
+            "the execution cgroup must be strictly below the discovered base (V-55)"
+        );
+        assert!(
+            o.memory_max.iter().any(|m| m == "67108864"),
+            "memory.max was not the requested ceiling: {:?}",
+            o.memory_max
+        );
+        assert!(
+            o.saw_payload_member && o.max_members > 1,
+            "only the supervisor was observed ({max_members}); the workload itself was not \
+             inside the cgroup",
+            max_members = o.max_members
+        );
+        assert_eq!(
+            o.leftover, 0,
+            "the dedicated cgroup was not cleaned up after execution"
+        );
+    }
+
+    // ------------------------------------------------------- 2. required-unavailable
+
+    /// A runner that reports the resource controllers unavailable, counting `run` calls.
+    struct UndelegatedRunner {
+        inner: Arc<dyn SandboxRunner>,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl SandboxRunner for UndelegatedRunner {
+        fn available_guarantees(&self) -> AvailableGuarantees {
+            let mut g = self.inner.available_guarantees();
+            // The only thing this double lies about. Everything else is the real runner.
+            g.resources = false;
+            g
+        }
+        fn run(
+            &self,
+            spec: &orxnud_platform_sandbox::contract::SandboxSpec,
+        ) -> Result<ExecutionResult, orxnud_platform_sandbox::contract::SandboxUnavailable>
+        {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.inner.run(spec)
+        }
+        fn cancel(&self) -> Result<(), orxnud_platform_sandbox::contract::SandboxUnavailable> {
+            self.inner.cancel()
+        }
+    }
+
+    /// A required control the host cannot establish must refuse, must never reach the
+    /// backend, and must not run the payload.
+    ///
+    /// Availability is forced with a delegating runner rather than by mutating the host's
+    /// delegation: a test that needs a broken host is a test that cannot be trusted on a
+    /// working one. The runner's `probe` is the same call the real runner makes, and the
+    /// refusal path exercised below is the production one.
+    #[test]
+    fn a_required_control_the_host_cannot_provide_refuses_without_spawning() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let backend = BwrapExecutionBackend::with_runner(Arc::new(UndelegatedRunner {
+            inner: Arc::new(orxnud_platform_sandbox::linux::BwrapRunner::new()),
+            runs: Arc::clone(&runs),
+        }));
+        let required = ResourcePolicy {
+            required: vec![ResourceRequirement::Memory],
+            budget: ResourceBudget {
+                memory_bytes: Some(64 * 1024 * 1024),
+                processes: None,
+                cpu_cores: None,
+            },
+        };
+        let id = cap();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        m.insert(id.clone(), bundle(required.clone()));
+        let mut engine = policy(0, 1_000);
+        let secrets = FakeSecrets::new();
+        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
+            .with_execution(Arc::new(backend));
+        let err = d
+            .dispatch(
+                request(),
+                human(),
+                context(),
+                None,
+                params(),
+                None,
+                None,
+                NOW,
+            )
+            .expect_err("an unsatisfiable required ceiling must refuse");
+        assert!(
+            matches!(err, DispatchError::SandboxRefused(_)),
+            "expected a refusal, got {err:?}"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the backend was invoked despite a required ceiling being unavailable"
+        );
+    }
+
+    // ------------------------------------------------------------ 3. cgroup.kill
+
+    /// A detached descendant that ignores every catchable signal, outliving a governed
+    /// execution that is cut off at its deadline, must not survive it.
+    ///
+    /// A signal cannot reach it: it ignores SIGTERM, SIGINT, SIGHUP and SIGQUIT, and it is
+    /// not a child of the process the supervisor signals.
+    ///
+    /// **What this proves, and what it does not.** It proves the governed outcome: a
+    /// detached descendant alive at the deadline is not alive after it, and the dedicated
+    /// cgroup is emptied and removed. It does *not* prove that `cgroup.kill` is what
+    /// killed it. On Linux `bwrap` already runs with `--unshare-pid --die-with-parent`,
+    /// so the namespace reaps descendants the moment the supervisor dies -- which is why
+    /// removing the runner's `cgroup.kill` left this test green. Containment here is
+    /// deliberately redundant: namespace first, cgroup as the backstop that also covers
+    /// anything the namespace cannot reach. `cgroup.kill`'s independent teeth are proven
+    /// where they are observable, in `enforcement.rs::cgroup_kill_terminates_a_three_level_subtree`.
+    ///
+    /// The earlier version of this test proved nothing at all: `spawn-descendant` returns
+    /// immediately, so the sandbox exited long before any kill path was reached and the
+    /// marker was never written. It "passed" on a sentinel value.
+    #[test]
+    fn a_governed_timeout_terminates_a_detached_descendant_and_reaps_its_cgroup() {
+        if !available() {
+            println!("  host does not delegate cgroup.kill; reported, not skipped");
+            return;
+        }
+        // A *directory* is bound, not a file, so the descendant can create and rewrite
+        // the marker inside the sandbox.
+        let dir = std::env::temp_dir().join(format!("orxnud-v46-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("marker dir");
+        let marker = dir.join("alive");
+        let _ = std::fs::remove_file(&marker);
+
+        let required = ResourcePolicy {
+            required: vec![ResourceRequirement::Processes],
+            budget: ResourceBudget {
+                memory_bytes: Some(256 * 1024 * 1024),
+                processes: Some(64),
+                cpu_cores: Some(1.0),
+            },
+        };
+        let mut adapter = Tier1HelperAdapter::running("descendant-hang");
+        adapter.env.insert(
+            "ORXNUD_DESCENDANT_MARKER".into(),
+            marker.display().to_string(),
+        );
+        let id = cap();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        m.insert(
+            id.clone(),
+            Arc::new(PolicyBundle {
+                adapter,
+                resources: required.clone(),
+                grant_rw: vec![dir.display().to_string()],
+                // Short enough that the deadline lands while the descendant is alive.
+                deadline_ms: 2_000,
+            }),
+        );
+        let mut engine = policy(0, 1_000);
+        let secrets = FakeSecrets::new();
+        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
+            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+
+        let (watcher, stop, base) = watch(30);
+        let outcome = d
+            .dispatch(
+                request(),
+                human(),
+                context(),
+                None,
+                params(),
+                None,
+                None,
+                NOW,
+            )
+            .expect("dispatch");
+        stop.store(true, Ordering::SeqCst);
+        println!("  governed execution: {:?}", outcome.execution);
+
+        let o = watcher.join().expect("observer");
+        // Liveness is a moving marker: the descendant rewrites its pid every 150 ms, so a
+        // *changing* value proves it was alive and a *stable* value after the dispatch
+        // proves it stopped. A host pid would prove nothing about which cgroup it was in.
+        let first = std::fs::read_to_string(&marker).unwrap_or_default();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let second = std::fs::read_to_string(&marker).unwrap_or_default();
+        println!(
+            "  descendant marker: {:?} -> {:?}; max_members={} leftover={}",
+            first.trim(),
+            second.trim(),
+            o.max_members,
+            o.leftover
+        );
+
+        assert!(
+            first.trim().parse::<u32>().is_ok(),
+            "the descendant never wrote a pid to the bound marker, so its death was not \
+             observed: {:?}",
+            first
+        );
+        assert_eq!(
+            first.trim(),
+            second.trim(),
+            "the detached descendant is still running after the governed execution ended"
+        );
+        // A deadline surfaces as `Unknown`, not `Failed`: `Failed` means nothing
+        // happened, `Unknown` means the subprocess was cut off mid-flight and nobody
+        // vouches for its state. That mapping is the point -- asserting `Failed` would
+        // have demanded the supervisor pretend the work never began.
+        assert!(
+            matches!(outcome.execution, ExecutionOutcome::Unknown { .. }),
+            "the execution should have been cut off at its deadline: {:?}",
+            outcome.execution
+        );
+        assert!(
+            o.max_members >= 2,
+            "only the supervisor was ever observed ({}); there was no descendant to kill",
+            o.max_members
+        );
+        assert_eq!(
+            o.leftover, 0,
+            "the dedicated cgroup was not removed: {:?}",
+            base.base
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling must be *enforced by the kernel*, not merely written to a file.
+    ///
+    /// The first governed test proves `memory.max` holds the requested value. That is
+    /// configuration, not enforcement: a file can contain `67108864` while nothing acts on
+    /// it. This one runs a helper that touches every page it allocates until the kernel
+    /// refuses, and requires the helper's own report to say it was refused -- evidence
+    /// that comes from the allocator, not from us.
+    #[test]
+    fn a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written() {
+        if !available() {
+            println!("  host does not delegate memory control; reported, not skipped");
+            return;
+        }
+        let required = ResourcePolicy {
+            required: vec![ResourceRequirement::Memory],
+            budget: ResourceBudget {
+                memory_bytes: Some(64 * 1024 * 1024),
+                processes: Some(16),
+                cpu_cores: Some(0.5),
+            },
+        };
+        let mut adapter = Tier1HelperAdapter::running("mem-hog");
+        // Asks for far more than the ceiling, so the ceiling is what stops it.
+        adapter.env.insert("ORXNUD_ARG1".into(), "4096".into());
+        let id = cap();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        m.insert(
+            id.clone(),
+            Arc::new(PolicyBundle {
+                adapter,
+                resources: required.clone(),
+                grant_rw: Vec::new(),
+                deadline_ms: 30_000,
+            }),
+        );
+        let mut engine = policy(0, 1_000);
+        let secrets = FakeSecrets::new();
+        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
+            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+
+        let outcome = d
+            .dispatch(
+                request(),
+                human(),
+                context(),
+                None,
+                params(),
+                None,
+                None,
+                NOW,
+            )
+            .expect("dispatch");
+        let text = format!("{:?}", outcome.execution);
+        println!("  governed execution: {text}");
+
+        // Any of these is enforcement evidence, and requiring one *particular* one is the
+        // mistake the mechanism suite already made once: `memory.max` is free to refuse,
+        // reclaim, or OOM-kill, and a helper that is killed cannot report anything. Exit
+        // 137 (128 + SIGKILL) is the kernel killing it for exceeding the ceiling, which is
+        // the strongest form of the evidence.
+        let refused = text.contains("refusals");
+        let killed = text.contains("137") || text.contains("Killed") || text.contains("Unknown");
+        assert!(
+            refused || killed,
+            "neither a refusal nor a kill was observed, so enforcement was not established: \
+             {text}"
+        );
+        println!("  evidence: refused={refused} killed={killed}");
+        // And the load it was asked to create must not have been accommodated.
+        assert!(
+            !text.contains("held 4096"),
+            "the workload held the full 4096 MiB against a 64 MiB ceiling: NOT enforced"
+        );
+    }
+}

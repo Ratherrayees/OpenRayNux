@@ -312,6 +312,18 @@ impl CgroupV2 {
         })
     }
 
+    /// Whether `pid` is currently a member, read from `cgroup.procs`.
+    ///
+    /// Membership is a fact about the kernel, not about a path string. Everything that
+    /// claims "this execution is resource-controlled" must be able to check this, because
+    /// writing a limit to a cgroup says nothing about who is inside it.
+    #[must_use]
+    pub fn contains(&self, pid: u32) -> bool {
+        std::fs::read_to_string(self.path.join("cgroup.procs"))
+            .map(|t| t.lines().any(|l| l.trim() == pid.to_string()))
+            .unwrap_or(false)
+    }
+
     /// How many processes are in the cgroup.
     #[must_use]
     pub fn member_count(&self) -> usize {

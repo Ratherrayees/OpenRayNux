@@ -465,13 +465,24 @@ pub fn helper_path() -> PathBuf {
                 .is_some_and(|n| n.starts_with("hostile_helper-"))
         })
         .collect();
-    found.sort();
     assert!(
         !found.is_empty(),
         "no hostile_helper-* binary in {}; run `cargo test --no-run` first",
         dir.display()
     );
-    found.remove(0)
+    // Newest, not lexicographically first.
+    //
+    // Stale helper binaries accumulate in `target/debug/deps` across builds, and their
+    // names embed a hash. Sorting by name and taking index 0 therefore picked whichever
+    // hash happened to sort first -- frequently an *older* build. A mode added to the
+    // helper then silently fell through to the catch-all `noop`, so a governed test
+    // appeared to pass while proving nothing about the behaviour it named.
+    found.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    found.pop().expect("non-empty")
 }
 
 /// The directory the helper lives in, which the sandbox must be granted read-only.
