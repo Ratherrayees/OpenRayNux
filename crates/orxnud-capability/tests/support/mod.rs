@@ -131,7 +131,7 @@ impl<A: CapabilityAdapter + 'static> Bundle<A> {
     pub fn unverifiable(adapter: A) -> Self {
         Self::new(adapter, VerifyMode::Unavailable)
     }
-    pub fn into_arc(self) -> Arc<dyn AdapterBundle> {
+    pub fn into_arc(self) -> Arc<dyn AdapterBundle + Send + Sync> {
         Arc::new(self)
     }
 }

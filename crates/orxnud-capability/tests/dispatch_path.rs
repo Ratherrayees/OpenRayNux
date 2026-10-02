@@ -90,10 +90,13 @@ fn secret_ref() -> SecretRef {
 /// Wraps a fixture bundle into the dispatcher's registry.
 ///
 /// Generic over the concrete adapter because every fixture is a different type; the
-/// `'static` bound is what lets it become an `Arc<dyn AdapterBundle>`.
+/// `'static` bound is what lets it become an `Arc<dyn AdapterBundle + Send + Sync>`.
 fn bundles<A: orxnud_capability::dispatch::CapabilityAdapter + 'static>(
     b: Bundle<A>,
-) -> BTreeMap<CapabilityId, std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle>> {
+) -> BTreeMap<
+    CapabilityId,
+    std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
+> {
     use orxnud_capability::dispatch::AdapterBundle as _;
     let mut m = BTreeMap::new();
     let id = b.adapter().capability_id().clone();
@@ -104,7 +107,10 @@ fn bundles<A: orxnud_capability::dispatch::CapabilityAdapter + 'static>(
 fn dispatcher<'a>(
     engine: &'a mut PolicyEngine,
     secrets: &'a FakeSecrets,
-    bundles: BTreeMap<CapabilityId, std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle>>,
+    bundles: BTreeMap<
+        CapabilityId,
+        std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
+    >,
 ) -> Dispatcher<'a, FakeSecrets> {
     Dispatcher::new(engine, secrets, bundles)
 }

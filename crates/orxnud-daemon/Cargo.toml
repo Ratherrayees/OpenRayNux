@@ -25,6 +25,19 @@ orxnud-obs = { workspace = true }
 orxnud-platform-fs = { workspace = true }
 orxnud-platform-secrets = { workspace = true }
 orxnud-platform-notify = { workspace = true }
+orxnud-platform-ipc = { workspace = true }
+orxnud-platform-sandbox = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# The runtime integration suite opens the runtime's own SQLite file to count the
+# records it persisted, so it uses the real store rather than a re-implementation
+# of the query.
+orxnud-store = { workspace = true }
+
+# The one canonical long-lived process. `orxnuctl` is the command-line client and
+# depends only on `orxnud-protocol`, so the two do not compete for the same role.
+[[bin]]
+name = "orxnud"
+path = "src/main.rs"

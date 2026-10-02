@@ -200,9 +200,9 @@ impl AdapterBundle for HelperBundle {
     }
 }
 
-fn bundles(a: Tier1HelperAdapter) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> {
+fn bundles(a: Tier1HelperAdapter) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
     let id = a.capability_id().clone();
-    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let dir = sandbox_helpers_dir();
     m.insert(
         id,
@@ -477,10 +477,10 @@ fn a_tier0_capability_still_runs_in_process() {
         }
     }
 
-    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     m.insert(
         CapabilityId::new("t0"),
-        Arc::new(B0) as Arc<dyn AdapterBundle>,
+        Arc::new(B0) as Arc<dyn AdapterBundle + Send + Sync>,
     );
     let mut engine = PolicyEngine::new(
         PolicySet::deny_all("v1").with_grant(Grant {
@@ -618,7 +618,7 @@ fn a_capability_resolution_failure_reaches_the_backend_zero_times() {
     let secrets = FakeSecrets::new();
     let backend = Arc::new(CountingBackend::new());
     // No bundles at all.
-    let m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+    let m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
         .with_execution(backend.clone());
 
@@ -769,7 +769,7 @@ fn a_governed_descendant_spawn_is_contained() {
     // Grant the marker directory read-write, or the grandchild cannot write there.
     let id = cap();
     let dir = sandbox_helpers_dir();
-    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     m.insert(
         id,
         Arc::new(HelperBundle {
@@ -778,7 +778,7 @@ fn a_governed_descendant_spawn_is_contained() {
                 vec![dir.display().to_string()],
                 vec![marker_dir.display().to_string()],
             ),
-        }) as Arc<dyn AdapterBundle>,
+        }) as Arc<dyn AdapterBundle + Send + Sync>,
     );
     let mut d2 = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
         .with_execution(Arc::new(SandboxExecutionBackend::new()));
@@ -925,7 +925,7 @@ fn a_disabled_capability_produces_no_execution_path() {
         assert_eq!(backend.calls(), 1, "the baseline must execute exactly once");
     }
 
-    let m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+    let m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let mut d3 = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
         .with_execution(backend.clone());
 
@@ -1121,7 +1121,7 @@ mod v46 {
         av.memory && av.processes && av.cpu
     }
 
-    fn bundle(resources: ResourcePolicy) -> Arc<dyn AdapterBundle> {
+    fn bundle(resources: ResourcePolicy) -> Arc<dyn AdapterBundle + Send + Sync> {
         let mut b = Tier1HelperAdapter::running("fork-many");
         b.env.insert("ORXNUD_ARG1".into(), "24".into());
         Arc::new(PolicyBundle {
@@ -1191,7 +1191,7 @@ mod v46 {
             },
         };
         let id = cap();
-        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
         m.insert(id.clone(), bundle(required.clone()));
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
@@ -1277,7 +1277,7 @@ mod v46 {
             "the policy is incomplete and validation must say so"
         );
         let id = cap();
-        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
         m.insert(id.clone(), bundle(incomplete));
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
@@ -1378,7 +1378,7 @@ mod v46 {
             },
         };
         let id = cap();
-        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
         m.insert(id.clone(), bundle(required.clone()));
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
@@ -1473,7 +1473,7 @@ mod v46 {
             marker.display().to_string(),
         );
         let id = cap();
-        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
         m.insert(
             id.clone(),
             Arc::new(PolicyBundle {
@@ -1585,7 +1585,7 @@ mod v46 {
         // ceiling is what refuses.
         adapter.env.insert("ORXNUD_ARG1".into(), "64".into());
         let id = cap();
-        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
         m.insert(
             id.clone(),
             Arc::new(PolicyBundle {
@@ -1739,7 +1739,7 @@ mod v46 {
         let mut adapter = Tier1HelperAdapter::running("mem-hog");
         adapter.env.insert("ORXNUD_ARG1".into(), "64".into());
         let id = cap();
-        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
         m.insert(
             id.clone(),
             Arc::new(PolicyBundle {
@@ -1819,7 +1819,8 @@ mod v46 {
         for (label, resources) in unexpressible_budgets() {
             let backend = Arc::new(SandboxExecutionBackend::new());
             let id = cap();
-            let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+            let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> =
+                BTreeMap::new();
             m.insert(id.clone(), bundle(resources.clone()));
 
             let mut engine = policy(0, 1_000);

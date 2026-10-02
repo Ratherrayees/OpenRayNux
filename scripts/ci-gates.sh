@@ -77,6 +77,7 @@ EXPECTED_CRATES=(
   orxnud-platform-sandbox
   orxnud-platform-secrets
   orxnud-platform-notify
+  orxnud-platform-ipc
 )
 
 FAILED=()
@@ -214,7 +215,7 @@ gate_G2() {
   # platform crate able to depend on the daemon, which is exactly backwards.
   local layers=(
     "orxnud-domain"
-    "orxnud-protocol|orxnud-store|orxnud-obs|orxnud-config|orxnud-platform-fs|orxnud-platform-secrets|orxnud-platform-notify|orxnud-platform-sandbox"
+    "orxnud-protocol|orxnud-store|orxnud-obs|orxnud-config|orxnud-platform-fs|orxnud-platform-secrets|orxnud-platform-notify|orxnud-platform-sandbox|orxnud-platform-ipc"
     "orxnud-audit"
     "orxnud-policy"
     "orxnud-task"

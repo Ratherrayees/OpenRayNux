@@ -197,14 +197,14 @@ impl AdapterBundle for Bundle {
     }
 }
 
-fn bundles() -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> {
+fn bundles() -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
     let mut m = BTreeMap::new();
     m.insert(
         cap(),
         Arc::new(Bundle {
             adapter: Successful,
             verifier: Confirming,
-        }) as Arc<dyn AdapterBundle>,
+        }) as Arc<dyn AdapterBundle + Send + Sync>,
     );
     m
 }

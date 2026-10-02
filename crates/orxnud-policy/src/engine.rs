@@ -79,9 +79,9 @@ pub struct PolicyEngine {
     capabilities: Vec<CapabilityDeclaration>,
     audit: AuditChain,
     /// Where the chain is made durable, when durability is attached.
-    journal: Option<Box<dyn AuditJournal>>,
+    journal: Option<Box<dyn AuditJournal + Send>>,
     /// Which approval digests have been spent. Single-use is this port's contract.
-    ledger: Box<dyn ApprovalLedger>,
+    ledger: Box<dyn ApprovalLedger + Send>,
     policy_version: String,
 }
 
@@ -138,8 +138,8 @@ impl PolicyEngine {
     #[must_use]
     pub fn with_security_state(
         mut self,
-        journal: Box<dyn AuditJournal>,
-        ledger: Box<dyn ApprovalLedger>,
+        journal: Box<dyn AuditJournal + Send>,
+        ledger: Box<dyn ApprovalLedger + Send>,
     ) -> Self {
         self.journal = Some(journal);
         self.ledger = ledger;

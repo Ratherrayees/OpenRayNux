@@ -21,6 +21,7 @@ members = [
     "crates/orxnud-platform-sandbox",
     "crates/orxnud-platform-secrets",
     "crates/orxnud-platform-notify",
+    "crates/orxnud-platform-ipc",
 ]
 
 # The crate graph is fixed by docs/13 §3.1. Adding, removing, or merging a
@@ -52,7 +53,7 @@ rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 # `orxnud-store`'s build script, which parses the bundled `sqlite3.h` to
 # assert the linked version at compile time. Never linked into the library.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal", "net", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt", "std"] }
 clap = { version = "4.6.7", features = ["derive"] }
@@ -91,6 +92,7 @@ orxnud-platform-fs = { path = "crates/orxnud-platform-fs" }
 orxnud-platform-sandbox = { path = "crates/orxnud-platform-sandbox" }
 orxnud-platform-secrets = { path = "crates/orxnud-platform-secrets" }
 orxnud-platform-notify = { path = "crates/orxnud-platform-notify" }
+orxnud-platform-ipc = { path = "crates/orxnud-platform-ipc" }
 
 [profile.release]
 lto = "thin"

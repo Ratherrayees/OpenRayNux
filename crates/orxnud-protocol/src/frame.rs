@@ -208,8 +208,30 @@ impl Response {
         }
     }
 
-    /// Whether this response carries a result rather than an error.
-    #[must_use]
+    /// Encodes the response, enforcing the same size bound as [`Request::encode`].
+    ///
+    /// A response that cannot be encoded must not be sent unbounded either, and the
+    /// bound is the protocol's own so a client decodes one thing.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::Malformed`] if serialisation fails, or
+    /// [`ProtocolError::FrameTooLarge`] if the response exceeds
+    /// [`limits::MAX_FRAME_BYTES`].
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        let bytes = serde_json::to_vec(self).map_err(|e| ProtocolError::Malformed {
+            reason: e.to_string(),
+        })?;
+        if bytes.len() > limits::MAX_FRAME_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                size: bytes.len(),
+                limit: limits::MAX_FRAME_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Whether this carries a result rather than an error.
     pub fn is_ok(&self) -> bool {
         self.error.is_none() && self.result.is_some()
     }

@@ -57,6 +57,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod runtime;
 pub mod task_service;
 
 use std::collections::BTreeMap;
@@ -332,7 +333,7 @@ pub struct DispatchWiring {
     /// adapter is a capability, and no capability exists yet. `Dispatcher::new`
     /// accepts an empty map, and every dispatch is refused with
     /// `NoImplementation` — the fail-closed result, not a gap.
-    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>,
+    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
     /// The only route to a Tier-1 process.
     ///
     /// Not an `Option`, deliberately. The governed dispatcher does accept `None`

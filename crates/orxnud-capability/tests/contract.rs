@@ -308,7 +308,8 @@ fn a_contract_adapter_can_actually_be_dispatched() {
     let a = Arc::new(ConformingAdapter::new("dispatchable"));
     let bundle = ConformingBundle(Arc::clone(&a) as Arc<dyn CapabilityAdapter>);
     let id = bundle.adapter().capability_id().clone();
-    let mut registry: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
+    let mut registry: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> =
+        BTreeMap::new();
     registry.insert(id, Arc::new(bundle));
 
     let mut engine = orxnud_policy::PolicyEngine::new(

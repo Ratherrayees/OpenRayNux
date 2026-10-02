@@ -61,6 +61,17 @@ impl RpcError {
         }
     }
 
+    /// Attaches structured detail.
+    ///
+    /// For machine-readable context a caller can branch on. Never for secrets:
+    /// redaction happens before this point (control S9), and this constructor takes
+    /// whatever it is given.
+    #[must_use]
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
     /// The JSON-RPC method-not-found error, used for unknown methods.
     ///
     /// Forward compatibility in action: a newer client calling a method this

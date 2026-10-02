@@ -96,7 +96,10 @@ fn params() -> NormalizedParams {
 
 fn registry(
     b: Bundle<impl CapabilityAdapter + 'static>,
-) -> BTreeMap<CapabilityId, std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle>> {
+) -> BTreeMap<
+    CapabilityId,
+    std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
+> {
     use orxnud_capability::dispatch::AdapterBundle as _;
     let mut m = BTreeMap::new();
     let id = b.adapter().capability_id().clone();

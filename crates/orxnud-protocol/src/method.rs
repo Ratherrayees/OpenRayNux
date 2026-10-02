@@ -31,6 +31,14 @@ pub enum Method {
     /// first name in a flat namespace, and flat namespaces collide as the surface
     /// grows — which is the whole reason this is a closed enum.
     Echo,
+    /// Invoke a capability through the governed path.
+    ///
+    /// The request carries an `ActionRequest`-shaped payload. The name is the only
+    /// thing this crate contributes: what it *means*, whether it is permitted, and
+    /// whether it runs are decided by `orxnud-policy` and `orxnud-capability`, and
+    /// this enum cannot express any of that. A peer that can call it has asked for
+    /// something; whether it happens is a separate and much stricter question.
+    CapabilityDispatch,
 }
 
 impl Method {
@@ -42,6 +50,7 @@ impl Method {
             Self::DaemonVersion => "daemon/version",
             Self::CapabilityList => "capability/list",
             Self::Echo => "daemon/echo",
+            Self::CapabilityDispatch => "capability/dispatch",
         }
     }
 
@@ -59,6 +68,7 @@ impl Method {
             "daemon/version" => Some(Self::DaemonVersion),
             "capability/list" => Some(Self::CapabilityList),
             "daemon/echo" => Some(Self::Echo),
+            "capability/dispatch" => Some(Self::CapabilityDispatch),
             _ => None,
         }
     }

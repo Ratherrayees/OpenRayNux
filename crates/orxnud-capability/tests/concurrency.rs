@@ -162,7 +162,7 @@ impl AdapterBundle for RecBundle {
     }
 }
 
-/// Builds the registry, doing the `Arc<Concrete> -> Arc<dyn AdapterBundle>`
+/// Builds the registry, doing the `Arc<Concrete> -> Arc<dyn AdapterBundle + Send + Sync>`
 /// coercion once.
 fn registry_for(rec: &Arc<Recorder>) -> Registry {
     let mut m: Registry = BTreeMap::new();
@@ -173,13 +173,13 @@ fn registry_for(rec: &Arc<Recorder>) -> Registry {
                 id: cap(),
                 rec: Arc::clone(rec),
             },
-        }) as Arc<dyn AdapterBundle>,
+        }) as Arc<dyn AdapterBundle + Send + Sync>,
     );
     m
 }
 
 /// The dispatcher's registry type, named so the coercion site is easy to find.
-type Registry = BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>;
+type Registry = BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>;
 
 // ---------------------------------------------------------------- concurrency
 
@@ -473,7 +473,10 @@ fn the_reentrancy_guard_is_not_left_set_after_a_panicking_adapter() {
     let mut engine = policy(RiskClass::Low, 0, 10_000);
     let secrets = FakeSecrets::new();
     let mut m = BTreeMap::new();
-    m.insert(cap(), Arc::new(PanicBundle) as Arc<dyn AdapterBundle>);
+    m.insert(
+        cap(),
+        Arc::new(PanicBundle) as Arc<dyn AdapterBundle + Send + Sync>,
+    );
     let mut d = Dispatcher::new(&mut engine, &secrets, m);
 
     let prev = std::panic::take_hook();

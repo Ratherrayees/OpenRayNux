@@ -1,0 +1,24 @@
+[package]
+name = "orxnud-platform-ipc"
+description = "OpenRayNux local IPC transport: a byte-oriented local endpoint, Unix socket on Unix."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# One of the `orxnud-platform-*` crates permitted to contain cfg(target_os) (gate G3).
+# The dependency is `tokio` only, and only for the asynchronous socket: a socket is
+# an OS facility, and gate G3 is what keeps `cfg` out of everything above this crate.
+#
+# No internal dependency, deliberately. This crate speaks bytes and knows nothing
+# about JSON-RPC; `orxnud-protocol` owns the wire vocabulary and the size bounds.
+# Two crates that both knew the wire format would be two definitions of it.
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

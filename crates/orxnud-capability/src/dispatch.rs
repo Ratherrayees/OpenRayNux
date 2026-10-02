@@ -1003,7 +1003,7 @@ impl ReentrancyGuard {
 pub struct Dispatcher<'p, S: SecretsContract> {
     policy: &'p mut PolicyEngine,
     secrets: &'p S,
-    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>,
+    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
     reentrancy: ReentrancyGuard,
     /// The only route to a Tier-1 process.
     ///
@@ -1019,7 +1019,7 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
     pub fn new(
         policy: &'p mut PolicyEngine,
         secrets: &'p S,
-        bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>,
+        bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
     ) -> Self {
         Self {
             policy,
@@ -1111,7 +1111,10 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
     ///
     /// [`DispatchError::NoImplementation`] is not the right error here; a duplicate
     /// is reported as [`RegisterError::Duplicate`].
-    pub fn register(&mut self, bundle: Arc<dyn AdapterBundle>) -> Result<(), RegisterError> {
+    pub fn register(
+        &mut self,
+        bundle: Arc<dyn AdapterBundle + Send + Sync>,
+    ) -> Result<(), RegisterError> {
         let id = bundle.adapter().capability_id().clone();
         if self.bundles.contains_key(&id) {
             return Err(RegisterError::Duplicate(id));
