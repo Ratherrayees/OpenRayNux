@@ -522,6 +522,30 @@ fn outcome_from_report(report: ExecutionReport) -> ExecutionOutcome {
 ///
 /// A hostile helper controls this text, so it must not be able to flood the audit
 /// journal or smuggle a newline that breaks a record's framing.
+///
+/// # The budget is bytes, not characters
+///
+/// [`MAX`] is a byte budget, deliberately: the audit record is bytes, and a budget
+/// counted in characters would let a record grow by a factor of four if the child
+/// emitted multi-byte text. The total reported in the suffix is therefore
+/// `str::len()`, which is bytes, and must stay that way.
+///
+/// # Why the truncation walks backwards
+///
+/// Slicing at a fixed byte offset is only correct when that offset happens to fall
+/// on a code-point boundary, and a hostile helper chooses its own output. A child
+/// that emitted a multi-byte character straddling the boundary made this panic:
+///
+/// ```text
+/// end byte index 512 is not a char boundary; it is inside '€' (bytes 511..514)
+/// ```
+///
+/// It is reached from `outcome_from_report`, **outside** the `catch_unwind` that
+/// wraps the backend, so it took the dispatcher down — which is exactly what
+/// `CapabilityAdapter::invoke`'s contract says must not happen ("a faulty
+/// integration must not take down the daemon"). The fix moves the cut back to the
+/// nearest boundary rather than widening the budget or dropping the offending
+/// bytes: at most three steps, because a code point is at most four bytes.
 fn redact(s: &str) -> String {
     const MAX: usize = 512;
     let cleaned: String = s
@@ -529,9 +553,222 @@ fn redact(s: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     if cleaned.len() <= MAX {
-        cleaned
-    } else {
-        format!("{}…[{} bytes total]", &cleaned[..MAX], cleaned.len())
+        return cleaned;
+    }
+    let mut end = MAX;
+    while !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[{} bytes total]", &cleaned[..end], cleaned.len())
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact;
+
+    /// The byte budget `redact` enforces, restated so a test cannot quietly pass by
+    /// agreeing with a changed constant.
+    const MAX: usize = 512;
+
+    /// Builds a string of `ascii` ASCII bytes followed by `tail`.
+    fn ascii_then(ascii: usize, tail: &str) -> String {
+        let mut s = "a".repeat(ascii);
+        s.push_str(tail);
+        s
+    }
+
+    /// The reported total, parsed out of the `…[N bytes total]` suffix.
+    fn reported_total(out: &str) -> usize {
+        let start = out.rfind('[').expect("suffix present") + 1;
+        let end = out.rfind(" bytes total]").expect("suffix present");
+        out[start..end].parse().expect("a number")
+    }
+
+    #[test]
+    fn a_short_string_is_returned_exactly() {
+        // "Exactly" means: unchanged by the *truncation*, which is a no-op below the
+        // budget. The control-character scrub applies at every length, so it is
+        // asserted separately below.
+        for s in ["", "ok", "a clean line with no control characters"] {
+            let out = redact(s);
+            assert_eq!(out, s, "short clean input must be untouched");
+            assert!(!out.contains('…'), "no truncation marker: {out}");
+        }
+    }
+
+    #[test]
+    fn control_characters_are_scrubbed_at_every_length() {
+        // The scrubbing half of the contract, independent of the budget. A newline
+        // or a tab is a framing character an audit record must not carry.
+        for s in ["a\nb", "a\tb", "a\rb", "a\u{0}b"] {
+            let out = redact(s);
+            assert_eq!(out, "a b", "control characters become spaces: {out:?}");
+            assert!(!out.contains('…'), "still short, still untruncated");
+        }
+    }
+
+    #[test]
+    fn ascii_behaviour_is_exact() {
+        // ASCII is one byte per character, so the cut lands on a boundary and
+        // nothing about the original path changes.
+        let s = "b".repeat(MAX);
+        assert_eq!(redact(&s), s, "exactly at the budget: untouched");
+
+        let over = "b".repeat(MAX + 100);
+        let out = redact(&over);
+        assert_eq!(
+            out,
+            format!("{}…[{} bytes total]", "b".repeat(MAX), MAX + 100)
+        );
+        assert!(out.starts_with(&"b".repeat(MAX)), "the full budget is kept");
+    }
+
+    #[test]
+    fn a_two_byte_character_straddling_the_boundary_does_not_panic() {
+        // 511 ASCII bytes, then a 2-byte char: byte 512 lands inside it.
+        let s = ascii_then(MAX - 1, "é");
+        assert_eq!(s.len(), 513, "the input must straddle the boundary");
+        let out = redact(&s);
+        assert!(out.starts_with(&"a".repeat(MAX - 1)));
+        assert!(out.ends_with(&format!("…[{} bytes total]", 513)));
+    }
+
+    #[test]
+    fn a_three_byte_character_straddling_the_boundary_does_not_panic() {
+        // The exact reproducer of the original panic: byte 512 inside '€'.
+        let s = ascii_then(MAX - 1, "€");
+        assert_eq!(s.len(), 514);
+        let out = redact(&s);
+        assert!(
+            out.starts_with(&"a".repeat(MAX - 1)),
+            "the cut moves back to the last boundary: {out}"
+        );
+        assert!(out.ends_with(&format!("…[{} bytes total]", 514)));
+    }
+
+    #[test]
+    fn a_four_byte_character_straddling_the_boundary_does_not_panic() {
+        // 509 ASCII bytes, then a 4-byte char starting at 509: every offset from
+        // 510 to 512 is inside it, so the cut must walk back three times.
+        let s = ascii_then(MAX - 3, "😀");
+        assert_eq!(s.len(), 513);
+        let out = redact(&s);
+        assert!(
+            out.starts_with(&"a".repeat(MAX - 3)),
+            "a four-byte code point needs three steps back: {out}"
+        );
+        assert!(out.ends_with(&format!("…[{} bytes total]", 513)));
+    }
+
+    #[test]
+    fn every_offset_inside_a_code_point_is_safe() {
+        // Not a sample: for each leading width, place a code point so that the
+        // 512th byte is *every* position inside it.
+        for width in 2..=4usize {
+            let cp = match width {
+                2 => "é",
+                3 => "€",
+                _ => "😀",
+            };
+            for inside in 1..width {
+                let lead = MAX - inside;
+                let s = ascii_then(lead, cp);
+                assert!(
+                    s.len() > MAX,
+                    "case must actually straddle: lead={lead} width={width}"
+                );
+                let out = redact(&s);
+                // No panic, valid UTF-8, and the byte budget is respected.
+                assert!(
+                    out.len() < s.len() + "…[514 bytes total]".len(),
+                    "output must be bounded"
+                );
+                assert_eq!(
+                    reported_total(&out),
+                    s.len(),
+                    "the reported total is the true byte length, not the cut"
+                );
+                // Whatever we kept must end on a boundary, i.e. be a valid prefix.
+                let kept = out.split('…').next().expect("a prefix");
+                assert!(
+                    s.starts_with(kept),
+                    "kept text must be a true prefix of the input"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_truncated_prefix_is_never_a_partial_code_point() {
+        // The property that matters for a downstream reader: what we emit is
+        // decodable, so an audit record can never be written with a split rune.
+        for cp in ["é", "€", "😀", "𝄞"] {
+            for lead in MAX - 4..=MAX {
+                let s = ascii_then(lead, cp);
+                let out = redact(&s);
+                let kept = out.split('…').next().expect("a prefix");
+                assert!(
+                    kept.is_char_boundary(kept.len()),
+                    "{cp:?} at {lead} produced a split code point"
+                );
+                // Round-tripping through bytes is the real proof it is intact.
+                assert_eq!(
+                    kept,
+                    String::from_utf8(kept.as_bytes().to_vec()).expect("valid UTF-8")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_ascii_and_multibyte_content_survives_the_cut() {
+        let mut s = String::new();
+        while s.len() < MAX {
+            s.push_str("héllo wörld ✓ ");
+        }
+        let out = redact(&s);
+        let kept = out.split('…').next().expect("a prefix");
+        assert!(s.starts_with(kept));
+        assert!(
+            kept.len() <= MAX,
+            "the kept prefix respects the byte budget"
+        );
+        assert_eq!(reported_total(&out), s.len());
+    }
+
+    #[test]
+    fn control_characters_are_still_replaced_and_the_budget_still_applies() {
+        // The original two responsibilities, unchanged: scrub framing characters,
+        // then bound the result.
+        let mut s = "x".repeat(MAX - 4);
+        s.push_str("\n\r\u{0} ");
+        let out = redact(&s);
+        assert!(
+            !out.contains('\n') && !out.contains('\r') && !out.contains('\u{0}'),
+            "control characters must be scrubbed: {out:?}"
+        );
+        assert!(out.contains(' '), "scrubbed positions become spaces");
+        assert_eq!(reported_total(&out), s.len());
+    }
+
+    #[test]
+    fn redaction_is_deterministic() {
+        let s = ascii_then(MAX - 1, "€");
+        let first = redact(&s);
+        for _ in 0..8 {
+            assert_eq!(redact(&s), first, "same input, same output");
+        }
+    }
+
+    #[test]
+    fn a_pathological_input_of_only_multibyte_characters_is_bounded() {
+        // Every character is 3 bytes, so no boundary is ever hit at a round number.
+        let s = "€".repeat(4_000);
+        let out = redact(&s);
+        assert_eq!(reported_total(&out), 12_000);
+        let kept = out.split('…').next().expect("a prefix");
+        assert!(kept.len() <= MAX);
+        assert!(s.starts_with(kept));
     }
 }
 
