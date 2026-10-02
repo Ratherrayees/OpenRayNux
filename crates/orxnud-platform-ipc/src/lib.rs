@@ -91,6 +91,39 @@ pub enum IpcError {
     Other(String),
 }
 
+/// Classifies an OS error raised by an operation on a peer-facing socket.
+///
+/// # Why this lives here and not in the daemon
+///
+/// A local client may vanish at any instant, *including while its response is being
+/// written* -- a client that sends a request and closes without reading is ordinary
+/// behaviour, not an attack. On Unix that surfaces as `EPIPE`/`ECONNRESET`. Deciding
+/// what those errno values mean is operating-system knowledge, and gate **G3** exists
+/// so only a `orxnud-platform-*` crate holds it. So the daemon sees only
+/// [`IpcError::Disconnected`], and `serve` treats it as "this connection ended",
+/// rather than learning that a vanished peer is somehow different from a dead one.
+///
+/// # What is deliberately *not* mapped
+///
+/// Only [`std::io::ErrorKind::BrokenPipe`] and
+/// [`std::io::ErrorKind::ConnectionReset`] mean "the peer disappeared while we were
+/// talking to it". Permission failures, a bad or closed descriptor, a short write for
+/// any other reason, and every unrecognised OS error stay [`IpcError::Other`] and keep
+/// propagating. Mapping every write failure to `Disconnected` would be the opposite
+/// defect: it would turn a real server-side fault into silence, and a daemon that can
+/// never report a transport problem is a daemon nobody can debug.
+///
+/// [`std::io::ErrorKind`] is used rather than raw `errno` precisely so this needs no
+/// `cfg(target_os)`: the kinds are portable, so a future Windows pipe inherits the same
+/// classification instead of a second, divergent copy of it.
+fn peer_io(e: std::io::Error) -> IpcError {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset};
+    match e.kind() {
+        BrokenPipe | ConnectionReset => IpcError::Disconnected,
+        _ => IpcError::Other(e.to_string()),
+    }
+}
+
 /// A connected local peer.
 ///
 /// Byte-oriented on purpose: framing is the caller's business, because only the
@@ -127,17 +160,15 @@ impl LocalStream {
     /// # Errors
     ///
     /// [`IpcError::Other`] if the peer sends more than `limit` bytes without a
-    /// newline, or [`IpcError::Disconnected`] if it closes first.
+    /// newline, or [`IpcError::Disconnected`] if it closes -- or is reset -- first.
     pub async fn read_line_bounded(&mut self, limit: usize) -> Result<Vec<u8>, IpcError> {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::with_capacity(limit.min(1024));
         let mut byte = [0u8; 1];
         loop {
-            let n = self
-                .inner
-                .read(&mut byte)
-                .await
-                .map_err(|e| IpcError::Other(e.to_string()))?;
+            // A reset mid-read is the peer disappearing, exactly as a close is, and
+            // `peer_io` says so for both without the caller having to know which.
+            let n = self.inner.read(&mut byte).await.map_err(peer_io)?;
             if n == 0 {
                 return if buf.is_empty() {
                     Err(IpcError::Disconnected)
@@ -161,21 +192,19 @@ impl LocalStream {
     ///
     /// # Errors
     ///
-    /// [`IpcError::Other`] if the peer is gone or the write fails.
+    /// [`IpcError::Disconnected`] if the peer has gone away -- the case that made a
+    /// request-then-close client able to stop the daemon, because the write failed
+    /// and the failure was reported as if the transport itself were broken. That is
+    /// now classified here, at the boundary that can recognise it.
+    ///
+    /// [`IpcError::Other`] for every other write failure, which stays a real error.
     pub async fn write_line(&mut self, bytes: &[u8]) -> Result<(), IpcError> {
         use tokio::io::AsyncWriteExt;
-        self.inner
-            .write_all(bytes)
-            .await
-            .map_err(|e| IpcError::Other(e.to_string()))?;
-        self.inner
-            .write_all(b"\n")
-            .await
-            .map_err(|e| IpcError::Other(e.to_string()))?;
-        self.inner
-            .flush()
-            .await
-            .map_err(|e| IpcError::Other(e.to_string()))
+        // Three syscalls, one classification: a peer that vanishes between the body
+        // and the newline must be the same event as one that vanishes during it.
+        self.inner.write_all(bytes).await.map_err(peer_io)?;
+        self.inner.write_all(b"\n").await.map_err(peer_io)?;
+        self.inner.flush().await.map_err(peer_io)
     }
 }
 
@@ -300,6 +329,57 @@ pub fn endpoint_for(root: &Path) -> PathBuf {
     root.join("orxnud.sock")
 }
 
+/// Releases an endpoint this process created, on shutdown.
+///
+/// The runtime calls this when it stops serving, so the socket file cannot outlive
+/// the daemon that owns it — including when the runtime exits on a genuine transport
+/// error rather than an orderly shutdown. That ordering used to live in the serve
+/// loop itself, where any early return could skip it and leave a stale socket behind.
+///
+/// # Why the removal is narrow
+///
+/// This unlinks the recorded path and nothing else, and only while that path is still
+/// a socket. [`bind`] refuses a path a live daemon is listening on rather than
+/// removing it, so reaching here means the file was this process's own; re-checking
+/// the type covers the remaining window, where something else replaced the path
+/// between bind and shutdown. A path that is not a socket is left alone rather than
+/// deleted.
+///
+/// A failure to remove is deliberately ignored: it is not the error the caller is
+/// dealing with, and reporting it would replace a real diagnosis with a cosmetic one.
+/// The next start handles a leftover socket through the documented stale-endpoint
+/// rule in [`bind`], so nothing is stranded.
+pub fn release_endpoint(path: &Path) {
+    if !is_socket(path) {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Whether `path` is still a socket file.
+fn is_socket(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type())
+            }
+            // No socket filesystem exists on this platform, and [`bind`] refuses
+            // rather than binding something else, so a bound endpoint here is always
+            // the Unix socket created above and the check can never be the thing that
+            // prevents cleanup.
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                true
+            }
+        }
+        // Already gone, which is the outcome wanted. `false` means "nothing to do",
+        // not "remove it anyway".
+        Err(_) => false,
+    }
+}
+
 /// Resolves when the host asks the process to stop.
 ///
 /// SIGINT **and** SIGTERM on Unix: a daemon that answers only Ctrl-C has to be
@@ -372,5 +452,101 @@ mod tests {
             .block_on(bind(Path::new("ignored")))
             .expect_err("must refuse");
         assert!(matches!(err, IpcError::Unsupported), "{err:?}");
+    }
+
+    #[test]
+    fn a_vanished_peer_is_disconnected_and_every_other_io_error_is_not() {
+        use std::io::{Error, ErrorKind};
+        // The conditions that mean "the peer disappeared while we were talking to
+        // it", and nothing else. This is the whole classification, so it is worth
+        // stating positively: these are Disconnected.
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
+            let e = Error::from(kind);
+            assert!(
+                matches!(peer_io(e), IpcError::Disconnected),
+                "{kind:?} is a peer disappearing and must be Disconnected"
+            );
+        }
+        // And these are not. A blanket "write failed, assume the peer left" rule
+        // would turn every one of them into silence, which is how a real fault gets
+        // reported as a healthy daemon.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Other,
+        ] {
+            let e = Error::from(kind);
+            let mapped = peer_io(e);
+            assert!(
+                matches!(mapped, IpcError::Other(_)),
+                "{kind:?} is a real fault and must stay an error, got {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn releasing_an_endpoint_never_unlinks_something_that_is_not_a_socket() {
+        let dir = std::env::temp_dir().join(format!("orxnud-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // A regular file where the socket should be: the one way the release path
+        // could destroy something it did not create.
+        let file = dir.join("not-a-socket");
+        std::fs::write(&file, b"a user document").expect("write");
+        release_endpoint(&file);
+        assert!(
+            file.exists(),
+            "release must leave a non-socket at the endpoint path alone"
+        );
+
+        // And a directory, which `remove_file` could not remove even if it tried.
+        let subdir = dir.join("a-directory");
+        std::fs::create_dir_all(&subdir).expect("mkdir");
+        release_endpoint(&subdir);
+        assert!(subdir.is_dir(), "release must leave a directory alone");
+
+        // A path that is not there is the outcome wanted, not an error.
+        release_endpoint(&dir.join("never-existed"));
+        assert!(!dir.join("never-existed").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writing_to_a_vanished_peer_is_a_disconnect_not_a_transport_failure() {
+        // The defect, exercised at the layer that fixes it: a real socket, a real
+        // peer that disappears, and a real write that used to fail as `Other` and
+        // stop the daemon.
+        let dir = std::env::temp_dir().join(format!("orxnud-vanish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("orxnud.sock");
+
+        let listener = bind(&path).await.expect("bind");
+        let serving = tokio::spawn(async move {
+            let mut s = listener.accept().await.expect("accept");
+            // Take the request, so the peer is gone by the time we answer.
+            let _ = s.read_line_bounded(4096).await;
+            s
+        });
+
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        drop(client);
+        // Let the close reach the server before it writes.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut stream = serving.await.expect("join");
+        let err = stream
+            .write_line(br#"{"jsonrpc":"2.0","id":1}"#)
+            .await
+            .expect_err("writing to a vanished peer cannot succeed");
+        assert!(
+            matches!(err, IpcError::Disconnected),
+            "a peer that vanished mid-response is Disconnected, not a broken transport: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -25,7 +25,7 @@ use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::{Runtime, RuntimeError};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_domain::security_state::AuditJournal;
-use orxnud_platform_ipc::endpoint_for;
+use orxnud_platform_ipc::{IpcError, endpoint_for};
 use orxnud_protocol::error::RpcErrorCode;
 use orxnud_protocol::frame::{Request, RequestId};
 use orxnud_protocol::method::Method;
@@ -142,6 +142,37 @@ where
     let _ = tx.send(());
     let _ = serving.await;
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Like [`with_runtime`], but returns how `serve` actually ended.
+///
+/// `with_runtime` discards the serve result, which is right for "does the endpoint
+/// answer" and wrong for error classification: "the daemon kept serving" and "the
+/// daemon reported a vanished peer as a fatal transport failure" are different claims
+/// about the same run, and only the second one is a defect.
+async fn with_observed_runtime<F, Fut>(tag: &str, body: F) -> Result<(), IpcError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let d = dir(tag);
+    let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+        .await
+        .expect("start");
+    let endpoint = runtime.endpoint().to_path_buf();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        runtime
+            .serve(async move {
+                let _ = rx.await;
+            })
+            .await
+    });
+    body(endpoint).await;
+    let _ = tx.send(());
+    let outcome = serving.await.expect("the serve task must not panic");
+    let _ = std::fs::remove_dir_all(&d);
+    outcome
 }
 
 #[test]
@@ -498,4 +529,143 @@ fn the_runtime_never_reaches_an_adapter_directly() {
         src.contains("daemon.dispatcher("),
         "and it must reach the governed dispatcher"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Write-side peer disconnect
+//
+// A local client may vanish at any instant, and the case that stopped the daemon
+// was the one the suite did not cover: send a *complete, valid* request and close
+// without reading the answer. The server has already accepted the request and is
+// writing into a socket nobody will read, so its write fails. That is an ordinary
+// client, not an attack, and it must not end the process.
+//
+// The test that existed covered only `connect` then `drop`, which is the read-side
+// disconnect and always worked -- so the suite reported this area as green.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_peer_that_closes_before_reading_its_response_does_not_stop_the_daemon() {
+    rt().block_on(async {
+        let ended = with_observed_runtime("write-side-disconnect", |endpoint| async move {
+            let mut s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+            let _ = s.write_all(br#"{"jsonrpc":"2.0","id":"w","method":"daemon/status"}"#);
+            let _ = s.write_all(b"\n");
+            let _ = s.flush();
+            // Close without reading a single byte of the answer.
+            drop(s);
+
+            // Long enough for the runtime to accept, route, and fail its write. This
+            // is a sleep rather than a signal because the property under test is
+            // "the daemon is still there afterwards", and the only way to observe
+            // that is to ask it.
+            tokio::time::sleep(Duration::from_millis(750)).await;
+
+            let reply = call_raw(
+                &endpoint,
+                br#"{"jsonrpc":"2.0","id":"2","method":"daemon/status"}"#,
+            )
+            .expect("a second client must still be served");
+            assert_eq!(
+                reply["result"]["status"], "running",
+                "the daemon must still be serving: {reply}"
+            );
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "an expected peer disappearance must not be reported as a daemon failure: {ended:?}"
+        );
+    });
+}
+
+#[test]
+fn a_reset_style_disconnect_does_not_stop_the_daemon() {
+    rt().block_on(async {
+        let ended = with_observed_runtime("reset-disconnect", |endpoint| async move {
+            // Repeated, because one close can land before the runtime is reading and
+            // would then prove nothing about the write path.
+            for attempt in 0..5 {
+                let mut s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+                let _ = s.write_all(br#"{"jsonrpc":"2.0","id":"r","method":"daemon/status"}"#);
+                let _ = s.write_all(b"\n");
+                let _ = s.flush();
+                // Discard the read side *before* the response arrives. The kernel
+                // then refuses the inbound answer with a reset instead of accepting
+                // it, which is the ECONNRESET half of the classification -- and it is
+                // reachable with portable std, so no cfg and no unsafe.
+                let _ = s.shutdown(std::net::Shutdown::Read);
+                drop(s);
+                let _ = attempt;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            let reply = call_raw(
+                &endpoint,
+                br#"{"jsonrpc":"2.0","id":"3","method":"daemon/status"}"#,
+            )
+            .expect("the daemon must still answer after repeated resets");
+            assert_eq!(reply["result"]["status"], "running", "{reply}");
+        })
+        .await;
+        assert!(ended.is_ok(), "{ended:?}");
+    });
+}
+
+#[test]
+fn a_peer_disconnect_ends_the_connection_rather_than_the_serve_loop() {
+    // Test D, stated as the classification it is: the disconnect must be absorbed by
+    // `serve` and never reach `main` as a fatal error. `serve` returning `Ok` after a
+    // peer vanished is the observable form of that, and it is the same assertion the
+    // first test makes -- separated because the two properties can regress apart:
+    // one is "the daemon survived", the other is "it classified the event correctly".
+    rt().block_on(async {
+        let ended = with_observed_runtime("disconnect-is-not-fatal", |endpoint| async move {
+            for _ in 0..3 {
+                let s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+                drop(s);
+            }
+            let mut s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+            let _ = s.write_all(br#"{"jsonrpc":"2.0","id":"d","method":"daemon/status"}"#);
+            let _ = s.write_all(b"\n");
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        })
+        .await;
+        assert!(
+            matches!(ended, Ok(())),
+            "a vanished peer must be absorbed, not propagated: {ended:?}"
+        );
+    });
+}
+
+#[test]
+fn the_endpoint_is_removed_when_the_runtime_finishes_serving() {
+    // The cleanup guarantee on the ordinary path, asserted through the public API:
+    // the socket file must not outlive the serve loop.
+    rt().block_on(async {
+        let d = dir("release");
+        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+            .await
+            .expect("start");
+        let endpoint = runtime.endpoint().to_path_buf();
+        assert!(endpoint.exists(), "precondition: the endpoint is bound");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(async move {
+            let _ = runtime
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(());
+        let _ = serving.await;
+        assert!(
+            !endpoint.exists(),
+            "the endpoint must be released when serving ends"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    });
 }

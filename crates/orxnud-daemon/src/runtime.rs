@@ -240,16 +240,35 @@ impl<S: SecretsContract> Runtime<S> {
     /// the graceful part: a request already being served gets to reach a defined
     /// outcome rather than having its socket torn out from under it.
     ///
+    /// # The endpoint is released on *every* exit path
+    ///
+    /// This used to clean up after the loop, which meant any `?` between the loop
+    /// and the cleanup returned first and left a stale socket file behind -- the
+    /// socket the next start then has to reason about. Releasing through a guard on
+    /// drop makes "the endpoint outlives the runtime" an invariant of the structure
+    /// rather than a property of control flow, so a future early return cannot
+    /// silently skip it.
+    ///
+    /// Cleanup cannot mask a failure: `Drop` runs during unwinding of the return
+    /// value, not instead of it, so the original [`IpcError`] is what the caller
+    /// receives.
+    ///
     /// # Errors
     ///
     /// [`IpcError`] if a connection failed. Individual request failures do **not**
     /// end the loop: they are answered and the peer is disconnected, because one
-    /// client sending nonsense is not a reason to take the daemon down.
+    /// client sending nonsense is not a reason to take the daemon down. A peer that
+    /// disappears mid-response is likewise not an error and is not reported as one.
     pub async fn serve(
         self,
         shutdown: impl std::future::Future<Output = ()>,
     ) -> Result<(), IpcError> {
         let listener = Arc::clone(&self.listener);
+        // Taken before the loop and released on every exit, including the `?`s below.
+        let _release = EndpointRelease {
+            listener: Arc::clone(&self.listener),
+            path: self.cleanup,
+        };
         tokio::pin!(shutdown);
 
         loop {
@@ -270,7 +289,9 @@ impl<S: SecretsContract> Runtime<S> {
                     // and handling them here means the loop cannot outlive `self`.
                     let served = handle_connection(&mut stream, &self.governed).await;
                     if let Err(IpcError::Disconnected) = served {
-                        // A client that opened and closed is not a failure.
+                        // A client that opened and closed is not a failure, and
+                        // neither is one that vanished while we were answering it.
+                        // Both are the same event seen from two ends of the socket.
                         continue;
                     }
                     served?;
@@ -278,17 +299,43 @@ impl<S: SecretsContract> Runtime<S> {
             }
         }
 
-        listener.close();
-        // Only now: the endpoint is removed after the loop stops accepting, so a
-        // client that connected before shutdown is never refused by a vanished path.
-        //
-        // Only ever removes the socket this runtime created. `bind` refuses a live
-        // endpoint rather than unlinking it, so reaching here means the path was
-        // ours and no other daemon is behind it.
-        if let Some(path) = self.cleanup {
-            let _ = std::fs::remove_file(path);
-        }
         Ok(())
+    }
+}
+
+/// Closes the listener and removes the endpoint this runtime created.
+///
+/// Held for the duration of [`Runtime::serve`] so the endpoint cannot outlive the
+/// runtime on any path, including an early return on a genuine transport error.
+///
+/// # Why the removal is still safe
+///
+/// The path here is not arbitrary: it is the endpoint [`Runtime::start`] successfully
+/// bound, and `orxnud_platform_ipc::bind` **refuses** a path another live daemon is
+/// listening on rather than unlinking it. So by the time a guard exists, the socket
+/// file is this runtime's own. Removing a file that has since been replaced by
+/// something else is the one case worth guarding against, and the check below does
+/// exactly that -- it unlinks only a socket file, and only at the recorded path.
+///
+/// A failure to remove is ignored on purpose: it is not the error the caller asked
+/// about, and inventing a second failure here would replace a real diagnosis with a
+/// cosmetic one.
+struct EndpointRelease {
+    listener: Arc<orxnud_platform_ipc::Listener>,
+    path: Option<PathBuf>,
+}
+
+impl Drop for EndpointRelease {
+    fn drop(&mut self) {
+        // Stop accepting before the path goes away, so a client that connected
+        // before shutdown is never refused by a vanished endpoint.
+        self.listener.close();
+        if let Some(path) = self.path.take() {
+            // The platform crate owns both the platform knowledge this needs and the
+            // ownership rule: it bound the path, and it is the only place that may
+            // unlink a socket file.
+            orxnud_platform_ipc::release_endpoint(&path);
+        }
     }
 }
 
@@ -623,5 +670,91 @@ mod tests {
                 .code,
             RpcErrorCode::METHOD_NOT_FOUND
         );
+    }
+
+    /// A current-thread runtime: these tests bind a socket and drive cleanup, and
+    /// none of them needs the parallelism a real serve loop would.
+    fn sync_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn the_endpoint_is_released_on_the_error_path_and_the_error_is_preserved() {
+        sync_rt().block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("orxnud-release-err-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let endpoint = dir.join("orxnud.sock");
+
+            let listener = Arc::new(orxnud_platform_ipc::bind(&endpoint).await.expect("bind"));
+            assert!(
+                endpoint.exists(),
+                "precondition: a real endpoint is bound at this path"
+            );
+
+            // The shape of `serve`'s early return, with the guard in the same scope
+            // `serve` builds it in. A genuine transport failure -- not a peer
+            // disappearing -- leaves the loop while the release guard is still live.
+            // Before the guard this was exactly the path that returned before the
+            // cleanup block and left a stale socket behind.
+            let outcome: Result<(), IpcError> = {
+                let _release = EndpointRelease {
+                    listener: Arc::clone(&listener),
+                    path: Some(endpoint.clone()),
+                };
+                Err(IpcError::Accept("a genuine accept failure".to_owned()))
+            };
+
+            // Cleanup must not become the error the caller sees.
+            assert!(
+                matches!(outcome, Err(IpcError::Accept(ref why)) if why.contains("genuine")),
+                "the original runtime error must survive the release: {outcome:?}"
+            );
+            assert!(
+                !endpoint.exists(),
+                "a fatal runtime error must not leave a stale endpoint behind"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn an_ordinary_shutdown_releases_the_endpoint_too() {
+        // The same guarantee on the happy path, so the error-path test above is
+        // asserting a property of the guard rather than a quirk of one branch.
+        sync_rt().block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("orxnud-release-ok-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let endpoint = dir.join("orxnud.sock");
+
+            let listener = Arc::new(orxnud_platform_ipc::bind(&endpoint).await.expect("bind"));
+            {
+                let _release = EndpointRelease {
+                    listener: Arc::clone(&listener),
+                    path: Some(endpoint.clone()),
+                };
+                assert!(endpoint.exists(), "precondition: still bound");
+            }
+            assert!(!endpoint.exists(), "shutdown must release the endpoint");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn the_release_guard_releases_nothing_when_there_is_no_endpoint() {
+        // `start` on a platform with no transport refuses, so `cleanup` is `None`
+        // there. The guard must tolerate that rather than panicking on a missing path.
+        sync_rt().block_on(async {
+            let _release = EndpointRelease {
+                listener: Arc::new(orxnud_platform_ipc::Listener::Unsupported),
+                path: None,
+            };
+        });
     }
 }
