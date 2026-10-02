@@ -70,6 +70,7 @@ pub mod region;
 pub mod repository;
 pub mod schedule_repo;
 pub mod schema;
+pub mod security_state;
 pub mod sqlite;
 pub mod task_repo;
 
@@ -77,6 +78,7 @@ pub use migration::{MIGRATIONS, Migration, MigrationError, MigrationRunner};
 pub use pragma::{Pragma, PragmaError};
 pub use region::{RegionRegistry, StateRegion, task_layer_regions};
 pub use repository::{Repository, RepositoryError, SchemaMeta};
+pub use security_state::{SqliteApprovalLedger, SqliteAuditJournal};
 pub use sqlite::{
     MIN_SQLITE_VERSION, SqliteVersion, Store, StoreError, open, verify_sqlite_version,
 };

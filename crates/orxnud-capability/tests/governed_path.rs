@@ -312,7 +312,14 @@ fn a_governed_tier1_dispatch_runs_a_sandboxed_subprocess() {
         "the helper's own PASS line is what verifies it, not the exit code: {:?}",
         outcome
     );
-    assert_eq!(d.audit_records(), 1, "the authorisation is audited");
+    // Authorisation before the call, terminal outcome after it: the pair a real
+    // execution produces. Counting only the authorisation would have hidden the
+    // terminal write, which is the point of asserting on the governed path.
+    assert_eq!(
+        d.audit_records(),
+        2,
+        "the authorisation and its terminal outcome are both audited"
+    );
 }
 
 #[test]

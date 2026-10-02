@@ -515,9 +515,14 @@ fn a_fresh_database_reaches_the_current_version_and_creates_only_the_task_schema
     assert_eq!(
         tables,
         vec![
+            // The durable security state: ADR-0027's control S33 journal, and TP-6's
+            // single-use ledger. Both were process-local until migration 6, so a
+            // fresh database now creates them alongside the task tables.
+            "audit_log",
             "schedule_fires",
             "schedules",
             "schema_meta",
+            "spent_approvals",
             "task_approvals",
             "task_attempts",
             "task_effects",

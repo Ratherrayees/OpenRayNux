@@ -916,6 +916,12 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
         now_ms: i64,
     ) -> Result<DispatchOutcome, DispatchError> {
         let capability = request.capability.clone();
+        // Kept for the terminal record in stage 9. `authorise_for_dispatch` takes
+        // them by value and returns only an invocation, so the journal would have
+        // to reconstruct them otherwise — and a reconstructed record does not
+        // correlate with the authorisation, which is the state TP-12 exists to
+        // make detectable.
+        let audit_subject = (request.clone(), actor.clone(), target.clone());
 
         // --- stages 1-4: AUTHORITY, POLICY, APPROVAL, BUDGET ---
         //
@@ -1083,20 +1089,45 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
 
         // --- stage 9: AUDIT / FINAL STATE ---
         //
-        // Stage 9's *authorisation* half is stage 1's `audit_pair`: policy wrote the
+        // The authorisation half was stage 1's `audit_pair`: policy wrote the
         // permit record, and a refusal record with the same correlation key, before
-        // this dispatcher saw a `Decision`. What remains is the terminal record, and
-        // it is written by the caller that owns the journal once it knows the
-        // execution and verification outcomes -- which is deliberately not this
-        // function, because only the caller knows whether the *task* may now be
-        // marked done. `decision` needs no second record: policy recorded the risk
-        // and the approval digest with it.
+        // this dispatcher saw a `Decision`. What remains is the terminal record,
+        // and it is written **here** rather than delegated.
+        //
+        // It used to be delegated "to the caller that owns the journal", on the
+        // reasoning that only the caller knows whether the *task* may now be marked
+        // done. That was correct about the task and wrong about the action: the
+        // caller does not exist, so the terminal record was never written, and an
+        // action that ran left a journal entry with no outcome — which
+        // `unresolved_authorisations` then reads as "outcome unknown", forever.
+        // A refusal to record is now a refusal to report success, which is what
+        // `DispatchError::Audit` has always claimed to mean.
         let outcome = DispatchOutcome {
             execution,
             verification,
             capability: capability.clone(),
         };
         let _ = decision;
+
+        let (audit_request, audit_actor, audit_target) = &audit_subject;
+        let risk = match &decision {
+            orxnud_policy::Decision::Allow { risk }
+            | orxnud_policy::Decision::Gate { risk, .. } => *risk,
+            orxnud_policy::Decision::Deny { .. } => orxnud_domain::enums::RiskClass::UNKNOWN,
+        };
+        let (kind, detail) = terminal_outcome(&outcome);
+        self.policy
+            .record_terminal(
+                audit_request,
+                audit_actor,
+                risk,
+                audit_target.as_deref(),
+                required_digest(&decision),
+                kind,
+                detail,
+                now_ms,
+            )
+            .map_err(|e| DispatchError::Audit(e.to_string()))?;
 
         if outcome.verification.is_refuted() {
             return Err(DispatchError::VerificationRefuted {
@@ -1108,6 +1139,31 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
         }
 
         Ok(outcome)
+    }
+}
+
+/// How a finished dispatch should be described in the journal.
+///
+/// # Why this is a function and not a field
+///
+/// The journal needs a decision that does not exist anywhere else: an execution
+/// that succeeded but was not verified is **not** a completed action, and an
+/// execution that never reported is **not** a failed one. Mapping those
+/// correctly once, here, is what stops stage 8's distinction from being lost on
+/// the way to the record.
+fn terminal_outcome(outcome: &DispatchOutcome) -> (orxnud_audit::OutcomeKind, Option<String>) {
+    use orxnud_audit::OutcomeKind;
+    match (&outcome.execution, outcome.verification.is_verified()) {
+        // Verified, or refused by policy after the fact.
+        (ExecutionOutcome::Succeeded { .. }, true) => (OutcomeKind::Completed, None),
+        // Succeeded but not verified: the effect may or may not have happened.
+        // This is TP-12's answer and it must not be recorded as `Completed`.
+        (ExecutionOutcome::Succeeded { .. }, false) => (
+            OutcomeKind::Uncertain,
+            Some("the adapter reported success but verification did not confirm it".to_owned()),
+        ),
+        (ExecutionOutcome::Failed { detail }, _) => (OutcomeKind::Failed, Some(redact(detail))),
+        (ExecutionOutcome::Unknown { detail }, _) => (OutcomeKind::Uncertain, Some(redact(detail))),
     }
 }
 

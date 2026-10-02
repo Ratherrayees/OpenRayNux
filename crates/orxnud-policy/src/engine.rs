@@ -1,7 +1,8 @@
 //! The engine: evaluate an action, and produce the only authorisation proof.
 
-use orxnud_audit::{AuditChain, AuditOutcome, OutcomeKind};
+use orxnud_audit::{AuditChain, AuditOutcome, OutcomeKind, RecordError};
 use orxnud_domain::ids::{CapabilityId, RequestId};
+use orxnud_domain::security_state::{ApprovalLedger, AuditJournal, InMemoryApprovals};
 use orxnud_domain::{
     ActionRequest, Actor, ApprovalRecord, AuthorisationProof, CapabilityInvocation, DataClass,
     InvocationContext, NormalizedParams, RiskClass,
@@ -12,6 +13,7 @@ use crate::decision::{Decision, DenialReason, PolicyError};
 use crate::digest::digest_for;
 use crate::policy_set::{GrantLookup, PolicySet};
 use crate::seal;
+use orxnud_domain::security_state::LedgerError;
 
 /// A capability's declared contract, as policy sees it.
 ///
@@ -55,23 +57,60 @@ impl CapabilityDeclaration {
 }
 
 /// The deterministic policy engine.
-#[derive(Debug)]
+///
+/// # The two durable pieces
+///
+/// [`Self::audit`] and [`Self::ledger`] are the only mutable security state, and
+/// both are ports: an [`AuditJournal`] that persists the chain and an
+/// [`ApprovalLedger`] that records which approvals are spent. The defaults are the
+/// in-memory implementations, which is what the unit tests use and what the engine
+/// did before durability existed — process-local, and **not** sufficient for a
+/// system that takes autonomous or delegated actions. [`Self::with_security_state`]
+/// attaches durable ones.
+///
+/// Attaching them is a builder rather than a constructor parameter so the fifteen
+/// existing `PolicyEngine::new` sites are untouched. There is still exactly one
+/// code path: `evaluate` asks [`ApprovalLedger::is_consumed`] and `authorise`
+/// calls [`ApprovalLedger::consume`] whichever implementation is attached, so
+/// there is no second set of rules to drift.
 pub struct PolicyEngine {
     policy: PolicySet,
     budget: BudgetLedger,
     capabilities: Vec<CapabilityDeclaration>,
     audit: AuditChain,
+    /// Where the chain is made durable, when durability is attached.
+    journal: Option<Box<dyn AuditJournal>>,
+    /// Which approval digests have been spent. Single-use is this port's contract.
+    ledger: Box<dyn ApprovalLedger>,
     policy_version: String,
-    /// Digests of approvals already honoured, so an approval is single-use (S6).
-    ///
-    /// A `BTreeSet` rather than a `HashSet`: the audit chain and policy output must be
-    /// reproducible across runs, and iteration order leaking into behaviour would make
-    /// a denial depend on hash seeds.
-    consumed_approvals: std::collections::BTreeSet<orxnud_domain::approval::ApprovalDigest>,
+}
+
+impl std::fmt::Debug for PolicyEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written: `Box<dyn ApprovalLedger>` and `Box<dyn AuditJournal>` have
+        // no `Debug`, and a derived one would print either nothing or whatever a
+        // backend chose to expose. Counts are both truthful and safe.
+        f.debug_struct("PolicyEngine")
+            .field("policy_version", &self.policy_version)
+            .field("capabilities", &self.capabilities.len())
+            .field("audit_records", &self.audit.len())
+            .field(
+                "durable_audit",
+                &self
+                    .journal
+                    .as_ref()
+                    .is_some_and(|j| j.len().map(|n| n > 0).unwrap_or(false)),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyEngine {
     /// Builds an engine that permits nothing.
+    ///
+    /// The audit chain and the approval ledger are in-memory. Use
+    /// [`Self::with_security_state`] before this engine is used by anything whose
+    /// decisions must outlive the process.
     #[must_use]
     pub fn new(policy: PolicySet, budget: BudgetLedger, policy_version: impl Into<String>) -> Self {
         Self {
@@ -79,9 +118,54 @@ impl PolicyEngine {
             budget,
             capabilities: Vec::new(),
             audit: AuditChain::new(),
+            journal: None,
+            ledger: Box::new(InMemoryApprovals::new()),
             policy_version: policy_version.into(),
-            consumed_approvals: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Attaches durable audit and approval storage.
+    ///
+    /// Both are ports from `orxnud-domain`; the SQLite implementations live in
+    /// `orxnud-store`. Nothing here invents policy — the attached objects only
+    /// answer "is this written" and "is this spent".
+    ///
+    /// The journal must already contain the history this engine is continuing.
+    /// Use [`Self::restore`] to load and verify it first: starting from an empty
+    /// chain while the journal holds records would produce a chain whose hashes do
+    /// not follow the ones already persisted, and the next append would be refused
+    /// rather than silently forking.
+    #[must_use]
+    pub fn with_security_state(
+        mut self,
+        journal: Box<dyn AuditJournal>,
+        ledger: Box<dyn ApprovalLedger>,
+    ) -> Self {
+        self.journal = Some(journal);
+        self.ledger = ledger;
+        self
+    }
+
+    /// Loads and verifies the durable audit journal into this engine's chain.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::AuditUnavailable`] if the journal could not be read, could
+    /// not be decoded, or **did not verify**. A corrupted journal is reported, not
+    /// repaired: an engine that silently corrected its own history would be
+    /// asserting something nobody can check.
+    pub fn restore(&mut self, journal: &dyn AuditJournal) -> Result<(), PolicyError> {
+        let chain = AuditChain::restore(journal)
+            .map_err(|e| PolicyError::AuditUnavailable(e.to_string()))?;
+        self.audit = chain;
+        self.journal = None;
+        Ok(())
+    }
+
+    /// Whether a durable journal is attached.
+    #[must_use]
+    pub fn is_audit_durable(&self) -> bool {
+        self.journal.is_some()
     }
 
     /// Registers a capability declaration.
@@ -95,20 +179,54 @@ impl PolicyEngine {
         &self.audit
     }
 
+    /// Appends one record, persisting it when a journal is attached.
+    ///
+    /// The single point every audit write goes through, so "every record is
+    /// durable" is one property rather than a habit. Fails closed: a journal that
+    /// refuses the write leaves the in-memory chain untouched.
+    fn record(&mut self, record: orxnud_audit::AuditRecord) -> Result<u64, PolicyError> {
+        let outcome = match &self.journal {
+            Some(j) => self.audit.record(record, j.as_ref()),
+            None => self.audit.append(record).map_err(RecordError::from),
+        };
+        outcome.map_err(|e| PolicyError::AuditUnavailable(e.to_string()))
+    }
+
     /// Marks an approval digest as spent.
     ///
     /// Called by [`Self::authorise`] when it permits a gated action. Exposed so a
     /// caller that obtains an approval through some other route — a UI approval
-    /// dialog, say — can record the consumption in the same place the decision reads
-    /// it, rather than in a second ledger that could drift.
-    pub fn consume_approval(&mut self, digest: orxnud_domain::approval::ApprovalDigest) {
-        self.consumed_approvals.insert(digest);
+    /// dialog, say — can record the consumption in the same place the decision
+    /// reads it, rather than in a second ledger that could drift.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::ApprovalLedgerUnavailable`] if the digest was already spent
+    /// or the ledger could not be written. Both mean "not consumed".
+    pub fn consume_approval(
+        &mut self,
+        digest: orxnud_domain::approval::ApprovalDigest,
+    ) -> Result<(), PolicyError> {
+        self.ledger
+            .consume(&digest)
+            .map_err(|e| PolicyError::ApprovalLedgerUnavailable(e.to_string()))
     }
 
     /// Whether an approval digest has already been spent.
-    #[must_use]
-    pub fn approval_is_consumed(&self, digest: &orxnud_domain::approval::ApprovalDigest) -> bool {
-        self.consumed_approvals.contains(digest)
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::ApprovalLedgerUnavailable`] if the ledger could not be read.
+    /// An unreadable ledger is not "not consumed": it is unknown, and a caller that
+    /// treated it as unspent would open the replay window single-use exists to
+    /// close.
+    pub fn approval_is_consumed(
+        &self,
+        digest: &orxnud_domain::approval::ApprovalDigest,
+    ) -> Result<bool, PolicyError> {
+        self.ledger
+            .is_consumed(digest)
+            .map_err(|e| PolicyError::ApprovalLedgerUnavailable(e.to_string()))
     }
 
     /// The policy version recorded in every audit record.
@@ -257,10 +375,21 @@ impl PolicyEngine {
             }
             // Single-use. See `DenialReason::ApprovalAlreadyUsed`: the digest proves
             // this is the approved operation, and this proves it has not already run.
-            if self.consumed_approvals.contains(&record.digest) {
-                return Ok(Decision::Deny {
-                    reason: DenialReason::ApprovalAlreadyUsed,
-                });
+            //
+            // An *unreadable* ledger is not the same as "not spent", so it is an
+            // error rather than a denial: `Unavailable` means we could not decide,
+            // and treating it as a denial would let a transient storage fault stand
+            // in for a policy answer.
+            match self.ledger.is_consumed(&record.digest) {
+                Err(e) => {
+                    return Err(PolicyError::ApprovalLedgerUnavailable(e.to_string()));
+                }
+                Ok(true) => {
+                    return Ok(Decision::Deny {
+                        reason: DenialReason::ApprovalAlreadyUsed,
+                    });
+                }
+                Ok(false) => {}
             }
             // An approval is honoured only for the human who gave it, so the
             // gate names that human rather than the delegating actor kind.
@@ -379,6 +508,14 @@ impl PolicyEngine {
         // does not go through `authorise_for_dispatch`. A replay or a retry is then
         // refused at the next decision (S6: single-use).
         //
+        // The burn is **atomic and durable**: the ledger's `consume` is one
+        // operation, so two concurrent dispatches presenting this digest produce
+        // one success and one `AlreadyConsumed`, never two successes. The race is
+        // not hypothetical and is not handled here: `evaluate` read the ledger a
+        // moment ago, and between that read and this write another writer can
+        // commit. That is why the answer comes from the write and not from the
+        // read.
+        //
         // WHEN the burn happens is a deliberate, recorded choice. It is *before*
         // execution, so a failure in capability resolution or credential acquisition
         // -- three stages later -- consumes an approval that produced no effect.
@@ -387,8 +524,31 @@ impl PolicyEngine {
         // dispatches could both pass the check before either burned it. Fail-closed
         // wins while the semantics are unspecified. V-43 records this for Phase 4/5,
         // where a reservation distinct from a consumption may be the better model.
-        if let Some(record) = approval {
-            self.consumed_approvals.insert(record.digest);
+        if let Some(record) = approval
+            && let Err(e) = self.ledger.consume(&record.digest)
+        {
+            // Lost the race, or the ledger is down. Either way this is not a permit,
+            // and the answer is a refusal carrying the reason it exists for.
+            let decision = Decision::Deny {
+                reason: match e {
+                    LedgerError::AlreadyConsumed => DenialReason::ApprovalAlreadyUsed,
+                    other => {
+                        return Err(PolicyError::ApprovalLedgerUnavailable(other.to_string()));
+                    }
+                },
+            };
+            // Record the refusal, so the journal shows an attempt that was turned
+            // away at the burn rather than one that never happened.
+            self.audit_pair(
+                &request,
+                &actor,
+                &risk,
+                target.as_deref(),
+                approval,
+                &decision,
+                now_ms,
+            )?;
+            return Ok(decision);
         }
 
         // --- 4. Charge, now that the decision is to proceed. ---
@@ -529,9 +689,7 @@ impl PolicyEngine {
             Some(request_id.clone()),
             now_ms,
         );
-        self.audit
-            .append(authorised)
-            .map_err(|e| PolicyError::AuditUnavailable(e.to_string()))?;
+        self.record(authorised)?;
 
         if let Decision::Deny { reason } = decision {
             let terminal = orxnud_audit::AuditRecord::authorised(
@@ -548,11 +706,60 @@ impl PolicyEngine {
                 now_ms,
             )
             .finished(OutcomeKind::Denied, now_ms, Some(reason.code().to_owned()));
-            self.audit
-                .append(terminal)
-                .map_err(|e| PolicyError::AuditUnavailable(e.to_string()))?;
+            self.record(terminal)?;
         }
         Ok(())
+    }
+
+    /// Writes the terminal record for an action this engine authorised.
+    ///
+    /// # Why the dispatcher asks policy to do it
+    ///
+    /// The pre-call authorisation record was written by [`Self::authorise`], and
+    /// it shares a correlation key with the terminal record because
+    /// [`orxnud_audit::AuditChain::unresolved_authorisations`] matches on that key:
+    /// a chain is append-only, so an outcome is a *separate* record, and it has to
+    /// be built from the same fields the authorisation was built from or the two
+    /// will not correlate.
+    ///
+    /// Those fields — policy version, effective class, assessed risk, the approval
+    /// digest policy demanded — live here. Asking the caller to reconstruct them
+    /// would make the correlation a convention, and a terminal record that fails
+    /// to correlate is an action the journal says has no outcome: the precise state
+    /// TP-12 exists to make detectable.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::AuditUnavailable`] if the record could not be persisted. The
+    /// caller must treat that as a **failed dispatch**, not a successful one with a
+    /// logging problem.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_terminal(
+        &mut self,
+        request: &ActionRequest,
+        actor: &Actor,
+        risk: RiskClass,
+        target: Option<&str>,
+        approval_digest: Option<orxnud_domain::approval::ApprovalDigest>,
+        outcome: OutcomeKind,
+        detail: Option<String>,
+        now_ms: i64,
+    ) -> Result<(), PolicyError> {
+        let terminal = orxnud_audit::AuditRecord::authorised(
+            actor.clone(),
+            request.capability.to_string(),
+            target.map(str::to_owned),
+            request.effective_class(),
+            risk,
+            self.policy_version.clone(),
+            approval_digest,
+            None,
+            Some(request.task.clone()),
+            Some(RequestId::new(correlation_of(request))),
+            now_ms,
+        )
+        .finished(outcome, now_ms, detail);
+        self.record(terminal).map(|_| ())
     }
 }
 
@@ -686,7 +893,7 @@ mod tests {
         )
         .expect("the first authorisation must succeed");
         assert!(
-            e.approval_is_consumed(&approval.digest),
+            e.approval_is_consumed(&approval.digest).expect("ledger"),
             "authorise must consume it"
         );
 

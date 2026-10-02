@@ -1078,6 +1078,7 @@ dependencies = [
  "orxnud-domain",
  "orxnud-platform-sandbox",
  "orxnud-policy",
+ "orxnud-store",
  "orxnud-task",
  "proptest",
  "serde",

@@ -23,6 +23,15 @@
 //! outcome **after**. There is no unlogged path. An entry whose outcome is
 //! absent means the process died between the two, which is exactly the
 //! "outcome unknown" case ADR-0029's TP-12 requires us to represent.
+//!
+//! # Durability
+//!
+//! [`AuditChain::record`] appends and persists in one step; [`AuditChain::restore`]
+//! rebuilds from the durable journal and verifies it. The chain owns the canonical
+//! form and the BLAKE3 algorithm; the journal stores bytes and never interprets
+//! them, so there is exactly one definition of the chain in this workspace.
+//!
+//! A journal that will not verify is **reported, never repaired**.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -30,7 +39,7 @@
 pub mod chain;
 pub mod record;
 
-pub use chain::{AuditChain, ChainError, GENESIS_HASH};
+pub use chain::{AuditChain, ChainError, GENESIS_HASH, RecordError};
 pub use record::{AuditOutcome, AuditRecord, OutcomeKind};
 
 #[cfg(test)]

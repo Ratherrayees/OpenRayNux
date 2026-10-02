@@ -71,6 +71,7 @@ use orxnud_domain::platform::SecretsContract;
 use orxnud_obs::TracingPlan;
 use orxnud_policy::PolicyEngine;
 use orxnud_store::Store;
+use orxnud_store::security_state::{SqliteApprovalLedger, SqliteAuditJournal};
 
 /// Where the daemon keeps its runtime state.
 ///
@@ -209,6 +210,20 @@ pub enum LifecycleError {
     /// A store could not be opened.
     #[error("the store could not be opened: {0}")]
     Store(String),
+
+    /// Durable security state could not be established.
+    ///
+    /// `what` names the mechanism and `reason` says what it answered, so a caller
+    /// can tell "the audit journal does not verify" from "the approval ledger is
+    /// unwritable" — one is a corrupted history, the other an outage, and they
+    /// want different responses.
+    #[error("could not establish {what}: {reason}")]
+    SecurityState {
+        /// Which mechanism.
+        what: &'static str,
+        /// What it answered.
+        reason: String,
+    },
 }
 
 /// What an instance lock holds.
@@ -569,6 +584,72 @@ impl Daemon {
     #[must_use]
     pub fn describe(&self) -> String {
         self.components.describe(self.audit_len())
+    }
+
+    /// Opens the durable audit journal and the spent-approval ledger, and makes
+    /// this daemon's policy engine use them.
+    ///
+    /// # Why this is separate from [`Self::compose`]
+    ///
+    /// `compose` opens nothing — a test asserts it — and these two adapters open a
+    /// SQLite file each. So durability is a *step* a caller takes once the state
+    /// root is known and the user has agreed to create it, not something that
+    /// happens as a side effect of building a struct.
+    ///
+    /// # What changes when this succeeds
+    ///
+    /// * Every audit record the governed path writes is persisted, so the journal
+    ///   survives the process and `restore` can verify it.
+    /// * An approval spent in this process stays spent in the next one. Before this,
+    ///   a restart returned every consumed approval to the pool, and the single-use
+    ///   guarantee held only for one process lifetime.
+    ///
+    /// # Refusals
+    ///
+    /// Fails without changing the engine if the database cannot be opened, or if
+    /// the existing journal **does not verify**. A corrupted audit history is
+    /// reported, never repaired and never appended to: continuing from an
+    /// unverified head would assert a chain nobody can check.
+    ///
+    /// # Errors
+    ///
+    /// [`LifecycleError::SecurityState`] naming what could not be established.
+    pub fn attach_durable_security_state(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), LifecycleError> {
+        let unavailable =
+            |what: &'static str, e: String| LifecycleError::SecurityState { what, reason: e };
+        let journal = SqliteAuditJournal::open(path)
+            .map_err(|e| unavailable("audit journal", e.to_string()))?;
+        self.policy
+            .restore(&journal)
+            .map_err(|e| unavailable("audit journal verification", e.to_string()))?;
+        let ledger = SqliteApprovalLedger::open(path)
+            .map_err(|e| unavailable("approval ledger", e.to_string()))?;
+        self.policy = std::mem::replace(
+            &mut self.policy,
+            // A placeholder is needed only because `with_security_state` consumes
+            // `self` and this method already holds a borrow. It is never observed:
+            // the real engine replaces it on the very next line, and if that line
+            // could not run we would already have returned.
+            PolicyEngine::new(
+                orxnud_policy::PolicySet::deny_all("daemon/1"),
+                orxnud_policy::BudgetLedger::empty(),
+                "daemon/1",
+            ),
+        )
+        .with_security_state(Box::new(journal), Box::new(ledger));
+        Ok(())
+    }
+
+    /// Whether the policy engine's audit records are persisted.
+    ///
+    /// `false` means the journal is in-memory and dies with the process, which is
+    /// correct for a test and wrong for a daemon that takes actions.
+    #[must_use]
+    pub fn has_durable_audit(&self) -> bool {
+        self.policy.is_audit_durable()
     }
 
     /// The policy engine, for inspection.

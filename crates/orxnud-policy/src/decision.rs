@@ -250,6 +250,16 @@ pub enum PolicyError {
     #[error("audit journal unavailable: {0}")]
     AuditUnavailable(String),
 
+    /// The approval ledger could not be read or written.
+    ///
+    /// Its own variant because it is **not** a denial. A denial is a policy answer
+    /// we can act on; an unreadable ledger means we could not determine whether an
+    /// approval was already spent, and the only safe response to that is to refuse
+    /// — but the two must never be logged as the same thing, because one is a
+    /// design decision and the other is an outage.
+    #[error("approval ledger unavailable: {0}")]
+    ApprovalLedgerUnavailable(String),
+
     /// A capability's declared schema could not be evaluated.
     #[error("capability schema invalid: {0}")]
     InvalidSchema(String),

@@ -286,6 +286,39 @@ CREATE TABLE IF NOT EXISTS schedule_fires (
 CREATE INDEX IF NOT EXISTS idx_schedule_fires_task ON schedule_fires (task_id);
 "#;
 
+/// Durable security state: the audit journal and the spent-approval ledger.
+///
+/// Two tables, and the constraints *are* the mechanisms:
+///
+/// * `audit_log` — `seq INTEGER PRIMARY KEY`. Two writers cannot claim one
+///   position, so a stale chain head fails loudly at insert rather than
+///   silently forking the journal. `record` holds the canonical bytes the chain
+///   hashed; `prev_hash` and `record_hash` are that computation's inputs and
+///   result, stored so a reload can re-verify without reimplementing BLAKE3
+///   chain assembly anywhere else.
+/// * `spent_approvals` — `digest BLOB PRIMARY KEY`. Single-use is then an
+///   `INSERT` that either lands once or fails with a uniqueness violation, which
+///   is atomic by construction. A `SELECT`-then-`INSERT` pair would not be.
+///
+/// `audit_log` carries no column for a secret: the record type has no field that
+/// could hold one, and `secret_ref` is a name.
+pub const MIGRATION_SECURITY_STATE: &str = r#"
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq         INTEGER NOT NULL PRIMARY KEY,
+    prev_hash   BLOB    NOT NULL,
+    record_hash BLOB    NOT NULL,
+    record      TEXT    NOT NULL,
+    CHECK (length(prev_hash) = 32),
+    CHECK (length(record_hash) = 32)
+);
+
+CREATE TABLE IF NOT EXISTS spent_approvals (
+    digest          BLOB    NOT NULL PRIMARY KEY,
+    consumed_at_ms  INTEGER NOT NULL,
+    CHECK (length(digest) = 32)
+);
+"#;
+
 /// The SQL for every Phase 2 migration, in the order it must be applied.
 ///
 /// Concatenated into [`crate::migration::MIGRATIONS`] at compile time so there is
@@ -295,6 +328,7 @@ pub const MIGRATION_SQL: &[(&str, &str)] = &[
     ("task_accounting", MIGRATION_ACCOUNTING),
     ("task_events", MIGRATION_EVENTS),
     ("schedules", MIGRATION_SCHEDULES),
+    ("security_state", MIGRATION_SECURITY_STATE),
 ];
 
 #[cfg(test)]
@@ -334,9 +368,17 @@ mod tests {
         // Named explicitly so a table added "just in case" fails this test.
         // `schema_meta` is added by the migration runner and so is absent here.
         let names = table_names(&migrated());
+        // Every name here is required by a decision already written down, and this
+        // test is what makes adding one a deliberate act rather than a side effect.
+        // `audit_log` and `spent_approvals` are the durable security state:
+        // ADR-0027's control S33 ("for every action the record answers five
+        // questions") and TP-6's single-use, which were previously both
+        // process-local and therefore only true for one process lifetime.
         let mut expected = vec![
+            "audit_log",
             "schedule_fires",
             "schedules",
+            "spent_approvals",
             "task_approvals",
             "task_attempts",
             "task_effects",
@@ -355,7 +397,7 @@ mod tests {
         for (_, sql) in MIGRATION_SQL {
             c.execute_batch(sql).expect("re-apply");
         }
-        assert_eq!(table_names(&c).len(), 7);
+        assert_eq!(table_names(&c).len(), 9);
     }
 
     #[test]

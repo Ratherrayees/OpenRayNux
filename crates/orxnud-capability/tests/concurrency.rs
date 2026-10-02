@@ -365,10 +365,26 @@ fn the_audit_chain_stays_linked_and_verifiable_across_many_dispatches() {
         .expect("dispatch");
     }
     let chain = engine.audit();
-    assert_eq!(chain.len(), 10, "one authorisation record per dispatch");
+    // Each dispatch now writes a *pair*: the authorisation policy recorded before
+    // the call, and the terminal record this function's stage 9 writes after it.
+    // Counting the whole chain and calling it "one record per dispatch" would hide
+    // the terminal write, which is the thing worth asserting.
+    let authorised = chain
+        .records()
+        .filter(|r| matches!(r.outcome, orxnud_audit::AuditOutcome::Authorised { .. }))
+        .count();
+    let terminal = chain.len() - authorised;
+    assert_eq!(authorised, 10, "one authorisation record per dispatch");
+    assert_eq!(terminal, 10, "one terminal record per dispatch");
     chain
         .verify()
         .expect("the hash chain must verify after many appends");
+    // And every authorisation must be resolved, or the journal is reporting
+    // "outcome unknown" for work that actually finished.
+    assert!(
+        chain.unresolved_authorisations().is_empty(),
+        "every dispatch recorded a terminal outcome"
+    );
     // Sequence numbers must be strictly increasing, which is what "causally linked"
     // means for an append-only chain.
     let seqs: Vec<u64> = chain.records().map(|r| r.seq).collect();

@@ -142,7 +142,7 @@ fn a_permitted_invocation_is_executed_and_verified() {
 }
 
 #[test]
-fn the_audit_chain_records_the_authorisation() {
+fn the_audit_chain_records_the_authorisation_and_the_terminal_outcome() {
     let mut engine = policy();
     let secrets = FakeSecrets::new();
     let mut d = dispatcher(
@@ -167,14 +167,72 @@ fn the_audit_chain_records_the_authorisation() {
     let chain = engine.audit();
     assert_eq!(
         chain.len(),
-        1,
-        "a permitted dispatch writes exactly one authorisation record; the terminal \
-         record is the caller's, because only the caller knows if the task is done"
+        2,
+        "a permitted dispatch writes an authorisation record and a terminal record"
     );
     assert!(chain.verify().is_ok(), "the hash chain must verify");
     let first = &chain.entries()[0];
     assert_eq!(first.capability, CAP);
     assert!(matches!(first.actor, Actor::Human { .. }));
+
+    // The terminal record is written by stage 9, before the outcome is returned, and
+    // it must resolve the authorisation. It previously was not written at all --
+    // deferred to "the caller that owns the journal", which did not exist -- so a
+    // completed action left the journal reporting its outcome as unknown.
+    let terminal = &chain.entries()[1];
+    assert!(
+        matches!(
+            terminal.outcome,
+            orxnud_audit::AuditOutcome::Finished { .. }
+        ),
+        "the second record is the terminal outcome"
+    );
+    assert_eq!(
+        terminal.correlation_key(),
+        first.correlation_key(),
+        "the terminal record must correlate with its authorisation, or the \
+         unresolved-authorisation detector will report a finished action as unknown"
+    );
+    assert!(
+        chain.unresolved_authorisations().is_empty(),
+        "a completed dispatch leaves nothing unresolved"
+    );
+}
+
+#[test]
+fn an_unverified_success_is_recorded_as_uncertain_rather_than_completed() {
+    // TP-12: an effect that was not confirmed must not be recorded as done. This is
+    // the case a `Ok(outcome)` return value alone would get wrong.
+    let mut engine = policy();
+    let secrets = FakeSecrets::new();
+    let mut d = dispatcher(
+        &mut engine,
+        &secrets,
+        bundles(Bundle::unverifiable(SuccessfulAdapter::new(CAP))),
+    );
+    d.dispatch(
+        request(),
+        human(),
+        context(),
+        Some("alice".into()),
+        params(),
+        None,
+        None,
+        NOW,
+    )
+    .expect("dispatch returned an outcome");
+
+    let chain = engine.audit();
+    let terminal = &chain.entries()[1];
+    let orxnud_audit::AuditOutcome::Finished { kind, .. } = &terminal.outcome else {
+        panic!("expected a terminal record, got {:?}", terminal.outcome);
+    };
+    assert_eq!(
+        *kind,
+        orxnud_audit::OutcomeKind::Uncertain,
+        "an adapter that reported success without confirmation must be recorded as \
+         uncertain, never as completed"
+    );
 }
 
 // ------------------------------------------------- stage 1: authority, first

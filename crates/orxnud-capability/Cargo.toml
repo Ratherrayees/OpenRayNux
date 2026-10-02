@@ -29,4 +29,10 @@ orxnud-platform-sandbox = { workspace = true }
 # would reverse the direction and gate G2 would fail with
 # "orxnud-task cannot reach orxnud-capability".
 orxnud-task = { workspace = true }
+# Dev-only, and inward: `orxnud-store` is layer 1 and this crate is layer 5. The
+# durability suite (`tests/durable_state.rs`) drives the real governed dispatcher
+# against a real migrated SQLite file, because proving that approval consumption and
+# the audit journal survive a restart is a property of the *joined* boundary and
+# cannot be observed from either crate's own tests.
+orxnud-store = { workspace = true }
 proptest = { workspace = true }

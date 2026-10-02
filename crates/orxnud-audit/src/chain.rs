@@ -6,10 +6,28 @@
 
 use blake3;
 
+use orxnud_domain::security_state::{AuditJournal, JournalEntry, JournalError};
+
 use crate::record::{AuditOutcome, AuditRecord};
 
 /// The hash the chain starts from, before any record.
 pub const GENESIS_HASH: [u8; 32] = [0u8; 32];
+
+/// A failure recording an entry durably.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    /// The entry could not be persisted.
+    ///
+    /// The in-memory chain is **unchanged**: a record that was not persisted is
+    /// not in the journal, and a chain that disagreed with the journal would be
+    /// worse than one that is short.
+    #[error("audit journal unavailable: {0}")]
+    Journal(#[from] JournalError),
+
+    /// The record's sequence number did not follow its predecessor.
+    #[error("{0}")]
+    Chain(#[from] ChainError),
+}
 
 /// A chain failure.
 #[derive(Debug, thiserror::Error)]
@@ -38,12 +56,25 @@ pub enum ChainError {
     },
 }
 
-/// An in-memory append-only hash chain.
+/// The append-only hash chain.
 ///
 /// The journal is append-only and unbounded by design; *retention* is a separate
 /// concern handled by rotation at the storage layer, because a chain whose
-/// entries are silently dropped is no longer verifiable. Phase 1 keeps the
-/// chain in memory because the storage layer it will persist through is Phase 2.
+/// entries are silently dropped is no longer verifiable.
+///
+/// # Durable, and who owns what
+///
+/// This type owns the canonical form and the chain algorithm, and **nothing else
+/// may**. [`record`](Self::record) computes a position, a link, and a hash, then
+/// hands the result to an [`AuditJournal`] to persist; [`restore`](Self::restore)
+/// reads them back and hands them to [`verify`](Self::verify). The journal stores
+/// bytes and never interprets them, so there is exactly one definition of the
+/// chain in this workspace.
+///
+/// [`append`](Self::append) remains the pure in-memory primitive. It is what the
+/// chain's own tests use, and it is correct — but it is not sufficient for a
+/// system that acts across process lifetimes, because a record it accepted would
+/// not survive the process. Production appends through [`record`](Self::record).
 #[derive(Debug, Clone, Default)]
 pub struct AuditChain {
     entries: Vec<(AuditRecord, [u8; 32])>,
@@ -122,6 +153,110 @@ impl AuditChain {
         let hash = Self::hash_of(&record, self.head());
         self.entries.push((record, hash));
         Ok(expected)
+    }
+
+    /// Rebuilds a chain from a durable journal, then verifies it.
+    ///
+    /// # What this refuses to do
+    ///
+    /// It does not repair. A hash mismatch, a broken link, or an out-of-order
+    /// sequence is returned to the caller as an error, because a corrupted
+    /// journal that was silently corrected is a corrupted journal nobody knows
+    /// about — which is the exact failure tamper-evidence exists to prevent.
+    ///
+    /// Verification runs the *existing* [`verify`](Self::verify), on the payloads
+    /// the chain itself hashed. Decoding a stored payload into a record is the one
+    /// thing done here that `verify` cannot do, and a payload that will not decode
+    /// is reported as [`JournalError::Undecodable`] rather than skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::Unavailable`] if storage could not be read,
+    /// [`JournalError::Undecodable`] if a payload is not a valid record, or a
+    /// [`ChainError`] if the reconstructed chain does not verify.
+    pub fn restore(journal: &dyn AuditJournal) -> Result<Self, RecordError> {
+        let stored = journal.entries()?;
+        let mut entries: Vec<(AuditRecord, [u8; 32])> = Vec::with_capacity(stored.len());
+        for e in stored {
+            let JournalEntry {
+                seq,
+                prev_hash,
+                hash,
+                payload,
+            } = e;
+            let text = String::from_utf8(payload).map_err(|e| JournalError::Undecodable {
+                seq,
+                reason: format!("payload is not UTF-8: {e}"),
+            })?;
+            let record: AuditRecord =
+                serde_json::from_str(&text).map_err(|e| JournalError::Undecodable {
+                    seq,
+                    reason: e.to_string(),
+                })?;
+            // The stored `prev_hash` is the link the chain computed, and `verify`
+            // re-derives it from the previous record. Disagreement between the
+            // two is corruption, so it is checked here rather than trusted.
+            if prev_hash != Self::link_before(&entries) {
+                return Err(RecordError::Chain(ChainError::BrokenLink { seq }));
+            }
+            entries.push((record, hash));
+        }
+        let chain = Self { entries };
+        chain.verify()?;
+        Ok(chain)
+    }
+
+    /// The hash the entry at `seq` must carry as its `prev_hash`.
+    fn link_before(entries: &[(AuditRecord, [u8; 32])]) -> [u8; 32] {
+        entries.last().map_or(GENESIS_HASH, |(_, h)| *h)
+    }
+
+    /// Appends a record and persists it.
+    ///
+    /// The only append a system that acts across process lifetimes should use.
+    /// Ordering is: compute, persist, then commit in memory.
+    ///
+    /// # Why that order
+    ///
+    /// Persisting first means a journal failure leaves the in-memory chain
+    /// untouched, so the two never disagree. The reverse order would leave a
+    /// record the chain believed in and the journal did not — and `verify` would
+    /// happily pass on it, because it only ever sees memory.
+    ///
+    /// # Errors
+    ///
+    /// [`RecordError::Chain`] if the caller supplied a `seq` that is not the next
+    /// one, in which case nothing is persisted; or [`RecordError::Journal`] if the
+    /// write failed, in which case nothing is persisted and nothing is held in
+    /// memory.
+    pub fn record(
+        &mut self,
+        mut record: AuditRecord,
+        journal: &dyn AuditJournal,
+    ) -> Result<u64, RecordError> {
+        let seq = self.entries.len() as u64;
+        if record.seq != 0 && record.seq != seq {
+            return Err(RecordError::Chain(ChainError::OutOfOrder {
+                expected: seq,
+                got: record.seq,
+            }));
+        }
+        record.seq = seq;
+        let prev = self.head();
+        let hash = Self::hash_of(&record, prev);
+        let payload = serde_json::to_vec(&record).map_err(|e| {
+            RecordError::Journal(JournalError::Unavailable(format!(
+                "record could not be serialised: {e}"
+            )))
+        })?;
+        journal.append(&JournalEntry {
+            seq,
+            prev_hash: prev,
+            hash,
+            payload,
+        })?;
+        self.entries.push((record, hash));
+        Ok(seq)
     }
 
     /// Re-verifies the whole chain.

@@ -37,6 +37,7 @@ pub mod ids;
 pub mod intent;
 pub mod invocation;
 pub mod platform;
+pub mod security_state;
 pub mod task_state;
 
 pub use actor::{Actor, AuthChannel, ModelProvenance, SystemComponent};
@@ -55,6 +56,9 @@ pub use invocation::{
     InvocationContext, PolicySeal,
 };
 pub use platform::{FsContract, NotificationRequest, NotifyContract, SecretRef, SecretsContract};
+pub use security_state::{
+    ApprovalLedger, AuditJournal, InMemoryApprovals, JournalEntry, JournalError, LedgerError,
+};
 pub use task_state::{MisfirePolicy, ScheduleFire, ScheduleSpec, TaskKind, TaskState, TaskStatus};
 
 /// Re-export of [`serde_json::json!`] so downstream crates and compile-fail

@@ -126,10 +126,15 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "schedules",
         sql: crate::schema::MIGRATION_SCHEDULES,
     },
+    Migration {
+        version: 6,
+        name: "security_state",
+        sql: crate::schema::MIGRATION_SECURITY_STATE,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Applies pending migrations.
 #[derive(Debug)]
@@ -365,9 +370,11 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "audit_log",
                 "schedule_fires",
                 "schedules",
                 "schema_meta",
+                "spent_approvals",
                 "task_approvals",
                 "task_attempts",
                 "task_effects",
