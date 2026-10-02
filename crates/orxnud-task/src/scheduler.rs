@@ -3,7 +3,7 @@
 //! # Occurrence arithmetic is not reimplemented here
 //!
 //! Enumeration and misfire resolution live in
-//! [`conformance::schedule::catch_up_plan`], which is where ADR-0029's TP-8 and
+//! [`crate::conformance::schedule::catch_up_plan`], which is where ADR-0029's TP-8 and
 //! TP-9 are stated and tested. This module *calls* it. A second implementation of
 //! DST and catch-up arithmetic would be two answers to the same correctness
 //! question, and they would disagree at exactly the edge cases that matter.
@@ -29,7 +29,7 @@
 //!
 //! ADR-0021 decision 3 specifies the catch-up window as **`(last_fired_at, now]`**
 //! — closed at the top, so an occurrence due exactly now does fire. The Phase 1
-//! harness's [`occurrences`] takes a window that is **open at both ends**, and
+//! harness's `occurrences` takes a window that is **open at both ends**, and
 //! pins that in its own test (`the_window_is_half_open`). Both are correct; they
 //! are windows with different conventions.
 //!

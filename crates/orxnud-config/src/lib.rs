@@ -27,10 +27,11 @@
 //! # Secrets never come from here
 //!
 //! Secret *references* may appear in config; secret *values* come from the
-//! platform secret store ([`SecretRef`]). [`ConfigValue::from_environment`]
-//! refuses to treat an environment variable as a secret store, because an
-//! environment variable is visible to every process of the same user and ends up
-//! in `ps` output and crash dumps.
+//! platform secret store ([`orxnud_domain::SecretRef`]). An environment variable must
+//! never be treated as that store, because an environment variable is visible to
+//! every process of the same user and ends up in `ps` output and crash dumps;
+//! `ConfigValue::from_environment`, which is the entry point expected to refuse
+//! that, does not exist in this crate.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

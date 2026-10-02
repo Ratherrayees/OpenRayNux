@@ -3,18 +3,18 @@
 //! # What this is
 //!
 //! An implementation of the ADR-0029 contract, backed by SQLite. It implements
-//! [`TaskEngine`](orxnud_task::conformance::properties::TaskEngine) — the trait
-//! the Phase 1 harness already defines — so the *unmodified* conformance suite is
-//! the acceptance criterion rather than a description of this code.
+//! [`TaskEngine`], the trait the Phase 1 harness already defines — so the
+//! *unmodified* conformance suite is the acceptance criterion rather than a
+//! description of this code.
 //!
 //! # What it deliberately is not
 //!
 //! There is no capability invocation here, and no `Actor`. Phase 2 makes the
 //! deterministic task layer operational; the adapter that eventually performs work
-//! is Phase 4, and it will receive a [`CapabilityInvocation`], which only
-//! `orxnud-policy` can construct. Putting one in the engine now would require
-//! either a policy call (a capability, and this crate may not enable one) or a
-//! bypass of the seal.
+//! is Phase 4, and it will receive a [`CapabilityInvocation`](orxnud_domain::CapabilityInvocation),
+//! which only `orxnud-policy` can construct. Putting one in the engine now would
+//! require either a policy call (a capability, and this crate may not enable one)
+//! or a bypass of the seal.
 //!
 //! Where actor attribution *does* belong — who authorised a schedule, which attempt
 //! ran — it is recorded as the actor's stable label, never as a reconstructed
@@ -32,7 +32,7 @@
 //! Nothing here reads the wall clock. `now_ms` is passed in, because TP-3, TP-4,
 //! TP-5, TP-8 and TP-9 are all time properties and a wall clock makes them
 //! untestable. A production caller passes
-//! [`crate::clock::SystemClock::now_ms`]; the conformance suite passes its own.
+//! [`crate::clock::NowMs::now_ms`]; the conformance suite passes its own.
 
 use rusqlite::Connection;
 

@@ -66,13 +66,14 @@ impl std::error::Error for StartupError {}
 
 /// A runtime failure of the task subsystem.
 ///
-/// # Why this exists instead of an eleventh [`EngineErrorKind`]
+/// # Why this exists instead of an eleventh [`EngineErrorKind`](orxnud_task::EngineErrorKind)
 ///
 /// "The service is shutting down" is a fact about the *daemon's* lifecycle, not
-/// about the task engine: [`EngineErrorKind`] is a closed taxonomy of things that
-/// can go wrong with a task, and each kind carries a retry decision. Shutdown has no
-/// retry decision — never retry — so folding it in as `Cancelled` would misreport a
-/// deliberate stop as a failure someone should act on, and as `Unavailable` it would
+/// about the task engine: [`EngineErrorKind`](orxnud_task::EngineErrorKind) is a
+/// closed taxonomy of things that can go wrong with a task, and each kind carries a
+/// retry decision. Shutdown has no retry decision — never retry — so folding it in
+/// as `Cancelled` would misreport a deliberate stop as a failure someone should act
+/// on, and as `Unavailable` it would
 /// suggest a dependency might come back. The engine's taxonomy stays closed; the
 /// lifecycle concern lives here.
 #[derive(Debug)]

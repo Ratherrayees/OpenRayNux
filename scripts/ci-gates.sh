@@ -24,10 +24,37 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Gates needing a tool this machine may lack. With CI set, a missing tool is a
-# failure; locally it is a visible skip. A silently skipped gate is worse than a
-# missing one, which is why skips are counted and printed.
-STRICT="${CI:-}"
+# Gates needing a tool this machine may lack. Under `is_strict` (below) a missing
+# tool is a failure; locally it is a visible skip. A silently skipped gate is worse
+# than a missing one, which is why skips are counted and printed.
+
+# Whether a value means "yes" in this script's environment.
+#
+# Empty, `0`, `false`, `no` and `off` mean no. Everything else means yes. Kept as
+# one function so the strict-mode decision has a single definition, and so it can
+# be *tested* — the previous version compared against a literal at six separate
+# sites, which is how it came to disagree with its own documentation.
+truthy() {
+    case "${1:-}" in
+        ''|0|false|no|off|FALSE|NO|OFF) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Whether a missing tool must fail the run rather than skip.
+#
+# The contract, in one place:
+#
+#   CI set to anything truthy           -> strict   (this is what CI sets)
+#   ORXNUD_STRICT set to anything truthy -> strict   (explicit local opt-in)
+#   anything else                        -> developer-friendly skips
+#
+# `CI=deny` remains strict, so the previously-documented explicit spelling still
+# works, and `CI=true` — which is what GitHub Actions actually sets — is strict
+# for the first time.
+is_strict() {
+    truthy "${ORXNUD_STRICT:-}" || truthy "${CI:-}"
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -354,7 +381,7 @@ gate_G4() {
 gate_G5() {
   banner G5
   if ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
-    if [ "$STRICT" = "deny" ]; then
+    if is_strict; then
       fail_gate "wasm32-unknown-unknown is not installed (rustup target add wasm32-unknown-unknown)"
     else
       note_skip "wasm32-unknown-unknown not installed"
@@ -426,7 +453,7 @@ gate_G7() {
 gate_G8() {
   banner G8
   if ! have cargo-deny; then
-    if [ "$STRICT" = "deny" ]; then
+    if is_strict; then
       fail_gate "cargo-deny is not installed (cargo install cargo-deny)"
     else
       note_skip "cargo-deny not installed"
@@ -461,7 +488,7 @@ gate_G9() {
     fi
     return
   fi
-  if [ "$STRICT" = "deny" ]; then
+  if is_strict; then
     fail_gate "cargo-nextest is not installed"
     return
   fi
@@ -522,7 +549,7 @@ gate_G11() {
     fi
     return
   fi
-  if [ "$STRICT" = "deny" ]; then
+  if is_strict; then
     fail_gate "cargo-audit is not installed"
   else
     note_skip "cargo-audit not installed"
@@ -548,7 +575,7 @@ gate_G12() {
     fi
     return
   fi
-  if [ "$STRICT" = "deny" ]; then
+  if is_strict; then
     fail_gate "cargo-semver-checks is not installed"
   else
     note_skip "cargo-semver-checks not installed"
@@ -573,7 +600,7 @@ main() {
   printf '\033[1mOpenRayNux Phase 1 gates\033[0m\n'
   printf 'rustc   %s\n' "$(rustc --version)"
   printf 'repo    %s\n' "$REPO_ROOT"
-  [ "$STRICT" = "deny" ] && printf 'strict  yes: a missing tool fails\n'
+  is_strict && printf 'strict  yes: a missing tool fails\n'
 
   local gate
   for gate in "${gates[@]}"; do
@@ -593,4 +620,8 @@ main() {
   [ ${#FAILED[@]} -eq 0 ]
 }
 
-main "$@"
+# Sourcing this file defines the gate functions and runs nothing, so the strict-mode
+# decision can be tested by `source scripts/ci-gates.sh` rather than by copying it.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

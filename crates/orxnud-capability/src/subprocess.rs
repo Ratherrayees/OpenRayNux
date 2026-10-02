@@ -28,7 +28,7 @@
 //!
 //! See [`crate::dispatch::ExecutionContract`]. A contract is logged and audited; a
 //! credential handle is neither. The handle is passed alongside, and reaches the child
-//! only through the mechanism [`stdin_credential`] describes.
+//! only through the mechanism `stdin_credential` describes.
 
 use std::sync::Arc;
 

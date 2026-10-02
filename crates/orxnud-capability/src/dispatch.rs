@@ -40,8 +40,9 @@
 //!
 //! # Reentrancy
 //!
-//! An adapter may not call back into the dispatcher. See
-//! [`Dispatcher::enter_guarded`] for why, and for what the bounded alternative is.
+//! An adapter may not call back into the dispatcher. `ReentrancyGuard` says why, and
+//! says why the bounded alternative — permitting reentrancy under a depth limit — was
+//! not taken. There is no `Dispatcher::enter_guarded` method in this crate.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -69,9 +70,11 @@ pub enum DispatchError {
 
     /// A Tier-1 capability could not be sandboxed, so nothing ran.
     ///
-    /// Distinct from [`Self::Execution`] and [`Self::Failed`] on purpose: nothing was
+    /// Distinct from [`Self::Execution`] and from a `Failed` on purpose: nothing was
     /// executed, so retrying the *capability* cannot help, and reporting it as an
-    /// execution failure would suggest the adapter ran and failed.
+    /// execution failure would suggest the adapter ran and failed. `DispatchError` has
+    /// no `Failed` variant; `Self::Execution` is the one that means the adapter ran and
+    /// failed.
     SandboxRefused(SandboxRefusal),
 
     /// The capability is declared but has no registered implementation.
@@ -429,9 +432,9 @@ pub struct ResourceBudget {
 /// The result a backend returns for a Tier-1 execution.
 ///
 /// `sandboxed` is not a field: a result that exists at all came from a sandbox, because
-/// [`Self::execute`] returning `Err` is how a refusal is expressed. A boolean would
-/// allow `Ok` with `sandboxed: false`, which is precisely the unsandboxed fallback this
-/// phase forbids.
+/// [`ExecutionBackend::execute`] returning `Err` is how a refusal is expressed. A
+/// boolean would allow `Ok` with `sandboxed: false`, which is precisely the unsandboxed
+/// fallback this phase forbids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionReport {
     /// Exit code, when the process ran and exited.

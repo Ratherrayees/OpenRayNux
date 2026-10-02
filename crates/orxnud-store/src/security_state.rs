@@ -41,11 +41,12 @@ use crate::pragma::Pragma;
 /// # Verifying what was loaded
 ///
 /// This type stores what the chain computed; it cannot check it. Verification is
-/// [`orxnud_audit::AuditChain::restore`]'s job, because the chain owns the
-/// hashing algorithm. Loading and verifying are separate steps on purpose: a
-/// corrupted journal must be *detected and reported*, not quietly repaired, and
-/// only the component that knows the algorithm can tell corruption from a
-/// legitimately empty journal.
+/// `orxnud_audit::AuditChain::restore`'s job, because the chain owns the
+/// hashing algorithm. It is written as plain code rather than a link on purpose:
+/// `orxnud-audit` depends on this crate, so this crate cannot name it. Loading
+/// and verifying are separate steps on purpose: a corrupted journal must be
+/// *detected and reported*, not quietly repaired, and only the component that
+/// knows the algorithm can tell corruption from a legitimately empty journal.
 #[derive(Debug)]
 pub struct SqliteAuditJournal {
     conn: Connection,

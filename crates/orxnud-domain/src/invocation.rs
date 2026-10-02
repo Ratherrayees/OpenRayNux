@@ -257,7 +257,7 @@ impl PolicySeal {
 /// any plan exists. Converting one into the other is a step of the authorisation
 /// pipeline, not a field copy.
 ///
-/// [`ActionRequest::authorise`] is not a method on this type precisely because
+/// [`CapabilityInvocation::authorise`] is not a method on this type precisely because
 /// authorisation needs an actor, a policy evaluation and a proof, none of which exist
 /// at ingress.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

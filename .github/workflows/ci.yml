@@ -83,9 +83,17 @@ jobs:
         run: ./scripts/ci-gates.sh
 
       - name: Build documentation
-        # Missing docs are denied in the crates, but `cargo doc` also catches
+        # Missing docs are denied in the crates, and `cargo doc` also catches
         # broken intra-doc links, which nothing else does.
+        #
+        # `-D warnings` is load-bearing. Without it `broken_intra_doc_links`
+        # defaults to *warn*, so this step exits 0 with any number of broken links
+        # and the check cannot fail -- which is the thing
+        # `scripts/ci-gates.sh`'s own header calls "a check that cannot fail is
+        # not a gate". Thirty broken links survived here before it was set.
         run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   windows-check:
     name: Windows cargo check (nightly)

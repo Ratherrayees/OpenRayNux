@@ -167,7 +167,7 @@ impl BwrapRunner {
     ///
     /// # Errors
     ///
-    /// As [`build_command`]: a relative program path is refused.
+    /// As `build_command`: a relative program path is refused.
     pub fn argv_for(spec: &SandboxSpec) -> Result<Vec<String>, SandboxUnavailable> {
         build_command(spec).map(|(argv, _)| argv)
     }

@@ -10,7 +10,7 @@
 //!
 //! [`RegionRegistry`] makes the answer a single lookup. Every region declares:
 //!
-//! * its [`StateClass`](orxnud_domain::StateClass),
+//! * its [`StateClass`],
 //! * its **single owner** — two writers to `critical` state would be a second
 //!   source of truth,
 //! * its consistency and retention,
@@ -81,8 +81,9 @@ impl RegionRegistry {
     /// # Errors
     ///
     /// [`RepositoryError::DuplicateRegion`] if the name is already taken, and
-    /// [`RepositoryError::InconsistentClass`] if a region's declared class
-    /// disagrees with the consistency it will actually be given.
+    /// `RepositoryError::InconsistentClass` if a region's declared class disagrees with
+    /// the consistency it will actually be given. That second variant does not exist on
+    /// `RepositoryError`, and this method makes no such check.
     pub fn declare(&mut self, region: StateRegion) -> Result<(), RepositoryError> {
         if self.regions.contains_key(region.name) {
             return Err(RepositoryError::DuplicateRegion { name: region.name });

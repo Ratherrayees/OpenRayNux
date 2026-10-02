@@ -213,7 +213,7 @@ impl Pragma {
     /// # Errors
     ///
     /// [`PragmaError::Apply`] on the first statement that fails, after the
-    /// journal-mode transition has exhausted [`JOURNAL_MODE_ATTEMPTS`] attempts.
+    /// journal-mode transition has exhausted `JOURNAL_MODE_ATTEMPTS` attempts.
     pub fn apply(self, conn: &Connection) -> Result<(), PragmaError> {
         for (name, sql) in self.statements() {
             if name == "journal_mode" {

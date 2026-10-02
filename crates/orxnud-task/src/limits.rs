@@ -10,7 +10,7 @@
 //!
 //! # Every bound here answers "what happens when this is exceeded?"
 //!
-//! * `max_concurrent_leases` — [`DurableEngine::can_claim`] returns false; a
+//! * `max_concurrent_leases` — [`EngineLimits::can_claim`] returns false; a
 //!   supervisor stops issuing claims. Never a queue that grows without limit.
 //! * `lease_duration_ms` — a lease expires and the task is reclaimable. Never a
 //!   task held forever.
@@ -40,7 +40,9 @@ pub struct EngineLimits {
 
     /// The maximum number of tasks that may hold a live lease at once.
     ///
-    /// Enforced by [`DurableEngine::can_claim`](crate::engine::DurableEngine::can_claim).
+    /// Enforced by [`EngineLimits::can_claim`], which
+    /// [`DurableEngine::claim_task_at`](crate::engine::DurableEngine::claim_task_at)
+    /// consults before every claim.
     /// A personal daemon's whole point is being light, so this is small.
     pub max_concurrent_leases: i64,
 

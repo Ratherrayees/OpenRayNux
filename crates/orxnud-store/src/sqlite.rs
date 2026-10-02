@@ -24,7 +24,7 @@ use crate::pragma::{Pragma, PragmaError};
 ///
 /// The encoded form of "3.51.3" is `3 * 1_000_000 + 51 * 1_000 + 3`.
 ///
-/// [`const_assert_min_sqlite`] is what turns this into a build failure rather
+/// `const_assert_min_sqlite` is what turns this into a build failure rather
 /// than a runtime surprise.
 pub const MIN_SQLITE_VERSION: i32 = 3 * 1_000_000 + 51 * 1_000 + 3;
 

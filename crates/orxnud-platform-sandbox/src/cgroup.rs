@@ -77,9 +77,10 @@ pub enum ResourceControl {
 ///
 /// # Why this is not a `String`
 ///
-/// Every variant here was measured on the Phase 4 host by writing the value and reading
-/// the kernel's answer back (see [`validate`]). The distinction matters because the two
-/// failure families demand opposite responses:
+/// Every variant here was measured on the Phase 4 host by writing the value and
+/// reading the kernel's answer back (see [`ResourceControl::validate`]). The
+/// distinction matters because the two failure families demand opposite
+/// responses:
 ///
 /// - [`Self::OutOfRange`] — **the request is wrong**. Refusing it is the whole point; a
 ///   caller that asked for a ceiling the kernel cannot express must be told so, not
@@ -94,7 +95,7 @@ pub enum ResourceControl {
 pub enum LimitInvalid {
     /// The value is well-formed but outside what the kernel accepts.
     ///
-    /// `cgroup v2` bounds, all measured rather than quoted (see [`validate`]):
+    /// `cgroup v2` bounds, all measured rather than quoted (see [`ResourceControl::validate`]):
     ///
     /// | Control | Accepted range |
     /// |---|---|

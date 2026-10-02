@@ -45,7 +45,8 @@ const PAGES_PER_STEP: i32 = 64;
 pub enum BackupError {
     /// The backup could not be written.
     ///
-    /// Holds `rusqlite::Error` directly rather than [`StoreError`]: `StoreError`
+    /// Holds `rusqlite::Error` directly rather than
+    /// [`StoreError`](crate::sqlite::StoreError): `StoreError`
     /// wraps `MigrationError`, which wraps this type, so wrapping it here would
     /// make the three infinitely sized.
     #[error("could not write the snapshot to {path}: {source}")]

@@ -7,9 +7,9 @@
 //! a SQL injection in a task engine is a privilege escalation, because the
 //! engine writes the audit table.
 //!
-//! [`Store::conn`] therefore stays `pub` (the Phase 2 engine lives in
-//! `orxnud-task` and needs it), but it is reachable only from within the
-//! workspace, and CI gate **G7** plus review are what watch it. [`Repository`]
+//! [`Store::conn`](crate::sqlite::Store::conn) therefore stays `pub` (the Phase 2
+//! engine lives in `orxnud-task` and needs it), but it is reachable only from within
+//! the workspace, and CI gate **G7** plus review are what watch it. [`Repository`]
 //! is the surface everything else uses.
 //!
 //! # The authority filter

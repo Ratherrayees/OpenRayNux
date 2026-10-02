@@ -487,7 +487,8 @@ impl<'a> TaskRepository<'a> {
     /// # Errors
     ///
     /// [`TaskRepoError::UnknownState`] if the stored state is unrecognised, or
-    /// [`TaskRepoError::CorruptRow`] if another column cannot be decoded.
+    /// `TaskRepoError::CorruptRow` if another column cannot be decoded. The variant is
+    /// spelled `TaskRepoError::Corrupt`; it carries a [`CorruptRowDetail`].
     pub fn get(&self, id: &TaskId) -> Result<Option<TaskRow>, TaskRepoError> {
         let sql = "SELECT id, kind, state, priority, attempts, max_attempts,
                           lease_expires_at_ms, lease_holder, idempotent, effect_observed,
@@ -692,8 +693,10 @@ impl<'a> TaskRepository<'a> {
     ///
     /// # Errors
     ///
-    /// Any SQLite error, or [`TaskRepoError::CorruptRow`] if the stored state is
-    /// unrecognisable.
+    /// Any SQLite error, or `TaskRepoError::CorruptRow` if the stored state is
+    /// unrecognisable. There is no `CorruptRow` variant: an unrecognisable stored
+    /// state is reported as [`TaskRepoError::UnknownState`], and a transition the
+    /// stored state cannot support is reported as `TaskRepoError::Corrupt`.
     pub fn complete(
         &mut self,
         id: &TaskId,
@@ -1169,7 +1172,8 @@ impl<'a> TaskRepository<'a> {
     ///
     /// # Errors
     ///
-    /// [`TaskRepoError::CorruptRow`] for a status outside the vocabulary.
+    /// `TaskRepoError::CorruptRow` for a status outside the vocabulary. There is no
+    /// `CorruptRow` variant; the error is reported as `TaskRepoError::Corrupt`.
     pub fn resolve_effect(
         &mut self,
         idempotency_key: &str,

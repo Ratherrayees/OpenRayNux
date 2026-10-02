@@ -60,7 +60,7 @@ impl CapabilityDeclaration {
 ///
 /// # The two durable pieces
 ///
-/// [`Self::audit`] and [`Self::ledger`] are the only mutable security state, and
+/// [`Self::audit`] and `Self::ledger` are the only mutable security state, and
 /// both are ports: an [`AuditJournal`] that persists the chain and an
 /// [`ApprovalLedger`] that records which approvals are spent. The defaults are the
 /// in-memory implementations, which is what the unit tests use and what the engine
@@ -586,8 +586,9 @@ impl PolicyEngine {
     /// [`Self::authorise`] builds the invocation and drops it on the floor, because
     /// Phase 1 had no dispatcher to hand one to. The dispatcher cannot build one
     /// itself: `CapabilityInvocation::authorise` demands *this crate's*
-    /// [`PolicySeal`], and gate G2 forbids any other crate from naming it. So the
-    /// only way an invocation can reach the dispatcher is for policy to hand it out
+    /// [`PolicySeal`](orxnud_domain::PolicySeal), and gate G2 forbids any other crate
+    /// from naming it. So the only way an invocation can reach the dispatcher is for
+    /// policy to hand it out
     /// — which is exactly the shape the boundary is supposed to have.
     ///
     /// The alternative — letting the dispatcher construct invocations — would move
