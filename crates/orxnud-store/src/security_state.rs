@@ -52,16 +52,14 @@ pub struct SqliteAuditJournal {
 }
 
 impl SqliteAuditJournal {
-    /// # Concurrency, and one honest limit
+    /// # Concurrency
     ///
     /// Two *adapters over one file* is the supported arrangement, and concurrent
-    /// writes through them are serialised by SQLite. Opening them *concurrently* is
-    /// not: `PRAGMA journal_mode = wal` needs an exclusive lock and the pragma is
-    /// applied before `busy_timeout` is set, so two threads calling this at the same
-    /// instant can race and one can see "database is locked".
-    ///
-    /// A composition root opens each adapter once, at startup, and that is fine. A
-    /// caller that genuinely opens these concurrently should open them in sequence.
+    /// writes through them are serialised by SQLite. Concurrent **opens** are also
+    /// supported: the journal-mode transition is retried with a re-read
+    /// ([`crate::pragma::Pragma::apply`]) and migrations run `BEGIN IMMEDIATE`, so
+    /// several processes opening one fresh database at the same instant all succeed.
+    /// See `concurrent_opens_of_one_database_all_succeed`.
     /// Opens the journal on an existing database file, applying any pending
     /// migration so a caller cannot read a table that does not exist yet.
     ///
@@ -225,8 +223,9 @@ impl SqliteApprovalLedger {
     ///
     /// # Concurrency
     ///
-    /// See [`SqliteAuditJournal::open`]: opening two adapters over one file
-    /// *concurrently* races on the `journal_mode` pragma. Open them in sequence.
+    /// Same as [`SqliteAuditJournal::open`]: concurrent opens of one database are
+    /// supported, and concurrent writes are serialised by the write lock plus
+    /// `BEGIN IMMEDIATE`.
     ///
     /// # Errors
     ///
@@ -553,5 +552,111 @@ mod tests {
         // And the last entry must be the one this module needs.
         let last = crate::migration::MIGRATIONS.last().expect("last");
         assert_eq!(last.name, "security_state");
+    }
+
+    #[test]
+    fn concurrent_opens_of_one_database_all_succeed() {
+        // The regression this file's `open` docs describe.
+        //
+        // `PRAGMA journal_mode = wal` needs an exclusive lock, and `busy_timeout` is
+        // what turns a lost race for that lock into a wait rather than an error. If
+        // the busy handler is not established *first*, two processes starting at once
+        // contend for the journal-mode transition with no handler, and one of them
+        // fails with "database is locked" -- which is a startup failure, not a busy
+        // condition, and is indistinguishable from a real problem in the log.
+        //
+        // No sleep is used, and none can be: the reproduction is the contention
+        // itself. Eight threads released together on a *fresh* path means eight
+        // simultaneous journal-mode transitions, and the first code path that
+        // established `journal_mode` before `busy_timeout` failed this.
+        let dir = db_path("concurrent-open");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state.db");
+
+        const N: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let db = db.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteAuditJournal::open(&db).map(|_| ())
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(
+            failures.is_empty(),
+            "every concurrent open must succeed; {} failed, first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+
+        // The shared database is still usable, and the chain is intact.
+        let journal = SqliteAuditJournal::open(&db).expect("reopen");
+        journal.append(&entry(0, [3u8; 32])).expect("append");
+        assert_eq!(journal.entries().expect("entries").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_opens_of_both_adapters_over_one_database_all_succeed() {
+        // The same race through the other adapter, and through both at once, because
+        // a daemon and a CLI subprocess would contend exactly this way.
+        let dir = db_path("concurrent-both");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db = dir.join("state.db");
+
+        const N: usize = 6;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let db = db.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // Both adapters are mapped to the same error shape, because the
+                    // point of the test is *that* the open succeeds, not which
+                    // adapter it was.
+                    if i % 2 == 0 {
+                        SqliteAuditJournal::open(&db)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    } else {
+                        SqliteApprovalLedger::open(&db)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(
+            failures.is_empty(),
+            "every concurrent open must succeed; {} failed, first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        // And both regions exist and work afterwards.
+        SqliteAuditJournal::open(&db)
+            .expect("journal afterwards")
+            .append(&entry(0, [4u8; 32]))
+            .expect("append afterwards");
+        SqliteApprovalLedger::open(&db)
+            .expect("ledger afterwards")
+            .consume(&digest(1))
+            .expect("consume afterwards");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

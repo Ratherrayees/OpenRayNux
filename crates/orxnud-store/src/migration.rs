@@ -195,13 +195,33 @@ impl<'a> MigrationRunner<'a> {
         let current = self.applied_version()?;
         let mut applied = Vec::new();
         for m in MIGRATIONS.iter().filter(|m| m.version > current) {
-            let tx =
-                self.conn
-                    .unchecked_transaction()
-                    .map_err(|source| MigrationError::Failed {
-                        version: m.version,
-                        source,
-                    })?;
+            // `IMMEDIATE`, never `DEFERRED`, and the reason is concurrency rather
+            // than discipline.
+            //
+            // `CREATE TABLE IF NOT EXISTS` must read the schema to decide whether the
+            // table exists before it writes. In a deferred transaction that read
+            // happens first, so a second connection writing in between leaves this
+            // one holding a stale snapshot, and the upgrade fails with
+            // `SQLITE_BUSY_SNAPSHOT` -- reported as "database is locked".
+            //
+            // `busy_timeout` does **not** rescue that case, because waiting cannot
+            // make a stale snapshot current. Two processes opening the same database
+            // at once therefore raced here even with the busy handler set, and the
+            // loser failed with a message that reads like a fault rather than a
+            // busy database.
+            //
+            // `IMMEDIATE` takes the write lock up front, so the migration either
+            // starts with a current view or waits for the writer to finish. Every
+            // statement is still `IF NOT EXISTS`, so the outcome does not depend on
+            // who wins: the schema is the same either way.
+            let tx = rusqlite::Transaction::new_unchecked(
+                self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|source| MigrationError::Failed {
+                version: m.version,
+                source,
+            })?;
             tx.execute_batch(m.sql)
                 .map_err(|source| MigrationError::Failed {
                     version: m.version,

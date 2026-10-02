@@ -25,6 +25,19 @@
 
 use rusqlite::Connection;
 
+/// Whether an error is SQLite reporting lock contention, rather than a fault.
+///
+/// The distinction matters because it is the only thing that makes a retry
+/// correct: retrying a misconfiguration sixteen times produces sixteen identical
+/// failures and hides the real cause.
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::DatabaseBusy
+            || f.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
 /// A pragma failure.
 #[derive(Debug, thiserror::Error)]
 pub enum PragmaError {
@@ -81,6 +94,14 @@ pub struct Pragma {
     pub cache_size_kib: i64,
 }
 
+/// How many times the journal-mode transition is retried before giving up.
+///
+/// Bounded, and the bound is small because the window is: the measured transition
+/// takes on the order of 100 microseconds, and a loser converges as soon as it
+/// re-reads the mode. This is a retry count, not a timeout — there is no sleeping
+/// anywhere in [`Pragma::apply`].
+const JOURNAL_MODE_ATTEMPTS: usize = 16;
+
 impl Pragma {
     /// The set for `critical` state: durable across power loss.
     #[must_use]
@@ -126,11 +147,25 @@ impl Pragma {
 
     /// The statements to apply, in order.
     ///
-    /// `journal_mode` first, because it is persistent and the others interact
-    /// with it.
+    /// **`busy_timeout` first**, and that ordering is load-bearing rather than
+    /// cosmetic. `PRAGMA journal_mode = wal` has to take an exclusive lock when it
+    /// performs the transition, and a `busy_timeout` set afterwards cannot help an
+    /// operation that has already failed. Two processes starting at once would then
+    /// contend for the transition with no busy handler and the loser would see
+    /// `database is locked` -- a *startup* failure, indistinguishable in a log from
+    /// a real fault.
+    ///
+    /// `journal_mode` comes second because it is persistent and the durability
+    /// settings below interact with it, so it must be in place before `synchronous`
+    /// and `cache_size`. `busy_timeout` is connection-local and interacts with
+    /// nothing, which is exactly why it can go first.
     #[must_use]
     pub fn statements(self) -> Vec<(&'static str, String)> {
         vec![
+            (
+                "busy_timeout",
+                format!("PRAGMA busy_timeout = {};", self.busy_timeout_ms),
+            ),
             (
                 "journal_mode",
                 format!("PRAGMA journal_mode = {};", self.journal_mode),
@@ -147,10 +182,6 @@ impl Pragma {
                 ),
             ),
             (
-                "busy_timeout",
-                format!("PRAGMA busy_timeout = {};", self.busy_timeout_ms),
-            ),
-            (
                 "cache_size",
                 format!("PRAGMA cache_size = {};", self.cache_size_kib),
             ),
@@ -159,15 +190,82 @@ impl Pragma {
 
     /// Applies every pragma.
     ///
+    /// # The journal-mode transition is retried, and why a busy handler is not enough
+    ///
+    /// `PRAGMA journal_mode = wal` takes an exclusive lock to perform the
+    /// transition, and it is *persistent, database-wide state*: every connection
+    /// wants the same value, so once one has done it the rest are no-ops. Two
+    /// processes opening the same fresh database at the same moment therefore
+    /// contend for a transition only one of them needs to perform.
+    ///
+    /// The surprising part, measured rather than assumed: `busy_timeout` does **not**
+    /// cover this. Holding the lock from another connection and attempting the
+    /// transition waits the full busy timeout and then fails — but eight threads
+    /// attempting it simultaneously fail in **168 microseconds**, with the busy
+    /// handler never invoked. So a busy handler cannot make the transition reliable
+    /// and this statement is handled separately.
+    ///
+    /// The retry is a loop of *attempt, then re-read*: a loser re-reads the mode,
+    /// finds the winner already set it, and is done. That converges as fast as the
+    /// winner takes, which is why the bound is 16 attempts rather than a timed wait.
+    /// It is bounded, it does not sleep, and it cannot loop forever.
+    ///
     /// # Errors
     ///
-    /// [`PragmaError::Apply`] on the first statement that fails.
+    /// [`PragmaError::Apply`] on the first statement that fails, after the
+    /// journal-mode transition has exhausted [`JOURNAL_MODE_ATTEMPTS`] attempts.
     pub fn apply(self, conn: &Connection) -> Result<(), PragmaError> {
         for (name, sql) in self.statements() {
+            if name == "journal_mode" {
+                self.apply_journal_mode(conn)?;
+                continue;
+            }
             conn.execute_batch(&sql)
                 .map_err(|source| PragmaError::Apply { name, source })?;
         }
         Ok(())
+    }
+
+    /// Applies the journal-mode transition, re-reading after each failed attempt.
+    ///
+    /// Split out because it is the one statement whose failure mode is *contention*
+    /// rather than *misconfiguration*, and it deserves to say so where it lives.
+    fn apply_journal_mode(self, conn: &Connection) -> Result<(), PragmaError> {
+        let sql = format!("PRAGMA journal_mode = {};", self.journal_mode);
+        let mismatch = |source: rusqlite::Error| PragmaError::Apply {
+            name: "journal_mode",
+            source,
+        };
+
+        for attempt in 1..=JOURNAL_MODE_ATTEMPTS {
+            match conn.execute_batch(&sql) {
+                Ok(()) => return Ok(()),
+                Err(source) => {
+                    // The transition is persistent, so a failure that is pure
+                    // contention is resolved by *looking* rather than by waiting:
+                    // whoever holds the lock is doing the work we wanted done, and
+                    // once they finish there is nothing left to do.
+                    if self.journal_mode_is(conn) {
+                        return Ok(());
+                    }
+                    // Not contention we can ride out — a genuine error. Retrying
+                    // would hide it behind sixteen identical failures.
+                    if !is_busy(&source) {
+                        return Err(mismatch(source));
+                    }
+                    if attempt == JOURNAL_MODE_ATTEMPTS {
+                        return Err(mismatch(source));
+                    }
+                }
+            }
+        }
+        unreachable!("the loop returns on the final attempt")
+    }
+
+    /// Reads the journal mode back, treating a read failure as "not yet".
+    fn journal_mode_is(self, conn: &Connection) -> bool {
+        conn.query_row("PRAGMA journal_mode;", [], |r| r.get::<_, String>(0))
+            .is_ok_and(|actual| actual.eq_ignore_ascii_case(self.journal_mode))
     }
 
     /// Reads every pragma back and compares it against what was set.
@@ -334,10 +432,43 @@ mod tests {
     }
 
     #[test]
-    fn statements_are_ordered_with_journal_mode_first() {
+    fn busy_timeout_is_applied_before_the_lock_taking_pragma() {
+        // The ordering that makes concurrent opens reliable. `journal_mode = wal`
+        // needs an exclusive lock to perform the transition; a busy handler set
+        // after that cannot rescue an operation that has already failed with
+        // `database is locked`.
         let st = Pragma::critical().statements();
-        assert_eq!(st[0].0, "journal_mode");
-        assert!(st.iter().any(|(n, _)| *n == "synchronous"));
+        let busy = st.iter().position(|(n, _)| *n == "busy_timeout");
+        let mode = st.iter().position(|(n, _)| *n == "journal_mode");
+        assert!(
+            busy.is_some() && mode.is_some(),
+            "both pragmas must be present: {st:?}"
+        );
+        assert!(
+            busy < mode,
+            "busy_timeout must precede journal_mode: {st:?}"
+        );
+        // And it must still be a real handler, not a fail-fast zero.
+        assert!(Pragma::critical().busy_timeout_ms > 0);
+    }
+
+    #[test]
+    fn every_pragma_is_still_applied_and_none_was_dropped_by_reordering() {
+        // Reordering must not lose a statement. The set is the contract; the order
+        // is the fix.
+        let st = Pragma::critical().statements();
+        let mut names: Vec<&str> = st.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "busy_timeout",
+                "cache_size",
+                "foreign_keys",
+                "journal_mode",
+                "synchronous",
+            ]
+        );
     }
 
     #[test]
@@ -347,8 +478,115 @@ mod tests {
     }
 
     #[test]
-    fn busy_timeout_is_configured_rather_than_failing_fast() {
-        // WAL can still return SQLITE_BUSY; a retry is the right response.
-        assert!(Pragma::critical().busy_timeout_ms > 0);
+    fn a_concurrent_journal_mode_transition_is_retried_until_it_is_satisfied() {
+        // The property `apply_journal_mode` exists for: several connections applying
+        // the pragma at once on a *fresh* database all end up with the mode set.
+        //
+        // Measured, not assumed: without the retry this fails in microseconds,
+        // because SQLite does not route the journal-mode transition through the busy
+        // handler. The contention is the reproduction -- no sleep manufactures it.
+        let dir = std::env::temp_dir().join(format!("orxnud-pragma-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("state.db");
+
+        const N: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).expect("open");
+                    barrier.wait();
+                    Pragma::critical().apply(&conn)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(
+            failures.is_empty(),
+            "every concurrent apply must succeed; {} failed, first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+
+        // And the database ended up in the state every caller asked for.
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        Pragma::critical()
+            .verify(&conn)
+            .expect("the pragma set took effect");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_journal_mode_retry_is_bounded_and_gates_on_busy() {
+        // The bound is what keeps the loop from being an unbounded poll. It is a
+        // constant, so it is checked at compile time rather than at runtime.
+        const {
+            assert!(JOURNAL_MODE_ATTEMPTS >= 2, "a retry of one is not a retry");
+            assert!(JOURNAL_MODE_ATTEMPTS <= 64, "the bound must stay small");
+        }
+
+        // `is_busy` is the gate that decides whether a failure is retried at all, so
+        // it is what distinguishes "wait for the winner" from "retry a
+        // misconfiguration sixteen times and hide it".
+        //
+        // Built from the raw SQLite codes rather than from `ErrorCode`, because
+        // `ffi::Error::new` is the direction that maps code -> code, and using it
+        // means these tests would still pass if either side of the comparison were
+        // renamed.
+        const SQLITE_BUSY: i32 = 5;
+        const SQLITE_LOCKED: i32 = 6;
+        let sqlite_err = |code: i32| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("locked".to_owned()),
+            )
+        };
+        assert!(
+            is_busy(&sqlite_err(SQLITE_BUSY)),
+            "SQLITE_BUSY is contention and must be retried"
+        );
+        assert!(
+            is_busy(&sqlite_err(SQLITE_LOCKED)),
+            "SQLITE_LOCKED is contention and must be retried"
+        );
+        assert!(
+            !is_busy(&sqlite_err(1)), // SQLITE_ERROR
+            "a non-lock SQLite error must not be retried"
+        );
+        assert!(!is_busy(&rusqlite::Error::InvalidQuery));
+        assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn a_journal_mode_that_is_not_a_mode_fails_on_its_own_terms() {
+        // A misconfiguration must surface as itself, not be retried into a generic
+        // "database is locked". This is the property that proves `is_busy` is doing
+        // the gating: if the loop retried everything, the same error would come back
+        // -- so what is asserted is that the error names the *mode*, never a lock.
+        let dir = std::env::temp_dir().join(format!("orxnud-pragma-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("state.db");
+        let conn = rusqlite::Connection::open(&path).expect("open");
+
+        let bogus = Pragma {
+            journal_mode: "definitely-not-a-journal-mode",
+            ..Pragma::critical()
+        };
+        let err = bogus.apply(&conn).expect_err("must refuse");
+        assert!(
+            !err.to_string().contains("locked"),
+            "a bad mode must not be reported as contention: {err}"
+        );
+        assert!(err.to_string().contains("journal_mode"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

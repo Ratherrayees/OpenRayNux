@@ -669,19 +669,17 @@ fn two_processes_racing_for_one_digest_produce_exactly_one_success() {
     std::fs::create_dir_all(&dir).expect("mkdir");
     let digest = orxnud_domain::ApprovalDigest::from_bytes([0xAB; 32]);
 
-    // Both connections are opened **before** the threads start. Opening races on the
-    // `journal_mode = wal` pragma, which needs an exclusive lock; that is a startup
-    // concern, not the single-use question this test asks. What races here is the
-    // `consume`.
-    let first = SqliteApprovalLedger::open(&db).expect("open a");
-    let second = SqliteApprovalLedger::open(&db).expect("open b");
-
     let barrier = Arc::new(std::sync::Barrier::new(2));
-    let handles: Vec<_> = [first, second]
-        .into_iter()
-        .map(|mut ledger| {
+    let handles: Vec<_> = (0..2u8)
+        .map(|_| {
+            let db = db.clone();
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
+                // Opened *concurrently*, which is the arrangement a daemon and a CLI
+                // subprocess would produce. What races here is the `consume`; what
+                // also has to survive is both opens contending for the journal-mode
+                // transition and the migrations on a fresh file.
+                let mut ledger = SqliteApprovalLedger::open(&db).expect("open");
                 barrier.wait();
                 ledger.consume(&digest)
             })
