@@ -1451,6 +1451,15 @@ mod tests {
         ScratchBase(dir)
     }
 
+    // Unix-gated with the helper it calls. `make_read_only` below is `#[cfg(unix)]`
+    // because POSIX mode bits are the only way this crate makes a directory
+    // unwritable, and this test is the helper's only caller -- so the caller has to
+    // carry the same gate or an MSVC `--all-targets` build fails to resolve the
+    // name. Gating the test rather than the helper is also the honest scope: the
+    // property under test is that a refused `memory.max` write leaves no cgroup
+    // directory behind, and there is no cgroup v2 hierarchy on Windows for that
+    // property to hold on. The Linux test is unchanged and still runs there.
+    #[cfg(unix)]
     #[test]
     fn a_failed_control_write_leaves_no_cgroup_behind() {
         // The leak, and the fix for it.

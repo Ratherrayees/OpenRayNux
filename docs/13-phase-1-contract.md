@@ -250,7 +250,7 @@ Phase 1 is complete when **all** hold, and not before:
 - [ ] A compile-fail test proves `Proposal` has no method reaching an adapter
 - [ ] `CapabilityInvocation` cannot be constructed outside `orxnud-policy`'s API
 - [ ] The ADR-0029 harness runs end-to-end against the reference queue fixture, with all 12 properties reported
-- [ ] Windows `cargo check` green on the nightly lane — **open**: blocked on this host by a missing MSVC C toolchain (`cc-rs: failed to find tool "lib.exe"`), not by a code defect. 7 of 14 crates check clean for MSVC today, including all three platform adapters. See register V-29.
+- [ ] Windows `cargo check` green on the nightly lane — **partly open (V-29)**: on this development host the six crates behind bundled SQLite are blocked by a missing MSVC C toolchain (`cc-rs: failed to find tool "lib.exe"`), not by a code defect, and no Rust-level error was observed in any of them. The other **9 of 15** crates — including all four platform adapters, `orxnud-domain`, `orxnud-protocol`, `orxnud-config`, `orxnud-obs` and `orxnuctl` — check clean for MSVC, and a second lane now runs the platform-neutral suites as tests rather than only compiling them. Windows *sandbox isolation* remains NOT PROVEN and is refused at runtime rather than degraded.
 - [ ] `cargo deny`, `cargo audit`, `cargo semver-checks` green; zero GPL/AGPL/NC
 - [ ] Repository `schema_meta` only; **no application tables**
 - [ ] **Zero capabilities enabled; zero features working**

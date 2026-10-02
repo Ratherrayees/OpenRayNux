@@ -37,6 +37,19 @@
 //! Guarantee 2 (`TreeLifetime`) is provided by the PID namespace, with `cgroup.kill` as a
 //! deliberate redundant backstop; see [`linux`].
 //! See ADR-0035.
+//!
+//! # Windows: refused, not degraded
+//!
+//! No Windows sandbox exists. Job Objects and AppContainer are unimplemented
+//! (verification register V-29), so [`platform::host_backend`] binds
+//! [`platform::UnsupportedRunner`] off Linux, which reports
+//! [`AvailableGuarantees::none`] and refuses every request.
+//!
+//! That is the honest outcome, and it is deliberate. A Windows runner that executed
+//! with weaker isolation would be an unsandboxed third-party subprocess, which
+//! ADR-0035 rules worse than no capability at all. So the portability work makes the
+//! absence **explicit and deterministic** — a Tier-1 capability is refused on Windows,
+//! visibly, rather than silently running without a sandbox.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -44,6 +57,7 @@
 pub mod cgroup;
 pub mod contract;
 pub mod linux;
+pub mod platform;
 
 pub use cgroup::{
     CgroupAvailability, CgroupV2, EnforcementEnvironment, LimitInvalid, ResourceControl,
@@ -54,3 +68,4 @@ pub use contract::{
     IsolationRequirements, NetworkPolicy, Resource, ResourceLimits, SandboxRunner, SandboxSpec,
     SandboxUnavailable, TreeLifetime, Visibility,
 };
+pub use platform::{UnsupportedRunner, host_backend, host_backend_mechanism, host_backend_name};

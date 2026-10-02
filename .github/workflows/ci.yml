@@ -1,14 +1,20 @@
 # OpenRayNux CI.
 #
-# # Two lanes, and why there are only two
+# # Two lanes on the PR path, and why
 #
 # * `pr` runs on every change. It is the lane that has to be fast enough that
 #   people do not batch commits to avoid it, so it does the full Linux gate set
 #   and nothing else.
-# * `windows-nightly` runs `cargo check` only, once a night. Full Windows test
+# * `windows-check` runs `cargo check` only, once a night. Full Windows test
 #   parity is deferred because the GUI arrives in Phase 6 and WebView2 needs a
 #   real Windows runner (docs-13 §5, ADR-0026). Checking nightly rather than per
 #   PR keeps Windows-specific breakage from blocking unrelated work.
+#
+# A third lane, `windows-portability`, runs the Windows *behaviour* tests for the
+# crates that are platform-neutral. It is PR-path because it is cheap and because
+# "the core is portable" is the architectural claim whose silent failure costs the
+# most (ADR-0026: a Linux-only CI with a "should work on Windows" claim is untested
+# and untrue). Its exclusions are enumerated in the job, with a reason each.
 #
 # # `CI: true` matters
 #
@@ -100,6 +106,62 @@ jobs:
       # here. Anything deeper arrives with the GUI (docs-13 §5).
       - name: cargo check for MSVC
         run: cargo check --workspace --all-targets
+
+  # A focused Windows *behaviour* lane, separate from the nightly check.
+  #
+  # # Why these crates and not the workspace
+  #
+  # Three groups are deliberately excluded, each for a stated reason rather than for
+  # convenience. A Windows job that quietly skips the hard parts is worse than no job.
+  #
+  # 1. `orxnud-platform-sandbox` integration tests, `orxnud-capability`'s
+  #    `governed_path`, and `orxnud-task`'s measurements are **Linux evidence**:
+  #    `bwrap`, `/bin/sh`, `/proc/self/fd`, `/usr/bin/python3`, `/proc/mounts`.
+  #    They compile for MSVC (`--all-targets` above proves it) and would measure
+  #    Linux kernel behaviour on a host that has none. Not applicable.
+  # 2. `orxnud-platform-secrets` needs a real credential store. Its tests are written
+  #    to tolerate either answer, so it is not *broken* here, but a Windows keyring
+  #    result is evidence that belongs in the verification register (V-29), not
+  #    something this lane may be the first to assert.
+  # 3. `orxnud-store` and everything above it (`task`, `policy`, `audit`,
+  #    `capability`, `daemon`) builds a bundled SQLite through `cl.exe`. It compiles
+  #    on this runner; running it would need the native tests to be proven portable
+  #    first, and they are not (see group 1).
+  #
+  # # What this lane does prove
+  #
+  # That the portable core, the configuration layer, the CLI, and the filesystem and
+  # notification adapters *behave* — not merely compile — on Windows. That is the claim
+  # V-29 needs, and `cargo check` cannot make it.
+  windows-portability:
+    name: Windows portability tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Portable-core and adapter tests
+        run: >-
+          cargo test
+          -p orxnud-domain
+          -p orxnud-protocol
+          -p orxnud-config
+          -p orxnud-obs
+          -p orxnuctl
+          -p orxnud-platform-fs
+          -p orxnud-platform-notify
+
+      # The platform dispatch itself: that a host without a sandbox backend refuses a
+      # Tier-1 execution, and that `SandboxSpec`'s default working directory is
+      # absolute on this platform. Both are platform-neutral assertions that a
+      # Windows host must also satisfy.
+      - name: Sandbox platform-dispatch tests
+        run: cargo test -p orxnud-platform-sandbox --lib
 
   # A dedicated lane for the portable-core claim, because it is the one gate whose
   # failure would invalidate an architectural claim rather than just a build.

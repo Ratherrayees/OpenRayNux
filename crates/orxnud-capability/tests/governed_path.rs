@@ -25,7 +25,7 @@ use orxnud_capability::dispatch::{
     AdapterBundle, CapabilityAdapter, DispatchError, ExecutionBackend, ExecutionContract,
     ExecutionReport, ExecutionTier, SandboxPlan, SandboxRefusal,
 };
-use orxnud_capability::subprocess::BwrapExecutionBackend;
+use orxnud_capability::subprocess::SandboxExecutionBackend;
 use orxnud_capability::verification::{
     ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
 };
@@ -250,7 +250,7 @@ impl Verifier for ReportVerifier {
 /// An execution backend that counts executions, so a refusal can be detected as
 /// "nothing ran" rather than inferred from timing.
 struct CountingBackend {
-    inner: Arc<BwrapExecutionBackend>,
+    inner: Arc<SandboxExecutionBackend>,
     calls: AtomicUsize,
     seen: Mutex<Vec<ExecutionContract>>,
 }
@@ -258,7 +258,7 @@ struct CountingBackend {
 impl CountingBackend {
     fn new() -> Self {
         Self {
-            inner: Arc::new(BwrapExecutionBackend::new()),
+            inner: Arc::new(SandboxExecutionBackend::new()),
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
         }
@@ -648,7 +648,7 @@ fn a_governed_filesystem_probe_is_denied() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -685,7 +685,7 @@ fn a_governed_network_probe_is_denied() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -719,7 +719,7 @@ fn a_governed_environment_probe_sees_no_secret() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -774,7 +774,7 @@ fn a_governed_descendant_spawn_is_contained() {
         }) as Arc<dyn AdapterBundle>,
     );
     let mut d2 = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
-        .with_execution(Arc::new(BwrapExecutionBackend::new()));
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     d2.dispatch(
         request(),
@@ -816,7 +816,7 @@ fn a_governed_hang_is_stopped_at_the_deadline() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let started = std::time::Instant::now();
     let outcome = d2
@@ -857,7 +857,7 @@ fn a_governed_flood_is_bounded() {
     let secrets = FakeSecrets::new();
     let mut d2 =
         orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -1189,7 +1189,7 @@ mod v46 {
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
         let (watcher, stop, _base) = watch(25, MY_CEILING);
         let outcome = d
             .dispatch(
@@ -1252,7 +1252,7 @@ mod v46 {
     #[test]
     fn a_required_control_with_no_budget_is_refused_before_execution() {
         let runs = Arc::new(AtomicUsize::new(0));
-        let backend = BwrapExecutionBackend::with_runner(Arc::new(UndelegatedRunner {
+        let backend = SandboxExecutionBackend::with_runner(Arc::new(UndelegatedRunner {
             inner: Arc::new(orxnud_platform_sandbox::linux::BwrapRunner::new()),
             runs: Arc::clone(&runs),
         }));
@@ -1358,7 +1358,7 @@ mod v46 {
     #[test]
     fn a_required_control_the_host_cannot_provide_refuses_without_spawning() {
         let runs = Arc::new(AtomicUsize::new(0));
-        let backend = BwrapExecutionBackend::with_runner(Arc::new(UndelegatedRunner {
+        let backend = SandboxExecutionBackend::with_runner(Arc::new(UndelegatedRunner {
             inner: Arc::new(orxnud_platform_sandbox::linux::BwrapRunner::new()),
             runs: Arc::clone(&runs),
         }));
@@ -1480,7 +1480,7 @@ mod v46 {
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
         let (watcher, stop, base) = watch(30, "268435456");
         let outcome = d
@@ -1591,7 +1591,7 @@ mod v46 {
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
         let (watcher, stop, _base) = watch(25, mine);
         let outcome = d
@@ -1745,7 +1745,7 @@ mod v46 {
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
         let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
-            .with_execution(Arc::new(BwrapExecutionBackend::new()));
+            .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
         let (watcher, stop, _base) = watch(25, mine);
         let outcome = d
@@ -1810,7 +1810,7 @@ mod v46 {
     #[test]
     fn an_unexpressible_budget_is_refused_before_any_cgroup_or_process_exists() {
         for (label, resources) in unexpressible_budgets() {
-            let backend = Arc::new(BwrapExecutionBackend::new());
+            let backend = Arc::new(SandboxExecutionBackend::new());
             let id = cap();
             let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
             m.insert(id.clone(), bundle(resources.clone()));

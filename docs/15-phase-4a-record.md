@@ -168,7 +168,7 @@ the threads are abandoned and the output reported as truncated.
 | Process-tree containment | **PROVEN** |
 | OS-enforced memory/CPU/PID ceilings | **NOT PROVEN** — refused, V-46 |
 | Credential non-leakage | **PROVEN** |
-| Windows isolation | **NOT PROVEN** — no code written, V-29 |
+| Windows isolation | **NOT PROVEN** — no backend written; a Tier-1 execution is *refused* on Windows rather than degraded, V-29 |
 | Cloud sandboxing | **NOT IMPLEMENTED** — documented only |
 
 ---
