@@ -98,6 +98,16 @@ fn hostile_helper_entry_point() {
         "cred-path-probe" => cred_path_probe(),
         // --- process -------------------------------------------------------
         "spawn-descendant" => spawn_descendant(),
+        "descendant-hang" => {
+            // A detached, signal-ignoring descendant plus a parent that never returns.
+            // The combination is the only way to exercise a *timeout* while a descendant
+            // is still alive: `spawn-descendant` returns immediately, so the sandbox exits
+            // before any kill path is reached.
+            let r = spawn_descendant();
+            emit(&r);
+            hang();
+            unreachable!("hang never returns")
+        }
         "hang" => {
             hang();
             unreachable!("hang never returns")
@@ -113,6 +123,8 @@ fn hostile_helper_entry_point() {
             Report::pass("stderr written")
         }
         "fd-scan" => fd_scan(),
+        "mem-hog" => mem_hog(owned(1).parse().ok()),
+        "fork-many" => fork_many(owned(1).parse().unwrap_or(8)),
         "malformed" => {
             // Not valid JSON, not the declared schema. A supervisor must classify this
             // as a bad result rather than parsing it into something plausible.
@@ -330,6 +342,73 @@ fn hang() -> Report {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
+}
+
+/// Allocates and *touches* memory up to a fixed, small bound.
+///
+/// # Bounded on purpose
+///
+/// This helper was originally unbounded: it allocated until the allocator refused,
+/// reasoning that a `memory.max` ceiling would always stop it first. That reasoning is
+/// exactly what a mutation invalidates. Two mutation experiments that removed the cgroup
+/// turned this into a whole-machine allocation and drove the host into swap exhaustion,
+/// freezing the machine both times.
+///
+/// So the workload bounds itself at [`TOUCH_BUDGET_MIB`] -- small enough that running it
+/// unenforced costs a rounding error, and large enough to press a tiny ceiling so the
+/// kernel's refusal accounting becomes visible in `memory.events`.
+///
+/// The touching is what makes it meaningful: `vec![0u8; n]` can be satisfied by untouched
+/// zero pages, so a helper that merely allocated would appear to succeed inside a ceiling
+/// that is working perfectly.
+const TOUCH_BUDGET_MIB: u64 = 64;
+
+/// Allocates and touches `TOUCH_BUDGET_MIB`, reporting how far it got.
+///
+/// Reports rather than panics, and does not loop until refused. Enforcement is read from
+/// the cgroup's `memory.events`, not from this helper's exit status: `memory.max` may
+/// refuse, reclaim, or OOM-kill, and a killed helper cannot report anything. Demanding a
+/// specific outcome here would demand a specific mechanism rather than a correct one.
+fn mem_hog(target_mib: Option<u64>) -> Report {
+    let target = target_mib.unwrap_or(TOUCH_BUDGET_MIB).min(TOUCH_BUDGET_MIB);
+    // Pages are *retained*, not dropped each iteration. An earlier version allocated and
+    // discarded inside the loop, so peak resident usage was ~1 MiB and a 16 MiB ceiling was
+    // never pressed at all -- the workload passed under a ceiling it never met, which is
+    // the same vacuity as no enforcement at all.
+    let mut held: Vec<Vec<u8>> = Vec::with_capacity(target as usize);
+    for n in 0..target {
+        let mut page = vec![0u8; 1024 * 1024];
+        // Touch every 4 KiB so the pages are resident and actually charged.
+        for i in (0..page.len()).step_by(4096) {
+            page[i] = (n % 251) as u8;
+        }
+        held.push(page);
+    }
+    let touched = held.len() as u64;
+    // Keep them alive until here so the peak is observable.
+    std::hint::black_box(&held);
+    Report::pass(format!("touched {touched} MiB"))
+}
+
+/// Forks `count` children that outlive this process, bounded.
+///
+/// Used through the governed path to prove that a PID ceiling is enforced by the kernel
+/// rather than by the helper's own restraint.
+fn fork_many(count: u64) -> Report {
+    let mut spawned = 0u64;
+    for _ in 0..count {
+        match std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => spawned += 1,
+            // The ceiling is enforced; further forks are refused.
+            Err(_) => break,
+        }
+    }
+    Report::pass(format!("spawned {spawned} of {count}"))
 }
 
 fn flood(bytes: Option<usize>) -> Report {

@@ -637,3 +637,99 @@ fn concurrent_discovery_never_reports_a_false_negative() {
 fn expected_base() -> std::path::PathBuf {
     CgroupV2::discover().base.clone()
 }
+
+// --------------------------------------------------------------- concurrency
+
+/// Two concurrent executions must get different cgroups, different limits, and neither
+/// may delete the other.
+///
+/// The property under test is not "concurrency works" but the specific hazard the brief
+/// names: two executions sharing one cgroup would share limits, so one capability could
+/// exhaust another's memory, and one execution's cleanup would `rmdir` a directory the
+/// other was still running in. The second failure is silent and severe — the kernel
+/// releases a cgroup's resources when it is removed, so an in-flight execution would lose
+/// its limits with no error anywhere.
+///
+/// Each thread requests a *distinct* ceiling and asserts it read back from its own
+/// directory. A shared cgroup cannot satisfy both, so this fails rather than passing
+/// quietly if paths are ever derived from a shared name.
+#[test]
+fn concurrent_executions_never_share_a_cgroup() {
+    let cg = CgroupV2::discover();
+    if !cg.availability.can_create {
+        println!("  no creatable base here; nothing to share or not");
+        return;
+    }
+
+    const THREADS: usize = 6;
+    // Distinct, page-aligned, and far enough apart that a mix-up is unambiguous.
+    let ceilings: Vec<u64> = (0..THREADS)
+        .map(|i| (32 + i as u64) * 1024 * 1024)
+        .collect();
+
+    let owned: Vec<CgroupV2> = std::thread::scope(|s| {
+        let handles: Vec<_> = ceilings
+            .iter()
+            .map(|bytes| {
+                let probe = CgroupV2::discover();
+                s.spawn(move || {
+                    let cgroup = probe
+                        .create("concurrent", &[ResourceControl::Memory { bytes: *bytes }])
+                        .expect("a delegated host must satisfy this");
+                    // Read back while every other thread is still working: this is the
+                    // window in which a shared path would show its damage.
+                    let observed =
+                        std::fs::read_to_string(cgroup.path.join("memory.max")).unwrap_or_default();
+                    assert_eq!(
+                        observed.trim(),
+                        bytes.to_string(),
+                        "a cgroup must carry the ceiling its own execution asked for"
+                    );
+                    // Hold it briefly so the peers genuinely overlap.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    cgroup
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("no thread may panic"))
+            .collect()
+    });
+
+    let paths: Vec<std::path::PathBuf> = owned.iter().map(|c| c.path.clone()).collect();
+    let unique: std::collections::BTreeSet<_> = paths.iter().collect();
+    assert_eq!(
+        unique.len(),
+        paths.len(),
+        "concurrent executions shared a cgroup: {paths:?}"
+    );
+    // And each is strictly below the base, so nothing was placed in the shared parent.
+    for p in &paths {
+        assert!(
+            p != &cg.base && p.starts_with(&cg.base),
+            "{p:?} is not strictly below {:?}",
+            cg.base
+        );
+    }
+    assert!(
+        owned.iter().all(|c| c.is_dedicated_child()),
+        "every execution cgroup must be a dedicated child: {:?}",
+        paths
+    );
+
+    // Cleanup is idempotent and per-owner, which is what makes concurrency safe: removing
+    // all of them while holding every handle alive first is the check. If `remove` touched
+    // anything but its own directory, a later removal would fail or a still-live peer's
+    // limits would disappear -- silently, because the kernel releases a cgroup's
+    // accounting when the directory goes away.
+    for cgroup in &owned {
+        assert!(cgroup.path.exists(), "still held before cleanup");
+    }
+    for cgroup in owned {
+        cgroup.remove();
+    }
+    for p in &paths {
+        assert!(!p.exists(), "{p:?} must be gone after its owner's removal");
+    }
+}

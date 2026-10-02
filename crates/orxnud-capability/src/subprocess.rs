@@ -161,6 +161,18 @@ fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal>
         .with_deadline(std::time::Duration::from_millis(contract.deadline_ms))
         .with_output_cap(contract.output_cap_bytes);
 
+    // The contract's budget becomes the spec's portable limits. No cgroup path, no
+    // controller name, no kernel API crosses this boundary: the capability layer states
+    // what it needs, and the platform decides how (or whether) to provide it.
+    //
+    // A required control with no budget is *not* filled in here. The backend enforces
+    // policy; it does not create it. `ResourcePolicy::validate` has already refused that
+    // case before the contract was built, so a `None` reaching this point would be a bug
+    // rather than a policy decision.
+    spec.limits.memory_bytes = contract.resources.budget.memory_bytes;
+    spec.limits.max_processes = contract.resources.budget.processes;
+    spec.limits.cpu_cores = contract.resources.budget.cpu_cores;
+
     // Containment is always required; it is what the sandbox *is*.
     spec.requires.tree_lifetime = TreeLifetime::Required;
 

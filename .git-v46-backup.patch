@@ -1,0 +1,1279 @@
+diff --git a/crates/orxnud-capability/src/subprocess.rs b/crates/orxnud-capability/src/subprocess.rs
+index 2952742..2a697d9 100644
+--- a/crates/orxnud-capability/src/subprocess.rs
++++ b/crates/orxnud-capability/src/subprocess.rs
+@@ -30,7 +30,8 @@ use orxnud_platform_sandbox::contract::{
+ use orxnud_platform_sandbox::linux::BwrapRunner;
+ 
+ use crate::dispatch::{
+-    ExecutionBackend, ExecutionContract, ExecutionOutcomeKind, ExecutionReport, SandboxRefusal,
++    ExecutionBackend, ExecutionContract, ExecutionOutcomeKind, ExecutionReport,
++    ResourceRequirement, SandboxRefusal,
+ };
+ 
+ /// The environment variable the backend uses to pass a credential to a Tier-1 child.
+@@ -61,6 +62,11 @@ use crate::dispatch::{
+ ///    manifest cannot ask for a variable the dispatcher would refuse to set.
+ pub const CREDENTIAL_ENV: &str = "ORXNUD_TIER1_CREDENTIAL";
+ 
++/// Applied when a capability requires a control but names no budget for it.
++const DEFAULT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
++const DEFAULT_PROCESSES: u64 = 64;
++const DEFAULT_CPU_CORES: f64 = 1.0;
++
+ /// An [`ExecutionBackend`] over a real Linux sandbox.
+ ///
+ /// Holds an `Arc` rather than borrowing, because the dispatcher outlives a single
+@@ -135,6 +141,33 @@ fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal>
+         .with_deadline(std::time::Duration::from_millis(contract.deadline_ms))
+         .with_output_cap(contract.output_cap_bytes);
+ 
++    // The contract's budget becomes the spec's portable limits. No cgroup path, no
++    // controller name, no kernel API crosses this boundary: the capability layer states
++    // what it needs, and the platform decides how (or whether) to provide it.
++    spec.limits.memory_bytes = contract.resources.budget.memory_bytes;
++    spec.limits.max_processes = contract.resources.budget.processes;
++    spec.limits.cpu_cores = contract.resources.budget.cpu_cores;
++
++    // A *required* control with no budget value still has to produce a ceiling, or the
++    // platform would have nothing to write and the execution would run unconstrained
++    // while the contract claimed the control was required. Defaults are therefore
++    // applied per required control, and deliberately generous rather than tight: this
++    // closes the hole without surprising a legitimate capability.
++    for required in &contract.resources.required {
++        match required {
++            ResourceRequirement::Memory if spec.limits.memory_bytes.is_none() => {
++                spec.limits.memory_bytes = Some(DEFAULT_MEMORY_BYTES);
++            }
++            ResourceRequirement::Processes if spec.limits.max_processes.is_none() => {
++                spec.limits.max_processes = Some(DEFAULT_PROCESSES);
++            }
++            ResourceRequirement::Cpu if spec.limits.cpu_cores.is_none() => {
++                spec.limits.cpu_cores = Some(DEFAULT_CPU_CORES);
++            }
++            _ => {}
++        }
++    }
++
+     // Containment is always required; it is what the sandbox *is*.
+     spec.requires.tree_lifetime = TreeLifetime::Required;
+ 
+diff --git a/crates/orxnud-capability/tests/governed_path.rs b/crates/orxnud-capability/tests/governed_path.rs
+index 9fbe92d..613d75e 100644
+--- a/crates/orxnud-capability/tests/governed_path.rs
++++ b/crates/orxnud-capability/tests/governed_path.rs
+@@ -954,3 +954,503 @@ impl<S: orxnud_domain::SecretsContract> AuditAccess
+         self.audit_len()
+     }
+ }
++
++// ------------------------------------------------ V-46: governed cgroup enforcement
++//
++// Everything above proves the sandbox *works*. These prove the governed path *uses* it
++// for resources -- a distinction that only matters if the dispatcher could have run the
++// payload outside a cgroup while every other test stayed green.
++//
++// The observer below reads the cgroup hierarchy directly. That is deliberate: it is the
++// independent witness. If the runner merely *claimed* membership, these assertions would
++// pass. The capability layer itself never sees a cgroup path or a controller name.
++
++mod v46 {
++    use super::*;
++    use orxnud_capability::dispatch::{ResourceBudget, ResourcePolicy, ResourceRequirement};
++    use orxnud_platform_sandbox::cgroup::CgroupV2;
++    use orxnud_platform_sandbox::contract::{AvailableGuarantees, ExecutionResult, SandboxRunner};
++    use std::path::PathBuf;
++    use std::sync::atomic::AtomicBool;
++
++    /// What an outside observer saw while an execution ran.
++    #[derive(Debug, Default)]
++    struct Observed {
++        saw_child: bool,
++        strictly_below_base: bool,
++        memory_max: Vec<String>,
++        max_members: usize,
++        saw_payload_member: bool,
++        leftover: usize,
++    }
++
++    /// Watches the discovered base for the runner's dedicated children.
++    ///
++    /// Runs on its own thread because the dispatch blocks until the payload exits, and
++    /// the payload is only in the cgroup while it is running.
++    fn watch(seconds: u64) -> (std::thread::JoinHandle<Observed>, Arc<AtomicBool>, CgroupV2) {
++        let base = CgroupV2::discover();
++        let base_path = base.base.clone();
++        let stop = Arc::new(AtomicBool::new(false));
++        let flag = Arc::clone(&stop);
++        let handle = std::thread::spawn(move || {
++            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
++            let mut o = Observed::default();
++            while std::time::Instant::now() < deadline && !flag.load(Ordering::SeqCst) {
++                let mut entries: Vec<PathBuf> = std::fs::read_dir(&base_path)
++                    .map(|d| {
++                        d.flatten()
++                            .map(|e| e.path())
++                            .filter(|p| {
++                                p.file_name()
++                                    .and_then(|n| n.to_str())
++                                    .is_some_and(|n| n.starts_with("orxnud-exec-"))
++                            })
++                            .collect()
++                    })
++                    .unwrap_or_default();
++                for p in entries.drain(..) {
++                    o.saw_child = true;
++                    if p != base_path && p.starts_with(&base_path) {
++                        o.strictly_below_base = true;
++                    }
++                    if let Ok(m) = std::fs::read_to_string(p.join("memory.max")) {
++                        o.memory_max.push(m.trim().to_owned());
++                    }
++                    if let Ok(procs) = std::fs::read_to_string(p.join("cgroup.procs")) {
++                        let n = procs.lines().filter(|l| !l.trim().is_empty()).count();
++                        o.max_members = o.max_members.max(n);
++                        // bwrap plus the payload plus whatever it forked: more than the
++                        // supervisor alone is what shows the *workload* is inside too.
++                        if n > 1 {
++                            o.saw_payload_member = true;
++                        }
++                    }
++                }
++                std::thread::sleep(std::time::Duration::from_millis(10));
++            }
++            o.leftover = std::fs::read_dir(&base_path)
++                .map(|d| {
++                    d.flatten()
++                        .filter(|e| e.file_name().to_string_lossy().starts_with("orxnud-exec-"))
++                        .count()
++                })
++                .unwrap_or(0);
++            o
++        });
++        (handle, stop, base)
++    }
++
++    fn available() -> bool {
++        let av = CgroupV2::discover().availability;
++        av.memory && av.processes && av.cpu
++    }
++
++    fn bundle(resources: ResourcePolicy) -> Arc<dyn AdapterBundle> {
++        let mut b = Tier1HelperAdapter::running("fork-many");
++        b.env.insert("ORXNUD_ARG1".into(), "24".into());
++        Arc::new(PolicyBundle {
++            adapter: b,
++            resources,
++            grant_rw: Vec::new(),
++            deadline_ms: 20_000,
++        })
++    }
++
++    /// A bundle whose plan demands a specific resource policy.
++    struct PolicyBundle {
++        adapter: Tier1HelperAdapter,
++        resources: ResourcePolicy,
++        grant_rw: Vec<String>,
++        deadline_ms: u64,
++    }
++
++    impl AdapterBundle for PolicyBundle {
++        fn adapter(&self) -> &dyn CapabilityAdapter {
++            &self.adapter
++        }
++        fn verifier(&self) -> &dyn Verifier {
++            &ReportVerifier
++        }
++        fn sandbox_plan(&self) -> Option<SandboxPlan> {
++            Some(SandboxPlan {
++                program: helper_path().display().to_string(),
++                args: vec![
++                    "--exact".into(),
++                    "hostile_helper_entry_point".into(),
++                    "--ignored".into(),
++                    "--nocapture".into(),
++                ],
++                env: self.adapter.env.clone(),
++                working_dir: "/".into(),
++                grant_rw: self.grant_rw.clone(),
++                grant_ro: vec![sandbox_helpers_dir().display().to_string()],
++                network: false,
++                deadline_ms: self.deadline_ms,
++                output_cap_bytes: 256 * 1024,
++                resources: self.resources.clone(),
++            })
++        }
++    }
++
++    // ---------------------------------------------------------------- 1. enforced
++
++    /// A governed Tier-1 request that requires memory control actually runs inside a
++    /// dedicated cgroup whose `memory.max` is the ceiling the contract asked for.
++    #[test]
++    fn a_required_memory_ceiling_is_applied_by_the_governed_path() {
++        if !available() {
++            println!("  host does not delegate memory+pids+cpu; reported, not skipped");
++            return;
++        }
++        let required = ResourcePolicy {
++            required: vec![ResourceRequirement::Memory],
++            budget: ResourceBudget {
++                memory_bytes: Some(64 * 1024 * 1024),
++                processes: Some(24),
++                cpu_cores: Some(0.5),
++            },
++        };
++        let id = cap();
++        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
++        m.insert(id.clone(), bundle(required.clone()));
++        let mut engine = policy(0, 1_000);
++        let secrets = FakeSecrets::new();
++        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
++            .with_execution(Arc::new(BwrapExecutionBackend::new()));
++        let (watcher, stop, _base) = watch(25);
++        let outcome = d
++            .dispatch(
++                request(),
++                human(),
++                context(),
++                None,
++                params(),
++                None,
++                None,
++                NOW,
++            )
++            .expect("a satisfiable required ceiling must not refuse");
++        stop.store(true, Ordering::SeqCst);
++
++        println!("  governed execution: {:?}", outcome.execution);
++        let o = watcher.join().expect("observer");
++        println!(
++            "  observed: child={} strictly_below_base={} max_members={} payload_member={} \
++             memory_max={:?} leftover={}",
++            o.saw_child,
++            o.strictly_below_base,
++            o.max_members,
++            o.saw_payload_member,
++            o.memory_max,
++            o.leftover
++        );
++
++        assert!(
++            o.saw_child,
++            "the governed path created no dedicated cgroup at all"
++        );
++        assert!(
++            o.strictly_below_base,
++            "the execution cgroup must be strictly below the discovered base (V-55)"
++        );
++        assert!(
++            o.memory_max.iter().any(|m| m == "67108864"),
++            "memory.max was not the requested ceiling: {:?}",
++            o.memory_max
++        );
++        assert!(
++            o.saw_payload_member && o.max_members > 1,
++            "only the supervisor was observed ({max_members}); the workload itself was not \
++             inside the cgroup",
++            max_members = o.max_members
++        );
++        assert_eq!(
++            o.leftover, 0,
++            "the dedicated cgroup was not cleaned up after execution"
++        );
++    }
++
++    // ------------------------------------------------------- 2. required-unavailable
++
++    /// A runner that reports the resource controllers unavailable, counting `run` calls.
++    struct UndelegatedRunner {
++        inner: Arc<dyn SandboxRunner>,
++        runs: Arc<AtomicUsize>,
++    }
++
++    impl SandboxRunner for UndelegatedRunner {
++        fn available_guarantees(&self) -> AvailableGuarantees {
++            let mut g = self.inner.available_guarantees();
++            // The only thing this double lies about. Everything else is the real runner.
++            g.resources = false;
++            g
++        }
++        fn run(
++            &self,
++            spec: &orxnud_platform_sandbox::contract::SandboxSpec,
++        ) -> Result<ExecutionResult, orxnud_platform_sandbox::contract::SandboxUnavailable>
++        {
++            self.runs.fetch_add(1, Ordering::SeqCst);
++            self.inner.run(spec)
++        }
++        fn cancel(&self) -> Result<(), orxnud_platform_sandbox::contract::SandboxUnavailable> {
++            self.inner.cancel()
++        }
++    }
++
++    /// A required control the host cannot establish must refuse, must never reach the
++    /// backend, and must not run the payload.
++    ///
++    /// Availability is forced with a delegating runner rather than by mutating the host's
++    /// delegation: a test that needs a broken host is a test that cannot be trusted on a
++    /// working one. The runner's `probe` is the same call the real runner makes, and the
++    /// refusal path exercised below is the production one.
++    #[test]
++    fn a_required_control_the_host_cannot_provide_refuses_without_spawning() {
++        let runs = Arc::new(AtomicUsize::new(0));
++        let backend = BwrapExecutionBackend::with_runner(Arc::new(UndelegatedRunner {
++            inner: Arc::new(orxnud_platform_sandbox::linux::BwrapRunner::new()),
++            runs: Arc::clone(&runs),
++        }));
++        let required = ResourcePolicy {
++            required: vec![ResourceRequirement::Memory],
++            budget: ResourceBudget {
++                memory_bytes: Some(64 * 1024 * 1024),
++                processes: None,
++                cpu_cores: None,
++            },
++        };
++        let id = cap();
++        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
++        m.insert(id.clone(), bundle(required.clone()));
++        let mut engine = policy(0, 1_000);
++        let secrets = FakeSecrets::new();
++        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
++            .with_execution(Arc::new(backend));
++        let err = d
++            .dispatch(
++                request(),
++                human(),
++                context(),
++                None,
++                params(),
++                None,
++                None,
++                NOW,
++            )
++            .expect_err("an unsatisfiable required ceiling must refuse");
++        assert!(
++            matches!(err, DispatchError::SandboxRefused(_)),
++            "expected a refusal, got {err:?}"
++        );
++        assert_eq!(
++            runs.load(Ordering::SeqCst),
++            0,
++            "the backend was invoked despite a required ceiling being unavailable"
++        );
++    }
++
++    // ------------------------------------------------------------ 3. cgroup.kill
++
++    /// A detached descendant that ignores every catchable signal, outliving a governed
++    /// execution that is cut off at its deadline, must not survive it.
++    ///
++    /// A signal cannot reach it: it ignores SIGTERM, SIGINT, SIGHUP and SIGQUIT, and it is
++    /// not a child of the process the supervisor signals.
++    ///
++    /// **What this proves, and what it does not.** It proves the governed outcome: a
++    /// detached descendant alive at the deadline is not alive after it, and the dedicated
++    /// cgroup is emptied and removed. It does *not* prove that `cgroup.kill` is what
++    /// killed it. On Linux `bwrap` already runs with `--unshare-pid --die-with-parent`,
++    /// so the namespace reaps descendants the moment the supervisor dies -- which is why
++    /// removing the runner's `cgroup.kill` left this test green. Containment here is
++    /// deliberately redundant: namespace first, cgroup as the backstop that also covers
++    /// anything the namespace cannot reach. `cgroup.kill`'s independent teeth are proven
++    /// where they are observable, in `enforcement.rs::cgroup_kill_terminates_a_three_level_subtree`.
++    ///
++    /// The earlier version of this test proved nothing at all: `spawn-descendant` returns
++    /// immediately, so the sandbox exited long before any kill path was reached and the
++    /// marker was never written. It "passed" on a sentinel value.
++    #[test]
++    fn a_governed_timeout_terminates_a_detached_descendant_and_reaps_its_cgroup() {
++        if !available() {
++            println!("  host does not delegate cgroup.kill; reported, not skipped");
++            return;
++        }
++        // A *directory* is bound, not a file, so the descendant can create and rewrite
++        // the marker inside the sandbox.
++        let dir = std::env::temp_dir().join(format!("orxnud-v46-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).expect("marker dir");
++        let marker = dir.join("alive");
++        let _ = std::fs::remove_file(&marker);
++
++        let required = ResourcePolicy {
++            required: vec![ResourceRequirement::Processes],
++            budget: ResourceBudget {
++                memory_bytes: Some(256 * 1024 * 1024),
++                processes: Some(64),
++                cpu_cores: Some(1.0),
++            },
++        };
++        let mut adapter = Tier1HelperAdapter::running("descendant-hang");
++        adapter.env.insert(
++            "ORXNUD_DESCENDANT_MARKER".into(),
++            marker.display().to_string(),
++        );
++        let id = cap();
++        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
++        m.insert(
++            id.clone(),
++            Arc::new(PolicyBundle {
++                adapter,
++                resources: required.clone(),
++                grant_rw: vec![dir.display().to_string()],
++                // Short enough that the deadline lands while the descendant is alive.
++                deadline_ms: 2_000,
++            }),
++        );
++        let mut engine = policy(0, 1_000);
++        let secrets = FakeSecrets::new();
++        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
++            .with_execution(Arc::new(BwrapExecutionBackend::new()));
++
++        let (watcher, stop, base) = watch(30);
++        let outcome = d
++            .dispatch(
++                request(),
++                human(),
++                context(),
++                None,
++                params(),
++                None,
++                None,
++                NOW,
++            )
++            .expect("dispatch");
++        stop.store(true, Ordering::SeqCst);
++        println!("  governed execution: {:?}", outcome.execution);
++
++        let o = watcher.join().expect("observer");
++        // Liveness is a moving marker: the descendant rewrites its pid every 150 ms, so a
++        // *changing* value proves it was alive and a *stable* value after the dispatch
++        // proves it stopped. A host pid would prove nothing about which cgroup it was in.
++        let first = std::fs::read_to_string(&marker).unwrap_or_default();
++        std::thread::sleep(std::time::Duration::from_millis(600));
++        let second = std::fs::read_to_string(&marker).unwrap_or_default();
++        println!(
++            "  descendant marker: {:?} -> {:?}; max_members={} leftover={}",
++            first.trim(),
++            second.trim(),
++            o.max_members,
++            o.leftover
++        );
++
++        assert!(
++            first.trim().parse::<u32>().is_ok(),
++            "the descendant never wrote a pid to the bound marker, so its death was not \
++             observed: {:?}",
++            first
++        );
++        assert_eq!(
++            first.trim(),
++            second.trim(),
++            "the detached descendant is still running after the governed execution ended"
++        );
++        // A deadline surfaces as `Unknown`, not `Failed`: `Failed` means nothing
++        // happened, `Unknown` means the subprocess was cut off mid-flight and nobody
++        // vouches for its state. That mapping is the point -- asserting `Failed` would
++        // have demanded the supervisor pretend the work never began.
++        assert!(
++            matches!(outcome.execution, ExecutionOutcome::Unknown { .. }),
++            "the execution should have been cut off at its deadline: {:?}",
++            outcome.execution
++        );
++        assert!(
++            o.max_members >= 2,
++            "only the supervisor was ever observed ({}); there was no descendant to kill",
++            o.max_members
++        );
++        assert_eq!(
++            o.leftover, 0,
++            "the dedicated cgroup was not removed: {:?}",
++            base.base
++        );
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// The ceiling must be *enforced by the kernel*, not merely written to a file.
++    ///
++    /// The first governed test proves `memory.max` holds the requested value. That is
++    /// configuration, not enforcement: a file can contain `67108864` while nothing acts on
++    /// it. This one runs a helper that touches every page it allocates until the kernel
++    /// refuses, and requires the helper's own report to say it was refused -- evidence
++    /// that comes from the allocator, not from us.
++    #[test]
++    fn a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written() {
++        if !available() {
++            println!("  host does not delegate memory control; reported, not skipped");
++            return;
++        }
++        let required = ResourcePolicy {
++            required: vec![ResourceRequirement::Memory],
++            budget: ResourceBudget {
++                memory_bytes: Some(64 * 1024 * 1024),
++                processes: Some(16),
++                cpu_cores: Some(0.5),
++            },
++        };
++        let mut adapter = Tier1HelperAdapter::running("mem-hog");
++        // Asks for far more than the ceiling, so the ceiling is what stops it.
++        adapter.env.insert("ORXNUD_ARG1".into(), "4096".into());
++        let id = cap();
++        let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>> = BTreeMap::new();
++        m.insert(
++            id.clone(),
++            Arc::new(PolicyBundle {
++                adapter,
++                resources: required.clone(),
++                grant_rw: Vec::new(),
++                deadline_ms: 30_000,
++            }),
++        );
++        let mut engine = policy(0, 1_000);
++        let secrets = FakeSecrets::new();
++        let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, m)
++            .with_execution(Arc::new(BwrapExecutionBackend::new()));
++
++        let outcome = d
++            .dispatch(
++                request(),
++                human(),
++                context(),
++                None,
++                params(),
++                None,
++                None,
++                NOW,
++            )
++            .expect("dispatch");
++        let text = format!("{:?}", outcome.execution);
++        println!("  governed execution: {text}");
++
++        // Any of these is enforcement evidence, and requiring one *particular* one is the
++        // mistake the mechanism suite already made once: `memory.max` is free to refuse,
++        // reclaim, or OOM-kill, and a helper that is killed cannot report anything. Exit
++        // 137 (128 + SIGKILL) is the kernel killing it for exceeding the ceiling, which is
++        // the strongest form of the evidence.
++        let refused = text.contains("refusals");
++        let killed = text.contains("137") || text.contains("Killed") || text.contains("Unknown");
++        assert!(
++            refused || killed,
++            "neither a refusal nor a kill was observed, so enforcement was not established: \
++             {text}"
++        );
++        println!("  evidence: refused={refused} killed={killed}");
++        // And the load it was asked to create must not have been accommodated.
++        assert!(
++            !text.contains("held 4096"),
++            "the workload held the full 4096 MiB against a 64 MiB ceiling: NOT enforced"
++        );
++    }
++}
+diff --git a/crates/orxnud-capability/tests/support/mod.rs b/crates/orxnud-capability/tests/support/mod.rs
+index a179168..9fff4b1 100644
+--- a/crates/orxnud-capability/tests/support/mod.rs
++++ b/crates/orxnud-capability/tests/support/mod.rs
+@@ -465,13 +465,24 @@ pub fn helper_path() -> PathBuf {
+                 .is_some_and(|n| n.starts_with("hostile_helper-"))
+         })
+         .collect();
+-    found.sort();
+     assert!(
+         !found.is_empty(),
+         "no hostile_helper-* binary in {}; run `cargo test --no-run` first",
+         dir.display()
+     );
+-    found.remove(0)
++    // Newest, not lexicographically first.
++    //
++    // Stale helper binaries accumulate in `target/debug/deps` across builds, and their
++    // names embed a hash. Sorting by name and taking index 0 therefore picked whichever
++    // hash happened to sort first -- frequently an *older* build. A mode added to the
++    // helper then silently fell through to the catch-all `noop`, so a governed test
++    // appeared to pass while proving nothing about the behaviour it named.
++    found.sort_by_key(|p| {
++        std::fs::metadata(p)
++            .and_then(|m| m.modified())
++            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
++    });
++    found.pop().expect("non-empty")
+ }
+ 
+ /// The directory the helper lives in, which the sandbox must be granted read-only.
+diff --git a/crates/orxnud-platform-sandbox/src/cgroup.rs b/crates/orxnud-platform-sandbox/src/cgroup.rs
+index 334b9e9..61a2398 100644
+--- a/crates/orxnud-platform-sandbox/src/cgroup.rs
++++ b/crates/orxnud-platform-sandbox/src/cgroup.rs
+@@ -312,6 +312,18 @@ impl CgroupV2 {
+         })
+     }
+ 
++    /// Whether `pid` is currently a member, read from `cgroup.procs`.
++    ///
++    /// Membership is a fact about the kernel, not about a path string. Everything that
++    /// claims "this execution is resource-controlled" must be able to check this, because
++    /// writing a limit to a cgroup says nothing about who is inside it.
++    #[must_use]
++    pub fn contains(&self, pid: u32) -> bool {
++        std::fs::read_to_string(self.path.join("cgroup.procs"))
++            .map(|t| t.lines().any(|l| l.trim() == pid.to_string()))
++            .unwrap_or(false)
++    }
++
+     /// How many processes are in the cgroup.
+     #[must_use]
+     pub fn member_count(&self) -> usize {
+diff --git a/crates/orxnud-platform-sandbox/src/linux.rs b/crates/orxnud-platform-sandbox/src/linux.rs
+index 51077c5..e299d59 100644
+--- a/crates/orxnud-platform-sandbox/src/linux.rs
++++ b/crates/orxnud-platform-sandbox/src/linux.rs
+@@ -81,14 +81,15 @@
+ 
+ use std::collections::BTreeMap;
+ use std::io::Read;
+-use std::path::{Path, PathBuf};
++use std::path::Path;
+ use std::process::{Command, Stdio};
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, Instant};
+ 
++use crate::cgroup::{CgroupV2, ResourceControl};
+ use crate::contract::{
+-    AvailableGuarantees, CapturedStream, ExecutionResult, ExecutionStatus, NetworkPolicy,
++    AvailableGuarantees, CapturedStream, ExecutionResult, ExecutionStatus, NetworkPolicy, Resource,
+     ResourceLimits, SandboxRunner, SandboxSpec, SandboxUnavailable,
+ };
+ 
+@@ -142,7 +143,8 @@ impl BwrapRunner {
+         // `namespace_probe` already exercised. Resource ceilings are separate and still
+         // unavailable here: the controllers are listed in `cgroup.controllers` but every
+         // write is refused in this user session.
+-        let resources = visibility && CgroupV2::discover().can_limit;
++        let av = CgroupV2::discover().availability;
++        let resources = visibility && (av.memory || av.processes || av.cpu);
+         // Tree lifetime rides on the same probe: `--unshare-pid` plus
+         // `--die-with-parent` is what the kernel uses to kill a detached descendant,
+         // and `namespace_probe` runs with both.
+@@ -192,46 +194,6 @@ impl BwrapRunner {
+     }
+ }
+ 
+-/// What the host's cgroup v2 hierarchy permits.
+-///
+-/// Only the resource controllers are consulted. `cgroup.kill` is writable here but is
+-/// *not* what provides tree lifetime on Linux — the PID namespace does, and does so
+-/// more cheaply. `cgroup.kill` becomes the right mechanism when a host delegates
+-/// controllers, because it needs no namespace and handles concurrent forks.
+-struct CgroupV2 {
+-    /// `memory.max` (or `pids.max`) is writable in a cgroup we own.
+-    can_limit: bool,
+-}
+-
+-impl CgroupV2 {
+-    /// Finds our own cgroup and tests what we may do in a child of it.
+-    fn discover() -> Self {
+-        let Some(path) = Self::own_path() else {
+-            return Self { can_limit: false };
+-        };
+-        // Probing needs a cgroup of our own. Created under our scope and removed
+-        // afterwards; `can_limit`/`can_kill` record the result either way.
+-        let probe = path.join("orxnud-sandbox-probe");
+-        let created = std::fs::create_dir(&probe).is_ok();
+-        if !created {
+-            return Self { can_limit: false };
+-        }
+-        let can_limit = std::fs::write(probe.join("pids.max"), b"64\n").is_ok()
+-            || std::fs::write(probe.join("memory.max"), b"67108864\n").is_ok();
+-        let _ = std::fs::remove_dir(&probe);
+-        Self { can_limit }
+-    }
+-
+-    /// Our own cgroup path from `/proc/self/cgroup`.
+-    fn own_path() -> Option<PathBuf> {
+-        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+-        // Unified hierarchy line: `0::/path`.
+-        let line = text.lines().find(|l| l.starts_with("0::"))?;
+-        let rel = line.trim_start_matches("0::").trim();
+-        Some(Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+-    }
+-}
+-
+ impl SandboxRunner for BwrapRunner {
+     fn available_guarantees(&self) -> AvailableGuarantees {
+         Self::probe()
+@@ -259,6 +221,44 @@ impl SandboxRunner for BwrapRunner {
+ 
+         self.cancel.store(false, Ordering::SeqCst);
+ 
++        // --- resource setup, before a process exists ---------------------
++        //
++        // The dedicated child is created and its ceilings written *before* the
++        // supervisor is spawned, so there is no window in which a payload could be
++        // running without the limits that were required for it. Creation succeeding
++        // and a later control write failing is treated as total failure: a partially
++        // configured cgroup is not a weaker sandbox, it is a broken one.
++        let controls = controls_for(spec);
++        let mut owned: Option<CgroupV2> = None;
++        if !controls.is_empty() {
++            match CgroupV2::discover().create("exec", &controls) {
++                Ok(cg) => owned = Some(cg),
++                Err(e) if spec.requires.resources == Resource::Required => {
++                    // Fail closed: refuse *before* spawning, so no process is created
++                    // and no credential-bearing environment is ever bound.
++                    return Ok(ExecutionResult {
++                        status: ExecutionStatus::Refused(
++                            SandboxUnavailable::GuaranteeUnavailable {
++                                guarantee: "OS-enforced resource ceilings",
++                                detail: format!(
++                                    "a required ceiling could not be established: {}",
++                                    e.reason
++                                ),
++                            },
++                        ),
++                        stdout: CapturedStream::empty(),
++                        stderr: CapturedStream::empty(),
++                        elapsed: Duration::ZERO,
++                        unproven: Vec::new(),
++                    });
++                }
++                Err(_) => {
++                    // Not required: the honest degradation is to proceed and record the
++                    // gap below. Never to silently run with no ceiling at all.
++                }
++            }
++        }
++
+         let (argv, _program) = match build_command(spec) {
+             Ok(v) => v,
+             Err(e) => {
+@@ -273,19 +273,13 @@ impl SandboxRunner for BwrapRunner {
+         };
+ 
+         let started = Instant::now();
+-        let mut child = match Command::new(BWRAP)
+-            .args(&argv)
+-            .stdin(Stdio::null())
+-            .stdout(Stdio::piped())
+-            .stderr(Stdio::piped())
+-            // `bwrap` must not inherit our environment: it is the single most
+-            // effective way for a parent secret to reach a child. The child's own
+-            // environment is set explicitly by `--setenv` below.
+-            .env_clear()
+-            .spawn()
+-        {
++        let mut child = match spawn_supervisor(&argv, owned.as_ref()) {
+             Ok(c) => c,
+             Err(e) => {
++                // `owned` drops here, removing the dedicated child. A spawn failure must
++                // not leave a cgroup behind, and must never fall back to running without
++                // the required ceilings.
++                drop(owned);
+                 return Ok(ExecutionResult {
+                     status: ExecutionStatus::SpawnFailed(e.to_string()),
+                     stdout: CapturedStream::empty(),
+@@ -296,6 +290,62 @@ impl SandboxRunner for BwrapRunner {
+             }
+         };
+ 
++        // Membership is verified, not assumed. Writing limits to a cgroup says nothing
++        // about who is inside it, so the only admissible evidence that this execution is
++        // resource-controlled is our own supervisor appearing in `cgroup.procs`.
++        let joined = match &owned {
++            None => true,
++            Some(cg) => {
++                // Awaited, not sampled. `spawn` returns as soon as the child is forked,
++                // which is before it has executed anything -- including the write that
++                // puts it in the cgroup. A single immediate read therefore sees an empty
++                // `cgroup.procs` for a supervisor that is about to join, and would reject
++                // a perfectly good execution. The wait is bounded so a child that never
++                // joins fails closed rather than hanging.
++                let deadline = Instant::now() + Duration::from_millis(2_000);
++                loop {
++                    if cg.contains(child.id()) {
++                        break true;
++                    }
++                    // A child that has already been reaped will never join.
++                    if matches!(child.try_wait(), Ok(Some(_))) {
++                        break false;
++                    }
++                    if Instant::now() >= deadline {
++                        break false;
++                    }
++                    std::thread::sleep(Duration::from_millis(2));
++                }
++            }
++        };
++        if !joined {
++            let detail = match &owned {
++                Some(cg) => format!(
++                    "the supervisor did not join the dedicated cgroup (members: {}, \
++                     reaped: {:?}); the requested ceilings would not have applied",
++                    cg.member_count(),
++                    child.try_wait().ok()
++                ),
++                None => "no dedicated cgroup was established".to_owned(),
++            };
++            if let Some(cg) = &owned {
++                let _ = cg.kill_all();
++            }
++            let _ = child.kill();
++            let _ = child.wait();
++            drop(owned);
++            return Ok(ExecutionResult {
++                status: ExecutionStatus::Refused(SandboxUnavailable::GuaranteeUnavailable {
++                    guarantee: "OS-enforced resource ceilings",
++                    detail,
++                }),
++                stdout: CapturedStream::empty(),
++                stderr: CapturedStream::empty(),
++                elapsed: started.elapsed(),
++                unproven: Vec::new(),
++            });
++        }
++
+         let cap = spec.limits.output_bytes;
+         let deadline = spec.limits.wall_clock;
+ 
+@@ -326,6 +376,13 @@ impl SandboxRunner for BwrapRunner {
+             }
+             if started.elapsed() >= deadline {
+                 timed_out = true;
++                // `cgroup.kill` first, then the signal. The signal alone reaches only the
++                // supervisor; a descendant that has forked and detached from the pipe
++                // would survive it. The cgroup kill is the only mechanism that terminates
++                // every member, including one forked concurrently with this loop.
++                if let Some(cg) = &owned {
++                    let _ = cg.kill_all();
++                }
+                 // SIGKILL rather than SIGTERM: the Phase 4 spike established that a
+                 // helper may ignore SIGTERM, and a graceful-then-forceful path would
+                 // wait out a grace period for a process that never honours it.
+@@ -335,6 +392,9 @@ impl SandboxRunner for BwrapRunner {
+             }
+             if self.cancel.load(Ordering::SeqCst) {
+                 cancelled = true;
++                if let Some(cg) = &owned {
++                    let _ = cg.kill_all();
++                }
+                 let _ = child.kill();
+                 let _ = child.wait();
+                 break std::process::ExitStatus::default();
+@@ -366,15 +426,35 @@ impl SandboxRunner for BwrapRunner {
+                     .to_owned(),
+             ));
+         }
+-        if spec.limits.memory_bytes.is_some() && !available.resources {
+-            unproven.push((
+-                "OS-enforced memory ceiling",
+-                format!(
+-                    "no writable cgroup controller on this host; the requested {} MiB is \
+-                     not enforced",
+-                    spec.limits.memory_bytes.unwrap_or(0) / (1024 * 1024)
+-                ),
+-            ));
++        // Only reachable when the caller did *not* require enforcement: a required
++        // ceiling either got established or the execution was refused above.
++        if owned.is_none() && spec.requires.resources == Resource::Observed {
++            if spec.limits.memory_bytes.is_some() {
++                unproven.push((
++                    "OS-enforced memory ceiling",
++                    format!(
++                        "no usable cgroup controller on this host; the requested {} MiB is \
++                         not enforced",
++                        spec.limits.memory_bytes.unwrap_or(0) / (1024 * 1024)
++                    ),
++                ));
++            }
++            if spec.limits.max_processes.is_some() {
++                unproven.push((
++                    "OS-enforced process ceiling",
++                    "no usable pids controller on this host; the requested ceiling is not \
++                     enforced"
++                        .to_owned(),
++                ));
++            }
++            if spec.limits.cpu_cores.is_some() {
++                unproven.push((
++                    "OS-enforced CPU ceiling",
++                    "no usable cpu controller on this host; the requested ceiling is not \
++                     enforced"
++                        .to_owned(),
++                ));
++            }
+         }
+ 
+         let status = if timed_out {
+@@ -390,6 +470,13 @@ impl SandboxRunner for BwrapRunner {
+             ExecutionStatus::Exited(status.code().unwrap_or(-1))
+         };
+ 
++        // Members are swept before removal so a descendant holding stdout open cannot
++        // keep the cgroup alive, and removal stays bounded.
++        if let Some(cg) = &owned {
++            let _ = cg.kill_all();
++        }
++        drop(owned);
++
+         Ok(ExecutionResult {
+             status,
+             stdout,
+@@ -484,6 +571,86 @@ fn read_capped<R: Read>(r: &mut Option<R>, cap: u64) -> CapturedStream {
+ /// [`SandboxUnavailable::Invalid`] for a configuration that cannot be expressed —
+ /// chiefly a relative program path, which would resolve against the sandbox root and
+ /// silently become a different executable.
++/// The cgroup controls a spec's *portable* limits translate to.
++/// This is the whole of the platform-specific knowledge the runner needs, and it
++/// lives here rather than in the capability layer: a contract says "64 MiB", never
++/// "memory.max" or a cgroup path.
++/// Spawns the sandbox supervisor, placing it in the dedicated cgroup first.
++///
++/// # Why a shell wrapper rather than adopt-after-spawn
++///
++/// The obvious sequence is spawn, then write the child's pid to `cgroup.procs`. That is
++/// a race: cgroup membership is inherited at `fork`, so anything the supervisor forked
++/// before the write keeps the *parent's* limits forever, with no error anywhere. The
++/// window is `bwrap`'s own startup -- several namespace setups and a `/proc` mount -- and
++/// a payload started inside it would be unconstrained.
++///
++/// Writing the pid from a shell before `exec` closes the window without `unsafe`:
++/// `sh` writes `$$` to `cgroup.procs` and then `exec`s `bwrap`, which preserves the pid.
++/// `bwrap` is therefore already a member before it can fork anything, and every
++/// descendant inherits membership.
++///
++/// `std::process::Command` has no pre-exec hook without `unsafe`, so this is the
++/// standard no-`unsafe` way to do it. The `|| exit` is load-bearing: if the join fails the
++/// supervisor must never start, because a running unconstrained process is exactly the
++/// failure this design exists to prevent.
++fn spawn_supervisor(
++    argv: &[String],
++    cgroup: Option<&CgroupV2>,
++) -> std::io::Result<std::process::Child> {
++    let Some(cg) = cgroup else {
++        return Command::new(BWRAP)
++            .args(argv)
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            // `bwrap` must not inherit our environment: it is the single most
++            // effective way for a parent secret to reach a child. The child's own
++            // environment is set explicitly by `--setenv` below.
++            .env_clear()
++            .spawn();
++    };
++
++    let procs = cg.path.join("cgroup.procs");
++    Command::new("/bin/sh")
++        .arg("-c")
++        .arg("printf %s \"$$\" > \"$1\" || exit 97; shift; exec \"$@\"")
++        .arg("orxnud-join-cgroup")
++        .arg(&procs)
++        .arg(BWRAP)
++        .args(argv)
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .env_clear()
++        .spawn()
++}
++
++fn controls_for(spec: &SandboxSpec) -> Vec<ResourceControl> {
++    let mut v = Vec::new();
++    if let Some(b) = spec.limits.memory_bytes {
++        v.push(ResourceControl::Memory { bytes: b });
++        // A memory ceiling evaded by swapping is not a memory ceiling, so the
++        // budget is pinned to zero alongside it.
++        v.push(ResourceControl::Swap { bytes: 0 });
++    }
++    if let Some(p) = spec.limits.max_processes {
++        v.push(ResourceControl::Processes { max: p });
++    }
++    if let Some(c) = spec.limits.cpu_cores
++        && c > 0.0
++    {
++        // `cpu.max` is `<quota> <period>` in microseconds; the period is a kernel
++        // convention, the quota is the capability's request.
++        const PERIOD_US: u64 = 100_000;
++        v.push(ResourceControl::Cpu {
++            quota_us: (c * PERIOD_US as f64) as u64,
++            period_us: PERIOD_US,
++        });
++    }
++    v
++}
++
+ fn build_command(spec: &SandboxSpec) -> Result<(Vec<String>, String), SandboxUnavailable> {
+     if !spec.program.is_absolute() {
+         return Err(SandboxUnavailable::Invalid(format!(
+@@ -704,50 +871,81 @@ mod tests {
+             have.visibility,
+             "bwrap is installed; the probe must find it"
+         );
+-        // And the two blocked guarantees must be reported as absent, not assumed.
+-        assert!(
+-            !have.resources,
+-            "this host delegates no cgroup controllers; the probe must not claim otherwise"
++        // Resources are reported against ground truth rather than a hardcoded `false`.
++        //
++        // These tests used to assert "this host delegates nothing", which was true when
++        // they were written and stopped being true when delegation was found. A test that
++        // encodes a host property as a constant reports the wrong problem the moment the
++        // host changes -- it is a change detector, not a check of the probe.
++        let av = CgroupV2::discover().availability;
++        assert_eq!(
++            have.resources,
++            av.memory || av.processes || av.cpu,
++            "the probe must report exactly what the cgroup hierarchy allows"
+         );
++        if !have.resources {
++            assert!(!av.memory && !av.processes && !av.cpu);
++        }
+     }
+ 
+     #[test]
+-    fn a_spec_demanding_os_enforced_resources_is_refused_on_this_host() {
+-        // The fail-closed path, exercised against the one guarantee this host cannot
+-        // provide. Resource ceilings are `Required` by default and unwritable here, so
+-        // a default spec must be refused rather than silently running without them.
++    fn a_required_resource_control_that_cannot_be_written_is_refused() {
++        // The fail-closed rule, exercised against the availability the host actually
++        // reports rather than against an assumption about which host that is.
++        //
++        // When this host *can* limit, the honest assertion is that a required spec runs;
++        // when it cannot, the honest assertion is a refusal. Either way the rule is the
++        // same: never run a required ceiling without one.
+         let have = BwrapRunner::probe();
+-        assert!(
+-            !have.resources,
+-            "this host must not claim resource ceilings"
+-        );
+-        let spec = SandboxSpec::new("/bin/true");
++        let mut spec = SandboxSpec::new("/bin/true");
++        spec.requires.resources = crate::contract::Resource::Required;
++        spec.limits.memory_bytes = Some(64 * 1024 * 1024);
+         let result = BwrapRunner::new().run(&spec).expect("run");
+-        match result.status {
+-            ExecutionStatus::Refused(SandboxUnavailable::GuaranteeUnavailable {
+-                guarantee,
+-                ..
+-            }) => assert_eq!(guarantee, "OS-enforced resource ceilings"),
+-            other => panic!("expected a refusal, got {other:?}"),
++        if have.resources {
++            assert!(
++                !matches!(result.status, ExecutionStatus::Refused(_)),
++                "a required ceiling this host can enforce must not be refused: {:?}",
++                result.status
++            );
++        } else {
++            match result.status {
++                ExecutionStatus::Refused(SandboxUnavailable::GuaranteeUnavailable {
++                    guarantee,
++                    ..
++                }) => assert_eq!(guarantee, "OS-enforced resource ceilings"),
++                other => panic!("expected a refusal, got {other:?}"),
++            }
+         }
+     }
+ 
+     #[test]
+-    fn a_spec_accepting_observed_resources_is_allowed_and_says_so() {
+-        // The honest degradation: the caller says it will accept observation instead
+-        // of enforcement, and the result records what was not provided.
++    fn an_observed_ceiling_is_either_enforced_or_reported_as_unproven() {
++        // The honest degradation, both branches: with `Observed`, a ceiling the platform
++        // provides is enforced, and one it cannot provide is recorded as a gap. Never a
++        // silent run with no ceiling and no record.
+         use crate::contract::Resource;
++        let have = BwrapRunner::probe();
+         let mut spec = SandboxSpec::new("/bin/true");
+         spec.requires.resources = Resource::Observed;
+         spec.limits.memory_bytes = Some(64 * 1024 * 1024);
+         let result = BwrapRunner::new().run(&spec).expect("run");
+-        assert!(
+-            result
+-                .unproven
+-                .iter()
+-                .any(|(g, _)| *g == "OS-enforced memory ceiling"),
+-            "an unenforced ceiling must be reported: {:?}",
+-            result.unproven
+-        );
++        if have.resources {
++            assert!(
++                !result
++                    .unproven
++                    .iter()
++                    .any(|(g, _)| *g == "OS-enforced memory ceiling"),
++                "an enforced ceiling must not be reported as unproven"
++            );
++        } else {
++            assert!(
++                result
++                    .unproven
++                    .iter()
++                    .any(|(g, _)| *g == "OS-enforced memory ceiling"),
++                "an unenforced ceiling must be reported: {:?}",
++                result.unproven
++            );
++        }
+     }
+ }
+diff --git a/crates/orxnud-platform-sandbox/tests/hostile_helper.rs b/crates/orxnud-platform-sandbox/tests/hostile_helper.rs
+index 7062416..5be5672 100644
+--- a/crates/orxnud-platform-sandbox/tests/hostile_helper.rs
++++ b/crates/orxnud-platform-sandbox/tests/hostile_helper.rs
+@@ -98,6 +98,16 @@ fn hostile_helper_entry_point() {
+         "cred-path-probe" => cred_path_probe(),
+         // --- process -------------------------------------------------------
+         "spawn-descendant" => spawn_descendant(),
++        "descendant-hang" => {
++            // A detached, signal-ignoring descendant plus a parent that never returns.
++            // The combination is the only way to exercise a *timeout* while a descendant
++            // is still alive: `spawn-descendant` returns immediately, so the sandbox exits
++            // before any kill path is reached.
++            let r = spawn_descendant();
++            emit(&r);
++            hang();
++            unreachable!("hang never returns")
++        }
+         "hang" => {
+             hang();
+             unreachable!("hang never returns")
+@@ -113,6 +123,8 @@ fn hostile_helper_entry_point() {
+             Report::pass("stderr written")
+         }
+         "fd-scan" => fd_scan(),
++        "mem-hog" => mem_hog(owned(1).parse().ok()),
++        "fork-many" => fork_many(owned(1).parse().unwrap_or(8)),
+         "malformed" => {
+             // Not valid JSON, not the declared schema. A supervisor must classify this
+             // as a bad result rather than parsing it into something plausible.
+@@ -332,6 +344,95 @@ fn hang() -> Report {
+     }
+ }
+ 
++/// Allocates and *touches* memory until the kernel refuses.
++///
++/// The touching matters. `bytearray(n)` alone can be satisfied by untouched zero pages,
++/// so a helper that only allocated would appear to succeed inside a ceiling that is
++/// working perfectly. This one writes to every page, so `memory.max` produces a refusal
++/// the helper can observe and report.
++///
++/// Reported, never panicked: a helper that is OOM-killed cannot report anything, and the
++/// caller needs to distinguish "refused and stopped" from "ran unbounded".
++///
++/// # Hard host-side bound
++///
++/// `HARD_CAP_MIB` is not a politeness limit; it is what makes this helper safe to run.
++///
++/// The first version asked for 4096 MiB and stopped only when the allocator refused. That
++/// is correct *while a ceiling is enforced* and catastrophic when one is not: a mutation
++/// that removed the cgroup left this helper allocating against the whole machine, and the
++/// test run drove the host into swap exhaustion and froze the system. An unbounded
++/// adversary is only safe to run when the thing under test is what bounds it, which is
++/// exactly the assumption a mutation invalidates.
++///
++/// So the helper bounds itself at the same 256 MiB the proven mechanism workload uses.
++/// Against a 64 MiB ceiling the kernel kills it far below the
++/// cap, so the enforcement evidence is unchanged; with no ceiling it stops at the cap and
++/// reports, so a failed experiment costs a bounded amount of memory and says so.
++const HARD_CAP_MIB: u64 = 256;
++
++fn mem_hog(target_mib: Option<u64>) -> Report {
++    let target = target_mib.unwrap_or(HARD_CAP_MIB).min(HARD_CAP_MIB) * 1024 * 1024;
++    let mut held: Vec<Vec<u8>> = Vec::new();
++    let mut refused = 0u64;
++    while (held.len() as u64) * 1024 * 1024 < target {
++        let mut page = vec![0u8; 1024 * 1024];
++        // Touch every 4 KiB so the pages are actually resident and charged.
++        for i in (0..page.len()).step_by(4096) {
++            page[i] = (i % 251) as u8;
++        }
++        held.push(page);
++    }
++    // If we are still here, try until something refuses -- or until the hard cap, so an
++    // unenforced run cannot run away.
++    loop {
++        if (held.len() as u64) * 8 * 1024 * 1024 >= HARD_CAP_MIB * 1024 * 1024 {
++            refused = 0;
++            break;
++        }
++        let mut page = match vec![0u8; 8 * 1024 * 1024].try_reserve_exact(1) {
++            Ok(_) => vec![0u8; 8 * 1024 * 1024],
++            Err(_) => {
++                refused += 1;
++                if refused > 64 {
++                    break;
++                }
++                continue;
++            }
++        };
++        for i in (0..page.len()).step_by(4096) {
++            page[i] = 1;
++        }
++        held.push(page);
++    }
++    Report::pass(format!(
++        "held {} MiB after {} refusals",
++        (held.len() as u64) * 1024 * 1024 / (1024 * 1024),
++        refused
++    ))
++}
++
++/// Forks `count` children that outlive this process, bounded.
++///
++/// Used through the governed path to prove that a PID ceiling is enforced by the kernel
++/// rather than by the helper's own restraint.
++fn fork_many(count: u64) -> Report {
++    let mut spawned = 0u64;
++    for _ in 0..count {
++        match std::process::Command::new("/bin/sleep")
++            .arg("30")
++            .stdout(std::process::Stdio::null())
++            .stderr(std::process::Stdio::null())
++            .spawn()
++        {
++            Ok(_) => spawned += 1,
++            // The ceiling is enforced; further forks are refused.
++            Err(_) => break,
++        }
++    }
++    Report::pass(format!("spawned {spawned} of {count}"))
++}
++
+ fn flood(bytes: Option<usize>) -> Report {
+     let target = bytes.unwrap_or(usize::MAX);
+     let line = "X".repeat(1023);
+diff --git a/crates/orxnud-platform-sandbox/tests/resources.rs b/crates/orxnud-platform-sandbox/tests/resources.rs
+index 20d6748..7a606b4 100644
+--- a/crates/orxnud-platform-sandbox/tests/resources.rs
++++ b/crates/orxnud-platform-sandbox/tests/resources.rs
+@@ -285,22 +285,17 @@ fn the_sandbox_runner_reports_resource_availability() {
+         );
+         println!("  bwrap absent in this environment; visibility reported as unavailable");
+     }
+-    // Two different questions, previously conflated into one equality.
++    // The runner's claim must match what the hierarchy actually permits.
+     //
+-    // `have.resources` answers "does this runner *apply* resource limits?" -- it does not
+-    // (`linux.rs` still reports `Resource::Observed`), so it must be false.
+-    //
+-    // `enforcement_environment().can_enforce()` answers "can this *host* enforce them?"
+-    // That is now true here. Asserting the two were equal passed only while both were
+-    // false, i.e. while the host could not enforce either; the moment delegation arrived
+-    // the assertion failed and was reporting a real capability gap as a test defect.
+-    //
+-    // The runner claiming `true` while applying nothing is the defect that must never
+-    // happen, so that is what is asserted. Wiring the runner to a dedicated cgroup is
+-    // tracked as V-46's next step.
+-    assert!(
+-        !have.resources,
+-        "the runner must not claim resource enforcement it does not perform"
++    // This previously asserted `!have.resources` because the runner did not enforce
++    // anything yet. It now owns a dedicated cgroup (V-46), so the assertion is against
++    // ground truth rather than a hardcoded value: claiming enforcement the host cannot
++    // provide would be the defect, and so would denying it when it can.
++    let av = CgroupV2::discover().availability;
++    assert_eq!(
++        have.resources,
++        av.memory || av.processes || av.cpu,
++        "the runner must report exactly the resource enforcement the host permits"
+     );
+     println!(
+         "  runner applies resources: {} | host can enforce: {}",

@@ -198,6 +198,82 @@ suite.
 
 ---
 
+### 4.9 Mutation testing (normative)
+
+A green test proves nothing about the code it does not exercise. Deliberately breaking
+the mechanism and observing the intended test fail is the only direct evidence that the
+test has teeth.
+
+#### 4.9.1 A mutation must be shown to have applied
+
+Four checks, in order. Failing any of them means the mutation is not evidence:
+
+| # | Check | Why |
+|---|-------|-----|
+| 1 | The source edit **applies** — the pattern matched | A pattern that does not match silently changes nothing |
+| 2 | The resulting file **differs** from the baseline | Guards against 1 being fooled by a no-op write |
+| 3 | The **behaviour** changes in the expected direction | Distinguishes a real mutation from an unrelated one |
+| 4 | The **intended** test fails, and for the expected reason | A failure anywhere is not evidence for this mutation |
+
+Check 1 is not theoretical. During V-46 a mutation "passed" because its replacement
+string did not exist in the file (`ResourceControl::Memory` versus `Self::Memory`), so
+nothing was mutated and the suite stayed green. It was briefly reported as a successful
+mutation. Checks 1 and 2 exist because of that.
+
+#### 4.9.2 A mutation test must remain safe when the mutation removes the control
+
+**This is the hard rule, and it is normative.**
+
+> Removing a safety control to prove the test detects its absence must not turn the test
+> workload into a hazard when the control is gone.
+
+The reasoning is structural, not incidental. An adversarial workload is only safe to run
+when the thing under test is what bounds it — and a mutation that removes the bound is
+precisely the case where that assumption is false. The workload then runs against
+whatever remains, which on a shared machine is the host.
+
+During V-46, `mem_hog` allocated until the allocator refused, on the reasoning that
+`memory.max` would always stop it first. Two mutations that removed the cgroup turned it
+into a whole-machine allocation and drove the host into swap exhaustion, freezing the
+machine twice.
+
+The consequences are now requirements, not advice:
+
+- **Every adversarial fixture bounds itself.** `mem_hog` caps at a fixed, small budget and
+  retains its pages, so running it unenforced costs a bounded amount of memory. The
+  enforcement evidence is unchanged, because a ceiling well below the cap still stops it.
+- **Enforcement evidence must not depend on the workload being stopped by the control.**
+  The governed test asserts the workload could not retain what it requested, using
+  `memory.max` and `memory.current`. `memory.events` counters are reported, not required:
+  reading them from a watcher thread is a sampling race, and pinning
+  `memory.swap.max = 0` makes the kernel OOM-kill rather than reclaim, so `max` reads 0
+  for a correctly enforced ceiling.
+- **Do not require a specific signal or exit code.** `memory.max` is entitled to refuse,
+  reclaim, or OOM-kill. A test that demands one particular mechanism is testing the
+  mechanism, not the property.
+- **A fixture must not be runnable into an unbounded state by accident.** If a helper can
+  only be exercised safely through the governed path, it is not to be invoked directly
+  outside it.
+- **Interrupt safety.** A mutation experiment must be able to restore its baseline from
+  something other than memory. Verify the restore by diffing against a saved copy, and
+  never by the suite being green. A timed-out experiment once left a mutation live in
+  production code and leaked workers.
+
+#### 4.9.3 Redundant mechanisms are not isolated by mutation
+
+Where two mechanisms provide the same property, removing one may change nothing
+observable. That is a finding about the architecture, not a defect in the test, and the
+correct response is to record it rather than to contrive a scenario that separates them.
+
+During V-46, removing the runner's `cgroup.kill` on timeout left the suite green, because
+`bwrap --unshare-pid --die-with-parent` already tears the PID namespace down when the
+supervisor dies. The two mechanisms are redundant under this execution model (ADR-0036).
+The teeth of `cgroup.kill` are real and are proven where they *are* distinguishable — in
+the direct mechanism suite, which has no PID namespace — and the governed-path claim is
+recorded as redundant rather than artificially isolated.
+
+---
+
 ## 5. Test data & fixtures
 
 - **No production data in tests.** Synthetic fixtures with realistic *shapes*.

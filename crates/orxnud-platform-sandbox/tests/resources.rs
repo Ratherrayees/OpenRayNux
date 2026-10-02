@@ -285,22 +285,17 @@ fn the_sandbox_runner_reports_resource_availability() {
         );
         println!("  bwrap absent in this environment; visibility reported as unavailable");
     }
-    // Two different questions, previously conflated into one equality.
+    // The runner's claim must match what the hierarchy actually permits.
     //
-    // `have.resources` answers "does this runner *apply* resource limits?" -- it does not
-    // (`linux.rs` still reports `Resource::Observed`), so it must be false.
-    //
-    // `enforcement_environment().can_enforce()` answers "can this *host* enforce them?"
-    // That is now true here. Asserting the two were equal passed only while both were
-    // false, i.e. while the host could not enforce either; the moment delegation arrived
-    // the assertion failed and was reporting a real capability gap as a test defect.
-    //
-    // The runner claiming `true` while applying nothing is the defect that must never
-    // happen, so that is what is asserted. Wiring the runner to a dedicated cgroup is
-    // tracked as V-46's next step.
-    assert!(
-        !have.resources,
-        "the runner must not claim resource enforcement it does not perform"
+    // This previously asserted `!have.resources` because the runner did not enforce
+    // anything yet. It now owns a dedicated cgroup (V-46), so the assertion is against
+    // ground truth rather than a hardcoded value: claiming enforcement the host cannot
+    // provide would be the defect, and so would denying it when it can.
+    let av = CgroupV2::discover().availability;
+    assert_eq!(
+        have.resources,
+        av.memory || av.processes || av.cpu,
+        "the runner must report exactly the resource enforcement the host permits"
     );
     println!(
         "  runner applies resources: {} | host can enforce: {}",
