@@ -319,6 +319,65 @@ pub fn backend_name() -> &'static str {
     }
 }
 
+/// Connects to an endpoint this host's local transport is already serving.
+///
+/// The client half of [`bind`], for a peer that already knows where the daemon is.
+/// It returns the same [`LocalStream`] the server side accepts, so both ends share
+/// one framing implementation rather than each having its own idea of where a message
+/// ends.
+///
+/// # Errors
+///
+/// [`IpcError::Unsupported`] where no backend exists, or [`IpcError::Other`] if nothing
+/// is listening — which is *not* [`IpcError::Disconnected`]. "The daemon is not
+/// running" and "the daemon hung up mid-conversation" are different facts and a
+/// caller has to be able to report them differently.
+pub async fn connect(path: &Path) -> Result<LocalStream, IpcError> {
+    #[cfg(unix)]
+    {
+        LocalStream::connect(path).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(IpcError::Unsupported)
+    }
+}
+
+/// The state root a default install uses.
+///
+/// The XDG convention, spelled out rather than pulled in as a dependency for one
+/// call: the rule is two environment lookups, and a personal install that cannot be
+/// relocated is a worse problem than a hand-written default.
+///
+/// # Why it lives here
+///
+/// Because [`endpoint_for`] takes a state root, *something* has to decide what that
+/// root is, and a client that cannot ask the same question the daemon answered will
+/// look in the wrong place — the failure mode being a CLI that reports "the daemon is
+/// not running" while the daemon is serving somewhere else. The rule is
+/// platform-and-environment knowledge, so it belongs in the crate that owns both the
+/// endpoint name and the platform branch, and both sides call this one function.
+#[must_use]
+pub fn default_state_root() -> PathBuf {
+    if let Some(base) = std::env::var_os("XDG_STATE_HOME")
+        && !base.is_empty()
+    {
+        return PathBuf::from(base).join("orxnud");
+    }
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from(".orxnud"), PathBuf::from);
+    home.join(".local").join("state").join("orxnud")
+}
+
+/// The endpoint a default install serves on, and a client connects to.
+///
+/// [`endpoint_for`] applied to [`default_state_root`], so the two derivations cannot
+/// drift into "the daemon is somewhere else".
+#[must_use]
+pub fn default_endpoint() -> PathBuf {
+    endpoint_for(&default_state_root())
+}
+
 /// Where the socket lives, under the daemon's state root.
 ///
 /// Derived from the existing `Paths` convention — a sibling of the database file,

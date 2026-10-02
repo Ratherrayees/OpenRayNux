@@ -179,6 +179,14 @@ gate_G2() {
   banner G2
   local ok_all=1
 
+  # The internal crates an interface (`orxnuctl`) is allowed to name.
+  #
+  # Transport and wire vocabulary only. Everything that could carry a domain rule --
+  # domain, store, task engine, policy, capability, daemon -- is absent on purpose,
+  # because the whole point of the check is that the CLI cannot reimplement a rule it
+  # cannot see (docs-03 §2, IR-2).
+  local CLI_ALLOWED_INTERNAL="orxnud-platform-ipc orxnud-protocol"
+
   # --- (a) the domain has no I/O or runtime dependency ---
   local domain_deps
   domain_deps="$(manifest_deps crates/orxnud-domain/Cargo.toml)"
@@ -193,13 +201,34 @@ gate_G2() {
   fi
 
   # --- (b) interfaces depend on protocol only ---
-  local cli_internal
+  local cli_internal unexpected
   cli_internal="$(manifest_deps crates/orxnuctl/Cargo.toml | grep -E '^orxnud-' | sort -u | tr '\n' ' ')"
   cli_internal="${cli_internal% }"
-  if [ "$cli_internal" = "orxnud-protocol" ]; then
-    ok "orxnuctl depends on orxnud-protocol only"
+  # A *subset* test against the permitted set, not an equality test against one name.
+  #
+  # `orxnud-platform-ipc` is permitted because opening the approved local transport is
+  # not the thing this gate protects against. The rule's purpose (docs-03 §2, IR-2) is
+  # that a CLI cannot reimplement a domain rule it cannot see -- so the danger is
+  # domain, business and security types, not sockets. Concretely:
+  #
+  #   transport dependency  = ALLOWED   (orxnud-platform-ipc: the socket)
+  #   wire vocabulary       = ALLOWED   (orxnud-protocol: the frames)
+  #   domain/business/security = FORBIDDEN (orxnud-domain, -store, -task, -policy,
+  #                                         -capability, -daemon)
+  #
+  # An equality test would have to be edited every time a permitted crate is added,
+  # and the failure that gets caught is the wrong one. A subset test fails on
+  # anything *added* without a deliberate edit to this list, which is the direction
+  # that matters.
+  unexpected="$(comm -23 \
+    <(printf '%s\n' $cli_internal | sort -u) \
+    <(printf '%s\n' $CLI_ALLOWED_INTERNAL | sort -u) \
+    | tr '\n' ' ')"
+  unexpected="${unexpected% }"
+  if [ -z "$unexpected" ]; then
+    ok "orxnuctl depends only on the permitted internal crates: ${cli_internal:-none}"
   else
-    fail_gate "orxnuctl depends on internal crates other than protocol: ${cli_internal:-none}"
+    fail_gate "orxnuctl depends on internal crates it may not: ${unexpected}"
     ok_all=0
   fi
 

@@ -72,9 +72,10 @@ fn parse_args() -> Result<Action, String> {
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
-    Ok(Action::Serve(root.map_or_else(default_root, |r| {
-        std::path::PathBuf::from(r)
-    })))
+    Ok(Action::Serve(root.map_or_else(
+        orxnud_platform_ipc::default_state_root,
+        std::path::PathBuf::from,
+    )))
 }
 
 enum Action {
@@ -82,24 +83,6 @@ enum Action {
     Help,
     Doctor,
     Serve(std::path::PathBuf),
-}
-
-/// The state root, following the XDG convention `directories` would give.
-///
-/// Spelled out rather than pulled in as a dependency for one call: the rule is two
-/// environment lookups, and a personal install not being relocatable is a worse
-/// problem than a hand-written default.
-fn default_root() -> std::path::PathBuf {
-    if let Some(base) = std::env::var_os("XDG_STATE_HOME")
-        && !base.is_empty()
-    {
-        return std::path::PathBuf::from(base).join("orxnud");
-    }
-    let home = std::env::var_os("HOME").map_or_else(
-        || std::path::PathBuf::from(".orxnud"),
-        std::path::PathBuf::from,
-    );
-    home.join(".local").join("state").join("orxnud")
 }
 
 fn main() -> ExitCode {
@@ -121,7 +104,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Action::Doctor => {
-            doctor(&Paths::under(default_root()));
+            doctor(&Paths::under(orxnud_platform_ipc::default_state_root()));
             return ExitCode::SUCCESS;
         }
         Action::Serve(root) => root.clone(),

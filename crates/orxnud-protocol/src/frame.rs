@@ -103,19 +103,7 @@ impl Request {
     ///
     /// [`ProtocolError::FrameTooLarge`] or [`ProtocolError::Malformed`].
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() > limits::MAX_FRAME_BYTES {
-            return Err(ProtocolError::FrameTooLarge {
-                size: bytes.len(),
-                limit: limits::MAX_FRAME_BYTES,
-            });
-        }
-        let value: Value = serde_json::from_slice(bytes).map_err(|e| ProtocolError::Malformed {
-            reason: e.to_string(),
-        })?;
-        check_depth(&value, 0)?;
-        serde_json::from_value(value).map_err(|e| ProtocolError::Malformed {
-            reason: e.to_string(),
-        })
+        decode_frame(bytes)
     }
 
     /// Whether the `jsonrpc` field is the expected version string.
@@ -123,6 +111,28 @@ impl Request {
     pub fn has_valid_version(&self) -> bool {
         self.jsonrpc == "2.0"
     }
+}
+
+/// A shared decoder for a frame of either direction.
+///
+/// One function because a client and a server have to agree on what a well-formed
+/// frame is, and two copies of that rule is one more thing to keep in step. The size
+/// bound is checked before parsing so an oversized frame cannot make the decoder
+/// allocate for it first.
+fn decode_frame<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolError> {
+    if bytes.len() > limits::MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge {
+            size: bytes.len(),
+            limit: limits::MAX_FRAME_BYTES,
+        });
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| ProtocolError::Malformed {
+        reason: e.to_string(),
+    })?;
+    check_depth(&value, 0)?;
+    serde_json::from_value(value).map_err(|e| ProtocolError::Malformed {
+        reason: e.to_string(),
+    })
 }
 
 /// A JSON-RPC notification: a request with no id, expecting no response.
@@ -231,9 +241,45 @@ impl Response {
         Ok(bytes)
     }
 
+    /// Decodes a response frame, enforcing the size bound first.
+    ///
+    /// The mirror of [`Request::decode`], and deliberately in this crate rather than
+    /// in each client: what a well-formed frame is has to be one rule, or a client and
+    /// a daemon can each believe the other's frames are fine.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::FrameTooLarge`], [`ProtocolError::DepthExceeded`] or
+    /// [`ProtocolError::Malformed`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        decode_frame(bytes)
+    }
+
     /// Whether this carries a result rather than an error.
     pub fn is_ok(&self) -> bool {
         self.error.is_none() && self.result.is_some()
+    }
+
+    /// The result, or the error this response carries.
+    ///
+    /// The one place a caller has to choose between "the answer" and "the refusal",
+    /// so it lives here rather than in each client. A client that wants the error's
+    /// structured fields gets the whole [`crate::error::RpcError`], not a string.
+    ///
+    /// # Errors
+    ///
+    /// The carried [`crate::error::RpcError`], when this is an error response.
+    pub fn into_result(self) -> Result<Value, crate::error::RpcError> {
+        match (self.result, self.error) {
+            (_, Some(e)) => Err(e),
+            (Some(v), None) => Ok(v),
+            // Neither field: a frame that is not a response at all. Reported as a
+            // malformed frame rather than as a successful call with no value.
+            (None, None) => Err(crate::error::RpcError::new(
+                crate::error::RpcErrorCode::PARSE_ERROR,
+                "response carried neither a result nor an error",
+            )),
+        }
     }
 }
 

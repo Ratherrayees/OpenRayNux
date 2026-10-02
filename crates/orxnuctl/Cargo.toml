@@ -1,6 +1,6 @@
 [package]
 name = "orxnuctl"
-description = "OpenRayNux CLI. Depends on orxnud-protocol only (docs-13 §3.1)."
+description = "OpenRayNux CLI. Protocol and transport only (docs-13 §3.1)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +9,27 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
-# Among *internal* crates, only orxnud-protocol. An interface that could import
-# domain types would eventually reimplement a rule to render a state it
-# disagrees with (docs-03 §2).
+# Among *internal* crates, only the wire vocabulary and the local transport.
+#
+# The rule (docs-03 §2, IR-2, enforced by gate G2(b)) is that an interface cannot
+# reimplement a domain rule it cannot see, so every type that could carry one --
+# domain, store, task engine, policy, capability, daemon -- is absent. Opening the
+# approved local socket is not such a type: `orxnud-platform-ipc` speaks bytes and
+# knows nothing about tasks, leases or policy.
 [dependencies]
 # The argument parser is hand-written rather than derived: the command set is
 # closed and tiny, and refusing an unexpected argument is a rule worth writing
 # by hand. `clap` would be a larger dependency for the same two verbs.
 thiserror = { workspace = true }
+# For `Value` in the requests and responses. Not an internal crate: the JSON type is
+# the protocol's own vocabulary, and `orxnud-protocol` speaks it in its public API.
+serde_json = { workspace = true }
 orxnud-protocol = { workspace = true }
+orxnud-platform-ipc = { workspace = true }
+# For one current-thread runtime to drive the transport's async client. A blocking
+# client would mean a second implementation of the socket, and the two would then
+# disagree about where a frame ends.
+tokio = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

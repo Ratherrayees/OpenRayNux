@@ -1,30 +1,35 @@
-//! `orxnuctl` — the CLI. Two subcommands, and that is the whole of it.
+//! `orxnuctl` — the CLI.
 //!
-//! # Why this is so small
+//! # What it does now
 //!
-//! `docs/13-phase-1-contract.md` §8 permits `--version` and `doctor` and nothing
-//! else. Every real command arrives in Phase 6, when there are interfaces to
-//! drive. A CLI with placeholder verbs — `run`, `list`, `stop` that print "not
-//! implemented" — teaches users that commands exist before they do, and the
-//! commands then have to be designed around expectations set by stubs.
+//! `version`, `doctor`, and `task {create,list,claim,complete}`.
 //!
-//! So the argument parser is *closed*: an unknown subcommand is an error listing
-//! what exists, rather than a hint that something is coming.
+//! # Why the parser is hand-written
 //!
-//! # Depends on `orxnud-protocol` only
+//! The command set is closed and small. `clap` is a larger dependency for the same
+//! result, and one of its behaviours is actively wrong for this CLI: deriving the
+//! parser means an unrecognised flag is often *ignored*. Refusing an unexpected
+//! argument is a rule worth writing by hand — silently dropping what a user typed is
+//! how `--porfile` becomes a mystery.
 //!
-//! The contract's rule for interfaces is that they may depend on
-//! `orxnud-protocol` and nothing else internal (docs-03 §2, IR-2). That is what
-//! makes "business logic exists exactly once" true: a CLI cannot reimplement a
-//! rule it cannot see. Gate G2 enforces it mechanically — `orxnuctl`'s manifest
-//! is the check.
+//! # Depends on the wire vocabulary and the transport, and nothing else internal
+//!
+//! `orxnud-protocol` for frames, `orxnud-platform-ipc` for the socket. Everything that
+//! could carry a domain rule — domain, store, task engine, policy, capability,
+//! daemon — is absent, so "business logic exists exactly once" stays true: the CLI
+//! cannot reimplement a rule it cannot see. Gate G2(b) checks the manifest
+//! mechanically.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::fmt;
 
+pub mod client;
+pub mod task;
+
 use orxnud_protocol::{PROTOCOL_VERSION, RpcErrorCode};
+use task::TaskCommand;
 
 /// The CLI's own version, from the crate metadata.
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -33,12 +38,14 @@ pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROGRAM: &str = "orxnuctl";
 
 /// The subcommands that exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Print the version and exit.
     Version,
     /// Report what this build is and what it can currently do.
     Doctor,
+    /// Manage tasks, through the local daemon.
+    Task(TaskCommand),
 }
 
 /// Why a command line could not be understood.
@@ -60,6 +67,42 @@ pub enum CliError {
         extra: String,
     },
 
+    /// A required flag was not supplied.
+    #[error("{command} needs {flag}")]
+    MissingFlag {
+        /// The subcommand.
+        command: &'static str,
+        /// The flag, spelled as the user should type it.
+        flag: &'static str,
+    },
+
+    /// A flag that takes a value did not get one.
+    #[error("{flag} needs a value")]
+    MissingValue {
+        /// The flag, spelled as the user should type it.
+        flag: &'static str,
+    },
+
+    /// A flag that this command does not accept.
+    #[error("{command} does not take {flag}")]
+    UnknownFlag {
+        /// The subcommand.
+        command: &'static str,
+        /// The flag that was supplied.
+        flag: String,
+    },
+
+    /// A flag given more than once.
+    #[error("{flag} was given more than once")]
+    RepeatedFlag {
+        /// The flag, spelled as the user should type it.
+        flag: &'static str,
+    },
+
+    /// A `task` verb that does not exist.
+    #[error("unknown task command {0:?}; expected create, list, claim or complete")]
+    UnknownTaskCommand(String),
+
     /// A global flag with no subcommand.
     #[error("{0} requires a subcommand; try `{PROGRAM} --help`")]
     MissingCommand(String),
@@ -70,6 +113,7 @@ impl fmt::Display for Command {
         let s = match self {
             Self::Version => "version",
             Self::Doctor => "doctor",
+            Self::Task(_) => "task",
         };
         f.write_str(s)
     }
@@ -80,6 +124,12 @@ impl fmt::Display for Command {
 pub struct Invocation {
     /// What to do.
     pub command: Command,
+    /// An endpoint override, when the user gave `--endpoint`.
+    ///
+    /// The daemon has `--state-root`, so a client needs the matching lever or a
+    /// non-default daemon is unreachable. `None` means "use the default derivation",
+    /// which is the same function the daemon uses.
+    pub endpoint: Option<std::path::PathBuf>,
 }
 
 /// The help text.
@@ -91,14 +141,25 @@ pub fn help() -> String {
          Usage:\n  \
            {PROGRAM} --version\n  \
            {PROGRAM} doctor\n  \
+           {PROGRAM} task list\n  \
+           {PROGRAM} task create --id <ID> [--kind <KIND>] <CONTENT>\n  \
+           {PROGRAM} task claim --id <ID> --worker <WORKER>\n  \
+           {PROGRAM} task complete --id <ID> --worker <WORKER>\n  \
            {PROGRAM} --help\n\
          \n\
          Commands:\n  \
            version   Print the version and exit\n  \
-           doctor    Report this build: capabilities, config, storage\n\
+           doctor    Report this build: capabilities, config, storage\n  \
+           task      Manage tasks through the local daemon\n\
          \n\
-         This build speaks local protocol version {PROTOCOL_VERSION}.\n\
-         There are no other commands yet."
+         Task commands accept --endpoint <PATH> to reach a daemon that is not\n\
+         on the default state root.\n\
+         \n\
+         Task state is owned by the daemon: this client sends the request and shows\n\
+         the answer, and decides nothing about whether a task may be claimed or\n\
+         completed.\n\
+         \n\
+         This build speaks local protocol version {PROTOCOL_VERSION}."
     )
 }
 
@@ -112,8 +173,8 @@ pub fn version_line() -> String {
 ///
 /// # Errors
 ///
-/// [`CliError`] for an unknown command, an unexpected argument, or a flag with no
-/// subcommand.
+/// [`CliError`] for an unknown command, a missing or repeated flag, an unexpected
+/// argument, or a flag with no subcommand.
 pub fn parse<I, S>(args: I) -> Result<Invocation, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -128,17 +189,237 @@ where
                 reject_extra("version", rest)?;
                 Ok(Invocation {
                     command: Command::Version,
+                    endpoint: None,
                 })
             }
             "doctor" => {
                 reject_extra("doctor", rest)?;
                 Ok(Invocation {
                     command: Command::Doctor,
+                    endpoint: None,
+                })
+            }
+            "task" => {
+                let (command, endpoint) = parse_task(rest)?;
+                Ok(Invocation {
+                    command: Command::Task(command),
+                    endpoint: endpoint.map(Into::into),
                 })
             }
             "--help" | "-h" | "help" => Err(CliError::MissingCommand("--help".to_owned())),
             other => Err(CliError::UnknownCommand(other.to_owned())),
         },
+    }
+}
+
+/// Parses the arguments after `task`, yielding the command and any endpoint override.
+///
+/// The endpoint is lifted out **before** the verb is read, so it is accepted in either
+/// position. `orxnuctl task --endpoint X list` and `orxnuctl task list --endpoint X`
+/// are both spellings a user will type, and a flag that works in only one of them is a
+/// papercut that produces a baffling error — which is exactly what it did before this
+/// was hoisted.
+fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError> {
+    let (endpoint, rest) = lift_endpoint(args)?;
+
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(CliError::MissingFlag {
+            command: "task",
+            flag: "a command: create, list, claim or complete",
+        });
+    };
+    let mut flags = Flags::parse(verb, rest)?;
+    if endpoint.is_some() && flags.take_optional("--endpoint").is_some() {
+        return Err(CliError::RepeatedFlag { flag: "--endpoint" });
+    }
+    let command = match verb.as_str() {
+        "create" => {
+            let id = flags.take("create", "--id")?;
+            let kind = flags.take_optional("--kind");
+            let content = flags.into_content();
+            TaskCommand::Create { id, kind, content }
+        }
+        "list" => {
+            flags.reject_all("list")?;
+            TaskCommand::List
+        }
+        "claim" => {
+            let id = flags.take("claim", "--id")?;
+            let worker = flags.take("claim", "--worker")?;
+            flags.reject_all("claim")?;
+            TaskCommand::Claim { id, worker }
+        }
+        "complete" => {
+            let id = flags.take("complete", "--id")?;
+            let worker = flags.take("complete", "--worker")?;
+            flags.reject_all("complete")?;
+            TaskCommand::Complete { id, worker }
+        }
+        other => return Err(CliError::UnknownTaskCommand(other.to_owned())),
+    };
+    Ok((command, endpoint))
+}
+
+/// Removes every `--endpoint` from `args`, returning it and what is left.
+///
+/// A value-taking flag read out of band, because it may appear before the verb and the
+/// verb is what says which other flags are legal.
+fn lift_endpoint(args: &[String]) -> Result<(Option<String>, Vec<String>), CliError> {
+    let mut endpoint: Option<String> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--endpoint" || arg.starts_with("--endpoint=") {
+            if endpoint.is_some() {
+                return Err(CliError::RepeatedFlag { flag: "--endpoint" });
+            }
+            let value = match arg.strip_prefix("--endpoint=") {
+                Some(v) => v.to_owned(),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or(CliError::MissingValue { flag: "--endpoint" })?
+                }
+            };
+            endpoint = Some(value);
+        } else {
+            rest.push(arg.to_owned());
+        }
+        i += 1;
+    }
+    Ok((endpoint, rest))
+}
+
+/// The `--flag value` pairs of one `task` invocation, plus any bare words.
+///
+/// Split out from [`parse_task`] so each verb reads as "take these flags, then insist
+/// nothing else was passed" — which is what makes an unexpected argument an error
+/// rather than a shrug.
+struct Flags {
+    values: Vec<(&'static str, String)>,
+    bare: Vec<String>,
+}
+
+impl Flags {
+    /// Reads `--flag value` and bare words. Anything else is refused immediately.
+    ///
+    /// Both `--flag value` and `--flag=value` are accepted, because both are what
+    /// people type and the cost of accepting one of them is a shell-quoting mistake.
+    fn parse(verb: &str, args: &[String]) -> Result<Self, CliError> {
+        // `--endpoint` is absent on purpose: `lift_endpoint` has already removed it,
+        // so seeing one here would mean the same flag was accepted twice.
+        const KNOWN: [&str; 3] = ["--id", "--kind", "--worker"];
+
+        let mut values: Vec<(&'static str, String)> = Vec::new();
+        let mut bare: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i].as_str();
+            if let Some(name) = arg.strip_prefix("--") {
+                let (name, inline) = match name.split_once('=') {
+                    Some((n, v)) => (n, Some(v.to_owned())),
+                    None => (name, None),
+                };
+                let flag = KNOWN
+                    .iter()
+                    .copied()
+                    .find(|k| k.trim_start_matches('-') == name)
+                    .ok_or_else(|| CliError::UnknownFlag {
+                        command: leak_verb(verb),
+                        flag: arg.to_owned(),
+                    })?;
+                let value = match inline {
+                    Some(v) => v,
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .cloned()
+                            .ok_or(CliError::MissingValue { flag })?
+                    }
+                };
+                if values.iter().any(|(k, _)| *k == flag) {
+                    return Err(CliError::RepeatedFlag { flag });
+                }
+                values.push((flag, value));
+            } else {
+                bare.push(arg.to_owned());
+            }
+            i += 1;
+        }
+        Ok(Self { values, bare })
+    }
+
+    /// The value of a required flag.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::MissingFlag`] if absent.
+    ///
+    /// **Removes** the flag it reads, which is what makes [`Self::reject_all`]
+    /// meaningful: a leftover is then exactly a flag this verb did not ask for, rather
+    /// than every flag including the ones just consumed.
+    fn take(&mut self, verb: &'static str, flag: &'static str) -> Result<String, CliError> {
+        self.take_optional(flag).ok_or(CliError::MissingFlag {
+            command: verb,
+            flag,
+        })
+    }
+
+    /// The value of an optional flag, removing it.
+    fn take_optional(&mut self, flag: &'static str) -> Option<String> {
+        let at = self.values.iter().position(|(k, _)| *k == flag)?;
+        Some(self.values.remove(at).1)
+    }
+
+    /// The trailing words, joined — a task's content.
+    fn into_content(mut self) -> Option<String> {
+        let content = std::mem::take(&mut self.bare).join(" ");
+        if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        }
+    }
+
+    /// Refuses anything not already consumed.
+    ///
+    /// A leftover here is a flag this verb never asked for, which is the whole point:
+    /// `--kind` is create's, and `claim` must not quietly accept it.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::UnknownFlag`] for a leftover flag.
+    fn reject_all(&self, verb: &'static str) -> Result<(), CliError> {
+        if let Some((flag, _)) = self.values.first() {
+            return Err(CliError::UnknownFlag {
+                command: verb,
+                flag: (*flag).to_owned(),
+            });
+        }
+        if let Some(extra) = self.bare.first() {
+            return Err(CliError::UnexpectedArgument {
+                command: verb,
+                extra: extra.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The verb a flag error should name.
+///
+/// `parse` learns the verb from a borrowed `&str`, but a `CliError` has to own it to
+/// outlive the call. The set is closed and tiny, so interning is a lookup rather than
+/// an allocation on a path that runs once per process.
+fn leak_verb(verb: &str) -> &'static str {
+    match verb {
+        "create" => "create",
+        "list" => "list",
+        "claim" => "claim",
+        "complete" => "complete",
+        _ => "task",
     }
 }
 
@@ -203,7 +484,14 @@ pub fn doctor() -> DoctorReport {
         enabled_capabilities: 0,
         audit_wired: true,
         store_wired: true,
-        commands: vec!["version", "doctor"],
+        commands: vec![
+            "version",
+            "doctor",
+            "task create",
+            "task list",
+            "task claim",
+            "task complete",
+        ],
     }
 }
 
@@ -225,12 +513,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_and_doctor_are_the_whole_interface() {
+    fn version_and_doctor_parse_without_a_subcommand() {
         for args in [vec!["--version"], vec!["version"], vec!["-V"]] {
             assert_eq!(
                 parse(args.clone()).expect("parses"),
                 Invocation {
-                    command: Command::Version
+                    command: Command::Version,
+                    endpoint: None,
                 },
                 "{args:?}"
             );
@@ -238,7 +527,8 @@ mod tests {
         assert_eq!(
             parse(vec!["doctor"]).expect("parses"),
             Invocation {
-                command: Command::Doctor
+                command: Command::Doctor,
+                endpoint: None,
             }
         );
     }
@@ -305,12 +595,289 @@ mod tests {
     #[test]
     fn doctor_lists_exactly_the_commands_that_exist() {
         let r = doctor();
-        assert_eq!(r.commands, vec!["version", "doctor"]);
+        assert_eq!(
+            r.commands,
+            vec![
+                "version",
+                "doctor",
+                "task create",
+                "task list",
+                "task claim",
+                "task complete"
+            ],
+            "doctor must not list a command that does not parse"
+        );
         // And nothing in the output implies a capability exists.
         assert!(
             !r.render().contains("asr") && !r.render().contains("llm"),
             "doctor must not imply capabilities exist: {}",
             r.render()
+        );
+    }
+
+    /// Every command `doctor` advertises must actually parse.
+    ///
+    /// The list in [`doctor`] and the parser are written separately, so they can
+    /// disagree — and a user who is told a command exists and then finds it does not is
+    /// worse off than one never told. This walks the advertised list through the real
+    /// parser, with the minimum arguments each verb needs.
+    #[test]
+    fn every_advertised_command_actually_parses() {
+        let invocations: Vec<Vec<&str>> = vec![
+            vec!["version"],
+            vec!["doctor"],
+            vec!["task", "create", "--id", "x", "c"],
+            vec!["task", "list"],
+            vec!["task", "claim", "--id", "x", "--worker", "w"],
+            vec!["task", "complete", "--id", "x", "--worker", "w"],
+        ];
+        assert_eq!(
+            invocations.len(),
+            doctor().commands.len(),
+            "the invocation list and the advertised list must be the same length"
+        );
+        for (args, advertised) in invocations.iter().zip(doctor().commands.iter()) {
+            assert!(
+                parse(args.clone()).is_ok(),
+                "`orxnuctl {}` is advertised as `{advertised}` but does not parse",
+                args.join(" ")
+            );
+        }
+    }
+
+    // ------------------------------------------------------------ task parsing
+
+    #[test]
+    fn every_task_verb_parses_into_its_command() {
+        assert_eq!(
+            parse(["task", "list"]).expect("parses").command,
+            Command::Task(TaskCommand::List)
+        );
+        assert_eq!(
+            parse(["task", "create", "--id", "t1", "buy", "milk"])
+                .expect("parses")
+                .command,
+            Command::Task(TaskCommand::Create {
+                id: "t1".to_owned(),
+                kind: None,
+                content: Some("buy milk".to_owned()),
+            }),
+            "bare words join into the content"
+        );
+        assert_eq!(
+            parse(["task", "create", "--id", "t1", "--kind", "workflow", "ship"])
+                .expect("parses")
+                .command,
+            Command::Task(TaskCommand::Create {
+                id: "t1".to_owned(),
+                kind: Some("workflow".to_owned()),
+                content: Some("ship".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(["task", "claim", "--id", "t1", "--worker", "w1"])
+                .expect("parses")
+                .command,
+            Command::Task(TaskCommand::Claim {
+                id: "t1".to_owned(),
+                worker: "w1".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(["task", "complete", "--id", "t1", "--worker", "w1"])
+                .expect("parses")
+                .command,
+            Command::Task(TaskCommand::Complete {
+                id: "t1".to_owned(),
+                worker: "w1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn flags_accept_both_spellings() {
+        // People type both; refusing one is a shell-quoting mistake, not a rule.
+        let spellings: [&[&str]; 2] = [
+            &["task", "claim", "--id", "t1", "--worker", "w1"],
+            &["task", "claim", "--id=t1", "--worker=w1"],
+        ];
+        for args in spellings {
+            assert_eq!(
+                parse(args).expect("parses").command,
+                Command::Task(TaskCommand::Claim {
+                    id: "t1".to_owned(),
+                    worker: "w1".to_owned(),
+                }),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_required_flag_is_refused_by_name() {
+        for (args, flag) in [
+            (["task", "create"].as_slice(), "--id"),
+            (["task", "claim", "--id", "t"].as_slice(), "--worker"),
+            (["task", "claim", "--worker", "w"].as_slice(), "--id"),
+            (["task", "complete", "--id", "t"].as_slice(), "--worker"),
+        ] {
+            let err = parse(args.to_vec()).expect_err("must refuse");
+            assert!(
+                matches!(&err, CliError::MissingFlag { flag: f, .. } if *f == flag),
+                "{args:?} should need {flag}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flag_with_no_value_is_refused_rather_than_swallowed() {
+        let err = parse(["task", "create", "--id"]).expect_err("must refuse");
+        assert!(
+            matches!(err, CliError::MissingValue { flag: "--id" }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unexpected_flag_is_refused_rather_than_ignored() {
+        // The behaviour a derive-based parser would get wrong: `--id` and `--ids` are
+        // not the same flag, and a typo must not become a silent default.
+        let err = parse(["task", "list", "--json"]).expect_err("must refuse");
+        assert!(
+            matches!(&err, CliError::UnknownFlag { flag, .. } if flag == "--json"),
+            "{err:?}"
+        );
+        let err = parse(["task", "create", "--id", "t1", "--ids", "t2"]).expect_err("must refuse");
+        assert!(
+            matches!(&err, CliError::UnknownFlag { flag, .. } if flag == "--ids"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_flag_is_refused_rather_than_last_one_wins() {
+        let err = parse(["task", "claim", "--id", "a", "--id", "b", "--worker", "w"])
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, CliError::RepeatedFlag { flag: "--id" }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_task_verb_lists_the_ones_that_exist() {
+        let err = parse(["task", "teleport"]).expect_err("must refuse");
+        assert!(
+            matches!(&err, CliError::UnknownTaskCommand(v) if v == "teleport"),
+            "{err:?}"
+        );
+        let rendered = err.to_string();
+        for expected in ["create", "list", "claim", "complete"] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal must say what exists: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_with_no_verb_is_refused() {
+        assert!(parse(["task"]).is_err());
+    }
+
+    #[test]
+    fn a_verb_does_not_borrow_another_verbs_flags() {
+        // `--kind` is create's; claim must not silently accept it.
+        let err = parse([
+            "task", "claim", "--id", "t", "--worker", "w", "--kind", "query",
+        ])
+        .expect_err("must refuse");
+        assert!(
+            matches!(&err, CliError::UnknownFlag { flag, .. } if flag == "--kind"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_override_is_lifted_out_of_every_verb() {
+        // Including `list`, which takes no other flags: without the exemption the
+        // override would read as an unknown flag there and nowhere else.
+        for args in [
+            ["task", "list", "--endpoint", "/tmp/x.sock"].as_slice(),
+            ["task", "create", "--id", "t", "--endpoint", "/tmp/x.sock"].as_slice(),
+            [
+                "task",
+                "claim",
+                "--id",
+                "t",
+                "--worker",
+                "w",
+                "--endpoint",
+                "/tmp/x.sock",
+            ]
+            .as_slice(),
+        ] {
+            let got = parse(args.to_vec()).expect("parses").endpoint;
+            assert_eq!(
+                got.as_deref(),
+                Some(std::path::Path::new("/tmp/x.sock")),
+                "{args:?}"
+            );
+        }
+        assert_eq!(parse(["task", "list"]).expect("parses").endpoint, None);
+    }
+
+    #[test]
+    fn the_endpoint_override_works_before_the_verb_too() {
+        // Both spellings are ones a user types. Before this was hoisted, the
+        // flag-first form produced "unknown task command \"--endpoint\"", which is a
+        // baffling answer to a reasonable command line.
+        let cases: [&[&str]; 4] = [
+            &["task", "--endpoint", "/tmp/x.sock", "list"],
+            &["task", "--endpoint=/tmp/x.sock", "list"],
+            &[
+                "task",
+                "--endpoint",
+                "/tmp/x.sock",
+                "create",
+                "--id",
+                "t",
+                "c",
+            ],
+            &[
+                "task",
+                "--endpoint=/tmp/x.sock",
+                "claim",
+                "--id",
+                "t",
+                "--worker",
+                "w",
+            ],
+        ];
+        for args in cases {
+            let got = parse(args.to_vec())
+                .unwrap_or_else(|e| panic!("{args:?} should parse: {e:?}"))
+                .endpoint;
+            assert_eq!(
+                got.as_deref(),
+                Some(std::path::Path::new("/tmp/x.sock")),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_or_valueless_endpoint_is_refused() {
+        let err = parse(["task", "--endpoint", "/a", "--endpoint", "/b", "list"])
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, CliError::RepeatedFlag { flag: "--endpoint" }),
+            "{err:?}"
+        );
+        let err = parse(["task", "list", "--endpoint"]).expect_err("must refuse");
+        assert!(
+            matches!(err, CliError::MissingValue { flag: "--endpoint" }),
+            "{err:?}"
         );
     }
 

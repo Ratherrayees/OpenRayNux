@@ -86,7 +86,7 @@ now): `platform-process`, `platform-net`, `platform-audio`, `platform-single-ins
 |---|---|
 | Deps point **inward** toward the core; never sideways | workspace member dependency lists; a violation is a compile error |
 | `orxnud-domain` has no I/O, no async, no platform dep | its own dependency list is the check |
-| Interfaces depend on `orxnud-protocol` **only** | not created in Phase 1; recorded as a Phase 6 gate |
+| Interfaces may name the wire vocabulary and the local transport, and nothing else that could carry a domain rule | **CI gate G2(b)**, over `orxnuctl`'s manifest. *Amended:* was "`orxnud-protocol` **only**", which predated a real local IPC client. Now `orxnud-protocol` + `orxnud-platform-ipc` are permitted and `orxnud-domain`, `-store`, `-task`, `-policy`, `-capability`, `-daemon` are not. The purpose is unchanged — a CLI cannot reimplement a rule it cannot see — and opening the approved socket is not such a rule |
 | `cfg(target_os)` / `cfg(windows)` / `env::consts::OS` appear **only** in `orxnud-platform-*` | **CI grep gate** (see §5) |
 | The portable core builds with no platform crate available | **CI check:** `cargo check -p orxnud-domain -p orxnud-protocol --target wasm32-unknown-unknown` (or equivalent), proving the boundary is real rather than asserted |
 
@@ -226,7 +226,9 @@ Stated so scope cannot drift:
 |---|---|
 | Any **capability** (ASR, TTS, LLM, browser, messaging) | Phase 4+. Phase 1 builds the *registry* and the *dispatcher* shell, wired to nothing |
 | The **task queue implementation** | Phase 2. Phase 1 builds the conformance harness |
-| Any **interface** — GUI, TUI, CLI commands beyond `--version`/`doctor` | Phase 6. Only protocol types are created |
+| Any **interface** — GUI, TUI | Phase 6. Only protocol types are created |
+| **GUI / TUI** interfaces | Phase 6 |
+| **CLI commands beyond `--version`/`doctor`** | Phase 6. *Since delivered:* `orxnuctl task {create,list,claim,complete}` exists, over the local IPC contract and the same protocol types. It stays within the interface rule — gate G2(b) permits `orxnud-protocol` and `orxnud-platform-ipc` and forbids every crate that could carry a domain rule |
 | **Tauri / Svelte / Vite / pnpm** | Phase 6. Node is provisioned (ADR-0031) but unused until then |
 | **Windows MSI, installers, signing** | Procured in parallel (lead time), built in Phase 5 |
 | Any **schema beyond `schema_meta`** | The brief prohibits creating application schemas in this phase |

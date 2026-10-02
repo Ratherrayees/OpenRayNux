@@ -1052,9 +1052,12 @@ dependencies = [
 name = "orxnuctl"
 version = "0.1.0"
 dependencies = [
+ "orxnud-platform-ipc",
  "orxnud-protocol",
  "proptest",
+ "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

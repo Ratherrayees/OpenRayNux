@@ -144,6 +144,26 @@ impl UnixSocketListener {
     }
 }
 
+impl LocalStream {
+    /// Connects to an already-bound endpoint.
+    ///
+    /// The client half of [`UnixSocketListener::bind_owned`]. Same stream type, same
+    /// framing, same peer-disconnect classification — a client that cannot reuse this
+    /// would have to own a second implementation of the socket, and the two would
+    /// then disagree about what a frame is.
+    pub(crate) async fn connect(path: &Path) -> Result<Self, IpcError> {
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            // Deliberately **not** `peer_io`: a failure to connect is not a peer that
+            // went away mid-conversation. ENOENT means nothing is listening at that
+            // path and ECONNREFUSED means a stale socket file, and a caller has to be
+            // able to tell "the daemon is not running" from "the daemon hung up", so
+            // this stays a distinct error rather than becoming `Disconnected`.
+            .map_err(|e| IpcError::Other(e.to_string()))?;
+        Ok(Self::wrap(stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
