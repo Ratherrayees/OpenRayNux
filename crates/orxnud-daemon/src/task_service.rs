@@ -29,9 +29,13 @@
 
 use std::path::Path;
 
+use orxnud_domain::ids::TaskId;
+use orxnud_domain::task_state::TaskState;
 use orxnud_store::StoreError;
 use orxnud_store::migration::MigrationRunner;
 use orxnud_store::sqlite::Store;
+use orxnud_store::task_repo::{ClaimRefusal, ClaimedTask, NewTask, TaskRow};
+use orxnud_task::engine::{ClaimAttempt, TaskCreation};
 use orxnud_task::scheduler::{PassReport, Scheduler};
 use orxnud_task::{DurableEngine, EngineError, EngineLimits};
 use tracing::{debug, error, info, warn};
@@ -489,5 +493,199 @@ mod tests {
         // A wrapped i64 would produce a plausible-looking timestamp, which is far
         // worse than a visibly negative one.
         assert!(now_ms() > 1_767_225_600_000, "this host's clock is sane");
+    }
+}
+
+/// Why a task request could not be carried out, in terms a caller can branch on.
+///
+/// Separate from [`TaskServiceError`] because the two answer different questions.
+/// `TaskServiceError` answers "is the subsystem still running"; this answers "what
+/// was wrong with your request". Folding them together would force the IPC layer to
+/// read an error *message* to tell "no such task" from "the database is gone" — and
+/// the endpoint is local and unauthenticated, so message text is also a disclosure
+/// surface. Every variant here carries a stable [`TaskFault::as_str`] instead, and
+/// [`TaskFault::Engine`] deliberately holds an opaque summary rather than the
+/// engine's own text.
+#[derive(Debug)]
+pub enum TaskFault {
+    /// The id is already in use.
+    AlreadyExists,
+    /// No task carries that id.
+    NotFound,
+    /// The task exists but cannot be claimed right now.
+    NotClaimable(ClaimRefusal),
+    /// A completion was refused by the lease fence.
+    ///
+    /// Not an error: a zombie worker asking to commit is a normal, expected event
+    /// under TP-5. It is reported rather than swallowed, and it is never converted
+    /// into a success.
+    Fenced,
+    /// The service is shutting down.
+    Stopped,
+    /// The engine failed. `String` is an opaque summary for the log, not the
+    /// engine's message: the detail never crosses to a peer.
+    Engine(String),
+}
+
+impl TaskFault {
+    /// A stable wire spelling.
+    ///
+    /// Clients branch on this, never on prose. It is the reason this enum exists
+    /// separately from [`EngineError`], whose taxonomy is about retry decisions
+    /// rather than about what a caller should be told.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AlreadyExists => "already-exists",
+            Self::NotFound => "not-found",
+            Self::NotClaimable(_) => "not-claimable",
+            Self::Fenced => "fenced",
+            Self::Stopped => "stopped",
+            Self::Engine(_) => "internal",
+        }
+    }
+
+    /// The specific reason inside [`Self::NotClaimable`], if that is the variant.
+    ///
+    /// So a client can tell "not found" from "already running" from "not due yet"
+    /// without parsing anything.
+    #[must_use]
+    pub fn detail(&self) -> Option<&'static str> {
+        match self {
+            Self::NotClaimable(r) => Some(r.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl TaskService {
+    /// The clock this service uses, in ms since the epoch.
+    ///
+    /// On the service rather than taken per call so the IPC layer cannot ask for
+    /// "now" from two places that disagree.
+    #[must_use]
+    pub fn clock_now_ms(&self) -> i64 {
+        now_ms()
+    }
+
+    /// Enqueues a task and returns the row as stored.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::AlreadyExists`] if the id is taken, or [`TaskFault::Engine`] if
+    /// the write fails.
+    pub fn create(&mut self, task: &NewTask, now_ms: i64) -> Result<TaskRow, TaskFault> {
+        self.guard_running()?;
+        match self.engine.create_task(task, now_ms) {
+            Ok(TaskCreation::Created) => self
+                .engine
+                .task(&task.id)
+                .map_err(|e| TaskFault::Engine(e.to_string()))?
+                .ok_or(TaskFault::NotFound),
+            Ok(TaskCreation::AlreadyExists) => Err(TaskFault::AlreadyExists),
+            Err(e) => Err(TaskFault::Engine(e.to_string())),
+        }
+    }
+
+    /// Reads one task.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Engine`] if the read fails.
+    pub fn task(&self, id: &TaskId) -> Result<Option<TaskRow>, TaskFault> {
+        self.engine
+            .task(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Every task, ordered by id.
+    ///
+    /// The ordering is the repository's own (`ORDER BY id`), so it is total and
+    /// stable across runs — a list whose order could change between two identical
+    /// databases would make "what changed" unanswerable.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Engine`] if the read fails.
+    pub fn list(&self) -> Result<Vec<TaskRow>, TaskFault> {
+        self.engine
+            .all_tasks()
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Claims **one named** task for `worker`, through the lease fence.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::NotClaimable`] when the task exists but cannot be claimed now,
+    /// [`TaskFault::Stopped`] after [`Self::shutdown`], or [`TaskFault::Engine`] for
+    /// a budget refusal or a storage failure.
+    pub fn claim_task(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<ClaimedTask, TaskFault> {
+        self.guard_running()?;
+        match self
+            .engine
+            .claim_task_id(id, worker, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+        {
+            ClaimAttempt::Claimed(c) => Ok(*c),
+            ClaimAttempt::Refused(r) => Err(TaskFault::NotClaimable(r)),
+        }
+    }
+
+    /// Records a terminal outcome for a task `worker` holds a live lease on.
+    ///
+    /// Goes through the engine's fenced completion, so a `Pending` task — one never
+    /// claimed — cannot be completed at all, and a worker without a live lease
+    /// cannot complete one that is.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Fenced`] if the lease is absent, expired or held by somebody
+    /// else, [`TaskFault::NotFound`] if there is no such task, or
+    /// [`TaskFault::Engine`] if the transition is illegal or the write fails.
+    pub fn complete_task(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+        to: TaskState,
+    ) -> Result<TaskRow, TaskFault> {
+        self.guard_running()?;
+        // The engine reports "not there" and "fence refused" with one `bool`, because
+        // a zombie worker must not be able to learn whether the task exists. So the
+        // existence check happens first, and only for a caller who could not
+        // otherwise have distinguished the two.
+        let known = self
+            .engine
+            .task(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .is_some();
+        let committed = self
+            .engine
+            .complete_task(id, worker, now_ms, to, true, None)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?;
+        if !committed {
+            return Err(if known {
+                TaskFault::Fenced
+            } else {
+                TaskFault::NotFound
+            });
+        }
+        self.engine
+            .task(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .ok_or(TaskFault::NotFound)
+    }
+
+    fn guard_running(&self) -> Result<(), TaskFault> {
+        if self.is_stopped() {
+            return Err(TaskFault::Stopped);
+        }
+        Ok(())
     }
 }

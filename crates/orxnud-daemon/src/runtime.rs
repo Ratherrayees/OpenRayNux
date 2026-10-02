@@ -52,13 +52,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use orxnud_capability::dispatch::{DispatchError, Dispatcher};
+use orxnud_domain::ids::TaskId;
 use orxnud_domain::platform::SecretsContract;
+use orxnud_domain::task_state::{TaskKind, TaskState};
 use orxnud_platform_ipc::{IpcError, LocalStream, endpoint_for};
 use orxnud_protocol::error::{ProtocolError, RpcError, RpcErrorCode};
 use orxnud_protocol::frame::{Request, RequestId, Response};
 use orxnud_protocol::method::Method;
+use orxnud_store::task_repo::NewTask;
 use serde_json::json;
 
+use orxnud_task::EngineLimits;
+
+use crate::task_service::{TaskFault, TaskService};
 use crate::{Daemon, LifecycleError, Paths};
 
 /// The transport's message ceiling.
@@ -89,6 +95,15 @@ pub enum RuntimeError {
     #[error("local endpoint unavailable: {0}")]
     Endpoint(#[from] IpcError),
 
+    /// The task subsystem could not be opened, migrated or recovered.
+    ///
+    /// Fatal, and for the same reason [`Self::SecurityState`] is: the endpoint is
+    /// never bound. There is no in-memory task fallback, because a daemon that
+    /// accepted `task/create` and then forgot it on restart would be worse than one
+    /// that refused to start.
+    #[error("task subsystem unavailable: {0}")]
+    TaskSubsystem(String),
+
     /// A lifecycle operation failed.
     #[error("daemon lifecycle: {0}")]
     Lifecycle(#[from] LifecycleError),
@@ -109,6 +124,21 @@ pub enum RequestError {
     /// The frame was valid JSON-RPC but not a valid request.
     #[error("invalid request: {0}")]
     Invalid(String),
+
+    /// Well-formed, but declined — with a reason and an optional refinement the
+    /// caller can branch on.
+    ///
+    /// Separate from [`Self::Invalid`] because the caller branches on
+    /// `data.reason` and sometimes on `data.detail` alongside it. Packing a JSON
+    /// object into the reason *string* would be a structured payload disguised as
+    /// prose, and the first thing to do to such a string is split it apart again.
+    #[error("invalid request: {reason}")]
+    Declined {
+        /// A fixed vocabulary word, never prose.
+        reason: String,
+        /// A second fixed word, when the first is not specific enough.
+        detail: Option<&'static str>,
+    },
 
     /// The method does not exist.
     #[error("unknown method: {0}")]
@@ -136,6 +166,13 @@ impl RequestError {
                 .with_data(json!({
                     "reason": why,
                 })),
+            Self::Declined { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(RpcErrorCode::INVALID_REQUEST, "invalid request").with_data(data)
+            }
             Self::UnknownMethod(m) => RpcError::method_not_found(m),
             Self::Refused(why) => {
                 RpcError::new(RpcErrorCode::INTERNAL_ERROR, "the request was refused")
@@ -156,8 +193,17 @@ pub struct Runtime<S: SecretsContract> {
     /// than binding a second one -- which would be refused as a live endpoint, and
     /// rightly so.
     listener: Arc<orxnud_platform_ipc::Listener>,
-    /// Serialises governed dispatches, per V-41. See the module docs.
-    governed: tokio::sync::Mutex<(Daemon, S)>,
+    /// The one authoritative [`TaskService`], and with it the only
+    /// [`orxnud_task::DurableEngine`] — the single writer for the task database.
+    ///
+    /// It shares the governed mutex rather than getting one of its own, and that is
+    /// the whole concurrency story: `DurableEngine` owns a `rusqlite::Connection`
+    /// whose write methods need `&mut`, so exactly one mutable handle may exist at a
+    /// time (ADR-0006). A second mutex would not add safety, only a second way to
+    /// interleave. Task operations therefore serialise against each other *and*
+    /// against governed dispatch — which is a throughput question, deliberately not
+    /// answered here.
+    governed: tokio::sync::Mutex<(Daemon, S, TaskService)>,
     /// Held so a caller can report *which* backend answered.
     backend: &'static str,
     /// The endpoint removal to perform on shutdown, if any.
@@ -178,26 +224,42 @@ impl<S: SecretsContract> Runtime<S> {
     ///
     /// # The ordering is the security property
     ///
-    /// See the module docs. In short: [`Daemon::attach_durable_security_state`] runs
-    /// before the endpoint exists, so there is no instant at which a peer can reach
-    /// a daemon whose approval ledger is in memory.
+    /// See the module docs. In short: [`Daemon::attach_durable_security_state`] and
+    /// the task subsystem are both established *before* the endpoint exists, so there
+    /// is no instant at which a peer can reach a daemon whose approval ledger is in
+    /// memory, or whose task database has not been recovered.
+    ///
+    /// The two are opened in that order deliberately. Durable security state first
+    /// means the audit chain is **verified** before the task engine performs any
+    /// write: a tampered journal refuses the startup before a single task row is
+    /// touched. Opening tasks first would still refuse on the same tamper, but only
+    /// after the task engine had already run its recovery pass.
     ///
     /// # Errors
     ///
     /// [`RuntimeError::SecurityState`] if durable state cannot be established or
-    /// the journal does not verify, or [`RuntimeError::Endpoint`] if the local
-    /// transport cannot be bound. In every case **no endpoint is left behind**.
+    /// the journal does not verify, [`RuntimeError::TaskSubsystem`] if the task
+    /// database cannot be opened, migrated or recovered, or
+    /// [`RuntimeError::Endpoint`] if the local transport cannot be bound. In every
+    /// case **no endpoint is left behind**.
     pub async fn start(paths: Paths, secrets: S) -> Result<Self, RuntimeError> {
         // 1 + 2 + 3. Durable security state, verified, attached.
         let mut daemon = Daemon::compose(paths.clone());
         daemon
             .attach_durable_security_state(&paths.database)
             .map_err(|e| RuntimeError::SecurityState(e.to_string()))?;
+
+        // 4. The task subsystem: opened, migrated under a snapshot, and every lease
+        //    orphaned by a dead predecessor reclaimed -- before a peer can ask for
+        //    work, so a request never arrives at an unrecovered queue.
+        let tasks = TaskService::open(&paths.database, EngineLimits::default())
+            .map_err(|e| RuntimeError::TaskSubsystem(e.to_string()))?;
+
         daemon
             .start()
             .map_err(|e| RuntimeError::SecurityState(e.to_string()))?;
 
-        // 4. Only now does anything become reachable.
+        // 5. Only now does anything become reachable.
         let endpoint = endpoint_for(&paths.root);
         let listener = orxnud_platform_ipc::bind(&endpoint).await?;
         let bound = listener
@@ -207,7 +269,7 @@ impl<S: SecretsContract> Runtime<S> {
         Ok(Self {
             endpoint: bound,
             listener: Arc::new(listener),
-            governed: tokio::sync::Mutex::new((daemon, secrets)),
+            governed: tokio::sync::Mutex::new((daemon, secrets, tasks)),
             backend: orxnud_platform_ipc::backend_name(),
             cleanup: Some(endpoint),
         })
@@ -348,7 +410,7 @@ impl Drop for EndpointRelease {
 /// we should let it do and learn that it was wrong.
 async fn handle_connection<S: SecretsContract>(
     stream: &mut LocalStream,
-    governed: &tokio::sync::Mutex<(Daemon, S)>,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<(), IpcError> {
     let bytes = match stream.read_line_bounded(MAX_REQUEST_BYTES).await {
         Ok(b) => b,
@@ -442,7 +504,7 @@ fn extract_id(bytes: &[u8]) -> Option<RequestId> {
 /// policy's seal, which is the point.
 async fn route<S: SecretsContract>(
     request: &Request,
-    governed: &tokio::sync::Mutex<(Daemon, S)>,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
     let Some(method) = Method::from_wire(&request.method) else {
         return Err(RequestError::UnknownMethod(request.method.clone()));
@@ -474,7 +536,197 @@ async fn route<S: SecretsContract>(
         }
         Method::Echo => Ok(request.params.clone().unwrap_or(json!({}))),
         Method::CapabilityDispatch => dispatch(request, governed).await,
+        // First-party durable state, not capability execution. These go to the
+        // TaskService and to nothing else.
+        Method::TaskCreate | Method::TaskList | Method::TaskClaim | Method::TaskComplete => {
+            tasks(method, request, governed).await
+        }
     }
+}
+
+/// The ceiling on a task's own human-visible content.
+///
+/// Well below [`MAX_REQUEST_BYTES`], because that bound protects the runtime's
+/// *memory* while this one protects the task's *usefulness*: a task description is
+/// text a person reads, and 64 KiB of it is not a description. Bounding content
+/// separately is what stops the frame limit from becoming the de facto content
+/// limit by accident.
+pub const MAX_TASK_CONTENT_BYTES: usize = 4 * 1024;
+
+/// The longest task id or worker label accepted.
+///
+/// Ids and worker labels are identifiers, not documents. An unbounded id is a way to
+/// make the task table expensive to key and the event log expensive to read, and
+/// neither is a cost a client should be able to impose.
+const MAX_TASK_ID_BYTES: usize = 128;
+
+/// Routes a `task/*` method.
+///
+/// # The boundary this draws
+///
+/// Everything below goes through [`TaskService`]. There is no SQL here, no
+/// repository handle, no `rusqlite` value, and no arithmetic on [`TaskState`] — the
+/// transition rules live in the engine and this function only translates between a
+/// peer's JSON and the service's calls. Validation *is* done here, because refusing a
+/// malformed request before it reaches durable state is the transport layer's job;
+/// deciding whether an action is *permitted* is not, and nothing here decides that.
+///
+/// Task management is deliberately **not** routed through the governed dispatcher.
+/// A task is first-party durable state this daemon owns; making `task/create` a
+/// capability invocation would mean asking the policy engine to authorise the daemon
+/// writing its own queue, and would put a row in the capability audit chain for
+/// something that has no capability, no target and no side effect.
+async fn tasks<S: SecretsContract>(
+    method: Method,
+    request: &Request,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let mut g = governed.lock().await;
+    let (_daemon, _secrets, tasks) = &mut *g;
+    let now = tasks.clock_now_ms();
+
+    match method {
+        Method::TaskCreate => {
+            let id = required_str(&params, "id")?;
+            check_len("id", &id, MAX_TASK_ID_BYTES)?;
+            let content = optional_str(&params, "content")?;
+            if let Some(c) = content.as_ref() {
+                check_len("content", c, MAX_TASK_CONTENT_BYTES)?;
+            }
+            let kind_raw = optional_str(&params, "kind")?.unwrap_or_else(|| "query".to_owned());
+            // `from_wire_str` refuses what it does not know, so an invented kind is a
+            // client error rather than a task the engine has to interpret.
+            let kind = TaskKind::from_wire_str(&kind_raw).ok_or_else(|| {
+                RequestError::Invalid(format!("`kind` is not a known task kind: {kind_raw:?}"))
+            })?;
+            let mut task = NewTask::new(TaskId::new(id), kind, now);
+            task.payload = content;
+            let row = tasks.create(&task, now).map_err(task_fault)?;
+            Ok(json!({ "task": task_json(&row) }))
+        }
+        Method::TaskList => {
+            let rows = tasks.list().map_err(task_fault)?;
+            Ok(json!({
+                // `ORDER BY id` in the repository: total, stable, and the same order
+                // two identical databases will always produce.
+                "tasks": rows.iter().map(task_json).collect::<Vec<_>>(),
+                "count": rows.len(),
+            }))
+        }
+        Method::TaskClaim => {
+            let id = required_str(&params, "id")?;
+            check_len("id", &id, MAX_TASK_ID_BYTES)?;
+            let worker = required_str(&params, "worker")?;
+            check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+            let claimed = tasks
+                .claim_task(&TaskId::new(id), &worker, now)
+                .map_err(task_fault)?;
+            Ok(json!({
+                "task": task_json(&claimed.row),
+                "attempt": claimed.attempt_no,
+                "lease_expires_at_ms": claimed.lease_expires_at_ms,
+            }))
+        }
+        Method::TaskComplete => {
+            let id = required_str(&params, "id")?;
+            check_len("id", &id, MAX_TASK_ID_BYTES)?;
+            let worker = required_str(&params, "worker")?;
+            check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+            // `Completed` is fixed by the method name, and it is reachable only from
+            // `running` through the engine's fence. A `pending` task has no lease, so
+            // this cannot complete one — the refusal comes back as `fenced`.
+            let row = tasks
+                .complete_task(&TaskId::new(id), &worker, now, TaskState::Completed)
+                .map_err(task_fault)?;
+            Ok(json!({ "task": task_json(&row) }))
+        }
+        // Unreachable: the caller only routes the four task methods here, and the
+        // match is exhaustive over them. Listed so adding a fifth is a compile error
+        // rather than a silent fall-through to the governed path.
+        _ => Err(RequestError::UnknownMethod(request.method.clone())),
+    }
+}
+
+/// Maps a task fault onto the wire.
+///
+/// Two existing codes and a stable `data.reason`, deliberately no new ones: "no such
+/// task" and "that id is taken" and "you do not hold the lease" are all things the
+/// caller can fix, so they are `INVALID_REQUEST`; a storage failure is the daemon's
+/// problem, so it is `INTERNAL_ERROR`. A client branches on `data.reason`, which is
+/// why the reasons are fixed strings rather than prose — and why the engine's own
+/// message, which can quote a constraint or a path, never reaches a peer.
+fn task_fault(fault: TaskFault) -> RequestError {
+    let reason = fault.as_str();
+    match fault {
+        TaskFault::AlreadyExists
+        | TaskFault::NotFound
+        | TaskFault::NotClaimable(_)
+        | TaskFault::Fenced => RequestError::Declined {
+            reason: reason.to_owned(),
+            detail: fault.detail(),
+        },
+        TaskFault::Stopped | TaskFault::Engine(_) => RequestError::Refused(reason.to_owned()),
+    }
+}
+
+/// The wire projection of one task row.
+///
+/// Only model fields. No id of an internal object, no path, no SQL, no error text
+/// from the engine: `last_error` is included because TP-11 requires a dead-lettered
+/// task's failure to be visible to whoever asked for it, which is a product
+/// requirement rather than debug output.
+fn task_json(row: &orxnud_store::task_repo::TaskRow) -> serde_json::Value {
+    json!({
+        "id": row.id.as_str(),
+        "kind": row.kind.as_wire_str(),
+        "state": row.state.as_wire_str(),
+        "priority": row.priority,
+        "attempts": row.attempts,
+        "max_attempts": row.max_attempts,
+        "content": row.payload,
+        "idempotent": row.idempotent,
+        "effect_observed": row.effect_observed,
+        "run_after_ms": row.run_after_ms,
+        "created_at_ms": row.created_at_ms,
+        "updated_at_ms": row.updated_at_ms,
+        "terminal_at_ms": row.terminal_at_ms,
+        "dead_lettered_at_ms": row.dead_lettered_at_ms,
+        "cancel_requested_at_ms": row.cancel_requested_at_ms,
+        "lease_holder": row.lease_holder,
+        "lease_expires_at_ms": row.lease_expires_at_ms,
+        "schedule_id": row.schedule_id.as_ref().map(ToString::to_string),
+        "fire_time_ms": row.fire_time_ms,
+        "last_error": row.last_error,
+    })
+}
+
+/// Reads a required string parameter.
+fn required_str(params: &serde_json::Value, field: &str) -> Result<String, RequestError> {
+    optional_str(params, field)?
+        .ok_or_else(|| RequestError::Invalid(format!("`{field}` must be a string")))
+}
+
+/// Reads an optional string parameter, refusing a non-string rather than coercing.
+///
+/// Coercion would make `{"id": 12}` and `{"id": "12"}` the same request, and an id is
+/// an identity: two spellings of one is one too many.
+fn optional_str(params: &serde_json::Value, field: &str) -> Result<Option<String>, RequestError> {
+    match params.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(RequestError::Invalid(format!("`{field}` must be a string"))),
+    }
+}
+
+/// Refuses an over-long string, naming the field and the bound.
+fn check_len(field: &str, value: &str, max: usize) -> Result<(), RequestError> {
+    if value.len() > max {
+        return Err(RequestError::Invalid(format!(
+            "`{field}` exceeds the {max}-byte limit"
+        )));
+    }
+    Ok(())
 }
 
 /// Builds an [`ActionRequest`] from the peer's params and hands it to the governed
@@ -501,7 +753,7 @@ async fn route<S: SecretsContract>(
 /// [`RequestError::Refused`] carrying the dispatcher's own reason.
 async fn dispatch<S: SecretsContract>(
     request: &Request,
-    governed: &tokio::sync::Mutex<(Daemon, S)>,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
     let capability = params
@@ -546,7 +798,7 @@ async fn dispatch<S: SecretsContract>(
     );
 
     let mut g = governed.lock().await;
-    let (daemon, secrets) = &mut *g;
+    let (daemon, secrets, _tasks) = &mut *g;
     let mut d: Dispatcher<'_, S> = daemon.dispatcher(secrets);
     match d.dispatch(
         action,

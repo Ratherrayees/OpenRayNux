@@ -40,7 +40,8 @@ use orxnud_domain::ids::TaskId;
 use orxnud_domain::task_state::{TaskKind, TaskState};
 use orxnud_store::schedule_repo::ScheduleRepository;
 use orxnud_store::task_repo::{
-    ApprovalRow, ClaimOutcome, EffectStatus, NewTask, TaskRepoError, TaskRepository, TaskRow,
+    ApprovalRow, ClaimOutcome, ClaimRefusal, ClaimedTask, EffectStatus, NewTask,
+    TargetedClaimOutcome, TaskRepoError, TaskRepository, TaskRow,
 };
 
 use crate::error::{EngineError, EngineErrorKind};
@@ -57,6 +58,43 @@ use crate::conformance::properties::{Claim, TaskEngine, TaskRecord};
 pub struct DurableEngine {
     conn: Connection,
     limits: EngineLimits,
+}
+
+/// The outcome of asking for one named task.
+///
+/// A typed outcome rather than an error, because "this task cannot be claimed" is an
+/// answer, not a malfunction: the caller asked a well-formed question about a task
+/// that exists, and the answer is no. Folding it into `Err` would make a caller
+/// treat an ordinary "already running" as something to retry or escalate.
+///
+/// The budget refusal does **not** come through here — that is an
+/// `EngineErrorKind::ConcurrencyConflict`, because it is a statement about the whole
+/// queue rather than about this task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimAttempt {
+    /// The task was claimed, with the lease granted.
+    ///
+    /// Boxed for the same reason [`ClaimOutcome::Claimed`] is: `ClaimedTask` embeds a
+    /// whole `TaskRow`, so the variant is ~264 bytes next to a one-byte sibling. An
+    /// unboxed pair would make every *refusal* — the common answer for a task that is
+    /// already running — copy 264 bytes to carry one byte of information.
+    Claimed(Box<ClaimedTask>),
+    /// The task exists and cannot be claimed right now.
+    Refused(ClaimRefusal),
+}
+
+/// The outcome of enqueuing a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCreation {
+    /// The task was enqueued.
+    Created,
+    /// The id is already in use.
+    ///
+    /// Distinct from an error because a duplicate id is a client mistake with a
+    /// precise fix, and a caller needs to say "that id is taken" rather than
+    /// "something went wrong". `enqueue_new` folds it into `InvalidInput` for
+    /// callers that do not care; this exists for the ones that do.
+    AlreadyExists,
 }
 
 impl DurableEngine {
@@ -173,6 +211,66 @@ impl DurableEngine {
             // dead-letter row plus the event log are the durable record. Surfacing
             // it as an error would make a supervisor retry a task that is finished.
             ClaimOutcome::Empty | ClaimOutcome::DeadLettered { .. } => Ok(None),
+        }
+    }
+
+    /// Claims one **named** task, if the concurrency budget allows.
+    ///
+    /// The same lease, attempt, event and fencing as [`Self::claim_task`]; the only
+    /// difference is that the caller says which task it wants. A caller that has
+    /// already decided what it is working on cannot be handed somebody else's work.
+    ///
+    /// The concurrency budget is checked first, exactly as in [`Self::claim_task`], and
+    /// a budget refusal is an error here too — "the queue is full" is not a statement
+    /// about this particular task, so it must not arrive as a per-task refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `ConcurrencyConflict` when the lease budget is
+    /// exhausted, or `Storage` if the claim fails.
+    pub fn claim_task_id(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<ClaimAttempt, EngineError> {
+        let live = self
+            .repo_ref()
+            .live_leases(now_ms)
+            .map_err(EngineError::from)?;
+        let limits = self.limits;
+        if !limits.can_claim(live, now_ms) {
+            return Err(limits.refuse_over_limit(live));
+        }
+        Ok(
+            match self
+                .repo()
+                .claim_specific(id, worker, now_ms, limits.lease_duration_ms)
+                .map_err(EngineError::from)?
+            {
+                TargetedClaimOutcome::Claimed(c) => ClaimAttempt::Claimed(c),
+                TargetedClaimOutcome::Refused(why) => ClaimAttempt::Refused(why),
+            },
+        )
+    }
+
+    /// Enqueues a task, distinguishing "created" from "that id is taken".
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `Storage` if the write fails for any reason other than
+    /// the id already existing.
+    pub fn create_task(
+        &mut self,
+        task: &NewTask,
+        now_ms: i64,
+    ) -> Result<TaskCreation, EngineError> {
+        match self.repo().insert(task, now_ms) {
+            Ok(()) => Ok(TaskCreation::Created),
+            // Matched on the variant, not on the message: the IPC layer has to be
+            // able to say "that id is taken" without reading prose.
+            Err(TaskRepoError::AlreadyExists(_)) => Ok(TaskCreation::AlreadyExists),
+            Err(other) => Err(EngineError::from(other)),
         }
     }
 

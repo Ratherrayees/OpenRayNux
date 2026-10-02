@@ -197,8 +197,12 @@ process owning the user's time, data and integrations, with several surfaces
 - `scripts/ci-gates.sh` — the twelve gates, runnable locally and in CI.
 
 Still absent by design: any capability (Phase 4+), any interface (Phase 6), and any
-domain model. `docs/13-phase-1-contract.md` remains the record of what Phase 1
-promised and delivered.
+provider integration. A **task** domain surface now exists over IPC
+(`task/create`, `task/list`, `task/claim`, `task/complete`) because the durable task
+engine was already there and correct; it manages first-party state and is
+deliberately not routed through the capability dispatcher.
+`docs/13-phase-1-contract.md` remains the record of what Phase 1 promised and
+delivered.
 
 ---
 
@@ -206,10 +210,10 @@ promised and delivered.
 
 No capability is registered, and none is reachable: `CapabilityRegistry` is empty
 and `CapabilityInvocation` cannot be constructed outside `orxnud-policy`. No
-interface exists beyond `orxnuctl --version` and `doctor`. No domain model, no
-provider integration, no MCP surface, no Tauri or Svelte project. The task engine
-stores and transitions tasks; it performs no work, because performing work is a
-capability and capabilities are Phase 4+.
+interface exists beyond `orxnuctl --version` and `doctor`. No provider integration,
+no MCP surface, no Tauri or Svelte project. The task engine stores and transitions
+tasks; it performs no work, because performing work is a capability and capabilities
+are Phase 4+.
 
 What *does* exist is the foundation those phases need: pinned and verified SQLite,
 a versioned schema with a tested migration and rollback path, a durable task engine

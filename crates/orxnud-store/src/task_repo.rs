@@ -142,6 +142,14 @@ pub struct TaskRow {
     pub state: TaskState,
     /// Higher runs first.
     pub priority: i64,
+    /// The task's own content, as written by [`NewTask::payload`].
+    ///
+    /// This column was always written and never read: `insert` has carried it since
+    /// the table was created, while every read listed its columns by hand and left it
+    /// out. So a task's content was durable and invisible at the same time, which
+    /// made "list my tasks" unable to say what any of them *were*. Exposing the
+    /// existing column is the whole fix — no migration, no second column.
+    pub payload: Option<String>,
     /// Attempts made.
     pub attempts: u32,
     /// Attempt ceiling before dead-lettering.
@@ -272,6 +280,61 @@ pub enum ClaimOutcome {
     },
 }
 
+/// Why one *specific* task could not be claimed.
+///
+/// A dedicated type rather than a bool or a string, because the caller has to answer
+/// a peer with something stable: "no such task", "already running", "not due yet"
+/// and "out of retries" are four different operational facts and a client cannot
+/// act on any of them if they all arrive as `false`.
+///
+/// Every variant is derived from durable state read inside the claim's own
+/// transaction, never from a separate pre-flight query — see
+/// [`TaskRepository::claim_specific`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// No task carries that id.
+    NotFound,
+    /// The task is not `pending`, so it is not claimable — already running,
+    /// already finished, or explicitly paused.
+    NotPending,
+    /// `run_after_ms` is still in the future.
+    NotYetRunnable,
+    /// `attempts` has reached `max_attempts`.
+    ///
+    /// Defence in depth. The public paths do not produce this state: `complete_with`
+    /// escalates an over-budget failure to `dead-lettered` rather than requeueing it,
+    /// and `recover` does the same for an orphaned lease. It is reported precisely
+    /// rather than folded into "not claimable" so that if a future writer *does*
+    /// produce it, the reason a request failed is still the true one.
+    ///
+    /// The task stays `pending` and is dead-lettered by the next generic
+    /// [`TaskRepository::claim`] pass, exactly as before: escalating here would make
+    /// a targeted request able to destroy a task it merely asked about.
+    RetriesExhausted,
+}
+
+impl ClaimRefusal {
+    /// A stable wire spelling, so a peer branches on data rather than on prose.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not-found",
+            Self::NotPending => "not-claimable",
+            Self::NotYetRunnable => "not-yet-runnable",
+            Self::RetriesExhausted => "retries-exhausted",
+        }
+    }
+}
+
+/// The result of asking for one named task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetedClaimOutcome {
+    /// That task was claimed.
+    Claimed(Box<ClaimedTask>),
+    /// It was not, for a stated reason.
+    Refused(ClaimRefusal),
+}
+
 /// An event in the transition log (ADR-0028 invariant 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskEvent {
@@ -343,6 +406,17 @@ impl ApprovalRow {
     }
 }
 
+/// The columns every read of `tasks` selects, in [`decode_row`]'s order.
+///
+/// One definition, because these were previously written out by hand in three places
+/// and that is exactly how `payload` came to be written but never read: the insert
+/// statement and the read statements had nothing to keep them in step, so adding a
+/// column to one silently did nothing to the other.
+const TASK_COLUMNS: &str = "id, kind, state, priority, payload, attempts, max_attempts, \
+     lease_expires_at_ms, lease_holder, idempotent, effect_observed, run_after_ms, \
+     catch_up, last_error, cancel_requested_at_ms, schedule_id, fire_time_ms, \
+     created_at_ms, updated_at_ms, dead_lettered_at_ms, completed_at_ms";
+
 /// The task store. Every SQL statement for the task layer lives here.
 #[derive(Debug)]
 pub struct TaskRepository<'a> {
@@ -357,6 +431,122 @@ impl From<rusqlite::Error> for TaskRepoError {
     fn from(e: rusqlite::Error) -> Self {
         Self::Sqlite(Box::new(e))
     }
+}
+
+type Taken = (String, String, i64, i64);
+
+/// Takes the lease, for either entry point.
+///
+/// `target` of `None` means "whichever task the queue picks"; `Some(id)` means
+/// exactly that task and no other.
+///
+/// Both forms are **one statement** (ADR-0007 invariant 2): the selection and the
+/// update are the same `UPDATE ... WHERE id = (...) RETURNING`. A `SELECT` followed
+/// by a separate `UPDATE` has a window in which two workers both see the same free
+/// task, and a targeted claim has the same race as a generic one — narrowing *which*
+/// row may be taken does not make the taking atomic.
+///
+/// The two SQL texts differ only in their `WHERE`, so the binding and the decoding
+/// are written once here rather than copied per entry point.
+fn take_lease(
+    tx: &Transaction<'_>,
+    worker: &str,
+    now_ms: i64,
+    lease_ms: i64,
+    target: Option<&TaskId>,
+) -> Result<Option<Taken>, TaskRepoError> {
+    const NEXT: &str = "SELECT id FROM tasks
+                          WHERE state = 'pending'
+                            AND run_after_ms <= ?3
+                            AND attempts < max_attempts
+                          ORDER BY priority DESC, created_at_ms ASC, id ASC
+                          LIMIT 1";
+    let sql = match target {
+        // The partial index `idx_tasks_claimable` contains exactly the rows the
+        // subquery can return, so this scan is proportional to the backlog rather
+        // than to history.
+        None => format!(
+            "UPDATE tasks
+                SET state                  = 'running',
+                    lease_holder           = ?1,
+                    lease_expires_at_ms    = ?2,
+                    attempts               = attempts + 1,
+                    updated_at_ms          = ?3
+              WHERE id = ({NEXT})
+             RETURNING id, kind, lease_expires_at_ms, attempts;"
+        ),
+        Some(_) => "UPDATE tasks
+                SET state                  = 'running',
+                    lease_holder           = ?1,
+                    lease_expires_at_ms    = ?2,
+                    attempts               = attempts + 1,
+                    updated_at_ms          = ?3
+              WHERE id = ?4
+                AND state = 'pending'
+                AND run_after_ms <= ?3
+                AND attempts < max_attempts
+             RETURNING id, kind, lease_expires_at_ms, attempts;"
+            .to_owned(),
+    };
+    let bound = now_ms.saturating_add(lease_ms);
+    let taken = match target {
+        None => tx.query_row(&sql, rusqlite::params![worker, bound, now_ms], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        }),
+        Some(id) => tx.query_row(
+            &sql,
+            rusqlite::params![worker, bound, now_ms, id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ),
+    };
+    Ok(taken.optional()?)
+}
+
+/// Opens the attempt row and the `claimed` event, then commits them together.
+///
+/// Every path that has taken a lease must come through here, so "a claim always
+/// opens an attempt, always logs `claimed`, and always commits both or neither" is
+/// one piece of code rather than a convention each caller has to remember.
+///
+/// Takes the transaction **by value** and commits it. That is what releases the
+/// write borrow on the connection, which is why the caller can read the row back
+/// afterwards — the ordering the fence depends on: the lease is durable before
+/// anybody is told about it.
+///
+/// Returns the 1-based attempt number this claim opened.
+fn commit_claim(
+    tx: Transaction<'_>,
+    id: &str,
+    kind: &str,
+    attempts: i64,
+    worker: &str,
+    now_ms: i64,
+) -> Result<u32, TaskRepoError> {
+    let task_id = TaskId::new(id);
+    let attempt_no = u32::try_from(attempts).unwrap_or(u32::MAX);
+
+    // Test-only: die holding the claim but with no attempt row. A restart must
+    // see neither a lease nor an attempt, because the claim never committed.
+    faults::maybe_crash(FaultPoint::ClaimAfterTakeBeforeAttempt);
+
+    tx.execute(
+        "INSERT INTO task_attempts (task_id, attempt_no, worker, started_at_ms)
+         VALUES (?1, ?2, ?3, ?4);",
+        rusqlite::params![task_id.as_str(), attempt_no, worker, now_ms],
+    )?;
+    log(
+        &tx,
+        Some(&task_id),
+        now_ms,
+        "claimed",
+        Some(TaskState::Pending),
+        Some(TaskState::Running),
+        Some(worker),
+        Some(attempt_no),
+        Some(kind),
+    )?;
+    tx.commit()?;
+    Ok(attempt_no)
 }
 
 impl<'a> TaskRepository<'a> {
@@ -490,14 +680,9 @@ impl<'a> TaskRepository<'a> {
     /// `TaskRepoError::CorruptRow` if another column cannot be decoded. The variant is
     /// spelled `TaskRepoError::Corrupt`; it carries a [`CorruptRowDetail`].
     pub fn get(&self, id: &TaskId) -> Result<Option<TaskRow>, TaskRepoError> {
-        let sql = "SELECT id, kind, state, priority, attempts, max_attempts,
-                          lease_expires_at_ms, lease_holder, idempotent, effect_observed,
-                          run_after_ms, catch_up, last_error, cancel_requested_at_ms,
-                          schedule_id, fire_time_ms, created_at_ms, updated_at_ms,
-                          dead_lettered_at_ms, completed_at_ms
-                     FROM tasks WHERE id = ?1;";
+        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1;");
         self.conn
-            .query_row(sql, [id.as_str()], decode_row)
+            .query_row(&sql, [id.as_str()], decode_row)
             .optional()?
             .transpose()
     }
@@ -513,13 +698,8 @@ impl<'a> TaskRepository<'a> {
     ///
     /// As [`Self::get`].
     pub fn all(&self) -> Result<Vec<TaskRow>, TaskRepoError> {
-        let sql = "SELECT id, kind, state, priority, attempts, max_attempts,
-                          lease_expires_at_ms, lease_holder, idempotent, effect_observed,
-                          run_after_ms, catch_up, last_error, cancel_requested_at_ms,
-                          schedule_id, fire_time_ms, created_at_ms, updated_at_ms,
-                          dead_lettered_at_ms, completed_at_ms
-                     FROM tasks ORDER BY id;";
-        self.read_rows(sql)
+        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY id;");
+        self.read_rows(&sql)
     }
 
     /// Reads at most `limit` tasks, for a diagnostic that does not need them all.
@@ -528,13 +708,8 @@ impl<'a> TaskRepository<'a> {
     ///
     /// As [`Self::get`].
     pub fn list_limited(&self, limit: u32) -> Result<Vec<TaskRow>, TaskRepoError> {
-        let sql = "SELECT id, kind, state, priority, attempts, max_attempts,
-                          lease_expires_at_ms, lease_holder, idempotent, effect_observed,
-                          run_after_ms, catch_up, last_error, cancel_requested_at_ms,
-                          schedule_id, fire_time_ms, created_at_ms, updated_at_ms,
-                          dead_lettered_at_ms, completed_at_ms
-                     FROM tasks ORDER BY id LIMIT ?1;";
-        self.read_rows_with(sql, [i64::from(limit)])
+        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY id LIMIT ?1;");
+        self.read_rows_with(&sql, [i64::from(limit)])
     }
 
     /// Tasks with a live lease, for a supervisor's concurrency check.
@@ -583,35 +758,9 @@ impl<'a> TaskRepository<'a> {
     ) -> Result<ClaimOutcome, TaskRepoError> {
         let tx = self.tx()?;
 
-        // INVARIANT (ADR-0007 invariant 2): the SELECT and the UPDATE are one
-        // statement. A separate SELECT followed by an UPDATE has a window in which
-        // two workers both see the same free task.
-        //
-        // The partial index `idx_tasks_claimable` contains exactly the rows this
-        // subquery can return, so the scan is proportional to the backlog rather
-        // than to history.
-        let claimed: Option<(String, String, i64, i64)> = tx
-            .query_row(
-                "UPDATE tasks
-                    SET state                  = 'running',
-                        lease_holder           = ?1,
-                        lease_expires_at_ms    = ?2,
-                        attempts               = attempts + 1,
-                        updated_at_ms          = ?3
-                  WHERE id = (
-                        SELECT id FROM tasks
-                         WHERE state = 'pending'
-                           AND run_after_ms <= ?3
-                           AND attempts < max_attempts
-                         ORDER BY priority DESC, created_at_ms ASC, id ASC
-                         LIMIT 1)
-                 RETURNING id, kind, lease_expires_at_ms, attempts;",
-                rusqlite::params![worker, now_ms.saturating_add(lease_ms), now_ms],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-
-        let Some((id, kind, lease_expires_at_ms, attempts)) = claimed else {
+        let Some((id, kind, lease_expires_at_ms, attempts)) =
+            take_lease(&tx, worker, now_ms, lease_ms, None)?
+        else {
             // Nothing claimable. A task past its budget is not claimable either --
             // but leaving it `pending` forever is the retry-storm bug TP-10 warns
             // about, so it is dead-lettered here, loudly, rather than being
@@ -647,39 +796,89 @@ impl<'a> TaskRepository<'a> {
             });
         };
 
-        let task_id = TaskId::new(&id);
-        let attempt_no = u32::try_from(attempts).unwrap_or(u32::MAX);
-
-        // Test-only: die holding the claim but with no attempt row. A restart must
-        // see neither a lease nor an attempt, because the claim never committed.
-        faults::maybe_crash(FaultPoint::ClaimAfterTakeBeforeAttempt);
-
-        tx.execute(
-            "INSERT INTO task_attempts (task_id, attempt_no, worker, started_at_ms)
-             VALUES (?1, ?2, ?3, ?4);",
-            rusqlite::params![task_id.as_str(), attempt_no, worker, now_ms],
-        )?;
-        log(
-            &tx,
-            Some(&task_id),
-            now_ms,
-            "claimed",
-            Some(TaskState::Pending),
-            Some(TaskState::Running),
-            Some(worker),
-            Some(attempt_no),
-            Some(&kind),
-        )?;
-        tx.commit()?;
-
+        let attempt_no = commit_claim(tx, &id, &kind, attempts, worker, now_ms)?;
         let row = self
-            .get(&task_id)?
+            .get(&TaskId::new(&id))?
             .ok_or_else(|| TaskRepoError::NotFound(id.clone()))?;
-        Ok(ClaimOutcome::Claimed(Box::new(ClaimedTask {
+        let claimed = ClaimedTask {
             row,
             attempt_no,
             lease_expires_at_ms,
-        })))
+        };
+        Ok(ClaimOutcome::Claimed(Box::new(claimed)))
+    }
+
+    /// Atomically claims **one named task**, taking a lease.
+    ///
+    /// The same lease, the same attempt, the same event and the same fencing as
+    /// [`Self::claim`]; the only difference is which row is eligible. Narrowing the
+    /// choice does not narrow the transaction, so this cannot become the weak link
+    /// the generic claim is careful not to be.
+    ///
+    /// # Why the refusal is classified inside the same transaction
+    ///
+    /// When the conditional `UPDATE` matches nothing, the row is read back to say
+    /// *why*. That read happens before the commit, so it observes the state the
+    /// failed `UPDATE` saw: `BEGIN IMMEDIATE` holds the write lock throughout, and no
+    /// other writer can slip between the two statements. Asking first and updating
+    /// afterwards would be the race this method exists not to have.
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error.
+    pub fn claim_specific(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> Result<TargetedClaimOutcome, TaskRepoError> {
+        let tx = self.tx()?;
+
+        let taken = take_lease(&tx, worker, now_ms, lease_ms, Some(id))?;
+        let Some((taken_id, kind, lease_expires_at_ms, attempts)) = taken else {
+            let refusal: Option<(String, String, i64, i64, i64)> = tx
+                .query_row(
+                    "SELECT id, state, run_after_ms, attempts, max_attempts
+                       FROM tasks WHERE id = ?1;",
+                    [id.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+            let Some((_, state_raw, run_after_ms, attempts, max_attempts)) = refusal else {
+                tx.commit()?;
+                return Ok(TargetedClaimOutcome::Refused(ClaimRefusal::NotFound));
+            };
+            // A state this build cannot parse is not "claimable" and not "not
+            // claimable": it is unreadable, so say so instead of guessing.
+            let state = TaskState::from_wire_str(&state_raw)
+                .ok_or_else(|| unknown_state(id.to_string(), state_raw.clone()))?;
+            let refusal = if state != TaskState::Pending {
+                ClaimRefusal::NotPending
+            } else if run_after_ms > now_ms {
+                ClaimRefusal::NotYetRunnable
+            } else if attempts >= max_attempts {
+                ClaimRefusal::RetriesExhausted
+            } else {
+                // Claimable by every condition the UPDATE tested, yet not taken. The
+                // only honest answer: something is wrong that this layer will not
+                // paper over.
+                ClaimRefusal::NotPending
+            };
+            tx.commit()?;
+            return Ok(TargetedClaimOutcome::Refused(refusal));
+        };
+
+        let attempt_no = commit_claim(tx, &taken_id, &kind, attempts, worker, now_ms)?;
+        let row = self
+            .get(&TaskId::new(&taken_id))?
+            .ok_or_else(|| TaskRepoError::NotFound(taken_id.clone()))?;
+        let claimed = ClaimedTask {
+            row,
+            attempt_no,
+            lease_expires_at_ms,
+        };
+        Ok(TargetedClaimOutcome::Claimed(Box::new(claimed)))
     }
 
     // --------------------------------------------------------------- complete
@@ -1569,6 +1768,9 @@ impl EffectStatus {
 
 /// Decodes one `tasks` row.
 ///
+/// The column order is [`TASK_COLUMNS`], which is also the table's own order with
+/// `payload` restored, so the indices below read left to right against that list.
+///
 /// The state is decoded through [`TaskState::from_wire_str`], which refuses
 /// anything unrecognised. A row that cannot be decoded is an error rather than a
 /// default, because the dangerous default is `pending` — the only claimable state.
@@ -1592,29 +1794,30 @@ fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<TaskRow, TaskRep
             }))));
         }
     };
-    let schedule_raw: Option<String> = r.get(14)?;
+    let schedule_raw: Option<String> = r.get(15)?;
 
     Ok(Ok(TaskRow {
         id: TaskId::new(id),
         kind,
         state,
         priority: r.get(3)?,
-        attempts: r.get(4)?,
-        max_attempts: r.get(5)?,
-        lease_expires_at_ms: r.get(6)?,
-        lease_holder: r.get(7)?,
-        idempotent: r.get::<_, i64>(8)? != 0,
-        effect_observed: r.get::<_, i64>(9)? != 0,
-        run_after_ms: r.get(10)?,
-        catch_up: r.get::<_, i64>(11)? != 0,
-        last_error: r.get(12)?,
-        cancel_requested_at_ms: r.get(13)?,
+        payload: r.get(4)?,
+        attempts: r.get(5)?,
+        max_attempts: r.get(6)?,
+        lease_expires_at_ms: r.get(7)?,
+        lease_holder: r.get(8)?,
+        idempotent: r.get::<_, i64>(9)? != 0,
+        effect_observed: r.get::<_, i64>(10)? != 0,
+        run_after_ms: r.get(11)?,
+        catch_up: r.get::<_, i64>(12)? != 0,
+        last_error: r.get(13)?,
+        cancel_requested_at_ms: r.get(14)?,
         schedule_id: schedule_raw.map(ScheduleId::new),
-        fire_time_ms: r.get(15)?,
-        created_at_ms: r.get(16)?,
-        updated_at_ms: r.get(17)?,
-        dead_lettered_at_ms: r.get(18)?,
-        terminal_at_ms: r.get(19)?,
+        fire_time_ms: r.get(16)?,
+        created_at_ms: r.get(17)?,
+        updated_at_ms: r.get(18)?,
+        dead_lettered_at_ms: r.get(19)?,
+        terminal_at_ms: r.get(20)?,
     }))
 }
 
@@ -1742,6 +1945,337 @@ mod tests {
         TaskRepository::new(conn)
             .insert(&NewTask::new(tid(id), kind, NOW), NOW)
             .expect("insert");
+    }
+
+    // ------------------------------------------------- targeted claim (V-57)
+    //
+    // The generic claim hands out whichever task the queue picks, which is right for
+    // a worker pool and wrong for a caller that has already decided what it is
+    // working on. These pin the targeted form to the *same* semantics as the generic
+    // one: same lease, same attempt, same event, same fence.
+
+    #[test]
+    fn a_targeted_claim_takes_the_requested_task() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t1", TaskKind::Query);
+        insert(&mut repo, "t2", TaskKind::Query);
+
+        let TargetedClaimOutcome::Claimed(got) = repo
+            .claim_specific(&tid("t2"), "w", NOW, LEASE)
+            .expect("claim")
+        else {
+            panic!("a pending task must be claimable");
+        };
+        assert_eq!(
+            got.row.id,
+            tid("t2"),
+            "the *requested* task, not another one"
+        );
+        assert_eq!(got.row.state, TaskState::Running);
+        assert_eq!(got.row.lease_holder.as_deref(), Some("w"));
+        assert_eq!(got.row.lease_expires_at_ms, Some(NOW + LEASE));
+        assert_eq!(got.attempt_no, 1, "the first attempt opens as 1");
+        assert_eq!(got.row.attempts, 1);
+
+        // The task that was not asked for is untouched, and still claimable.
+        let other = repo.get(&tid("t1")).expect("get").expect("present");
+        assert_eq!(other.state, TaskState::Pending);
+        assert!(other.lease_holder.is_none());
+    }
+
+    #[test]
+    fn a_targeted_claim_records_the_same_event_the_generic_claim_does() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t1", TaskKind::Query);
+        repo.claim_specific(&tid("t1"), "w", NOW, LEASE)
+            .expect("claim");
+
+        let events = repo.events_for(&tid("t1")).expect("events");
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["enqueued", "claimed"],
+            "a targeted claim must leave the same trail, not a thinner one"
+        );
+        let claimed = &events[1];
+        assert_eq!(claimed.from_state, Some(TaskState::Pending));
+        assert_eq!(claimed.to_state, Some(TaskState::Running));
+        assert_eq!(claimed.worker.as_deref(), Some("w"));
+        assert_eq!(claimed.attempt_no, Some(1));
+
+        // And it opened an attempt row, exactly as the generic path does.
+        let attempts = repo.attempts_for(&tid("t1")).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].worker, "w");
+    }
+
+    #[test]
+    fn a_targeted_claim_refuses_a_task_that_does_not_exist() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        let out = repo
+            .claim_specific(&tid("absent"), "w", NOW, LEASE)
+            .expect("claim");
+        assert_eq!(out, TargetedClaimOutcome::Refused(ClaimRefusal::NotFound));
+        assert_eq!(ClaimRefusal::NotFound.as_str(), "not-found");
+    }
+
+    #[test]
+    fn a_targeted_claim_refuses_a_task_that_is_not_pending() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t1", TaskKind::Query);
+        // Claim it once, so it is `running`.
+        repo.claim_specific(&tid("t1"), "w1", NOW, LEASE)
+            .expect("claim");
+
+        // A second worker asking for the same task is refused, and specifically as
+        // "not claimable" rather than "not found": the distinction is what tells a
+        // client it lost a race rather than named a task that never existed.
+        let out = repo
+            .claim_specific(&tid("t1"), "w2", NOW, LEASE)
+            .expect("claim");
+        assert_eq!(out, TargetedClaimOutcome::Refused(ClaimRefusal::NotPending));
+        assert_eq!(ClaimRefusal::NotPending.as_str(), "not-claimable");
+    }
+
+    #[test]
+    fn a_targeted_claim_refuses_a_task_that_is_not_yet_runnable() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        let mut task = NewTask::new(tid("t1"), TaskKind::Query, NOW);
+        task.run_after_ms = NOW + 1_000;
+        repo.insert(&task, NOW).expect("insert");
+
+        let out = repo
+            .claim_specific(&tid("t1"), "w", NOW, LEASE)
+            .expect("claim");
+        assert_eq!(
+            out,
+            TargetedClaimOutcome::Refused(ClaimRefusal::NotYetRunnable)
+        );
+
+        // Once it is due, the same call succeeds.
+        let later = NOW + 1_000;
+        assert!(matches!(
+            repo.claim_specific(&tid("t1"), "w", later, LEASE)
+                .expect("claim"),
+            TargetedClaimOutcome::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn a_targeted_claim_reports_an_exhausted_budget_without_dead_lettering() {
+        // Reaching "pending with the budget spent" through the public API is not
+        // possible: `complete_with` escalates to `dead-lettered` rather than
+        // requeueing an over-budget task, and so does `recover`. So the row is built
+        // with SQL here. That makes this a test of a *defensive* branch — it proves
+        // that if some other writer ever produces that state, a targeted claim says
+        // so precisely and, above all, does not destroy the row on its way past.
+        let mut c = mem();
+        insert_raw(&mut c, "t1", TaskKind::Query);
+        c.execute(
+            "UPDATE tasks SET state = 'pending', attempts = max_attempts WHERE id = 't1';",
+            [],
+        )
+        .expect("force the state");
+
+        let mut repo = TaskRepository::new(&mut c);
+        let out = repo
+            .claim_specific(&tid("t1"), "w", NOW, LEASE)
+            .expect("claim");
+        assert_eq!(
+            out,
+            TargetedClaimOutcome::Refused(ClaimRefusal::RetriesExhausted)
+        );
+        assert_eq!(ClaimRefusal::RetriesExhausted.as_str(), "retries-exhausted");
+
+        // The refusal must not have destroyed the row: dead-lettering is the generic
+        // pass's job, and a targeted request that merely asked must not escalate it.
+        let row = repo.get(&tid("t1")).expect("get").expect("present");
+        assert_eq!(row.state, TaskState::Pending);
+        assert!(row.dead_lettered_at_ms.is_none());
+    }
+
+    #[test]
+    fn a_budgeted_failure_requeues_so_the_next_claim_can_retry() {
+        // The counterpart to the test above, and the reachable path: a `Failed`
+        // outcome while the budget still holds puts the task back in the queue, which
+        // is what makes the targeted claim retryable rather than one-shot.
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        let mut task = NewTask::new(tid("t1"), TaskKind::Query, NOW);
+        task.max_attempts = 2;
+        repo.insert(&task, NOW).expect("insert");
+
+        let TargetedClaimOutcome::Claimed(first) = repo
+            .claim_specific(&tid("t1"), "w1", NOW, LEASE)
+            .expect("claim")
+        else {
+            panic!("a pending task must be claimable");
+        };
+        assert_eq!(first.attempt_no, 1);
+        assert!(
+            repo.complete(
+                &tid("t1"),
+                "w1",
+                NOW,
+                TaskState::Failed,
+                false,
+                Some("boom")
+            )
+            .expect("complete"),
+            "the fence should accept this completion"
+        );
+
+        let row = repo.get(&tid("t1")).expect("get").expect("present");
+        assert_eq!(row.state, TaskState::Pending, "a budgeted failure requeues");
+
+        let TargetedClaimOutcome::Claimed(second) = repo
+            .claim_specific(&tid("t1"), "w2", NOW + 1, LEASE)
+            .expect("claim")
+        else {
+            panic!("the requeued task must be claimable again");
+        };
+        assert_eq!(second.attempt_no, 2, "the retry is the second attempt");
+        assert!(
+            repo.complete(&tid("t1"), "w2", NOW + 2, TaskState::Completed, true, None)
+                .expect("complete"),
+            "the retry's holder completes"
+        );
+    }
+
+    #[test]
+    fn a_completed_task_cannot_be_claimed_targeted() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t1", TaskKind::Query);
+        repo.claim_specific(&tid("t1"), "w", NOW, LEASE)
+            .expect("claim");
+        assert!(
+            repo.complete(&tid("t1"), "w", NOW, TaskState::Completed, true, None)
+                .expect("complete"),
+            "the fence should accept this completion"
+        );
+        let out = repo
+            .claim_specific(&tid("t1"), "w", NOW, LEASE)
+            .expect("claim");
+        assert_eq!(out, TargetedClaimOutcome::Refused(ClaimRefusal::NotPending));
+    }
+
+    #[test]
+    fn a_targeted_lease_completes_only_for_its_holder_and_only_while_live() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t1", TaskKind::Query);
+        repo.claim_specific(&tid("t1"), "holder", NOW, LEASE)
+            .expect("claim");
+
+        // A different worker cannot commit somebody else's work (TP-5).
+        assert!(
+            !repo
+                .complete(
+                    &tid("t1"),
+                    "intruder",
+                    NOW,
+                    TaskState::Completed,
+                    true,
+                    None
+                )
+                .expect("complete"),
+            "a worker without the lease must be fenced out"
+        );
+
+        // An expired lease cannot either, however it was obtained.
+        let expired = NOW + LEASE;
+        assert!(
+            !repo
+                .complete(
+                    &tid("t1"),
+                    "holder",
+                    expired,
+                    TaskState::Completed,
+                    true,
+                    None
+                )
+                .expect("complete"),
+            "an expired lease must be fenced out"
+        );
+
+        // Still `running`: no refusal above moved the state.
+        let row = repo.get(&tid("t1")).expect("get").expect("present");
+        assert_eq!(row.state, TaskState::Running);
+
+        // The holder, inside its lease, commits.
+        assert!(
+            repo.complete(
+                &tid("t1"),
+                "holder",
+                NOW + 1,
+                TaskState::Completed,
+                true,
+                None
+            )
+            .expect("complete"),
+            "the holder must be able to complete inside its own lease"
+        );
+        let row = repo.get(&tid("t1")).expect("get").expect("present");
+        assert_eq!(row.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn recovery_after_a_targeted_claim_reclaims_it_as_before() {
+        let mut c = mem();
+        insert_raw(&mut c, "t1", TaskKind::Query);
+        let mut repo = TaskRepository::new(&mut c);
+        repo.claim_specific(&tid("t1"), "w", NOW, LEASE)
+            .expect("claim");
+
+        // Recovery is what a restart does, and it must treat a targeted claim
+        // exactly like a generic one: the lease is orphaned, so the task is pending
+        // again.
+        assert_eq!(repo.recover(NOW + 1).expect("recover"), 1);
+        let row = repo.get(&tid("t1")).expect("get").expect("present");
+        assert_eq!(row.state, TaskState::Pending);
+        assert!(row.lease_holder.is_none());
+
+        // And the reopened task can be claimed and completed normally.
+        let TargetedClaimOutcome::Claimed(got) = repo
+            .claim_specific(&tid("t1"), "w2", NOW + 2, LEASE)
+            .expect("claim")
+        else {
+            panic!("the recovered task must be claimable again");
+        };
+        assert_eq!(got.attempt_no, 2, "recovery does not refund the attempt");
+        assert!(
+            repo.complete(&tid("t1"), "w2", NOW + 3, TaskState::Completed, true, None)
+                .expect("complete"),
+            "the second holder must be able to complete"
+        );
+    }
+
+    #[test]
+    fn the_generic_claim_is_unchanged_by_the_targeted_one() {
+        // The targeted path shares its machinery with the generic path; this is what
+        // stops that sharing from having quietly changed the generic behaviour.
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t1", TaskKind::Query);
+
+        let ClaimOutcome::Claimed(got) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("one pending task must be claimable");
+        };
+        assert_eq!(got.row.id, tid("t1"));
+        assert_eq!(got.attempt_no, 1);
+
+        // An empty queue still reports Empty, and still dead-letters a stranded task
+        // on the way past.
+        assert_eq!(
+            repo.claim("w", NOW, LEASE).expect("claim"),
+            ClaimOutcome::Empty
+        );
     }
 
     #[test]
