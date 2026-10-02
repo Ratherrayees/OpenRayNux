@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use orxnud_platform_sandbox::SandboxRunner;
@@ -42,7 +42,19 @@ pub fn helper_path() -> PathBuf {
     // Cargo gives each test binary a *different* metadata hash, so deriving the
     // helper's filename from this one does not work. Scan the directory instead.
     let dir = exe.parent().expect("deps directory");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+
+    // Why the executable check is load-bearing: cargo writes *several* files per test
+    // binary into `deps/` under that binary's own hash -- the executable, a `.d`
+    // dep-info file, and for a crate with a lib target an `.rmeta`. A name-prefix
+    // filter matches all of them, so the "binary" this function returned could be a
+    // 369-byte text file. bwrap then refuses to execute it and every test that needs
+    // the helper fails with no output at all:
+    //
+    //     bwrap: execvp .../deps/hostile_helper-1c609b67bc4a3424.d: Permission denied
+    //
+    // Which reads like a sandbox failure and is not one. Only a file the kernel would
+    // actually execute can be the helper, so that -- not its name -- is the filter.
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read deps directory")
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
@@ -51,14 +63,43 @@ pub fn helper_path() -> PathBuf {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("hostile_helper-") && n != name)
         })
+        .filter(|p| is_executable(p))
         .collect();
-    found.sort();
     assert!(
-        !found.is_empty(),
-        "no hostile_helper-* binary in {}; run `cargo test --no-run` first",
+        !candidates.is_empty(),
+        "no hostile_helper-* executable in {}; run `cargo test --no-run` first",
         dir.display()
     );
-    found.remove(0)
+
+    // Newest first, rather than the lexicographically first *name*. More than one
+    // helper can be present after a rebuild, and the stale ones are the earlier build
+    // of the same source; picking by name has no relationship to which binary is
+    // current, so it could silently test old behaviour. Modification time is what
+    // distinguishes them, and sorting by name as a tie-break keeps the choice
+    // reproducible when two files share a timestamp.
+    candidates.sort_by(|a, b| modified(b).cmp(&modified(a)).then_with(|| a.cmp(b)));
+    candidates.remove(0)
+}
+
+/// Whether `path` is a regular file this process may execute.
+///
+/// The executable bit, because that is precisely the property `bwrap` needs and the
+/// one a name filter was approximating badly. Cargo's sidecar files are readable
+/// text, which is exactly why they slipped through.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// When `path` was last modified, or the epoch if that cannot be read.
+///
+/// The epoch keeps an unreadable candidate at the bottom of the ordering instead of
+/// panicking a test over a file's timestamp.
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// The harness flags that re-execute one ignored test as a plain program.
