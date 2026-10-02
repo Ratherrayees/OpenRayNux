@@ -2808,3 +2808,71 @@ only, and prove no bypass exists.
 (Phase 4b), at which point `cgroup.kill` replaces the namespace approach for tree
 lifetime. Revisit the contract if a capability legitimately needs weaker containment —
 by relaxing that one spec, not by changing the default.
+
+## ADR-0036 — Tree lifetime on Linux: the PID namespace is load-bearing, `cgroup.kill` is a redundant backstop
+
+**Status:** accepted
+**Date:** 2026-10-01
+**Supersedes:** nothing. Extends ADR-0035 (which established `--unshare-pid` +
+`PDEATHSIG` as the containment topology, and was careful not to overclaim).
+
+### Context
+
+ADR-0035 established that process-tree containment on Linux comes from a PID namespace
+plus `--die-with-parent`: when the supervisor dies, the namespace's init dies, and the
+kernel tears down every process in it. It explicitly declined to claim more than that.
+
+V-46 added a second mechanism. The runner creates a dedicated cgroup, adopts the
+supervisor into it, and issues `cgroup.kill` on timeout, on cancellation, and at
+teardown. Both mechanisms were then observed to terminate a detached, signal-ignoring
+descendant — but only one of them can be credited.
+
+The evidence is asymmetric. Mutating the runner's `cgroup.kill` away leaves the entire
+governed suite green (`M2`, no teeth): `--unshare-pid --die-with-parent` has already
+reaped the descendant by then. The mechanism suite, which has no PID namespace, does
+show `cgroup.kill` terminating a three-level subtree, and that is mutation-verified.
+
+So the question is not whether `cgroup.kill` works. It is what it is *for*.
+
+### Decision
+
+1. **The PID namespace is the load-bearing tree-lifetime mechanism on Linux.** This is
+   already what the code assumes: `BwrapRunner` derives `tree_lifetime` from the
+   namespace probe, not from `cgroup.kill`, and a host offering `cgroup.kill` but no PID
+   namespace is refused. Fail-closed and consistent.
+
+2. **`cgroup.kill` is a deliberate redundant backstop, not an independent guarantee.**
+   It is issued on every teardown path, and it is what makes cgroup removal prompt — a
+   descendant holding `stdout` open cannot keep the cgroup alive. Redundancy is
+   acceptable: two mechanisms for one property fail safer than one, and the cost is
+   three extra file writes per execution.
+
+3. **The governed-path `cgroup.kill` claim is `NOT_APPLICABLE`, not `NOT_PROVEN`.**
+   Under this execution model the distinguishing scenario is unreachable, so no test can
+   separate the two. Recording it as unproven would imply a test exists and is failing;
+   recording it as not-applicable states the architectural fact. No artificial mutation
+   will be built to manufacture a distinction.
+
+4. **Sandboxed processes cannot escape the cgroup, so the backstop cannot be the sole
+   defence for a reachable case.** Leaving the cgroup requires writing another
+   `cgroup.procs`, and leaving the PID namespace requires `CAP_SYS_ADMIN`. `bwrap` mounts
+   no `/sys/fs/cgroup` for the payload, so the former is unavailable and the latter is
+   unprivileged. This is why the redundancy is safe rather than merely convenient.
+
+### Consequences
+
+- V-46 closes with the honest shape: mechanism proven, governed-path adoption proven,
+  governed `cgroup.kill` teeth recorded as redundant rather than proven.
+- The capability layer stays free of Linux specifics; the decision lives entirely in the
+  platform runner.
+- A future execution model without a PID namespace — a Windows Job Object runner, or a
+  Linux path that cannot unshare PIDs — inherits the converse obligation: there,
+  `cgroup.kill` becomes load-bearing and must be proven on its own. This is the coupling
+  that makes V-29's evidence requirement real rather than clerical.
+
+### What this ADR does not claim
+
+It does not claim `cgroup.kill` is useless, nor that the two mechanisms are
+interchangeable. It claims only that on the current Linux path the namespace already
+provides the property, so the governed test cannot distinguish them, and that the honest
+record is redundancy.

@@ -4,20 +4,38 @@
 #
 # # Why a separate runner
 #
-# The development host does not delegate cgroup controllers: `memory.max`,
-# `pids.max` and `cpu.max` all return EPERM in a cgroup created under the user's own
-# scope, while the controllers *appear* in `cgroup.controllers`. Those are different
-# facts, and only the second one matters (V-46).
+# A cgroup that accepts `mkdir` need not have any controller delegated to it.
+# `memory.max`, `pids.max` and `cpu.max` can return EPERM in a cgroup created under the
+# user's own scope while the controllers *appear* in `cgroup.controllers`. Those are
+# different facts, and only the second one matters (V-46). Discovery therefore probes by
+# *writing*, walking from the process's own cgroup up through its ancestors.
 #
 # A container with the cgroup filesystem mounted read-write *does* get delegation, and
-# that is verified on this host. So the resource tests run there, unmodified, and the
-# developer's session is left alone — changing a desktop session's cgroup delegation to
-# make a test pass would be a system-wide configuration change for a test's benefit.
+# that is verified. So the resource tests run there, unmodified, and the developer's
+# session is left alone — changing a desktop session's cgroup delegation to make a test
+# pass would be a system-wide configuration change for a test's benefit.
+#
+# # Delegation is per-host, not per-machine
+#
+# Whether a *native* run can enforce depends entirely on where the process sits in the
+# hierarchy, and that varies by host even on the same kernel:
+#
+#   * Under a desktop session on systemd, the user's own slice typically DOES delegate.
+#     Measured 2026-10-02 on the Phase 4 host: `user.slice/user-1000.slice/
+#     user@1000.service/app.slice` accepts `memory.max`, `memory.swap.max`, `pids.max`,
+#     `cpu.max` and `cgroup.kill`, and the whole Phase 4b enforcement suite passes
+#     natively there.
+#   * Inside a container with a private cgroup namespace, the container's own cgroup
+#     usually has nothing delegated to it, and `--privileged --cgroupns=host` is required.
+#
+# So `--native` below reports what it actually found rather than assuming either answer.
+# Do not read "this host delegates nothing" into an old log line: it was true for one
+# host and is false for another.
 #
 # # Usage
 #
 #   scripts/run-resource-tests.sh            # container
-#   scripts/run-resource-tests.sh --native   # run directly, reporting NOT_PROVEN
+#   scripts/run-resource-tests.sh --native   # run directly, reporting what was found
 #
 # # Current standing (Phase 4b, measured)
 #
@@ -49,7 +67,12 @@ IMAGE="${ORXNUD_RESOURCE_IMAGE:-rust:1-bookworm}"
 MOUNT_CGROUP="${ORXNUD_MOUNT_CGROUP:-/sys/fs/cgroup}"
 
 if [ "${1:-}" = "--native" ]; then
-  echo "== resource tests, native (no delegation expected) =="
+  # Delegation is per-host, so the banner reports what this host actually has rather
+  # than what a previous host happened to have. `cargo test` prints the same finding
+  # per test; this line just makes it visible before the run starts.
+  echo "== resource tests, native =="
+  echo "   own cgroup: $(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
+  echo "   (delegation is per-host: the suite reports NOT_PROVEN if this host has none)"
   # Reports NOT_PROVEN per control rather than skipping. A skip teaches nothing.
   cargo test -p orxnud-platform-sandbox --test resources -- --nocapture --test-threads=1
   exit $?

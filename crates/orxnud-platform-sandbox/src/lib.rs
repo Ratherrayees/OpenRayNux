@@ -27,11 +27,15 @@
 //! namespace hides processes but does not terminate them.
 //!
 //! Phase 4a proves 1, and proves environment/filesystem/network/output/timeout
-//! isolation. It does **not** prove 2 or 3, because this host delegates no cgroup
-//! controllers (`cgroup.kill`, `memory.max`, and `pids.max` are all unwritable
-//! in our user session). Those remain `NOT_PROVEN` and are refused at runtime when
-//! a capability requires them, rather than being quietly downgraded.
+//! isolation. Phase 4b then proves 3 (`Resource`) as well, on a host that delegates the
+//! controllers — see [`cgroup`] and `tests/enforcement.rs`. Delegation is a property of
+//! the *host*, not of the code, so the standing is measured rather than assumed: where the
+//! controllers are unavailable, a capability that requires ceilings is **refused** at
+//! runtime rather than quietly downgraded, and [`cgroup::enforcement_environment`]
+//! reports which case this host is.
 //!
+//! Guarantee 2 (`TreeLifetime`) is provided by the PID namespace, with `cgroup.kill` as a
+//! deliberate redundant backstop; see [`linux`].
 //! See ADR-0035.
 
 #![forbid(unsafe_code)]
@@ -42,7 +46,8 @@ pub mod contract;
 pub mod linux;
 
 pub use cgroup::{
-    CgroupAvailability, CgroupV2, EnforcementEnvironment, ResourceControl, ResourceMiss,
+    CgroupAvailability, CgroupV2, EnforcementEnvironment, LimitInvalid, ResourceControl,
+    ResourceMiss, ResourceMissKind,
 };
 pub use contract::{
     AvailableGuarantees, CapturedStream, ExecutionResult, ExecutionStatus, FsPolicy,
