@@ -26,16 +26,48 @@
 //! Phase 2 supplies the actual filesystem or socket primitive; what is
 //! implemented and tested now is the decision logic — including that a stale lock
 //! from a crashed process is distinguishable from a live one.
+//!
+//! # The dispatcher this daemon composes
+//!
+//! [`Daemon::compose`] wires the **governed** dispatcher —
+//! `orxnud_capability::dispatch::Dispatcher`, the one that runs all nine stages —
+//! and installs the real [`SandboxExecutionBackend`] as its only execution
+//! backend. It deliberately does **not** compose
+//! `orxnud_capability::Dispatcher` from the crate root, which is the Phase-1
+//! registry-resolution shell: it performs no policy evaluation, consults no
+//! authority, and reaches no process.
+//!
+//! # Why the dispatcher is a borrow, not a field
+//!
+//! The governed dispatcher holds `&'p mut PolicyEngine`. A struct cannot contain
+//! both an owned `PolicyEngine` and a mutable borrow of itself, so the dispatcher
+//! cannot be a field of [`Daemon`] — not without taking ownership of the engine
+//! inside the dispatcher, which would undo the single-writer guarantee ADR-0006
+//! documents and that the register records as V-41.
+//!
+//! So the daemon **owns** everything the dispatcher needs — the one policy engine,
+//! the adapter bundles, and the execution backend — and [`Daemon::dispatcher`]
+//! lends them out for the duration of one borrow. That is not a workaround for the
+//! borrow checker; it is a stricter version of the invariant. Two governed
+//! dispatchers cannot exist at once, because the second borrow would not compile.
+//! `PolicyEngine` also owns the one audit chain that policy writes to, so the
+//! daemon reads its audit depth through the engine rather than keeping a second,
+//! always-empty chain of its own.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod task_service;
 
-use orxnud_audit::AuditChain;
-use orxnud_capability::{CapabilityRegistry, Dispatcher};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use orxnud_capability::CapabilityRegistry;
+use orxnud_capability::dispatch::{AdapterBundle, ExecutionBackend};
+use orxnud_capability::subprocess::SandboxExecutionBackend;
 use orxnud_config::{ConfigSchemaVersion, LayeredConfig};
-use orxnud_domain::ids::RequestId;
+use orxnud_domain::ids::{CapabilityId, RequestId};
+use orxnud_domain::platform::SecretsContract;
 use orxnud_obs::TracingPlan;
 use orxnud_policy::PolicyEngine;
 use orxnud_store::Store;
@@ -262,6 +294,69 @@ impl InstanceLock {
     }
 }
 
+/// Everything the governed dispatcher needs, owned by the daemon.
+///
+/// # Why this is a type
+///
+/// `orxnud_capability::dispatch::Dispatcher` *borrows* its policy engine and
+/// secret store, so it cannot itself be stored on [`Daemon`]. What the daemon
+/// owns is the configuration the dispatcher is built from: the adapter bundles and
+/// the one execution backend. Holding them here is what makes [`Daemon::compose`]
+/// a composition root rather than a factory that discards its work.
+///
+/// # Why `Debug` is hand-written
+///
+/// `Arc<dyn ExecutionBackend>` cannot be derived. A derived `Debug` would either
+/// not compile or, once someone boxed a handle, print whatever the backend chose
+/// to expose. Reporting the two counts is both true and safe.
+#[derive(Clone)]
+pub struct DispatchWiring {
+    /// Capability id to the implementation that satisfies it.
+    ///
+    /// Empty until a capability is registered, which is the correct state: an
+    /// adapter is a capability, and no capability exists yet. `Dispatcher::new`
+    /// accepts an empty map, and every dispatch is refused with
+    /// `NoImplementation` — the fail-closed result, not a gap.
+    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>,
+    /// The only route to a Tier-1 process.
+    ///
+    /// Not an `Option`, deliberately. The governed dispatcher does accept `None`
+    /// and refuses a Tier-1 capability when it sees one, so an `Option` here would
+    /// not be a safety hole — but it would make "this daemon has no sandbox" a
+    /// state someone can write. Making the field non-optional means composition
+    /// cannot express it, and the only way to lose the backend is to stop building
+    /// a daemon.
+    execution: Arc<dyn ExecutionBackend>,
+}
+
+impl DispatchWiring {
+    /// How many capabilities have an implementation.
+    #[must_use]
+    pub fn bundle_count(&self) -> usize {
+        self.bundles.len()
+    }
+
+    /// Whether an execution backend is installed.
+    ///
+    /// Always `true`, and that is the useful part: it is a *structural* property,
+    /// not a runtime observation. There is no code path that produces a
+    /// `DispatchWiring` without a backend, so this cannot be false and a caller
+    /// that branches on it is reading a compile-time fact.
+    #[must_use]
+    pub fn has_execution_backend(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for DispatchWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchWiring")
+            .field("bundles", &self.bundles.len())
+            .field("execution_backend", &"installed")
+            .finish()
+    }
+}
+
 /// Everything the daemon is composed of.
 ///
 /// The fields are read by `doctor` and asserted by tests; nothing here holds an
@@ -272,10 +367,8 @@ pub struct Components {
     pub paths: Paths,
     /// The capability registry. Empty in Phase 1.
     pub registry: CapabilityRegistry,
-    /// The dispatcher over that registry.
-    pub dispatcher: Dispatcher,
-    /// The audit chain. Empty; the journal file is not created.
-    pub audit: AuditChain,
+    /// What the governed dispatcher is built from.
+    pub dispatch: DispatchWiring,
     /// The resolved configuration. No schema is defined yet.
     pub config: LayeredConfig,
     /// The tracing description. No subscriber is installed.
@@ -303,8 +396,12 @@ impl Components {
     }
 
     /// A multi-line summary, for `doctor`.
+    ///
+    /// `audit_entries` is passed in rather than read from a field, because the
+    /// journal that matters is the one inside the policy engine and this type does
+    /// not hold it. See [`Daemon::audit_len`].
     #[must_use]
-    pub fn describe(&self) -> String {
+    pub fn describe(&self, audit_entries: usize) -> String {
         let mut s = String::new();
         s.push_str(&format!(
             "capabilities enabled: {}\n",
@@ -314,9 +411,14 @@ impl Components {
             "capabilities registered: {}\n",
             self.registry.ids().len()
         ));
+        s.push_str(&format!(
+            "capability implementations: {}\n",
+            self.dispatch.bundle_count()
+        ));
+        s.push_str("execution backend: installed\n");
         s.push_str(&format!("config schema version: {}\n", self.config_version));
         s.push_str(&format!("tracing: {}\n", self.tracing.describe()));
-        s.push_str(&format!("audit entries: {}\n", self.audit.len()));
+        s.push_str(&format!("audit entries: {audit_entries}\n"));
         s.push_str(&format!("config keys: {}\n", self.config.keys().len()));
         s.push_str(&format!("state root: {}", self.paths.root.display()));
         s
@@ -344,16 +446,31 @@ impl Daemon {
     /// Composes a daemon over `paths`.
     ///
     /// Opens nothing and creates nothing. The name says *compose* for that reason.
+    ///
+    /// # What this wires
+    ///
+    /// * a deny-all [`PolicyEngine`] — the composition root is not where
+    ///   permissions are granted;
+    /// * an empty [`CapabilityRegistry`] and an empty adapter-bundle map, so every
+    ///   dispatch is refused as `NoImplementation` rather than reaching an
+    ///   adapter that does not exist;
+    /// * the real [`SandboxExecutionBackend`], chosen by the sandbox crate for
+    ///   this host. Constructing it touches nothing: the runner is selected at
+    ///   compile time and a not-yet-cancelled flag is the only state it holds. The
+    ///   probe that asks whether the host *can* sandbox happens at dispatch time,
+    ///   where a refusal is actionable.
     #[must_use]
     pub fn compose(paths: Paths) -> Self {
         let registry = CapabilityRegistry::empty();
-        let dispatcher = Dispatcher::with_registry(registry.clone());
+        let dispatch = DispatchWiring {
+            bundles: BTreeMap::new(),
+            execution: Arc::new(SandboxExecutionBackend::new()),
+        };
         let instance = InstanceLock::at(paths.instance_lock.clone());
         let components = Components {
             paths,
             registry,
-            dispatcher,
-            audit: AuditChain::new(),
+            dispatch,
             config: LayeredConfig::empty(),
             tracing: TracingPlan::new(),
             config_version: ConfigSchemaVersion::INITIAL,
@@ -362,8 +479,6 @@ impl Daemon {
         Self {
             components,
             state: LifecycleState::Created,
-            // Deny-all policy and an empty budget: the composition root is not
-            // where permissions are granted.
             policy: PolicyEngine::new(
                 orxnud_policy::PolicySet::deny_all("daemon/1"),
                 orxnud_policy::BudgetLedger::empty(),
@@ -391,10 +506,75 @@ impl Daemon {
         &self.components.registry
     }
 
+    /// What the governed dispatcher is built from.
+    #[must_use]
+    pub fn dispatch_wiring(&self) -> &DispatchWiring {
+        &self.components.dispatch
+    }
+
+    /// The **governed** dispatcher: the one that evaluates authority, policy,
+    /// approval and budget, resolves capabilities and credentials, runs Tier-1 work
+    /// through the sandbox, verifies the effect, and hands the outcome to audit.
+    ///
+    /// This is the production entry point into the capability layer. It replaces
+    /// the Phase-1 shell that `orxnud_capability::Dispatcher` provides: that type
+    /// resolves an id against a registry and refuses, which is a real check but
+    /// none of the nine stages.
+    ///
+    /// # Why it is a borrow
+    ///
+    /// It takes `&mut self`, because it takes `&'p mut PolicyEngine` — the single
+    /// writer ADR-0006 documents and that the verification register records as
+    /// V-41. Holding it for one borrow means two governed dispatchers cannot exist
+    /// at once; that is the invariant stated as a type rather than as a convention.
+    ///
+    /// # `secrets`
+    ///
+    /// The secret store is borrowed rather than owned because a store is a handle
+    /// to a process-wide facility (a Secret Service, DPAPI, a Keychain), not daemon
+    /// state, and `orxnud-platform-secrets` exposes no portable constructor the
+    /// daemon could call without deciding *which* backend to use — a configuration
+    /// decision that belongs to configuration, not to the composition root.
+    ///
+    /// Nothing is skipped by the borrow. The returned dispatcher has the same nine
+    /// stages, the same refusal paths, and the same single execution backend as
+    /// every other governed dispatcher; there is no reduced variant.
+    #[must_use]
+    pub fn dispatcher<'p, S: SecretsContract>(
+        &'p mut self,
+        secrets: &'p S,
+    ) -> orxnud_capability::dispatch::Dispatcher<'p, S> {
+        let Self {
+            policy, components, ..
+        } = self;
+        orxnud_capability::dispatch::Dispatcher::new(
+            policy,
+            secrets,
+            components.dispatch.bundles.clone(),
+        )
+        .with_execution(components.dispatch.execution.clone())
+    }
+
+    /// How many records the audit chain policy writes to holds.
+    ///
+    /// Read through the policy engine, because `PolicyEngine` owns the chain and
+    /// policy is what appends to it. A daemon that kept its own chain would report
+    /// zero forever while policy recorded every authorisation.
+    #[must_use]
+    pub fn audit_len(&self) -> usize {
+        self.policy.audit().len()
+    }
+
+    /// A multi-line summary, for `doctor`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.components.describe(self.audit_len())
+    }
+
     /// The policy engine, for inspection.
     ///
-    /// Phase 1 never calls it: there are no actions to authorise, and
-    /// `docs/13-phase-1-contract.md` §8 forbids capabilities.
+    /// Read-only, so a caller cannot authorise an action through it by accident.
+    /// The governed dispatcher borrows it mutably; see [`Self::dispatcher`].
     #[must_use]
     pub fn policy(&self) -> &PolicyEngine {
         &self.policy
@@ -662,7 +842,7 @@ mod tests {
     #[test]
     fn the_description_reports_zero_enabled_capabilities() {
         let d = daemon();
-        let text = d.components().describe();
+        let text = d.describe();
         assert!(text.contains("capabilities enabled: 0"), "{text}");
         assert!(text.contains("config schema version: 1"), "{text}");
     }
@@ -677,6 +857,145 @@ mod tests {
             0,
             "composition must not authorise anything"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Composition: the governed capability path
+    //
+    // These are the tests that stop `Daemon::compose` from regressing to the
+    // Phase-1 shell dispatcher. Two mechanisms, deliberately:
+    //
+    // * **Compile time.** `Daemon::dispatcher` is declared to return
+    //   `orxnud_capability::dispatch::Dispatcher`. The assertions below call
+    //   `has_execution_backend` and `audit_len`, which the shell type does not
+    //   have. Restoring the shell does not compile, so the regression cannot be
+    //   reintroduced quietly.
+    // * **Run time.** The assertions themselves run against a composed daemon,
+    //   not against a separately constructed dispatcher, so they fail if
+    //   composition stops wiring the backend even if the signature survives.
+    // ------------------------------------------------------------------
+
+    /// A secret store with nothing in it.
+    ///
+    /// The secret store is not what this test is about — `orxnud-capability`
+    /// tests that thoroughly. It is here because the governed dispatcher is
+    /// generic over `SecretsContract` and has no default, so *some* store must
+    /// exist to lend one. Empty is the safe choice: a dispatch can never resolve
+    /// a credential from it.
+    struct NoSecrets;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("no secret store in the composition test")]
+    struct NoSecretsError;
+
+    impl SecretsContract for NoSecrets {
+        type Error = NoSecretsError;
+
+        fn get(
+            &self,
+            _reference: &orxnud_domain::platform::SecretRef,
+        ) -> Result<orxnud_domain::platform::SecretLookup, Self::Error> {
+            Ok(orxnud_domain::platform::SecretLookup::Absent)
+        }
+
+        fn set(
+            &self,
+            _reference: &orxnud_domain::platform::SecretRef,
+            _value: &str,
+        ) -> Result<(), Self::Error> {
+            Err(NoSecretsError)
+        }
+
+        fn delete(
+            &self,
+            _reference: &orxnud_domain::platform::SecretRef,
+        ) -> Result<(), Self::Error> {
+            Err(NoSecretsError)
+        }
+
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn composition_installs_a_governed_dispatcher_with_an_execution_backend() {
+        let mut d = daemon();
+        let secrets = NoSecrets;
+
+        // The governed dispatcher, borrowed from the composition root. Nothing here
+        // constructs a dispatcher independently: every field it carries came out of
+        // `Daemon::compose`.
+        let governed = d.dispatcher(&secrets);
+
+        assert!(
+            governed.has_execution_backend(),
+            "a composed daemon must install the execution backend, or a Tier-1 \
+             capability would be refused for a reason the daemon chose"
+        );
+        assert_eq!(
+            governed.audit_len(),
+            0,
+            "composition must not authorise anything"
+        );
+        // The governed dispatcher reads the *same* engine the daemon holds, which is
+        // what makes the single-writer guarantee mean anything.
+        assert_eq!(governed.audit_len(), d.audit_len());
+    }
+
+    #[test]
+    fn composition_wires_a_backend_without_inventing_a_capability() {
+        let d = daemon();
+        assert!(
+            d.dispatch_wiring().has_execution_backend(),
+            "compose must install a backend"
+        );
+        assert_eq!(
+            d.dispatch_wiring().bundle_count(),
+            0,
+            "composition must not invent a capability"
+        );
+        assert_eq!(
+            d.components().enabled_capabilities(),
+            0,
+            "composition must not enable a capability"
+        );
+        // What is being proven here is the *wiring*, not the backend's behaviour:
+        // `orxnud-capability`'s suite is what proves `SandboxExecutionBackend`
+        // refuses on a host with no sandbox. A deliberately-refusing stub would also
+        // satisfy `has_execution_backend`, so this test does not claim more than it
+        // establishes — that `compose` installs the backend named in its source, and
+        // that no capability, grant, or ceiling was invented to make it construct.
+    }
+
+    #[test]
+    fn one_composed_dispatcher_at_a_time_and_the_daemon_is_unchanged() {
+        // The single-writer invariant. `dispatcher` takes `&mut self`, so a second
+        // governed dispatcher cannot coexist with the first — that is the V-41
+        // guarantee expressed as a type rather than a convention. What is checkable
+        // at runtime is the consequence: lending one changes no daemon state, and a
+        // new one is available once the previous is dropped.
+        let mut d = daemon();
+        let secrets = NoSecrets;
+        let before = d.state();
+        {
+            let governed = d.dispatcher(&secrets);
+            assert!(governed.has_execution_backend());
+        }
+        assert_eq!(d.state(), before, "lending a dispatcher changed the daemon");
+        let second = d.dispatcher(&secrets);
+        assert!(second.has_execution_backend());
+    }
+
+    #[test]
+    fn the_dispatcher_debug_reports_the_wiring_without_printing_a_trait_object() {
+        // `Arc<dyn ExecutionBackend>` has no `Debug`, so `DispatchWiring` writes its
+        // own. A daemon log therefore gets the counts and the word "installed", not
+        // whatever a backend's `Debug` happened to expose.
+        let d = daemon();
+        let text = format!("{:?}", d.dispatch_wiring());
+        assert!(text.contains("bundles: 0"), "{text}");
+        assert!(text.contains("execution_backend: \"installed\""), "{text}");
     }
 
     #[test]
