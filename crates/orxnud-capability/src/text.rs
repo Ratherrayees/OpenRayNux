@@ -110,6 +110,8 @@ pub fn declaration() -> crate::CapabilityDeclaration {
     .with_risk(RiskClass::Low)
     .with_data(DataClass::Public, DataClass::Public)
     .with_isolation(IsolationTier::InProcess)
+    .with_params(crate::schema::word_count_params())
+    .with_target(orxnud_domain::TargetSemantics::None)
     .idempotent()
     .enabled()
 }
@@ -164,6 +166,16 @@ impl Counts {
 /// [`ExecutionOutcome::Failed`]. Every branch names the field and what was wrong with
 /// it, because "invalid parameters" tells a caller nothing they can act on.
 fn text_param(params: &Value) -> Result<String, String> {
+    // An unrecognised field is refused rather than ignored, for the same reason
+    // `write_text::parse` refuses one: ignoring it would report success for an
+    // operation the caller did not describe.
+    if let Some(object) = params.as_object() {
+        for key in object.keys() {
+            if key != TEXT_PARAM {
+                return Err(format!("`{key}` is not a parameter of this capability"));
+            }
+        }
+    }
     let Some(raw) = params.get(TEXT_PARAM) else {
         return Err(format!("`{TEXT_PARAM}` is required"));
     };

@@ -3050,3 +3050,87 @@ a state that already means "a human is required to continue".
 Re-read if a second waiting-for-human reason appears that `WaitingForUser` cannot
 express; if `task_approvals` is ever asked to represent an unapproved proposal; or if
 `may_use_approval` is called from a dispatch path without a subsequent policy check.
+
+## ADR-0039 — A capability declares its parameters; the proposer reads the declaration
+
+**Status.** **Implemented.** `CapabilityDeclaration` carries `params: ParamSpec` (prose
+plus a machine-checkable `ParamSchema`) and `target: TargetSemantics`; `ai_propose` walks
+`Registry::enabled()` to build the menu it offers a model instead of a literal list;
+`proposer::validate` refuses a proposal whose parameters do not match the declared shape
+(`proposal-schema-mismatch`) or that omits a required target
+(`proposal-target-missing`); and the provider is owned per `Runtime` rather than by a
+process-global slot. Cites V-76.
+
+**Context.** V-75's slice left one hardcoded list standing. `ai_propose` named
+`filesystem/write-text` literally, alongside its display name and its two parameter
+names, in a file that had nothing to do with the capability. The capability itself carried
+no statement of what it accepted: `write_text::parse` knew the rule, and the proposer
+knew a second, partial copy of it. Two lists, one of them in the wrong place, and the
+drift was structural rather than accidental — the next capability added would be
+registrable and therefore invisible to the model until somebody remembered to edit the
+proposer.
+
+The deeper problem is that a proposal could be *persisted* with parameters no capability
+would accept. The shape check lived inside the capability, reached only when the execution
+plan was built, which is after the proposal was durable and after a human had been asked
+to approve it. So the cost of a malformed parameter set was paid at the most expensive
+moment in the pipeline, and attributed to the sandbox rather than to the request.
+
+**Decision.** A capability describes its own parameters, in the domain layer so that the
+capability and its callers share one type without either depending on the other. The
+schema is *shape only* — field names, types, which are required, what a nested object
+contains — and value rules stay with the capability that understands the world. A schema
+that expressed "a path must stay inside the workspace" would either become a second
+implementation of the capability's own checks or a constraint language nobody could read.
+`orxnud-capability` asserts the two agree, so the shape can never be the stricter of them
+in a way that refuses valid work.
+
+`ai_propose` walks the registry. A capability that is registered and enabled is
+proposable, with its own declared shape and target semantics, and adding one requires no
+edit to the proposer.
+
+The provider moved from a process-global `OnceLock` to a field on `Runtime`. The
+`OnceLock` panicked on its second write, which meant the suite could test exactly one
+provider scenario and no more. Replacing it with a scoped, restorable `RwLock` fixed that
+and introduced a worse bug: a process-global mutable value cannot be scoped against
+concurrency, so one test installing a malformed provider changed the answer another test
+was receiving at the same moment — which the suite demonstrated by failing a test that
+had nothing to do with it. Per-runtime ownership makes the interference structurally
+impossible rather than merely unlikely, and it is also simply true that two daemons in one
+process may be configured differently.
+
+**Alternatives rejected.**
+
+* *A capability-owned validator trait, invoked by the proposer.* Rejected: it puts the
+  capability crate's parse path behind the proposal path, so a shape error and a semantic
+  error become indistinguishable at both ends, and a model cannot be told which it made.
+* *Keeping the hardcoded list and adding a test that it matches the registry.* Rejected:
+  this is a synchronisation test for a duplication that should not exist. It would have
+  caught the first drift and then required a second edit per capability forever.
+* *Expressing the schema in JSON Schema and validating with a library.* Rejected for now:
+  it adds a dependency to the domain layer, which is held to serde alone, and buys
+  expressiveness that no shipped capability uses. A constraint language is also
+  unreadable in an approval prompt, which is one of the consumers this slice names.
+* *Passing the schema to the model so it can conform exactly.* Rejected: it invites a
+  model to contrive a shape-satisfying request rather than an honest one. The model is
+  told field *names*; the deterministic side holds the shape and enforces it.
+
+**Consequences.** The model is told what each capability is for, what its parameters are
+called, and what risk it carries — risk included, because a proposer that cannot see that
+a capability is High will confidently propose work that is always going to wait for a
+human. A malformed parameter set is refused at propose time, costs nothing, and is
+attributed to the request. Approval presentation has a single source to render from,
+which is the consumer this slice was building toward. `ParamKind::Array` has no element
+type: no shipped capability takes an array, and an unconstrained array is honest about
+that where a guessed element type would not be.
+
+The refusal reasons are diagnostic on purpose. `proposal-capability-not-allowed` and
+`proposal-unknown-capability` stay distinct because they say different things about a
+model's mistake — it asked for something real but off-limits, or it invented an id.
+
+### Amendment trigger
+
+Re-read if a capability needs a parameter constraint the shape cannot express (at which
+point the split between shape and semantics is being tested rather than respected); if a
+second consumer needs the schema to be something other than prose plus structure; or if
+the model is ever handed the schema itself.

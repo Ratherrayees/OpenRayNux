@@ -102,6 +102,8 @@ pub fn declaration() -> crate::CapabilityDeclaration {
     .with_risk(RiskClass::High)
     .with_data(DataClass::Public, DataClass::Public)
     .with_isolation(IsolationTier::Subprocess)
+    .with_params(crate::schema::write_text_params())
+    .with_target(orxnud_domain::TargetSemantics::Required)
     // Deliberately absent: `.idempotent()`. See the module docs.
     .enabled()
 }
@@ -133,6 +135,16 @@ pub fn parse(params: &Value) -> Result<WriteText, String> {
         .get("contents")
         .and_then(Value::as_str)
         .ok_or_else(|| "`contents` must be a string".to_owned())?;
+    // An unrecognised field is refused rather than ignored. A caller that sends a field
+    // this capability does not read has misunderstood the request, and ignoring it would
+    // perform a *different* operation from the one described -- the shape check in
+    // `schema.rs` refuses it too, and this is the layer that still holds when a proposal
+    // reaches execution without passing through the proposer.
+    for key in object.keys() {
+        if key != "path" && key != "contents" {
+            return Err(format!("`{key}` is not a parameter of this capability"));
+        }
+    }
     if path.is_empty() {
         return Err("`path` must not be empty".to_owned());
     }

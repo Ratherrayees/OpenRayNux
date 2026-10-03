@@ -58,6 +58,15 @@ pub struct AllowedCapability {
     pub description: String,
     /// The parameter names it takes, so the model need not guess the schema.
     pub params: Vec<String>,
+    /// The declared shape, carried so [`validate`] can check a proposal against the same
+    /// declaration the capability was registered with.
+    ///
+    /// Not shown to the model. The model is told the field *names*; the shape is what the
+    /// deterministic side enforces, and telling a model the exact schema invites it to
+    /// contrive a shape-satisfying request rather than an honest one.
+    pub schema: orxnud_domain::ParamSchema,
+    /// Whether the capability needs a named target.
+    pub target: orxnud_domain::TargetSemantics,
 }
 
 /// What the model is shown about the task.
@@ -157,6 +166,23 @@ pub enum ProposalRejected {
     /// It named a capability this build does not have.
     #[error("the model asked for an unknown capability: {0:?}")]
     UnknownCapability(String),
+    /// It named a capability that acts on a target, and supplied none.
+    #[error("{capability:?} acts on a named target and the model supplied none")]
+    MissingTarget {
+        /// The capability asked for.
+        capability: String,
+    },
+    /// The parameters do not match the capability's declared shape.
+    ///
+    /// Carries every problem found, not just the first: a model that got the shape wrong
+    /// usually got it wrong in several places, and a single message would make it guess.
+    #[error("{capability:?} parameters do not match the declared shape: {}", .problems.join("; "))]
+    SchemaMismatch {
+        /// The capability asked for.
+        capability: String,
+        /// What was wrong, one clause per problem.
+        problems: Vec<String>,
+    },
 }
 
 impl ProposalRejected {
@@ -168,6 +194,8 @@ impl ProposalRejected {
             Self::Unreadable => "proposal-unreadable",
             Self::CapabilityNotAllowed(_) => "proposal-capability-not-allowed",
             Self::UnknownCapability(_) => "proposal-unknown-capability",
+            Self::MissingTarget { .. } => "proposal-target-missing",
+            Self::SchemaMismatch { .. } => "proposal-schema-mismatch",
         }
     }
 }
@@ -206,12 +234,36 @@ pub fn validate(
     let raw: RawProposal =
         serde_json::from_str(text.trim()).map_err(|_| ProposalRejected::Unreadable)?;
 
-    if !ctx.allowed.iter().any(|c| c.id == raw.capability) {
+    // Whether the model was *offered* this capability. The menu is built by walking the
+    // registry, so this is "not enabled in this build" rather than a curated list — a
+    // capability added to the registry is proposable with no edit here, which is the
+    // drift this replaced.
+    let Some(offered) = ctx.allowed.iter().find(|c| c.id == raw.capability) else {
         return Err(ProposalRejected::CapabilityNotAllowed(raw.capability));
-    }
+    };
     if !is_registered(&raw.capability) {
         return Err(ProposalRejected::UnknownCapability(raw.capability));
     }
+
+    // A capability that acts on a named target cannot be asked to act without one.
+    if !offered.target.satisfied_by(raw.target.is_some()) {
+        return Err(ProposalRejected::MissingTarget {
+            capability: raw.capability,
+        });
+    }
+
+    // The declared shape, checked *here* so a malformed request never becomes a durable
+    // proposal that only fails later. The capability's own parser still runs at
+    // execution — this is the first gate, not the only one, and the two are asserted to
+    // agree so the shape can never be the stricter of them in a way that refuses valid
+    // work.
+    if let Err(problems) = offered.schema.validate(&raw.params) {
+        return Err(ProposalRejected::SchemaMismatch {
+            capability: raw.capability,
+            problems,
+        });
+    }
+
     Ok(ValidatedProposal {
         capability: raw.capability,
         target: raw.target,
@@ -223,16 +275,39 @@ pub fn validate(
 mod tests {
     use super::*;
 
+    /// The declared shape `filesystem/write-text` is registered with, so these tests
+    /// check real enforcement rather than a permissive fixture.
+    fn write_text_schema() -> orxnud_domain::ParamSchema {
+        orxnud_domain::ParamSchema::new(vec![
+            orxnud_domain::ParamField::required(
+                "path",
+                orxnud_domain::ParamKind::String,
+                "File name.",
+            ),
+            orxnud_domain::ParamField::required(
+                "contents",
+                orxnud_domain::ParamKind::String,
+                "The text.",
+            ),
+        ])
+    }
+
+    fn write_text() -> AllowedCapability {
+        AllowedCapability {
+            id: "filesystem/write-text".into(),
+            description: "Write a text file into the workspace".into(),
+            params: vec!["path".into(), "contents".into()],
+            schema: write_text_schema(),
+            target: orxnud_domain::TargetSemantics::Required,
+        }
+    }
+
     fn ctx() -> ProposalContext {
         ProposalContext {
             task_id: "t-1".into(),
             content: "Create final.txt containing 'delegated governance works'.".into(),
             attempt_no: 1,
-            allowed: vec![AllowedCapability {
-                id: "filesystem/write-text".into(),
-                description: "Write a text file into the workspace".into(),
-                params: vec!["path".into(), "contents".into()],
-            }],
+            allowed: vec![write_text()],
         }
     }
 
@@ -303,6 +378,12 @@ mod tests {
             id: "email/send".into(),
             description: "Send an email".into(),
             params: vec!["to".into()],
+            schema: orxnud_domain::ParamSchema::new(vec![orxnud_domain::ParamField::required(
+                "to",
+                orxnud_domain::ParamKind::String,
+                "Recipient.",
+            )]),
+            target: orxnud_domain::TargetSemantics::Required,
         });
         let err = validate(
             r#"{"capability":"email/send","params":{"to":"a@b.test"}}"#,
@@ -315,6 +396,102 @@ mod tests {
             ProposalRejected::UnknownCapability("email/send".into())
         );
         assert_eq!(err.reason(), "proposal-unknown-capability");
+    }
+
+    /// The declared shape is enforced at propose time, so a malformed request never
+    /// becomes a durable proposal that can only fail later.
+    ///
+    /// This is the case that used to be invisible: the shape existed only inside the
+    /// capability, reached at execution, where the proposal had already been written and
+    /// a human had already been asked to approve it.
+    #[test]
+    fn parameters_must_match_the_declared_shape() {
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt"}}"#,
+                "`contents` is required",
+            ),
+            (
+                r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":42}}"#,
+                "`contents` must be string",
+            ),
+            (
+                r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"a.txt","contents":"x","sudo":true}}"#,
+                "`sudo` is not a parameter",
+            ),
+        ];
+        for (text, expected) in cases {
+            let err = validate(text, &ctx(), &registered)
+                .expect_err("a malformed parameter set must not become a proposal");
+            assert_eq!(err.reason(), "proposal-schema-mismatch", "{text}");
+            let ProposalRejected::SchemaMismatch { problems, .. } = &err else {
+                panic!("expected a schema refusal, got {err:?}");
+            };
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "{text}: {problems:?} does not mention {expected:?}"
+            );
+        }
+    }
+
+    /// A well-formed proposal still passes, and the refusal above is not a blanket ban.
+    #[test]
+    fn a_conforming_proposal_is_accepted() {
+        let ok = validate(
+            r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"delegated governance works"}}"#,
+            &ctx(),
+            &registered,
+        );
+        assert!(ok.is_ok(), "a conforming proposal must be accepted");
+    }
+
+    /// A capability that acts on a named target cannot be asked to act without one. This
+    /// used to reach the execution planner, where a `None` target became a missing-file
+    /// error attributed to the sandbox rather than to the request.
+    #[test]
+    fn a_capability_that_needs_a_target_must_be_given_one() {
+        let err = validate(
+            r#"{"capability":"filesystem/write-text","params":{"path":"final.txt","contents":"x"}}"#,
+            &ctx(),
+            &registered,
+        )
+        .expect_err("no target supplied");
+        assert_eq!(err.reason(), "proposal-target-missing");
+        assert_eq!(
+            err,
+            ProposalRejected::MissingTarget {
+                capability: "filesystem/write-text".into()
+            }
+        );
+    }
+
+    /// A capability with no target semantics accepts a request either way — refusing
+    /// here would be a rule about the wire rather than about the capability.
+    #[test]
+    fn a_capability_with_no_target_semantics_needs_no_target() {
+        let mut c = ctx();
+        c.allowed = vec![AllowedCapability {
+            id: "text/word-count".into(),
+            description: "Count words".into(),
+            params: vec!["text".into()],
+            schema: orxnud_domain::ParamSchema::new(vec![orxnud_domain::ParamField::required(
+                "text",
+                orxnud_domain::ParamKind::String,
+                "The text.",
+            )]),
+            target: orxnud_domain::TargetSemantics::None,
+        }];
+        let counted = |target: &str| {
+            validate(
+                &format!(
+                    r#"{{"capability":"text/word-count",{target}"params":{{"text":"hello world"}}}}"#
+                ),
+                &c,
+                &|id| id == "text/word-count",
+            )
+        };
+        assert!(counted("").is_ok(), "no target is fine");
+        assert!(counted(r#""target":"a.txt","#).is_ok(), "a target is fine");
     }
 
     /// The allowlist is what stops a model from asking for something merely because it

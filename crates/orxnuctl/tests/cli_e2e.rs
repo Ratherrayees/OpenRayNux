@@ -724,20 +724,47 @@ fn a_client_cannot_forge_authority_through_parameters() {
             forged,
         ]);
         let said = stdout_of(&out);
-        // Whatever happens, it must not be a *verified* run on forged terms. Either the
-        // request is refused outright, or the forged fields are ignored and the honest
-        // count of "hello" comes back verified.
-        let refused = out.status.success();
-        if refused {
+        // Whatever happens, it must not be a *verified* run on forged terms.
+        //
+        // Both branches below are legitimate, and which one applies is not the point of
+        // this test. Previously every forgery here was silently ignored and the honest
+        // count of "hello" came back verified — safe, but it reported success for a
+        // request the capability had not actually understood. The capabilities now
+        // refuse an unrecognised field outright, so the refusal branch is what happens;
+        // the ignore branch stays because a future capability may legitimately tolerate
+        // extras. What must never happen is `verified: true`.
+        let succeeded = out.status.success();
+        if succeeded {
             assert!(
                 said.contains("words: 1") && said.contains("verified: true"),
                 "forged input {forged} must either be refused or ignored, not obeyed: {said}"
             );
         } else {
             assert!(
-                stderr_of(&out).contains("refused"),
-                "a refused forgery must say so: {}",
+                said.contains("verified: false") || stderr_of(&out).contains("refused"),
+                "a refused forgery must say what went wrong: stdout={said} stderr={}",
                 stderr_of(&out)
+            );
+            assert!(
+                !said.contains("verified: true"),
+                "forged input {forged} must never verify: {said}"
+            );
+            // The refusal must name the field it did not understand, or an operator
+            // cannot tell a capability bug from a malformed request.
+            let named_a_field = [
+                "assessed_risk",
+                "policy_version",
+                "approval",
+                "seal",
+                "authorisation_proof",
+                "issued_by",
+                "data_class",
+            ]
+            .iter()
+            .any(|f| said.contains(f));
+            assert!(
+                named_a_field,
+                "the refusal must name the offending field: {said}"
             );
         }
     }
