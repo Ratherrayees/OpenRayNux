@@ -324,6 +324,7 @@ fn a_consumed_approval_cannot_authorise_a_second_dispatch() {
 
     let digest = orxnud_policy::digest::digest_for(
         &human(),
+        &human(),
         &cap(),
         Some("t"),
         &params(),
@@ -331,6 +332,7 @@ fn a_consumed_approval_cannot_authorise_a_second_dispatch() {
         NOW + 60_000,
     );
     let approval = ApprovalRecord {
+        approver: human(),
         actor_label: human().label().to_owned(),
         capability: cap().to_string(),
         target: "t".into(),

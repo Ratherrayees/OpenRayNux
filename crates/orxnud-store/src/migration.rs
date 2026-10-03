@@ -399,6 +399,7 @@ mod tests {
                 "task_attempts",
                 "task_effects",
                 "task_events",
+                "task_proposals",
                 "tasks",
             ],
             "unexpected tables"

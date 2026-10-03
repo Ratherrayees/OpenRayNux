@@ -83,6 +83,21 @@ pub enum Method {
     /// actor may do -- it can only produce the artefact the dispatcher's anti-Loopjacking
     /// check compares against.
     CapabilityApprove,
+
+    /// Ask for a governed action to be proposed by a running task.
+    ///
+    /// Creates the durable proposal and parks the task in `WaitingForUser` in one
+    /// transaction. First-party task state, not a capability invocation: it is the
+    /// request for permission, and `capability/dispatch` remains the only way to
+    /// actually run something.
+    TaskPropose,
+
+    /// Begin execution of an approved proposal.
+    ///
+    /// Takes a fresh execution lease, resumes the task, and — for a proposal whose
+    /// capability is approved and current — dispatches it through the governed path.
+    /// The worker named here gains execution ownership and no authority (V-71).
+    TaskExecute,
 }
 
 impl Method {
@@ -90,7 +105,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -102,6 +117,8 @@ impl Method {
         Self::TaskComplete,
         Self::TaskCancel,
         Self::CapabilityApprove,
+        Self::TaskPropose,
+        Self::TaskExecute,
     ];
 
     /// The wire name.
@@ -119,6 +136,8 @@ impl Method {
             Self::TaskComplete => "task/complete",
             Self::TaskCancel => "task/cancel",
             Self::CapabilityApprove => "capability/approve",
+            Self::TaskPropose => "task/propose",
+            Self::TaskExecute => "task/execute",
         }
     }
 
@@ -143,6 +162,8 @@ impl Method {
             "task/complete" => Some(Self::TaskComplete),
             "task/cancel" => Some(Self::TaskCancel),
             "capability/approve" => Some(Self::CapabilityApprove),
+            "task/propose" => Some(Self::TaskPropose),
+            "task/execute" => Some(Self::TaskExecute),
             _ => None,
         }
     }

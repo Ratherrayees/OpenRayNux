@@ -72,9 +72,15 @@ pub enum CapabilityCommand {
     /// own terms, whereas a run either happens or does not.
     Approve {
         /// Which capability the approval would be for.
-        capability: String,
+        capability: Option<String>,
         /// The parameters the approval would commit to, verbatim JSON.
-        params: String,
+        params: Option<String>,
+        /// Approve a durable proposal instead of an ad-hoc action.
+        ///
+        /// The stronger form, and the one the governed task path uses: naming a proposal
+        /// means the action comes from storage, so a caller cannot approve one thing and
+        /// cause another. Exactly one of `proposal` or `capability` is required.
+        proposal: Option<String>,
         /// The human-readable target, if any.
         target: Option<String>,
         /// How long the approval should live, in milliseconds.
@@ -150,7 +156,9 @@ pub enum CliError {
     },
 
     /// A `task` verb that does not exist.
-    #[error("unknown task command {0:?}; expected create, list, claim, complete or cancel")]
+    #[error(
+        "unknown task command {0:?}; expected create, list, claim, complete, cancel, propose or execute"
+    )]
     UnknownTaskCommand(String),
 
     /// A `capability` verb that does not exist.
@@ -340,6 +348,27 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
             flags.reject_all("complete")?;
             TaskCommand::Complete { id, worker }
         }
+        "propose" => {
+            let task = flags.take("propose", "--task")?;
+            let worker = flags.take("propose", "--worker")?;
+            let capability = flags.take("propose", "--capability")?;
+            let params = flags.take("propose", "--params")?;
+            let target = flags.take_optional("--target");
+            flags.reject_all("propose")?;
+            TaskCommand::Propose {
+                task,
+                worker,
+                capability,
+                params,
+                target,
+            }
+        }
+        "execute" => {
+            let proposal = flags.take("execute", "--proposal")?;
+            let worker = flags.take("execute", "--worker")?;
+            flags.reject_all("execute")?;
+            TaskCommand::Execute { proposal, worker }
+        }
         "cancel" => {
             // No `--worker`: cancellation is the engine's decision about a task, and
             // requiring an identity here would make an unclaimed task uncancellable.
@@ -388,8 +417,9 @@ fn parse_capability(args: &[String]) -> Result<(CapabilityCommand, Option<String
             ))
         }
         "approve" => {
-            let capability = flags.take("approve", "--capability")?;
-            let params = flags.take("approve", "--params")?;
+            let capability = flags.take_optional("--capability");
+            let params = flags.take_optional("--params");
+            let proposal = flags.take_optional("--proposal");
             let target = flags.take_optional("--target");
             let ttl_ms = match flags.take_optional("--ttl-ms") {
                 None => None,
@@ -405,10 +435,31 @@ fn parse_capability(args: &[String]) -> Result<(CapabilityCommand, Option<String
                 }
             };
             flags.reject_all("approve")?;
+            // Exactly one form. Approving a proposal and approving an ad-hoc action are
+            // different acts; accepting both at once would leave which one was meant to
+            // the daemon's guess.
+            match (proposal.is_some(), capability.is_some()) {
+                (true, false) => {}
+                (false, true) => {
+                    if params.is_none() {
+                        return Err(CliError::MissingFlag {
+                            command: "approve",
+                            flag: "--params",
+                        });
+                    }
+                }
+                _ => {
+                    return Err(CliError::MissingFlag {
+                        command: "approve",
+                        flag: "exactly one of --proposal or --capability",
+                    });
+                }
+            }
             Ok((
                 CapabilityCommand::Approve {
                     capability,
                     params,
+                    proposal,
                     target,
                     ttl_ms,
                 },
@@ -474,12 +525,15 @@ impl Flags {
         // question, answered by what that verb `take`s and by `reject_all` refusing
         // whatever is left -- so `task create --target x` parses here and is then
         // refused by the verb, rather than being invisible to the task parser.
-        const KNOWN: [&str; 8] = [
+        const KNOWN: [&str; 10] = [
             "--id",
             "--kind",
             "--worker",
             "--capability",
             "--params",
+            // Task verbs: which task a proposal is for, and which proposal to execute.
+            "--task",
+            "--proposal",
             // Part of the tuple an approval commits to, so it is carried rather than
             // derived: an approval for one target must not carry to another.
             "--target",

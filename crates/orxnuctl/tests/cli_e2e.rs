@@ -1145,3 +1145,231 @@ fn state_bytes(root: &std::path::Path) -> String {
     );
     out
 }
+
+// ---------------------------------------------------------------------------
+// The governed task action path, through both real binaries
+// ---------------------------------------------------------------------------
+//
+// The daemon socket suite proves the runtime behaviour. This proves the *product*
+// interface: that the CLI serialises the three verbs the way the daemon expects, and
+// that a refusal reaches the user as a refusal rather than as a success with empty
+// output. Wiring bugs between the two live here and nowhere else.
+
+/// The proposal id from `task propose` output.
+fn propose_id(out: &Output) -> String {
+    stdout_of(out)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("id: "))
+        .map(|v| v.trim().trim_matches('"').to_owned())
+        .expect("a proposal id in the output")
+}
+
+/// The whole loop as a person performs it.
+#[test]
+fn a_user_proposes_a_governed_action_approves_it_and_executes_it() {
+    let root = dir("governed-happy");
+    let daemon = Daemon::start(&root);
+
+    daemon.cli(&["task", "create", "--id", "cg1"]);
+    let claimed = daemon.cli(&["task", "claim", "--id", "cg1", "--worker", "w1"]);
+    assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+
+    let proposed = daemon.cli(&[
+        "task",
+        "propose",
+        "--task",
+        "cg1",
+        "--worker",
+        "w1",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "cli.txt",
+        "--params",
+        r#"{"path":"cli.txt","contents":"written through the cli"}"#,
+    ]);
+    assert!(proposed.status.success(), "{}", stderr_of(&proposed));
+    assert!(
+        stdout_of(&proposed).contains("waiting_for"),
+        "{}",
+        stdout_of(&proposed)
+    );
+    let pid = propose_id(&proposed);
+
+    // Parked, lease released.
+    let listed = daemon.cli(&["task", "list"]);
+    assert!(
+        stdout_of(&listed).contains("waiting-for-user"),
+        "{}",
+        stdout_of(&listed)
+    );
+
+    // The human approves the proposal — supplying no action.
+    let approved = daemon.cli(&[
+        "capability",
+        "approve",
+        "--proposal",
+        &pid,
+        "--ttl-ms",
+        "60000",
+    ]);
+    assert!(approved.status.success(), "{}", stderr_of(&approved));
+    let approval = stdout_of(&approved);
+    assert!(approval.contains("\"approver\": \"human\""), "{approval}");
+    assert!(approval.contains("\"actor_label\": \"ai\""), "{approval}");
+
+    // Execution.
+    let executed = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+    assert!(executed.status.success(), "{}", stderr_of(&executed));
+    assert!(
+        stdout_of(&executed).contains("verified: true"),
+        "{}",
+        stdout_of(&executed)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("workspace").join("cli.txt")).expect("written"),
+        "written through the cli"
+    );
+
+    let listed = daemon.cli(&["task", "list"]);
+    assert!(
+        stdout_of(&listed).contains("completed"),
+        "{}",
+        stdout_of(&listed)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The refusals a person will actually hit, and they must be non-zero exits.
+#[test]
+fn the_governed_refusals_reach_the_cli_as_failures() {
+    let root = dir("governed-refusals");
+    let daemon = Daemon::start(&root);
+    daemon.cli(&["task", "create", "--id", "cg2"]);
+    daemon.cli(&["task", "claim", "--id", "cg2", "--worker", "w1"]);
+
+    let proposed = daemon.cli(&[
+        "task",
+        "propose",
+        "--task",
+        "cg2",
+        "--worker",
+        "w1",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "r.txt",
+        "--params",
+        r#"{"path":"r.txt","contents":"x"}"#,
+    ]);
+    let pid = propose_id(&proposed);
+
+    // Executing before approval.
+    let early = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+    assert!(!early.status.success(), "an unapproved proposal must fail");
+    assert!(
+        stderr_of(&early).contains("approval"),
+        "{}",
+        stderr_of(&early)
+    );
+
+    // An unknown proposal.
+    let ghost = daemon.cli(&["task", "execute", "--proposal", "p-nope", "--worker", "w1"]);
+    assert!(!ghost.status.success(), "an unknown proposal must fail");
+
+    // Approve, then reuse the same proposal.
+    let approved = daemon.cli(&[
+        "capability",
+        "approve",
+        "--proposal",
+        &pid,
+        "--ttl-ms",
+        "60000",
+    ]);
+    assert!(approved.status.success());
+    assert!(
+        daemon
+            .cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"])
+            .status
+            .success()
+    );
+    let again = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+    assert!(!again.status.success(), "an approval must be single-use");
+
+    // A worker that does not hold the lease cannot propose.
+    let impostor = daemon.cli(&[
+        "task",
+        "propose",
+        "--task",
+        "cg2",
+        "--worker",
+        "someone-else",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "z.txt",
+        "--params",
+        r#"{"path":"z.txt","contents":"x"}"#,
+    ]);
+    assert!(
+        !impostor.status.success(),
+        "a worker without the lease must not propose"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The governed execution is audited durably, with real timestamps.
+#[test]
+fn the_governed_execution_is_audited_and_survives_a_restart() {
+    let root = dir("governed-audit");
+    {
+        let daemon = Daemon::start(&root);
+        daemon.cli(&["task", "create", "--id", "cg3"]);
+        daemon.cli(&["task", "claim", "--id", "cg3", "--worker", "w1"]);
+        let proposed = daemon.cli(&[
+            "task",
+            "propose",
+            "--task",
+            "cg3",
+            "--worker",
+            "w1",
+            "--capability",
+            "filesystem/write-text",
+            "--target",
+            "audited.txt",
+            "--params",
+            r#"{"path":"audited.txt","contents":"recorded"}"#,
+        ]);
+        let pid = propose_id(&proposed);
+        daemon.cli(&[
+            "capability",
+            "approve",
+            "--proposal",
+            &pid,
+            "--ttl-ms",
+            "60000",
+        ]);
+        let out = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+    }
+    let bytes = state_bytes(&root);
+    assert!(
+        bytes.contains("filesystem/write-text"),
+        "the action must be audited"
+    );
+    assert!(
+        !bytes.contains("\"at-ms\":0"),
+        "a governed execution must not be stamped at the epoch"
+    );
+    // A restart must accept the chain.
+    let daemon = Daemon::start(&root);
+    assert!(daemon.cli(&["task", "list"]).status.success());
+    assert!(
+        root.join("workspace").join("audited.txt").exists(),
+        "the side effect survives the daemon that produced it"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

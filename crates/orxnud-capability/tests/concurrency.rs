@@ -273,6 +273,7 @@ fn concurrent_approval_attempts_produce_exactly_one_execution() {
     // approval. Exactly one may succeed.
     let mut engine = policy(RiskClass::High, 0, 10_000);
     let approval = ApprovalRecord {
+        approver: human(),
         actor_label: human().label().to_owned(),
         capability: cap().to_string(),
         target: "t".into(),
@@ -280,7 +281,15 @@ fn concurrent_approval_attempts_produce_exactly_one_execution() {
         issued_at_ms: NOW,
         expires_at_ms: NOW + 60_000,
         risk: RiskClass::High,
-        digest: digest_for(&human(), &cap(), Some("t"), &params(), NOW, NOW + 60_000),
+        digest: digest_for(
+            &human(),
+            &human(),
+            &cap(),
+            Some("t"),
+            &params(),
+            NOW,
+            NOW + 60_000,
+        ),
     };
 
     let rec = Arc::new(Recorder::default());

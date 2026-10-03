@@ -88,6 +88,28 @@ pub enum DenialReason {
     /// not the one that was approved.
     ApprovalDigestMismatch,
 
+    /// **The approval was signed by something that cannot grant authority.**
+    ///
+    /// ADR-0037, V-69. Distinct from `ApprovalDigestMismatch` on purpose: a mismatch
+    /// means the approval does not describe this operation, whereas this means the
+    /// operation is described correctly by something with no standing to permit it. A
+    /// caller can act on the first by re-issuing; the second cannot be fixed by
+    /// retrying, which is exactly why collapsing them would be misleading.
+    ApprovalApproverCannotGrant,
+
+    /// **The approval's human is not the authority behind the proposer.**
+    ///
+    /// ADR-0037, V-69. The delegation chain says `Actor::Ai { delegated_by: H }` may
+    /// do what `H` may do; this refuses an approval presented by anyone other than
+    /// `H`. Without it, one human could consent on behalf of a delegation they have
+    /// no part in.
+    ApprovalApproverNotAuthorised {
+        /// Who signed the approval.
+        approver: String,
+        /// Whose action it was presented for.
+        proposer: String,
+    },
+
     /// **The approval was already used.**
     ///
     /// ADR-0027 and control S6 require approvals to be *single-use*. The digest check
@@ -148,6 +170,8 @@ impl DenialReason {
             Self::ApprovalRequired { .. } => "approval_required",
             Self::ApprovalExpired { .. } => "approval_expired",
             Self::ApprovalDigestMismatch => "approval_digest_mismatch",
+            Self::ApprovalApproverCannotGrant => "approval_approver_cannot_grant",
+            Self::ApprovalApproverNotAuthorised { .. } => "approval_approver_not_authorised",
             Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::PolicyUnavailable { .. } => "policy_unavailable",
             Self::AuditUnavailable { .. } => "audit_unavailable",

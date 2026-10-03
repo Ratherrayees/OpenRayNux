@@ -124,9 +124,17 @@ fn ungated_policy() -> PolicyEngine {
 /// after a restart and present it again.
 fn approval(target: &str, issued: i64, expires: i64) -> orxnud_domain::ApprovalRecord {
     let p = NormalizedParams::canonical(format!("{{\"to\":\"{target}\"}}"));
-    let digest =
-        orxnud_policy::digest::digest_for(&human(), &cap(), Some(target), &p, issued, expires);
+    let digest = orxnud_policy::digest::digest_for(
+        &human(),
+        &human(),
+        &cap(),
+        Some(target),
+        &p,
+        issued,
+        expires,
+    );
     orxnud_domain::ApprovalRecord {
+        approver: human(),
         actor_label: "u-1".into(),
         capability: CAP.into(),
         target: target.into(),

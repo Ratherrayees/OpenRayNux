@@ -2876,3 +2876,177 @@ It does not claim `cgroup.kill` is useless, nor that the two mechanisms are
 interchangeable. It claims only that on the current Linux path the namespace already
 provides the property, so the governed test cannot distinguish them, and that the honest
 record is redundancy.
+---
+
+## ADR-0037 — An approval names its approver, and the digest binds them
+
+**Status.** **Implemented.** `ApprovalRecord` carries an explicit `approver: Actor`;
+`canonical_bytes` binds both parties and its prefix moved `v1` -> `v2` so a pre-change
+digest cannot verify; `authorise` refuses a non-granting approver
+(`approval_approver_cannot_grant`) and an approver who is not the proposer's authority
+root (`approval_approver_not_authorised`); and `issue_approval` asserts
+`approver.can_grant()` at minting. The minting path re-derives the approver from the
+trusted local-human boundary and never reads it from the request. Cites V-69 and V-70.
+
+**Context.** ADR-0012 committed this project to "the model proposes; the deterministic
+engine disposes", and ADR-0034 later proved one of its structural claims false in the
+way that matters: `CapabilityInvocation` derived `Deserialize`, and a derived
+`Deserialize` writes private fields without a constructor, so the type-level seal was
+bypassable. The lesson carried forward is that a claim about who *may* authorise has to
+be checked where authorisation happens, not asserted at the type that carries it.
+
+**Problem.** The approval as it exists today is a **bearer token**. `ApprovalRecord`
+carries `actor_label`, capability, target, params, issued/expires, risk and a digest —
+and **no approver**, anywhere:
+
+- `canonical_bytes` binds `actor.label()`, `actor.authority_root()`, capability, target,
+  params, issued-at and expires-at. The *proposer's* identity is bound. The approver's
+  is not.
+- `actor_label` is written to the record and to `task_approvals.actor_label`, and **no
+  dispatch-time code reads it.**
+- `Decision::Gate.approver` is *derived* at `engine.rs:396` from the proposer's
+  `authority_root()` — an inference sitting where evidence should be. The system
+  asserts "the approver is the human whose authority is being used" rather than
+  recording that a human was asked.
+- `Actor::can_grant()` is enforced in exactly one non-test place (`engine.rs:266`), and
+  only to refuse an actor with neither grant capability nor an authority root. It cannot
+  check *who approved*, because there is nothing to check.
+
+So an approval currently establishes: *these parameters, for this proposer, before this
+time*. It does not establish: *a specific human examined this and consented*. Combined
+with a minting endpoint that answers any caller, a delegated pipeline built on this
+would be a **false demonstration** — the AI side could obtain its own approval through
+the same mechanism, and every stage would report success.
+
+**Decision.** An approval is a statement about a *pair* of parties, and the digest
+covers both.
+
+1. **D1 — approval is non-bearer.** The bound tuple becomes
+   `approver + proposer/actor + authority_root + capability + target +
+   normalized params + issued_at + expires_at`. An approval cannot be detached and
+   reused for a different actor or action, because both parties are inside the digest.
+2. **D2 — the approver is explicit and grant-capable.** `ApprovalRecord` gains an
+   approver identity. Dispatch verifies, in order: the approval exists, is unexpired,
+   is unconsumed, its digest matches the action about to run, the approver
+   `can_grant()`, and `approver == proposer.authority_root()` for delegated execution.
+   The authority-root relation becomes a **checked** equality rather than an assumption
+   the engine makes on the actor's behalf.
+3. **D6 — a wire actor is an asserted principal, not an authenticated identity.**
+   `Actor` crossing local IPC means the structure deserialises; it does not mean the
+   caller possesses that identity. The three are kept distinct in naming, docs and
+   tests: *principal assertion* ≠ *principal authentication* ≠ *principal
+   authorization*. Today's boundary is the 0700 Unix socket plus the single-user local
+   model, and that is stated as the boundary rather than implied by the type.
+
+### Consequences
+
+- For `Actor::Ai { delegated_by: H, .. }`, the approval must come from `H`. The
+  delegation becomes enforceable rather than descriptive: **delegation is not authority
+  creation**, and an AI actor's authority is bounded by its delegating human's.
+- Human approval becomes the only place new authority enters the chain, which is what
+  makes ADR-0012's sentence true of the *runtime* and not only of the type.
+- The register gains V-69 (the gap above) and V-70 (asserted principal vs authenticated
+  identity), because both are claims that will silently become false.
+- Multi-user authentication stays out of scope, and is now *named* as out of scope. The
+  hazard is specific: an `Actor { user: "H" }` arriving over a socket is easy to later
+  mistake for proof that the caller is `H`.
+
+### What this ADR does not claim
+
+It does not claim the current approval flow is exploitable today. With one local user
+behind a 0700 socket, minting on request is equivalent to that user consenting, so V-69
+is a **latent** defect that becomes live the moment a non-human proposer exists. It does
+not claim adding an approver field alone is sufficient: the minting path must also be
+reachable only by a grant-capable principal, or the field is decoration.
+
+### Amendment trigger
+
+Re-read if any of: an actor other than `Human` reaches the dispatcher; a capability is
+reachable over anything other than the local socket; `can_grant` gains a second true
+variant; or multi-user support is proposed.
+---
+
+## ADR-0038 — A governed action is proposed durably before it is approved
+
+**Status.** **Implemented.** A `task_proposals` table carries the durable proposal;
+`TaskRepository::propose_action` commits the proposal, the transition to
+`waiting_for_user` and the task event in one transaction, and releases the lease;
+`decide_proposal` records the human's decision without touching task state; and
+`begin_approved_execution` takes a **fresh** lease and resumes the task in one
+transaction, leaving `attempts` untouched. The proposal carries an `Actor::Ai` proposer
+derived from the task identity, never from the lease holder. Cites V-71. Builds on
+ADR-0037.
+
+**Context.** ADR-0037 settles *what an approval is*. It says nothing about the thing
+that precedes one, and the store already contains a half-built answer that is worth
+reading before adding anything.
+
+**Problem.** Three concrete gaps, all verified against source rather than inferred:
+
+1. **There is no durable proposal.** `task_approvals` is keyed `(task_id, attempt_no)`
+   and its `digest` column is `NOT NULL`, so a row can only exist *once approved*. A
+   proposed-but-unapproved action has no representation at all — which means there is
+   no durable answer to "why did this task enter `WaitingForUser`?", and an approval row
+   appears with no antecedent.
+2. **Two approval ledgers exist with materially different strength.** The policy layer's
+   `spent_approvals` is digest-keyed and verifies the digest against the action, checks
+   expiry, and enforces single-use. The task layer's `may_use_approval` checks
+   `is_valid_at(now_ms)` **only** — it never verifies the digest, and its own doc
+   defers that to policy. Reading `may_use_approval() == true` as "this action is
+   authorised" would be wrong.
+3. **`WaitingForUser` already exists and is already correct.** The transitions are
+   `Pending → WaitingForUser`, `Running → WaitingForUser`, and
+   `WaitingForUser → Running | Cancelled`. A task can rest awaiting a human and resume.
+
+**Decision.**
+
+1. **D3 — the proposal precedes the approval, durably.** `ActionProposal` is a new
+   durable object holding capability, target, normalized params, proposer `Actor`,
+   authority root, `created_at`, status, and a nullable approval reference. It exists
+   *before* the task rests in `WaitingForUser`, so the wait is explained by a record
+   rather than by an absence.
+2. **A new table, not a nullable digest.** `task_approvals` stays the **approved-action
+   ledger**. Overloading it with a nullable-digest proposal row was considered and
+   rejected: it would make "the task asked for permission" and "permission was granted"
+   the same row, which is precisely the distinction the audit trail exists to preserve.
+3. **D4 — approval remains per-attempt.** A retry creates a new attempt, which derives
+   its own proposal and requires its own approval. This is what TP-6 already implies by
+   keying approvals on `(task_id, attempt_no)`; the proposal inherits the same keying
+   rather than inventing a second scheme.
+4. **D5 — a lease never grants authority, and this becomes a test.** The current state is
+   structurally sound: a lease grants exactly one thing, completion fencing, and **no
+   `Actor` is constructed from a task or lease anywhere** — the only non-test `Actor::`
+   in the codebase is the hardcoded local human in the runtime. That is true by absence
+   of code paths, which is exactly the kind of truth that erodes silently. It becomes a
+   regression test: a task claimed by a worker must not influence the actor, the
+   authority, or the approval at dispatch.
+
+### Consequences
+
+- The lifecycle becomes: `Running → (ordinary work | governed action proposed) →
+  WaitingForUser → approved → Running → capability → verification → task completion`,
+  with rejection reaching a terminal task outcome. **No new task state is introduced**;
+  the reason for waiting lives in the proposal's status, not in the state machine.
+- An **expired approval implies neither approval nor execution.** It is a terminal
+  status on the proposal, and a retry is a new attempt with a new proposal.
+- The two ledgers stay separate and their boundary is documented: the task ledger scopes
+  and consumes per attempt, the policy ledger is the only place a digest is verified
+  against an action. Any future caller of `may_use_approval` must still go through
+  policy.
+- V-71 exists because D5's invariant is currently guaranteed by nothing but the absence
+  of the code path that would break it.
+
+### What this ADR does not claim
+
+It does not claim the proposal needs to be a first-class table forever; a proposal that
+never leaves `pending` may later prove to be derivable from the task's own attempt
+record, and this decision can be amended if that is shown. It does not claim rejection
+needs a task state — it does not. It does not claim `WaitingForUser` is well-named for
+every future use; it is reused here because adding `WaitingForApproval` would duplicate
+a state that already means "a human is required to continue".
+
+### Amendment trigger
+
+Re-read if a second waiting-for-human reason appears that `WaitingForUser` cannot
+express; if `task_approvals` is ever asked to represent an unapproved proposal; or if
+`may_use_approval` is called from a dispatch path without a subsequent policy check.

@@ -77,6 +77,7 @@ fn invocation(params: &serde_json::Value) -> orxnud_domain::invocation::Capabili
             orxnud_policy::canonical_params(params),
             Some(&orxnud_policy::issue_approval(
                 &human(),
+                &human(),
                 &cap(),
                 Some("a.txt"),
                 &orxnud_policy::canonical_params(params),
@@ -237,6 +238,7 @@ impl Fixture {
     /// A fresh approval for one operation.
     fn approval(&self, path: &str, contents: &str, ttl_ms: i64) -> orxnud_domain::ApprovalRecord {
         orxnud_policy::issue_approval(
+            &human(),
             &human(),
             &cap(),
             Some(path),

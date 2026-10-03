@@ -30,8 +30,19 @@ pub enum DigestError {
 ///
 /// Fixed field order, explicit separators, and an explicit `-` for absent
 /// values so that "absent" and "empty string" cannot collide.
+///
+/// The approver is part of this tuple (ADR-0037, V-69). Before it was, an approval
+/// was a bearer token: it bound *who was asking* but not *who consented*, so one
+/// approval covered every action any caller could present it for. Binding both parties
+/// is what makes "Human H approved Actor A doing C to T with P until X" a statement
+/// that can be checked rather than assumed.
+///
+/// **The version prefix is `v2` because the tuple changed.** A `v1` digest must not
+/// verify against a `v2` computation, or an approval minted before this change would
+/// keep working with the approver field silently absent — the state V-69 describes.
 #[must_use]
 pub fn canonical_bytes(
+    approver: &Actor,
     actor: &Actor,
     capability: &CapabilityId,
     target: Option<&str>,
@@ -39,8 +50,12 @@ pub fn canonical_bytes(
     issued_at_ms: i64,
     expires_at_ms: i64,
 ) -> Vec<u8> {
-    let mut s = String::with_capacity(256);
-    s.push_str("orxnud-approval-v1|");
+    let mut s = String::with_capacity(320);
+    s.push_str("orxnud-approval-v2|");
+    s.push_str(approver.label());
+    s.push('|');
+    s.push_str(approver.authority_root().map_or("-", |u| u.as_str()));
+    s.push('|');
     s.push_str(actor.label());
     s.push('|');
     s.push_str(actor.authority_root().map_or("-", |u| u.as_str()));
@@ -60,6 +75,7 @@ pub fn canonical_bytes(
 /// Computes the digest of an operation.
 #[must_use]
 pub fn digest_for(
+    approver: &Actor,
     actor: &Actor,
     capability: &CapabilityId,
     target: Option<&str>,
@@ -68,6 +84,7 @@ pub fn digest_for(
     expires_at_ms: i64,
 ) -> ApprovalDigest {
     let bytes = canonical_bytes(
+        approver,
         actor,
         capability,
         target,
@@ -167,7 +184,7 @@ mod tests {
         i: i64,
         e: i64,
     ) -> ApprovalDigest {
-        digest_for(actor, cap, target, p, i, e)
+        digest_for(actor, actor, cap, target, p, i, e)
     }
 
     #[test]
@@ -420,10 +437,10 @@ mod tests {
     fn the_canonical_form_is_prefixed_with_its_version() {
         // So a future change to the field set cannot be confused with an old
         // approval.
-        let bytes = canonical_bytes(&human(), &cap(), Some("a"), &params(), 1, 2);
+        let bytes = canonical_bytes(&human(), &human(), &cap(), Some("a"), &params(), 1, 2);
         let s = String::from_utf8_lossy(&bytes);
         assert!(
-            s.starts_with("orxnud-approval-v1|"),
+            s.starts_with("orxnud-approval-v2|"),
             "missing version prefix: {s}"
         );
     }
@@ -525,8 +542,10 @@ mod tests {
 /// whose `params` were canonicalised differently from the ones dispatch will canonicalise
 /// would never verify, so callers must pass [`canonical_params`] output rather than
 /// hand-built text.
+#[allow(clippy::too_many_arguments)] // The tuple is the digest's tuple.
 #[must_use]
 pub fn issue_approval(
+    approver: &Actor,
     actor: &Actor,
     capability: &CapabilityId,
     target: Option<&str>,
@@ -535,8 +554,19 @@ pub fn issue_approval(
     expires_at_ms: i64,
     risk: orxnud_domain::enums::RiskClass,
 ) -> ApprovalRecord {
+    // Refused here rather than only at dispatch. ADR-0037's central constraint is that
+    // the approver field is decoration unless minting happens in a grant-capable
+    // context; asserting it here means an approval that could never have been honoured
+    // can never exist. Dispatch checks the same property independently, so a record that
+    // reached storage another way is still refused.
+    assert!(
+        approver.can_grant(),
+        "an approval must be issued by a grant-capable principal; {} cannot grant",
+        approver.label()
+    );
     ApprovalRecord {
         actor_label: actor.label().to_owned(),
+        approver: approver.clone(),
         capability: capability.as_str().to_owned(),
         target: target.unwrap_or("-").to_owned(),
         params: params.clone(),
@@ -544,6 +574,7 @@ pub fn issue_approval(
         expires_at_ms,
         risk,
         digest: digest_for(
+            approver,
             actor,
             capability,
             target,
@@ -577,6 +608,7 @@ mod issue_tests {
         let params = canonical_params(&serde_json::json!({"path": "a.txt", "contents": "alpha"}));
 
         let record = issue_approval(
+            &local_human(),
             &actor,
             &capability,
             Some("a.txt"),
@@ -591,9 +623,22 @@ mod issue_tests {
         // The digest must be the one dispatch recomputes for the same tuple.
         assert_eq!(
             record.digest,
-            digest_for(&actor, &capability, Some("a.txt"), &params, 1_000, 2_000)
+            digest_for(
+                &local_human(),
+                &actor,
+                &capability,
+                Some("a.txt"),
+                &params,
+                1_000,
+                2_000,
+            )
         );
         assert_eq!(record.capability, "filesystem/write-text");
+        assert_eq!(
+            record.approver.authority_root(),
+            actor.authority_root(),
+            "the approver is the authority behind the proposer, and is recorded as such"
+        );
         assert_eq!(record.params.as_str(), params.as_str());
     }
 
@@ -603,6 +648,7 @@ mod issue_tests {
         let capability = CapabilityId::new("filesystem/write-text");
         let params = canonical_params(&serde_json::json!({"path": "a.txt", "contents": "alpha"}));
         let issued = issue_approval(
+            &local_human(),
             &actor,
             &capability,
             Some("a.txt"),
@@ -617,7 +663,15 @@ mod issue_tests {
         let other = canonical_params(&serde_json::json!({"path": "a.txt", "contents": "beta"}));
         assert_ne!(
             issued.digest,
-            digest_for(&actor, &capability, Some("a.txt"), &other, 1_000, 2_000)
+            digest_for(
+                &local_human(),
+                &actor,
+                &capability,
+                Some("a.txt"),
+                &other,
+                1_000,
+                2_000,
+            )
         );
         // Reordered keys: the same operation, so it must still verify.
         let reordered =
@@ -625,7 +679,15 @@ mod issue_tests {
         assert_eq!(reordered.as_str(), params.as_str());
         assert_eq!(
             issued.digest,
-            digest_for(&actor, &capability, Some("a.txt"), &reordered, 1_000, 2_000)
+            digest_for(
+                &local_human(),
+                &actor,
+                &capability,
+                Some("a.txt"),
+                &reordered,
+                1_000,
+                2_000,
+            )
         );
     }
 }

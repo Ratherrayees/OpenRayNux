@@ -29,12 +29,13 @@
 
 use std::path::Path;
 
-use orxnud_domain::ids::TaskId;
+use orxnud_domain::Actor;
+use orxnud_domain::ids::{CapabilityId, TaskId};
 use orxnud_domain::task_state::TaskState;
 use orxnud_store::StoreError;
 use orxnud_store::migration::MigrationRunner;
 use orxnud_store::sqlite::Store;
-use orxnud_store::task_repo::{ClaimRefusal, ClaimedTask, NewTask, TaskRow};
+use orxnud_store::task_repo::{ClaimRefusal, ClaimedTask, NewTask, ProposalRow, TaskRow};
 use orxnud_task::engine::{ClaimAttempt, TaskCreation};
 use orxnud_task::scheduler::{PassReport, Scheduler};
 use orxnud_task::{DurableEngine, EngineError, EngineLimits};
@@ -648,6 +649,55 @@ impl TaskService {
     /// [`TaskFault::Fenced`] if the lease is absent, expired or held by somebody
     /// else, [`TaskFault::NotFound`] if there is no such task, or
     /// [`TaskFault::Engine`] if the transition is illegal or the write fails.
+    /// Completes a task through the engine's lease-fenced completion.
+    ///
+    /// The same fence every other completion goes through; a governed execution takes no
+    /// shorter route to `completed` than a worker's own report does.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Fenced`] if the caller does not hold the live lease.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_task_with(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+        to: TaskState,
+        effect_observed: bool,
+        error: Option<&str>,
+        retry_delay_ms: Option<i64>,
+    ) -> Result<TaskRow, TaskFault> {
+        self.guard_running()?;
+        let ok = self
+            .engine
+            .complete_task_with(
+                id,
+                worker,
+                now_ms,
+                to,
+                effect_observed,
+                error,
+                retry_delay_ms,
+            )
+            .map_err(|e| TaskFault::Engine(e.to_string()))?;
+        if !ok {
+            return Err(TaskFault::Fenced);
+        }
+        // Re-read rather than construct: the authoritative post-state is what the engine
+        // stored, including `terminal_at_ms` and the effect bookkeeping.
+        self.engine
+            .task(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .ok_or(TaskFault::Fenced)
+    }
+
+    /// Completes a task through the engine, fenced by the caller's live lease.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Fenced`] if the caller does not hold the live lease, or
+    /// [`TaskFault::Stopped`] after [`Self::shutdown`].
     pub fn complete_task(
         &mut self,
         id: &TaskId,
@@ -682,29 +732,88 @@ impl TaskService {
             .ok_or(TaskFault::NotFound)
     }
 
-    /// Cancels a task, through the engine's existing cancellation path.
+    // ------------------------------------------------- governed action proposals
+    // ------------------------------------------------- governed action proposals
+
+    /// Records a governed action a task asks to perform, and parks it for a human.
     ///
-    /// # What the caller is told
+    /// # Errors
     ///
-    /// The returned row is the **authoritative state after the call**, read back from
-    /// storage rather than assumed. That matters because cancellation is not uniformly a
-    /// transition:
+    /// [`TaskFault`] if the task is unknown, is not `running` under this worker's live
+    /// lease, or already has a proposal for this attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_action(
+        &mut self,
+        proposal_id: &str,
+        id: &TaskId,
+        worker: &str,
+        capability: &CapabilityId,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer: &Actor,
+        now_ms: i64,
+    ) -> Result<ProposalRow, TaskFault> {
+        self.guard_running()?;
+        self.engine
+            .propose_action(
+                proposal_id,
+                id,
+                worker,
+                capability,
+                target,
+                canonical_params,
+                proposer,
+                now_ms,
+            )
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Reads a proposal.
     ///
-    /// * from `pending`, `running`, `waiting-for-user` or `waiting-for-external` it
-    ///   transitions to `cancelled`, immediately and in the same call;
-    /// * from a terminal state it is a **no-op that succeeds** — the repository returns
-    ///   `Ok(())` without writing an event, because a task that is already `cancelled`
-    ///   has nothing left to cancel and a second cancel must not manufacture a second
-    ///   terminal transition.
+    /// # Errors
     ///
-    /// So the honest contract is "here is the task now", and the caller decides what that
-    /// means. Turning the no-op into a refusal would be inventing a rule the engine does
-    /// not have; reporting `cancelled` unconditionally would be a lie about a task that
-    /// was already `completed`.
+    /// [`TaskFault`] if it cannot be read.
+    pub fn proposal(&self, proposal_id: &str) -> Result<Option<ProposalRow>, TaskFault> {
+        self.engine
+            .proposal(proposal_id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Records a human decision on a proposal. Does not change the task's state.
     ///
-    /// No worker identity is required, and that is the engine's semantics rather than a
-    /// convenience: cancellation is a decision about the task and clears whatever lease it
-    /// holds, whereas completion is a *report* from a lease holder and is fenced by it.
+    /// # Errors
+    ///
+    /// [`TaskFault`] if the proposal is unknown or already decided.
+    pub fn decide_proposal(
+        &mut self,
+        proposal_id: &str,
+        status: &'static str,
+        now_ms: i64,
+    ) -> Result<ProposalRow, TaskFault> {
+        self.guard_running()?;
+        self.engine
+            .decide_proposal(proposal_id, status, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Takes the fresh execution lease for an approved proposal and resumes the task.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if the proposal is not approved, or the task is not waiting.
+    pub fn begin_approved_execution(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<ProposalRow, TaskFault> {
+        self.guard_running()?;
+        self.engine
+            .begin_approved_execution(proposal_id, worker, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Cancels a task through the engine's existing cancellation.
     ///
     /// # Errors
     ///

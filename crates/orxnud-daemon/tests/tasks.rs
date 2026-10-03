@@ -1098,3 +1098,640 @@ fn set_state(root: &Path, id: &str, state: &str) {
         .expect("set the state");
     assert_eq!(changed, 1, "the fixture must have found exactly one row");
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0037 / ADR-0038 — the governed task action path
+// ---------------------------------------------------------------------------
+//
+// Every test here drives the real runtime over a real socket. The properties under test
+// are *arrangement* properties — a proposal and a waiting task committed together, a
+// lease released and retaken, an approval bound to one action — and none of them is
+// observable from a unit test that wires the pieces up itself.
+
+/// The workspace the daemon confines governed writes to.
+fn workspace(root: &Path) -> PathBuf {
+    root.join("workspace")
+}
+
+/// How many proposals are stored for this daemon's state directory.
+///
+/// Counted through the store's own migrated connection, matching the rest of this suite:
+/// a raw handle would accept an unmigrated file, which is the opposite of what a
+/// durability assertion wants.
+fn stored_proposal_count(root: &Path) -> usize {
+    let db = conn(root);
+    db.conn()
+        .query_row("SELECT count(*) FROM task_proposals;", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .expect("count proposals") as usize
+}
+
+/// Creates, claims and proposes in one step; returns the proposal id.
+fn propose(s: &Serving, task: &str, worker: &str, file: &str, contents: &str) -> String {
+    send(
+        &s.endpoint,
+        "c",
+        "task/create",
+        json!({"id": task, "content": "governed"}),
+    );
+    send(
+        &s.endpoint,
+        "c",
+        "task/claim",
+        json!({"id": task, "worker": worker}),
+    );
+    let reply = send(
+        &s.endpoint,
+        "p",
+        "task/propose",
+        json!({
+            "task": task,
+            "worker": worker,
+            "capability": "filesystem/write-text",
+            "target": file,
+            "params": {"path": file, "contents": contents},
+        }),
+    );
+    reply["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned()
+}
+
+/// The governed path, end to end, through the governed dispatcher.
+///
+/// The load-bearing assertion is that the task reaches `completed` **only after** the
+/// verifier confirmed the file. A refuted effect must leave the task running, because
+/// "we do not know whether it happened" is not "it happened".
+#[test]
+fn a_proposed_action_is_approved_executed_verified_and_completes_its_task() {
+    rt().block_on(async {
+        let d = dir("governed-happy");
+        let s = Serving::start(d.clone()).await;
+        let pid = propose(&s, "g1", "w1", "governed.txt", "written under approval");
+
+        // Parked, and the lease released: a human wait is not a lease reservation.
+        let listed = send(&s.endpoint, "l", "task/list", json!({}));
+        assert_eq!(listed["result"]["tasks"][0]["state"], "waiting-for-user");
+        assert!(
+            listed["result"]["tasks"][0]["lease_holder"].is_null(),
+            "the lease must be released while waiting: {}",
+            listed["result"]["tasks"][0]
+        );
+
+        // The trusted human approves the *proposal*, supplying no action of its own.
+        let approved = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let ap = &approved["result"]["approval"];
+        assert_eq!(ap["approver"], "human", "the approver is the trusted human");
+        assert_eq!(
+            ap["actor_label"], "ai",
+            "the proposer is the delegated model"
+        );
+        assert_eq!(ap["authority_root"], "local");
+
+        let executed = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        assert_eq!(executed["result"]["verified"], true, "{executed}");
+        assert_eq!(
+            std::fs::read_to_string(workspace(&d).join("governed.txt")).expect("written"),
+            "written under approval"
+        );
+        assert_eq!(
+            executed["result"]["task"]["state"], "completed",
+            "the task completes only after verification"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The approval is single-use, and the second use is refused before any side effect.
+#[test]
+fn an_approval_cannot_be_executed_twice() {
+    rt().block_on(async {
+        let d = dir("governed-single-use");
+        let s = Serving::start(d.clone()).await;
+        let pid = propose(&s, "g2", "w1", "once.txt", "first");
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        assert_eq!(
+            send(
+                &s.endpoint,
+                "x",
+                "task/execute",
+                json!({"proposal": pid, "worker": "w1"})
+            )["result"]["verified"],
+            true
+        );
+        let again = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        assert!(
+            again.get("error").is_some(),
+            "a second execution must be refused: {again}"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// An expired approval is refused, deterministically, with nothing written.
+#[test]
+fn an_expired_approval_is_refused_and_writes_nothing() {
+    rt().block_on(async {
+        let d = dir("governed-expired");
+        let s = Serving::start(d.clone()).await;
+        let pid = propose(&s, "g3", "w1", "late.txt", "expired");
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 0}),
+        );
+        let out = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        let reason = out["error"]["data"]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("approval-expired"), "{out}");
+        assert!(
+            !workspace(&d).join("late.txt").exists(),
+            "an expired approval must not write"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// V-71: the lease holder is not the proposer.
+///
+/// A worker that does not hold the live lease cannot propose at all — that is the
+/// ownership check — and the proposal that results records a proposer derived from the
+/// task, never from the worker. Changing which worker holds the lease must therefore
+/// leave the proposer, its authority root, and the eventual approval untouched.
+#[test]
+fn the_lease_holder_does_not_become_the_proposer() {
+    rt().block_on(async {
+        let d = dir("governed-v71");
+        let s = Serving::start(d.clone()).await;
+
+        // A worker with no lease is refused outright.
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "g4", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "g4", "worker": "w1"}),
+        );
+        let impostor = send(
+            &s.endpoint,
+            "p",
+            "task/propose",
+            json!({
+                "task": "g4", "worker": "not-the-lease-holder",
+                "capability": "filesystem/write-text", "target": "a.txt",
+                "params": {"path": "a.txt", "contents": "x"},
+            }),
+        );
+        assert!(
+            impostor.get("error").is_some(),
+            "a worker without the live lease must not propose: {impostor}"
+        );
+
+        // The legitimate holder's proposal records a delegated actor, not itself.
+        let reply = send(
+            &s.endpoint,
+            "p",
+            "task/propose",
+            json!({
+                "task": "g4", "worker": "w1",
+                "capability": "filesystem/write-text", "target": "a.txt",
+                "params": {"path": "a.txt", "contents": "x"},
+            }),
+        );
+        assert_eq!(
+            reply["result"]["proposal"]["authority_root"], "local",
+            "the proposer acts under the delegating human, not under the worker"
+        );
+        let pid = reply["result"]["proposal"]["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let approved = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        assert_eq!(approved["result"]["approval"]["approver"], "human");
+        assert_eq!(
+            approved["result"]["approval"]["actor_label"], "ai",
+            "the worker string must never appear as the actor"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// A proposal is durable, and so is a waiting task: both survive a restart unchanged.
+///
+/// This is the property that makes `waiting-for-user` explainable rather than merely
+/// empty. It also covers the accident the design had to avoid: `recover` reclaims leases
+/// on `running` tasks, so if the proposal path had left the task `running` with a dead
+/// lease, a restart would have silently reset it to `pending`.
+#[test]
+fn a_proposal_and_its_waiting_task_survive_a_restart_unchanged() {
+    rt().block_on(async {
+        let d = dir("governed-restart");
+        let before = {
+            let s = Serving::start(d.clone()).await;
+            let pid = propose(&s, "g5", "w1", "keep.txt", "durable");
+            let row = send(&s.endpoint, "l", "task/list", json!({}));
+            let proposal = send(&s.endpoint, "q", "task/list", json!({}));
+            let _ = proposal;
+            let p = stored_proposal_count(&d);
+            s.crash().await;
+            (
+                pid,
+                p,
+                row["result"]["tasks"][0]["state"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+
+        let (pid, stored, state) = before;
+        assert_eq!(state, "waiting-for-user");
+        assert_eq!(stored, 1, "the proposal must be durable before the wait");
+
+        // A fresh process over the same directory: reaching here means the journal loaded
+        // and verified.
+        let s = Serving::start(d.clone()).await;
+        let listed = send(&s.endpoint, "l", "task/list", json!({}));
+        assert_eq!(
+            listed["result"]["tasks"][0]["state"], "waiting-for-user",
+            "recovery must not reset a waiting task; it is not running"
+        );
+
+        // And it can still be approved and executed after the restart.
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 600_000}),
+        );
+        let out = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        assert_eq!(out["result"]["verified"], true, "{out}");
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The attempt number does not advance across the human wait.
+///
+/// A wait is not a retry: TP-6 requires a fresh approval after a *retry*, so the attempt
+/// that asked must be the attempt that executes. If this regressed, the approval and the
+/// execution it authorises would sit on different attempt numbers.
+#[test]
+fn the_attempt_does_not_advance_across_the_approval_wait() {
+    rt().block_on(async {
+        let d = dir("governed-attempt");
+        let s = Serving::start(d.clone()).await;
+        let pid = propose(&s, "g6", "w1", "attempt.txt", "x");
+        let at_propose =
+            send(&s.endpoint, "q", "task/list", json!({}))["result"]["tasks"][0]["attempts"]
+                .clone();
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let at_approve =
+            send(&s.endpoint, "q", "task/list", json!({}))["result"]["tasks"][0]["attempts"]
+                .clone();
+        assert_eq!(
+            at_propose, at_approve,
+            "approval must not start a new attempt"
+        );
+        send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        let at_execute =
+            send(&s.endpoint, "q", "task/list", json!({}))["result"]["tasks"][0]["attempts"]
+                .clone();
+        assert_eq!(
+            at_approve, at_execute,
+            "execution resumes the same attempt; a human wait is not a retry"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The proposal commits to the parameters that were actually asked for.
+///
+/// This is the test that makes parameter binding *externally* checkable. Without it,
+/// replacing the canonical form with any other consistent value would pass every other
+/// test in this file: the proposal stores what it is given, approval is computed over
+/// the stored value, and execution replays the stored value — so a consistently-wrong
+/// canonicalisation is self-consistent and invisible. What catches it is comparing the
+/// stored canonical text against the request that produced it.
+#[test]
+fn the_proposal_commits_to_the_parameters_that_were_requested() {
+    rt().block_on(async {
+        let d = dir("governed-params");
+        let s = Serving::start(d.clone()).await;
+        // Deliberately written in the "wrong" key order, to show the stored form is
+        // canonical rather than verbatim.
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "g8", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "g8", "worker": "w1"}),
+        );
+        let r = send(
+            &s.endpoint,
+            "p",
+            "task/propose",
+            json!({
+                "task": "g8", "worker": "w1",
+                "capability": "filesystem/write-text", "target": "p.txt",
+                "params": {"contents": "alpha", "path": "p.txt"},
+            }),
+        );
+        assert_eq!(
+            r["result"]["proposal"]["params"], r#"{"contents":"alpha","path":"p.txt"}"#,
+            "the stored parameters must be the canonical form of what was requested"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// An unapproved proposal cannot be executed, and a decided proposal cannot be re-approved.
+#[test]
+fn an_unapproved_or_already_decided_proposal_is_refused() {
+    rt().block_on(async {
+        let d = dir("governed-unapproved");
+        let s = Serving::start(d.clone()).await;
+        let pid = propose(&s, "g7", "w1", "no.txt", "x");
+
+        let early = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        assert!(early.get("error").is_some(), "{early}");
+
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let twice = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        assert!(
+            twice.get("error").is_some(),
+            "a decided proposal must not be approvable again: {twice}"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// Approve proposal A, then try to execute proposal B with A's approval.
+///
+/// The interface makes this hard by construction — `task/execute` accepts only a
+/// proposal id and a worker, so there is no field through which "execute B using A's
+/// approval" could be expressed. That is the right design, but "hard by construction" is
+/// a claim about code, not a test, so the invariant is asserted here directly: B executes
+/// only under B's own approval, and never against A's.
+#[test]
+fn an_approval_for_one_proposal_does_not_execute_another() {
+    rt().block_on(async {
+        let d = dir("governed-cross");
+        let s = Serving::start(d.clone()).await;
+
+        // Two proposals on two tasks, with different contents.
+        let pid_a = propose(&s, "xa", "w1", "a.txt", "alpha");
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "xb", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "xb", "worker": "w1"}),
+        );
+        let pid_b = send(
+            &s.endpoint,
+            "p",
+            "task/propose",
+            json!({
+                "task": "xb", "worker": "w1",
+                "capability": "filesystem/write-text", "target": "b.txt",
+                "params": {"path": "b.txt", "contents": "beta"},
+            }),
+        )["result"]["proposal"]["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(pid_a, pid_b);
+
+        // Only A is approved.
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid_a, "ttl_ms": 60_000}),
+        );
+
+        // B is not, so B cannot execute — A's approval does not reach it.
+        let b_first = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid_b, "worker": "w1"}),
+        );
+        assert!(
+            b_first.get("error").is_some(),
+            "B must not execute under A's approval: {b_first}"
+        );
+        assert!(
+            !workspace(&d).join("b.txt").exists(),
+            "the refused execution must have written nothing"
+        );
+
+        // A executes under its own approval, and only its own contents land.
+        let a = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid_a, "worker": "w1"}),
+        );
+        assert_eq!(a["result"]["verified"], true, "{a}");
+        assert_eq!(
+            std::fs::read_to_string(workspace(&d).join("a.txt")).expect("written"),
+            "alpha"
+        );
+        assert!(
+            !workspace(&d).join("b.txt").exists(),
+            "A's approval must never cause B's side effect"
+        );
+
+        // And once B is approved in its own right, it writes *its* contents.
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid_b, "ttl_ms": 60_000}),
+        );
+        let b = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid_b, "worker": "w1"}),
+        );
+        assert_eq!(b["result"]["verified"], true, "{b}");
+        assert_eq!(
+            std::fs::read_to_string(workspace(&d).join("b.txt")).expect("written"),
+            "beta"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// Object-key order is not part of the operation; array order is.
+///
+/// Two halves of one rule, and the second is the one that would be quietly broken by a
+/// well-meaning "let's sort everything" later: `{"a":1,"b":2}` and `{"b":2,"a":1}` are the
+/// same request written twice, while `["a","b"]` and `["b","a"]` are different arguments
+/// to almost any capability.
+#[test]
+fn key_order_is_canonicalised_but_array_order_is_meaningful() {
+    // The property is about the canonical form the approval commits to, so it is asserted
+    // where that form is produced.
+    let forward: serde_json::Value =
+        serde_json::from_str(r#"{"path":"p.txt","contents":"alpha"}"#).expect("json");
+    let reversed: serde_json::Value =
+        serde_json::from_str(r#"{"contents":"alpha","path":"p.txt"}"#).expect("json");
+    assert_eq!(
+        orxnud_policy::canonical_params(&forward).as_str(),
+        orxnud_policy::canonical_params(&reversed).as_str(),
+        "two spellings of one request must produce one canonical form"
+    );
+
+    let arr_forward: serde_json::Value = serde_json::from_str(r#"{"xs":["a","b"]}"#).expect("json");
+    let arr_reversed: serde_json::Value =
+        serde_json::from_str(r#"{"xs":["b","a"]}"#).expect("json");
+    assert_ne!(
+        orxnud_policy::canonical_params(&arr_forward).as_str(),
+        orxnud_policy::canonical_params(&arr_reversed).as_str(),
+        "array order is meaning and must not be sorted away"
+    );
+}
+
+/// Durable parameters that cannot be read are refused, never defaulted.
+///
+/// The regression for the fail-open this slice removed: the stored text is what the
+/// digest is computed over, so defaulting a corrupt row to `{}` used to produce a
+/// *verified* execution of parameters nobody approved.
+#[test]
+fn unreadable_stored_parameters_are_refused_rather_than_defaulted() {
+    rt().block_on(async {
+        let d = dir("governed-corrupt");
+        let s = Serving::start(d.clone()).await;
+        let pid = propose(&s, "gc", "w1", "c.txt", "x");
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        s.stop().await;
+
+        // Corrupt the durable parameters behind the daemon's back — in **both** the
+        // proposal and the approval row.
+        //
+        // Both, deliberately: corrupting only the proposal is caught earlier by the
+        // action-mismatch pre-check (the approval's params no longer match), which is
+        // fail-closed but would mask the guard under test. Corrupting both lets the
+        // mismatch check pass, so the parse guard is what actually has to stop it.
+        let db = conn(&d);
+        db.conn()
+            .execute(
+                "UPDATE task_proposals SET params = '{not json' WHERE proposal_id = ?1;",
+                [pid.as_str()],
+            )
+            .expect("corrupt the proposal params");
+        db.conn()
+            .execute("UPDATE task_approvals SET params = '{not json';", [])
+            .expect("corrupt the approval params");
+
+        let s = Serving::start(d.clone()).await;
+        let out = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+        let reason = out["error"]["data"]["reason"].as_str().unwrap_or_default();
+        assert_eq!(reason, "proposal-corrupt", "{out}");
+        assert!(
+            !workspace(&d).join("c.txt").exists(),
+            "unreadable durable parameters must produce no side effect at all"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}

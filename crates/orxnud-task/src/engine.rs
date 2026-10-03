@@ -36,7 +36,8 @@
 
 use rusqlite::Connection;
 
-use orxnud_domain::ids::TaskId;
+use orxnud_domain::Actor;
+use orxnud_domain::ids::{CapabilityId, TaskId};
 use orxnud_domain::task_state::{TaskKind, TaskState};
 use orxnud_store::schedule_repo::ScheduleRepository;
 use orxnud_store::task_repo::{
@@ -550,6 +551,90 @@ impl DurableEngine {
         Ok(self
             .approval_for(id, attempt_no)?
             .is_some_and(|a| a.is_valid_at(now_ms)))
+    }
+
+    // ------------------------------------------------- governed action proposals
+
+    /// Records a governed action this task asks to perform, and parks it for a human.
+    ///
+    /// A thin pass-through to the repository, which owns the transaction. Deliberately
+    /// not more: the task engine's job here is to decide *whether* this task may ask,
+    /// and the proposal's contents are governance data the policy layer validates later.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `Storage`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_action(
+        &mut self,
+        proposal_id: &str,
+        id: &TaskId,
+        worker: &str,
+        capability: &CapabilityId,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer: &Actor,
+        now_ms: i64,
+    ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
+        let authority = proposer.authority_root().map(|u| u.as_str().to_owned());
+        let proposer_json = serde_json::to_string(proposer)
+            .map_err(|e| EngineError::storage(format!("proposer could not be encoded: {e}")))?;
+        self.repo()
+            .propose_action(
+                proposal_id,
+                id,
+                worker,
+                capability.as_str(),
+                target,
+                canonical_params,
+                &proposer_json,
+                authority.as_deref(),
+                now_ms,
+            )
+            .map_err(EngineError::from)
+    }
+
+    /// Reads a proposal.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `Storage`.
+    pub fn proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<orxnud_store::task_repo::ProposalRow>, EngineError> {
+        Ok(self.repo_ref().proposal_by_id(proposal_id)?)
+    }
+
+    /// Records a human decision on a proposal.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `Storage`.
+    pub fn decide_proposal(
+        &mut self,
+        proposal_id: &str,
+        status: &'static str,
+        now_ms: i64,
+    ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
+        Ok(self.repo().decide_proposal(proposal_id, status, now_ms)?)
+    }
+
+    /// Begins execution of an approved proposal: a fresh lease, and back to `running`.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `Storage`.
+    pub fn begin_approved_execution(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
+        let lease = self.limits.lease_duration_ms;
+        Ok(self
+            .repo()
+            .begin_approved_execution(proposal_id, worker, now_ms, lease)?)
     }
 
     // ------------------------------------------------------------ schedules

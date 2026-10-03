@@ -56,6 +56,29 @@ pub enum TaskCommand {
         /// The task id.
         id: String,
     },
+    /// Ask for a governed action to be performed by a running task.
+    ///
+    /// Creates a durable proposal and parks the task for human approval. The worker is
+    /// the task's current lease holder and gains no authority from being named here.
+    Propose {
+        /// The task id.
+        task: String,
+        /// The worker holding the task's lease.
+        worker: String,
+        /// Which capability to ask for.
+        capability: String,
+        /// The capability's parameters, verbatim JSON.
+        params: String,
+        /// The human-readable target, if any.
+        target: Option<String>,
+    },
+    /// Execute an approved proposal.
+    Execute {
+        /// Which proposal.
+        proposal: String,
+        /// The worker taking the fresh execution lease.
+        worker: String,
+    },
 }
 
 /// Runs a task command and returns what to print.
@@ -89,6 +112,46 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             let reply = client.call("task/claim", json!({ "id": id, "worker": worker }))?;
             Ok(render_claim(&reply))
         }
+        TaskCommand::Propose {
+            task,
+            worker,
+            capability,
+            params,
+            target,
+        } => {
+            let params: Value =
+                serde_json::from_str(params).map_err(|e| ClientError::InvalidParams {
+                    detail: format!("`--params` is not valid JSON: {e}"),
+                })?;
+            let mut payload = json!({
+                "task": task,
+                "worker": worker,
+                "capability": capability,
+                "params": params,
+            });
+            if let Some(t) = target {
+                payload["target"] = json!(t);
+            }
+            let reply = client.call("task/propose", payload)?;
+            Ok(render_proposal(&reply))
+        }
+        TaskCommand::Execute { proposal, worker } => {
+            let reply = client.call(
+                "task/execute",
+                json!({ "proposal": proposal, "worker": worker }),
+            )?;
+            let mut out = render_proposal(&reply);
+            // The verdict is the daemon's, not a local guess: a proposal that dispatched
+            // but did not verify must not read as success to a script.
+            let flag = |k: &str| reply.get(k).and_then(Value::as_bool).unwrap_or(false);
+            out.push_str(&format!(
+                "verified: {}\nrefuted: {}\nundetermined: {}\n",
+                flag("verified"),
+                flag("refuted"),
+                flag("undetermined"),
+            ));
+            Ok(out)
+        }
         TaskCommand::Complete { id, worker } => {
             let reply = client.call("task/complete", json!({ "id": id, "worker": worker }))?;
             Ok(render_task_field(&reply, "completed"))
@@ -98,6 +161,26 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             Ok(render_cancel(&reply))
         }
     }
+}
+
+/// Renders a proposal from a `task/propose` or `task/execute` reply.
+fn render_proposal(reply: &Value) -> String {
+    let Some(p) = reply.get("proposal") else {
+        return "no proposal in reply\n".to_owned();
+    };
+    let field = |k: &str| p.get(k).map_or_else(|| "-".to_owned(), Value::to_string);
+    let mut out = String::new();
+    out.push_str("proposal\n");
+    out.push_str(&format!("  id: {}\n", field("proposal_id")));
+    out.push_str(&format!("  task: {}\n", field("task_id")));
+    out.push_str(&format!("  attempt: {}\n", field("attempt_no")));
+    out.push_str(&format!("  capability: {}\n", field("capability")));
+    out.push_str(&format!("  status: {}\n", field("status")));
+    out.push_str(&format!("  params: {}\n", field("params")));
+    if let Some(w) = reply.get("waiting_for").and_then(Value::as_str) {
+        out.push_str(&format!("  waiting_for: {w}\n"));
+    }
+    out
 }
 
 /// Renders `task/cancel`.
@@ -334,18 +417,36 @@ pub fn run_capability(
 /// result is an artefact whose digest the dispatcher will later recompute from the
 /// action it is actually about to run.
 pub fn approve_capability(
-    capability: &str,
-    params: &str,
+    capability: Option<&str>,
+    params: Option<&str>,
+    proposal: Option<&str>,
     target: Option<&str>,
     ttl_ms: Option<i64>,
     client: &Client,
 ) -> Result<String, ClientError> {
-    let params: Value = serde_json::from_str(params).map_err(|e| ClientError::InvalidParams {
-        detail: format!("`--params` is not valid JSON: {e}"),
-    })?;
     client.negotiate()?;
 
-    let mut payload = json!({ "capability": capability, "params": params });
+    // A proposal carries its own action, so nothing else is sent — which is what makes
+    // the approved action unforgeable by the caller.
+    let payload = match (proposal, capability) {
+        (Some(p), _) => json!({ "proposal": p }),
+        (None, Some(c)) => {
+            let raw = params.ok_or_else(|| ClientError::InvalidParams {
+                detail: "`--params` is required with `--capability`".to_owned(),
+            })?;
+            let parsed: Value =
+                serde_json::from_str(raw).map_err(|e| ClientError::InvalidParams {
+                    detail: format!("`--params` is not valid JSON: {e}"),
+                })?;
+            json!({ "capability": c, "params": parsed })
+        }
+        (None, None) => {
+            return Err(ClientError::InvalidParams {
+                detail: "either --proposal or --capability is required".to_owned(),
+            });
+        }
+    };
+    let mut payload = payload;
     if let Some(t) = target {
         payload["target"] = json!(t);
     }

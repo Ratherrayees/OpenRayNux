@@ -527,6 +527,7 @@ fn a_fresh_database_reaches_the_current_version_and_creates_only_the_task_schema
             "task_attempts",
             "task_effects",
             "task_events",
+            "task_proposals",
             "tasks",
         ]
     );

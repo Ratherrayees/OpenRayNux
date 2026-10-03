@@ -187,9 +187,14 @@ impl From<TaskRepoError> for EngineError {
         // storage failure, because the repository only reports storage problems
         // plus the two caller-fixable ones.
         let kind = match &e {
-            TaskRepoError::AlreadyExists(_) | TaskRepoError::NotFound(_) => {
-                EngineErrorKind::InvalidInput
-            }
+            // A proposal that is missing or in the wrong state is a caller-fixable
+            // condition, not a storage failure — the same category as an unknown task
+            // id. Mapping it to `Storage` would report "the database is broken" for what
+            // is really "you asked to execute something nobody approved".
+            TaskRepoError::AlreadyExists(_)
+            | TaskRepoError::NotFound(_)
+            | TaskRepoError::NoSuchProposal(_)
+            | TaskRepoError::ProposalNotInState { .. } => EngineErrorKind::InvalidInput,
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => {
                 EngineErrorKind::Invariant
             }

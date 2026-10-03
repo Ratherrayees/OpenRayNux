@@ -81,11 +81,13 @@ fn main() -> ExitCode {
                     orxnuctl::CapabilityCommand::Approve {
                         capability,
                         params,
+                        proposal,
                         target,
                         ttl_ms,
                     } => match task::approve_capability(
-                        capability,
-                        params,
+                        capability.as_deref(),
+                        params.as_deref(),
+                        proposal.as_deref(),
                         target.as_deref(),
                         *ttl_ms,
                         &client,

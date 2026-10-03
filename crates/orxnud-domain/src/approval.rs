@@ -108,6 +108,18 @@ impl ApprovalDigest {
 pub struct ApprovalRecord {
     /// Who gave it. An approval given to one actor is not usable by another.
     pub actor_label: String,
+    /// The human who actually approved this. ADR-0037, V-69.
+    ///
+    /// Present because without it the record is a **bearer token**: it proves
+    /// *these parameters, for this proposer, before this time*, and nothing about
+    /// whether any human was asked. `actor_label` above is the *proposer's* label
+    /// and was never read at dispatch, so before this field existed an approval
+    /// carried no approver at all.
+    ///
+    /// Stored as a whole [`crate::actor::Actor`] rather than a bare id so dispatch can ask
+    /// `can_grant()` of it, which is the check that makes the field more than
+    /// decoration. An approver that cannot grant must not be able to approve.
+    pub approver: crate::actor::Actor,
     /// The capability the user believed they were approving.
     pub capability: String,
     /// The human-readable target — a URL, a file path, a recipient.
@@ -140,11 +152,22 @@ impl ApprovalRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::{Actor, AuthChannel};
     use crate::enums::RiskClass;
+    use crate::ids::UserId;
     use proptest::prelude::*;
+
+    /// The approving human. Grant-capable, which is what dispatch requires.
+    fn approver() -> Actor {
+        Actor::Human {
+            user: UserId::new("u-1"),
+            via: AuthChannel::LocalInteractive,
+        }
+    }
 
     fn record() -> ApprovalRecord {
         ApprovalRecord {
+            approver: approver(),
             actor_label: "human".into(),
             capability: "send-message".into(),
             target: "https://example.invalid/alice".into(),
@@ -204,7 +227,24 @@ mod tests {
         let base = record();
         let variants = [
             ApprovalRecord {
+                approver: approver(),
                 actor_label: "other".into(),
+                ..base.clone()
+            },
+            // ADR-0037: the approver is part of the record, so dropping one must be
+            // caught the same way dropping any other field is.
+            ApprovalRecord {
+                approver: Actor::Ai {
+                    delegated_by: UserId::new("u-2"),
+                    run: crate::ids::RunId::new("r-2"),
+                    task: crate::ids::TaskId::new("t-2"),
+                    provenance: crate::actor::ModelProvenance {
+                        model: "test/model".into(),
+                        revision: None,
+                        prompt_hash: "h".into(),
+                        request_id: crate::ids::RequestId::new("q-2"),
+                    },
+                },
                 ..base.clone()
             },
             ApprovalRecord {

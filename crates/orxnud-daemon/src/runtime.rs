@@ -546,7 +546,12 @@ async fn route<S: SecretsContract>(
         | Method::TaskList
         | Method::TaskClaim
         | Method::TaskComplete
+        | Method::TaskPropose
         | Method::TaskCancel => tasks(method, request, governed).await,
+        // Execution crosses from the task layer into the governed dispatcher, so it is
+        // routed separately rather than through `tasks`: it needs the capability registry
+        // and the sandbox backend, which `tasks` deliberately has no access to.
+        Method::TaskExecute => execute_proposal(request, governed).await,
     }
 }
 
@@ -561,6 +566,334 @@ fn local_actor() -> orxnud_domain::Actor {
         user: orxnud_domain::ids::UserId::new("local"),
         via: orxnud_domain::actor::AuthChannel::LocalInteractive,
     }
+}
+
+/// The delegated proposer for a task's governed action.
+///
+/// Built from the **task identity** and the trusted local human, never from the worker
+/// holding the lease. That is V-71 as code rather than as a comment: the two inputs a
+/// caller controls (task id, worker) and the two that determine authority (delegating
+/// human, task) are separate, and only the former is reachable from the request.
+fn delegated_actor(task_id: &str) -> orxnud_domain::Actor {
+    use orxnud_domain::actor::ModelProvenance;
+    orxnud_domain::Actor::Ai {
+        delegated_by: orxnud_domain::ids::UserId::new("local"),
+        run: orxnud_domain::ids::RunId::new(task_id),
+        task: orxnud_domain::ids::TaskId::new(task_id),
+        provenance: ModelProvenance::new(
+            "openraynux/task-agent",
+            "phase-2",
+            orxnud_domain::ids::RequestId::new(task_id),
+        ),
+    }
+}
+
+/// The wire projection of one proposal row.
+fn proposal_json(row: &orxnud_store::task_repo::ProposalRow) -> serde_json::Value {
+    json!({
+        "proposal_id": row.proposal_id,
+        "task_id": row.task_id.as_str(),
+        "attempt_no": row.attempt_no,
+        "capability": row.capability,
+        "target": row.target,
+        "params": row.params,
+        "authority_root": row.authority_root,
+        "created_at_ms": row.created_at_ms,
+        "status": row.status,
+        "decided_at_ms": row.decided_at_ms,
+    })
+}
+
+/// Executes an approved proposal through the governed dispatcher.
+///
+/// The load-bearing property of this function is that it **rebuilds the action from the
+/// durable proposal** rather than from the request. A caller supplies only a proposal id
+/// and a worker; there is no parameter to substitute, so there is nothing to substitute.
+/// That is what makes "approve A, execute B" unrepresentable over this interface.
+///
+/// Policy remains the authority: the `ApprovalRecord` is handed to
+/// `Dispatcher::dispatch`, which performs expiry, single-use, the digest recompute over
+/// both parties, the approver's grant-capability and authority relationship, and the
+/// budget. This function adds no authorisation logic of its own.
+async fn execute_proposal<S: SecretsContract>(
+    request: &Request,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let proposal_id = required_str(&params, "proposal")?;
+    check_len("proposal", &proposal_id, MAX_TASK_ID_BYTES)?;
+    let worker = required_str(&params, "worker")?;
+    check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+
+    let mut g = governed.lock().await;
+    let now = g.2.clock_now_ms();
+
+    // 1. The durable proposal. Everything below is derived from it.
+    let proposal =
+        g.2.proposal(&proposal_id)
+            .map_err(task_fault)?
+            .ok_or_else(|| RequestError::Invalid(format!("no proposal {proposal_id:?}")))?;
+    let proposer = proposal
+        .proposer()
+        .map_err(|e| RequestError::Invalid(format!("proposal proposer unusable: {e}")))?;
+    let canonical = orxnud_domain::NormalizedParams::canonical(proposal.params.clone());
+
+    // 2. The approval for *this attempt*, recomposed against the trusted approver. The
+    //    digest was computed over that approver, so if it were minted under anyone else
+    //    the dispatcher refuses it — which is the check, not this reconstruction.
+    let approval_row =
+        g.2.engine()
+            .approval_for(&proposal.task_id, proposal.attempt_no)
+            .map_err(|e| RequestError::Refused(format!("approval unreadable: {e}")))?
+            .ok_or_else(|| RequestError::Declined {
+                reason: "approval-required".to_owned(),
+                // A fixed word, not a formatted sentence: `detail` is a second term in a
+                // vocabulary a client branches on, and putting a task id in it would make
+                // the value unpredictable.
+                detail: Some("no approval is recorded for this proposal's attempt"),
+            })?;
+    let record = approval_record_from_row(&approval_row, &proposer, &proposal)?;
+
+    // 3. Take the fresh execution lease and resume the task, atomically.
+    let began =
+        g.2.begin_approved_execution(&proposal_id, &worker, now)
+            .map_err(task_fault)?;
+
+    // 4. Dispatch. The action comes from the proposal; `action.params` and
+    //    `canonical_params` are the same value by construction, which is what the
+    //    dispatcher's digest check then confirms.
+    // The stored parameters are parsed, and a parse failure is **fatal**.
+    //
+    // This line used to be `.unwrap_or(json!({}))`, which was fail-*open* in the worst
+    // way available: the digest is computed over the stored canonical *text*, so a
+    // corrupt row still verified, and the adapter then ran with `{}` — a side effect
+    // from parameters nobody approved. Durable state that cannot be read is refused,
+    // never defaulted.
+    let stored_params: serde_json::Value = match serde_json::from_str(&proposal.params) {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(RequestError::Declined {
+                reason: "proposal-corrupt".to_owned(),
+                detail: Some("the stored parameters are not readable JSON"),
+            });
+        }
+    };
+    let action = orxnud_domain::ActionRequest::new(
+        proposal.task_id.clone(),
+        orxnud_domain::ids::RunId::new(proposal.task_id.as_str()),
+        proposal.attempt_no,
+        orxnud_domain::CapabilityId::new(proposal.capability.as_str()),
+        stored_params,
+        orxnud_domain::DataClass::Public,
+        orxnud_domain::DataClass::Public,
+    );
+    let context = orxnud_domain::InvocationContext::new(
+        format!("proposal-{proposal_id}"),
+        30_000,
+        format!("ipc-{}", request.id),
+    );
+    // Scoped so the dispatcher — which borrows the governed lock — is dropped before the
+    // completion below needs the same lock. A second `lock().await` while `d` is alive
+    // would deadlock rather than queue, because a `tokio::sync::Mutex` is not reentrant.
+    let outcome = {
+        let (daemon, secrets, _tasks) = &mut *g;
+        let mut d: Dispatcher<'_, S> = daemon.dispatcher(secrets);
+        d.dispatch(
+            action,
+            proposer,
+            context,
+            proposal.target.clone(),
+            canonical,
+            Some(&record),
+            None,
+            now,
+        )
+    };
+
+    let o = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            // The dispatcher's own message, which is already structured and already
+            // safe to show. `Refused` rather than `Declined` because the detail is the
+            // dispatcher's to word, not a fixed term this layer owns.
+            return Err(RequestError::Refused(e.to_string()));
+        }
+    };
+
+    // Completion is gated on the **verifier**, not on the dispatcher having returned.
+    // A refuted or undetermined effect leaves the task `running` under its lease, which
+    // is the honest state: something may have happened and nobody can say what. Reporting
+    // completion there would be the task layer asserting an effect the verification stage
+    // explicitly refused to confirm.
+    let completed = if o.is_verified() {
+        let complete_at = g.2.clock_now_ms();
+        Some(
+            g.2.complete_task_with(
+                &began.task_id,
+                &worker,
+                complete_at,
+                TaskState::Completed,
+                true,
+                None,
+                None,
+            )
+            .map_err(task_fault)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "proposal": proposal_json(&began),
+        "verified": o.is_verified(),
+        "refuted": o.verification.is_refuted(),
+        "undetermined": o.verification.is_undetermined(),
+        "result": o.verification.to_string(),
+        // `null` when the verifier did not confirm, so a client can tell "not completed"
+        // from "completed, and here is the stored row".
+        "task": completed.as_ref().map(task_json),
+    }))
+}
+
+/// Rebuilds the approval record for dispatch from the stored row.
+///
+/// The approver is **not** read from storage or from the request: it is re-derived from
+/// the trusted local-human boundary, exactly as at minting time. Because the digest
+/// binds the approver, a row minted by anyone else fails the recompute rather than
+/// quietly verifying.
+fn approval_record_from_row(
+    row: &orxnud_store::task_repo::ApprovalRow,
+    proposer: &orxnud_domain::Actor,
+    proposal: &orxnud_store::task_repo::ProposalRow,
+) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
+    let digest = digest_from_hex(&row.digest_hex).ok_or_else(|| RequestError::Declined {
+        reason: "approval-corrupt".to_owned(),
+        detail: Some("the stored digest is not 64 hex characters"),
+    })?;
+    // The approval must be *for this action*. Cheap pre-check so the refusal names the
+    // mismatch instead of surfacing as a digest failure deep in the dispatcher.
+    if row.capability != proposal.capability
+        || row.params != proposal.params
+        || row.target != proposal.target
+    {
+        return Err(RequestError::Declined {
+            reason: "approval-action-mismatch".to_owned(),
+            detail: Some("the approval was issued for a different action"),
+        });
+    }
+    Ok(orxnud_domain::ApprovalRecord {
+        actor_label: proposer.label().to_owned(),
+        approver: local_actor(),
+        capability: row.capability.clone(),
+        target: row.target.clone().unwrap_or_else(|| "-".to_owned()),
+        params: orxnud_domain::NormalizedParams::canonical(row.params.clone()),
+        issued_at_ms: row.issued_at_ms,
+        expires_at_ms: row.expires_at_ms,
+        risk: orxnud_domain::enums::RiskClass::High,
+        digest,
+    })
+}
+
+/// Approves a **durable proposal**, if the request names one.
+///
+/// This is the ADR-0037 minting path, and its shape is the point:
+///
+/// ```text
+/// trusted local human -> proposal_id -> daemon loads the proposal
+///   -> daemon derives the approving Human -> issues for *that* action
+/// ```
+///
+/// The caller supplies **only a proposal id**. It cannot supply the capability, the
+/// parameters, the target, the proposer, or an approver — every one of those comes from
+/// the stored proposal. That is what makes "approve A, execute B" unrepresentable: there
+/// is no field through which B could be named.
+///
+/// The approver is the trusted local human, derived here. A caller cannot nominate its
+/// own approver, and `issue_approval` refuses a non-granting principal, so the approver
+/// field is evidence rather than decoration (V-69).
+///
+/// # Errors
+///
+/// [`RequestError::Invalid`] for a malformed request, or a proposal that is unknown or
+/// already decided.
+async fn approve_proposal<S: SecretsContract>(
+    request: &Request,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let proposal_id = required_str(&params, "proposal")?;
+    check_len("proposal", &proposal_id, MAX_TASK_ID_BYTES)?;
+    let ttl_ms = params
+        .get("ttl_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(60_000);
+
+    let mut g = governed.lock().await;
+    let now = g.2.clock_now_ms();
+
+    let proposal =
+        g.2.proposal(&proposal_id)
+            .map_err(task_fault)?
+            .ok_or_else(|| RequestError::Invalid(format!("no proposal {proposal_id:?}")))?;
+    if !proposal.is_pending() {
+        return Err(RequestError::Declined {
+            reason: "proposal-already-decided".to_owned(),
+            detail: Some("only a pending proposal can be approved"),
+        });
+    }
+    let proposer = proposal
+        .proposer()
+        .map_err(|e| RequestError::Invalid(format!("proposal proposer unusable: {e}")))?;
+
+    // The trusted approver, and the digest computed over BOTH parties plus the stored
+    // action. Nothing here is taken from the request except the proposal id.
+    let approver = local_actor();
+    let canonical = orxnud_domain::NormalizedParams::canonical(proposal.params.clone());
+    let record = orxnud_policy::issue_approval(
+        &approver,
+        &proposer,
+        &orxnud_domain::CapabilityId::new(proposal.capability.as_str()),
+        proposal.target.as_deref(),
+        &canonical,
+        now,
+        now.saturating_add(ttl_ms),
+        orxnud_domain::enums::RiskClass::High,
+    );
+
+    // Recorded against the attempt, so a retry would not inherit it (TP-6), and marked
+    // decided, so the proposal stops being approvable.
+    let approval_row = orxnud_store::task_repo::ApprovalRow {
+        task_id: proposal.task_id.clone(),
+        attempt_no: proposal.attempt_no,
+        digest_hex: digest_hex(&record.digest),
+        capability: record.capability.clone(),
+        target: proposal.target.clone(),
+        params: record.params.as_str().to_owned(),
+        issued_at_ms: record.issued_at_ms,
+        expires_at_ms: record.expires_at_ms,
+        consumed_at_ms: None,
+    };
+    g.2.engine_mut()
+        .record_approval(&approval_row)
+        .map_err(|e| RequestError::Refused(format!("approval could not be recorded: {e}")))?;
+    let decided =
+        g.2.decide_proposal(&proposal_id, "approved", now)
+            .map_err(task_fault)?;
+
+    Ok(json!({
+        "approval": {
+            "actor_label": record.actor_label,
+            "approver": record.approver.label(),
+            "authority_root": record.approver.authority_root().map(|u| u.as_str()),
+            "capability": record.capability,
+            "target": record.target,
+            "params": record.params.as_str(),
+            "issued_at_ms": record.issued_at_ms,
+            "expires_at_ms": record.expires_at_ms,
+            "digest": digest_hex(&record.digest),
+        },
+        "proposal": proposal_json(&decided),
+    }))
 }
 
 /// Issues an approval for one proposed invocation.
@@ -591,6 +924,11 @@ async fn approve<S: SecretsContract>(
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
+    // A named proposal takes a different path entirely: the caller supplies no action at
+    // all, so there is nothing for it to have substituted.
+    if params.get("proposal").is_some() {
+        return approve_proposal(request, governed).await;
+    }
     let capability = params
         .get("capability")
         .and_then(|v| v.as_str())
@@ -613,7 +951,14 @@ async fn approve<S: SecretsContract>(
     // Canonicalised through the one function dispatch canonicalises with. Building the
     // canonical text here any other way is precisely the V-63 defect in a new place.
     let canonical = orxnud_policy::canonical_params(&inner);
+    // The approver is the trusted local human, derived here rather than supplied by the
+    // request (ADR-0037, V-69). An approval caller cannot nominate its own approver:
+    // this line is the whole reason the approver field is evidence rather than
+    // decoration. `issue_approval` independently refuses a non-granting principal, so a
+    // future caller cannot quietly widen it.
+    let approver = local_actor();
     let record = orxnud_policy::issue_approval(
+        &approver,
         &actor,
         &capability_id,
         target,
@@ -695,6 +1040,12 @@ fn approval_from_json(
         digest_from_hex(&digest_text).ok_or_else(|| bad("needs a 64-character hex `digest`"))?;
     Ok(orxnud_domain::ApprovalRecord {
         actor_label: text("actor_label")?,
+        // The approver is **not** read from the client. It is re-derived from the
+        // trusted local-human boundary at the point of use, so a client cannot present
+        // an approval naming an approver of its choosing — the digest check would fail
+        // anyway, but refusing to carry the field at all is what makes the guarantee
+        // structural rather than arithmetic.
+        approver: local_actor(),
         capability: text("capability")?,
         target: text("target")?,
         params: orxnud_domain::NormalizedParams::canonical(text("params")?),
@@ -823,7 +1174,42 @@ async fn tasks<S: SecretsContract>(
                 "cancelled": row.state == TaskState::Cancelled,
             }))
         }
-        // Unreachable: the caller only routes the four task methods here, and the
+        Method::TaskPropose => {
+            let task_id = required_str(&params, "task")?;
+            check_len("task", &task_id, MAX_TASK_ID_BYTES)?;
+            let worker = required_str(&params, "worker")?;
+            check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+            let capability = required_str(&params, "capability")?;
+            let target = params.get("target").and_then(|v| v.as_str());
+            let inner = params.get("params").cloned().unwrap_or(json!({}));
+            // The proposer is **delegated**, and is built from the task identity rather
+            // than from the worker. That separation is V-71 as code: the caller controls
+            // the worker string, and the worker cannot reach the actor.
+            let proposer = delegated_actor(&task_id);
+            let canonical = orxnud_policy::canonical_params(&inner);
+            // Derived from the task and the instant, so two proposals for one attempt in
+            // the same millisecond collide in the primary key rather than both existing.
+            let proposal_id = format!("p-{task_id}-{now}");
+            let row = tasks
+                .propose_action(
+                    &proposal_id,
+                    &TaskId::new(task_id.as_str()),
+                    &worker,
+                    &orxnud_domain::CapabilityId::new(capability.as_str()),
+                    target,
+                    canonical.as_str(),
+                    &proposer,
+                    now,
+                )
+                .map_err(task_fault)?;
+            Ok(json!({
+                "proposal": proposal_json(&row),
+                // Stated rather than implied: the task is now waiting on a person, with
+                // a durable proposal explaining what it is waiting for.
+                "waiting_for": "human-approval",
+            }))
+        }
+        // Unreachable: the caller only routes the task methods here, and the
         // match is exhaustive over them. Listed so adding a fifth is a compile error
         // rather than a silent fall-through to the governed path.
         _ => Err(RequestError::UnknownMethod(request.method.clone())),

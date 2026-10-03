@@ -102,6 +102,24 @@ pub enum TaskRepoError {
     /// No task with this id.
     #[error("no task {0}")]
     NotFound(String),
+
+    /// No proposal with this id.
+    #[error("no action proposal {0}")]
+    NoSuchProposal(String),
+
+    /// The proposal cannot be decided or executed in its current state.
+    ///
+    /// Carries the state it was in, because "why was this refused" is the whole
+    /// question a caller has when a proposal is not `pending`.
+    #[error("action proposal {id} is {status}, not {expected}")]
+    ProposalNotInState {
+        /// The proposal.
+        id: String,
+        /// What it actually is.
+        status: String,
+        /// What the caller needed.
+        expected: &'static str,
+    },
 }
 
 /// What an unreadable `state` column contained.
@@ -373,6 +391,67 @@ pub struct ReservedEffect {
     pub status: String,
     /// Detail. Never a secret.
     pub detail: Option<String>,
+}
+
+/// A governed action a task has asked to perform (ADR-0038).
+///
+/// Durable *before* the task is observable as `WaitingForUser`, so the wait is
+/// explained by a record rather than by an absence.
+///
+/// The proposer is stored as canonical JSON and re-read at execution time, never
+/// re-derived from the task or its lease. That is V-71 expressed as a schema: there
+/// is no worker column here at all, so the lease holder cannot become the actor even
+/// by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalRow {
+    /// This proposal's id.
+    pub proposal_id: String,
+    /// The task that asked.
+    pub task_id: TaskId,
+    /// The attempt that asked. Unchanged across the human wait.
+    pub attempt_no: u32,
+    /// The capability requested.
+    pub capability: String,
+    /// The target, if the capability names one.
+    pub target: Option<String>,
+    /// Canonical JSON parameters — what an approval will be computed over.
+    pub params: String,
+    /// The proposer, as canonical `Actor` JSON.
+    pub proposer_json: String,
+    /// The human whose authority the proposer acts under, when it has one.
+    pub authority_root: Option<String>,
+    /// When the proposal was made.
+    pub created_at_ms: i64,
+    /// `pending`, `approved`, `rejected` or `expired`.
+    pub status: String,
+    /// When it was decided, if it has been.
+    pub decided_at_ms: Option<i64>,
+}
+
+impl ProposalRow {
+    /// Whether this proposal is still awaiting a decision.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
+
+    /// The proposer, decoded.
+    ///
+    /// An error rather than a silent default: a proposal whose actor cannot be read
+    /// must not become an execution with no actor, because the whole authorisation path
+    /// hangs off that identity.
+    ///
+    /// # Errors
+    ///
+    /// If the stored JSON is not a valid `Actor`.
+    pub fn proposer(&self) -> Result<orxnud_domain::Actor, String> {
+        serde_json::from_str(&self.proposer_json).map_err(|e| {
+            format!(
+                "proposal {} has an unreadable proposer: {e}",
+                self.proposal_id
+            )
+        })
+    }
 }
 
 /// An approval, bound to exactly one attempt.
@@ -1219,6 +1298,326 @@ impl<'a> TaskRepository<'a> {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ------------------------------------------------------- action proposals
+
+    /// Records a governed action a task is asking to perform, and parks the task.
+    ///
+    /// ADR-0038. **One transaction, three writes**: the proposal row, the transition to
+    /// `waiting_for_user`, and the `task_events` entry. The single transaction is the
+    /// requirement rather than a convenience: a task that is observably waiting with no
+    /// proposal behind it is unexplainable state, and a proposal with no waiting task
+    /// is an action nobody was ever asked about. Neither is recoverable by reading.
+    ///
+    /// ## The lease is released, not carried
+    ///
+    /// The lease is cleared here rather than held across the human wait. `limits.rs`
+    /// states the invariant — a lease expires and the task is reclaimable, *never a task
+    /// held forever* — and a human approval routinely outlives the 30s default lease.
+    /// Carrying it would leave the task `running` with a dead lease: `complete_with`
+    /// requires a live one, and `take_lease` only accepts `pending`, so the task could
+    /// never complete. Execution takes a fresh lease in
+    /// [`Self::begin_approved_execution`].
+    ///
+    /// The worker is verified to hold the live lease *before* the proposal is accepted,
+    /// so only the task's current owner may propose on its behalf. That is a check that
+    /// the caller owns the task — it grants nothing, and it is deliberately not how the
+    /// proposer identity is decided (V-71).
+    ///
+    /// # Errors
+    ///
+    /// [`TaskRepoError::NotFound`] if the task is unknown, [`TaskRepoError::AlreadyExists`]
+    /// if this attempt already has a proposal, or any SQLite error.
+    #[allow(clippy::too_many_arguments)] // One column per argument; see the docs for why each is needed.
+    pub fn propose_action(
+        &mut self,
+        proposal_id: &str,
+        task_id: &TaskId,
+        worker: &str,
+        capability: &str,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer_json: &str,
+        authority_root: Option<&str>,
+        now_ms: i64,
+    ) -> Result<ProposalRow, TaskRepoError> {
+        let tx = self.tx()?;
+
+        let row: (String, String, Option<i64>, u32) = tx.query_row(
+            "SELECT state, lease_holder, lease_expires_at_ms, attempts
+               FROM tasks WHERE id = ?1;",
+            rusqlite::params![task_id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let state = TaskState::from_wire_str(&row.0).ok_or_else(|| {
+            TaskRepoError::UnknownState(Box::new(UnknownStateDetail {
+                id: task_id.to_string(),
+                raw: row.0,
+            }))
+        })?;
+        if state != TaskState::Running {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: proposal_id.to_owned(),
+                status: format!("task is {}", state.as_wire_str()),
+                expected: "running",
+            });
+        }
+        // Ownership of the task, not authority over it. A proposal from a worker that
+        // does not hold the live lease would let any caller speak for a running task.
+        if row.1.as_str() != worker || row.2.is_none_or(|e| now_ms >= e) {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: proposal_id.to_owned(),
+                status: format!("the caller does not hold the live lease on {}", task_id),
+                expected: "running under a live lease held by the caller",
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO task_proposals
+               (proposal_id, task_id, attempt_no, capability, target, params,
+                proposer, authority_root, created_at_ms, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending');",
+            rusqlite::params![
+                proposal_id,
+                task_id.as_str(),
+                row.3,
+                capability,
+                target,
+                canonical_params,
+                proposer_json,
+                authority_root,
+                now_ms,
+            ],
+        )
+        .map_err(|e| {
+            if String::from_utf8_lossy(e.to_string().as_bytes()).contains("UNIQUE") {
+                TaskRepoError::AlreadyExists(format!(
+                    "a proposal already exists for {task_id} attempt {}",
+                    row.3
+                ))
+            } else {
+                TaskRepoError::Sqlite(Box::new(e))
+            }
+        })?;
+
+        // `WaitingForUser` and the lease release in one statement, so there is no
+        // interleaving in which the task is waiting while still holding a lease.
+        tx.execute(
+            "UPDATE tasks
+                SET state = 'waiting-for-user',
+                    lease_holder = NULL,
+                    lease_expires_at_ms = NULL,
+                    updated_at_ms = ?2
+              WHERE id = ?1 AND state = 'running';",
+            rusqlite::params![task_id.as_str(), now_ms],
+        )?;
+
+        log(
+            &tx,
+            Some(task_id),
+            now_ms,
+            "action-proposed",
+            Some(state),
+            Some(TaskState::WaitingForUser),
+            Some(worker),
+            Some(row.3),
+            Some(proposal_id),
+        )?;
+
+        tx.commit()?;
+        self.proposal_by_id(proposal_id)?
+            .ok_or_else(|| TaskRepoError::NoSuchProposal(proposal_id.to_owned()))
+    }
+
+    /// Reads one proposal by id.
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error.
+    pub fn proposal_by_id(&self, id: &str) -> Result<Option<ProposalRow>, TaskRepoError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT proposal_id, task_id, attempt_no, capability, target, params,
+                    proposer, authority_root, created_at_ms, status, decided_at_ms
+               FROM task_proposals WHERE proposal_id = ?1;",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        let Some(r) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(ProposalRow {
+            proposal_id: r.get(0)?,
+            task_id: TaskId::new(r.get::<_, String>(1)?.as_str()),
+            attempt_no: r.get::<_, i64>(2)? as u32,
+            capability: r.get(3)?,
+            target: r.get(4)?,
+            params: r.get(5)?,
+            proposer_json: r.get(6)?,
+            authority_root: r.get(7)?,
+            created_at_ms: r.get(8)?,
+            status: r.get(9)?,
+            decided_at_ms: r.get(10)?,
+        }))
+    }
+
+    /// Records a human decision on a proposal.
+    ///
+    /// Deliberately does **not** change the task's state or take a lease: the task stays
+    /// `waiting-for-user` until execution actually begins, so an approved proposal that
+    /// is never executed leaves a task that is honestly still waiting rather than one
+    /// that looks like it is running.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskRepoError::NoSuchProposal`], [`TaskRepoError::ProposalNotInState`] if it
+    /// was already decided, or any SQLite error.
+    pub fn decide_proposal(
+        &mut self,
+        id: &str,
+        status: &'static str,
+        now_ms: i64,
+    ) -> Result<ProposalRow, TaskRepoError> {
+        debug_assert!(matches!(status, "approved" | "rejected" | "expired"));
+        let tx = self.tx()?;
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT task_id, status FROM task_proposals WHERE proposal_id = ?1;",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((task_id, was)) = existing else {
+            return Err(TaskRepoError::NoSuchProposal(id.to_owned()));
+        };
+        if was != "pending" {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: id.to_owned(),
+                status: was,
+                expected: "pending",
+            });
+        }
+        tx.execute(
+            "UPDATE task_proposals
+                SET status = ?2, decided_at_ms = ?3
+              WHERE proposal_id = ?1 AND status = 'pending';",
+            rusqlite::params![id, status, now_ms],
+        )?;
+        let from: String = tx.query_row(
+            "SELECT state FROM tasks WHERE id = ?1;",
+            rusqlite::params![task_id.as_str()],
+            |r| r.get(0),
+        )?;
+        let from_state = TaskState::from_wire_str(&from);
+        log(
+            &tx,
+            Some(&TaskId::new(task_id.as_str())),
+            now_ms,
+            &format!("action-{status}"),
+            from_state,
+            from_state,
+            None,
+            None,
+            Some(id),
+        )?;
+        tx.commit()?;
+        self.proposal_by_id(id)?
+            .ok_or_else(|| TaskRepoError::NoSuchProposal(id.to_owned()))
+    }
+
+    /// Begins execution of an approved proposal: fresh lease, and back to `running`.
+    ///
+    /// This is Option C's transaction, and it is where the two properties the user
+    /// separated come together:
+    ///
+    /// * **Fencing continuity, not lease reservation.** The wait released the lease; this
+    ///   takes a *fresh* time-bounded one, so `limits.rs`'s "never a task held forever"
+    ///   holds across an arbitrarily long human wait.
+    /// * **The attempt does not advance.** `attempts` is deliberately untouched. A human
+    ///   wait is not a retry — TP-6 requires a fresh approval after a retry, and the
+    ///   whole point of binding the approval to this attempt is that it stays the same
+    ///   attempt. Incrementing here would put the approval and the execution it
+    ///   authorises on different attempt numbers.
+    ///
+    /// The worker named here gains **execution ownership and nothing else**. The proposer
+    /// and approver come from the proposal and the approval respectively (V-71).
+    ///
+    /// # Errors
+    ///
+    /// [`TaskRepoError::NoSuchProposal`], [`TaskRepoError::ProposalNotInState`] if the
+    /// proposal is not `approved` or the task is not `waiting-for-user`, or any SQLite
+    /// error.
+    pub fn begin_approved_execution(
+        &mut self,
+        id: &str,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> Result<ProposalRow, TaskRepoError> {
+        let tx = self.tx()?;
+        let row: Option<(String, String, u32)> = tx
+            .query_row(
+                "SELECT task_id, status, attempt_no FROM task_proposals WHERE proposal_id = ?1;",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32)),
+            )
+            .optional()?;
+        let Some((task_id, status, _attempt)) = row else {
+            return Err(TaskRepoError::NoSuchProposal(id.to_owned()));
+        };
+        if status != "approved" {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: id.to_owned(),
+                status,
+                expected: "approved",
+            });
+        }
+        let task = TaskId::new(task_id.as_str());
+        let from: String = tx.query_row(
+            "SELECT state FROM tasks WHERE id = ?1;",
+            rusqlite::params![task_id.as_str()],
+            |r| r.get(0),
+        )?;
+        let state = TaskState::from_wire_str(&from).ok_or_else(|| {
+            TaskRepoError::UnknownState(Box::new(UnknownStateDetail {
+                id: task_id.clone(),
+                raw: from.clone(),
+            }))
+        })?;
+        if state != TaskState::WaitingForUser {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: id.to_owned(),
+                status: format!("task is {}", state.as_wire_str()),
+                expected: "waiting-for-user",
+            });
+        }
+        tx.execute(
+            "UPDATE tasks
+                SET state = 'running',
+                    lease_holder = ?2,
+                    lease_expires_at_ms = ?3,
+                    updated_at_ms = ?4
+              WHERE id = ?1 AND state = 'waiting-for-user';",
+            rusqlite::params![
+                task_id.as_str(),
+                worker,
+                now_ms.saturating_add(lease_ms),
+                now_ms
+            ],
+        )?;
+        log(
+            &tx,
+            Some(&task),
+            now_ms,
+            "approved-execution-begun",
+            Some(state),
+            Some(TaskState::Running),
+            Some(worker),
+            Some(_attempt),
+            Some(id),
+        )?;
+        tx.commit()?;
+        self.proposal_by_id(id)?
+            .ok_or_else(|| TaskRepoError::NoSuchProposal(id.to_owned()))
     }
 
     // ---------------------------------------------------------------- recover

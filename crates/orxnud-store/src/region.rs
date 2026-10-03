@@ -169,6 +169,13 @@ pub fn task_layer_regions() -> Vec<StateRegion> {
             key_column: "id",
         },
         StateRegion {
+            name: "task_proposals",
+            class: StateClass::Critical,
+            owner: "orxnud-task",
+            retention: "at least the approval expiry, then pruned",
+            key_column: "proposal_id",
+        },
+        StateRegion {
             name: "task_approvals",
             class: StateClass::Critical,
             owner: "orxnud-task",
@@ -299,7 +306,7 @@ mod tests {
         // paying fsync for nothing or, worse, not paying it for something.
         let reg = task_layer_registry();
         let regions = reg.all();
-        assert_eq!(regions.len(), 8);
+        assert_eq!(regions.len(), 9);
         for r in &regions {
             assert_eq!(r.class, StateClass::Critical, "{} is not critical", r.name);
         }
@@ -308,6 +315,7 @@ mod tests {
             "tasks",
             "task_attempts",
             "task_effects",
+            "task_proposals",
             "task_approvals",
             "task_events",
             "schedules",

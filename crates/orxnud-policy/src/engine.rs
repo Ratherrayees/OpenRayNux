@@ -360,7 +360,34 @@ impl PolicyEngine {
             }
             // The anti-Loopjacking check: recompute from the action about to
             // run, and compare with what the user approved.
+            // ADR-0037: the approver is checked, not inferred. Before this the
+            // "approver" was derived from `actor.authority_root()` and the digest was
+            // recomputed without any approver in it, so the field was decorative.
+            //
+            // (a) Grant-capability. An approval signed by something that cannot grant
+            //     authority must not be honoured, however well-formed its digest is.
+            if !record.approver.can_grant() {
+                return Ok(Decision::Deny {
+                    reason: DenialReason::ApprovalApproverCannotGrant,
+                });
+            }
+            // (b) Authority relationship. For a delegated proposer, the approver must
+            //     BE that proposer's authority root — otherwise a human could approve on
+            //     behalf of a delegation they have nothing to do with. For a
+            //     self-proposing human this is trivially true, which is why it is
+            //     written as one rule rather than two.
+            if record.approver.authority_root() != actor.authority_root() {
+                return Ok(Decision::Deny {
+                    reason: DenialReason::ApprovalApproverNotAuthorised {
+                        approver: record.approver.label().to_owned(),
+                        proposer: actor.label().to_owned(),
+                    },
+                });
+            }
+            // Recomputed over BOTH parties, so an approval minted for one approver
+            // cannot be presented by, or on behalf of, anyone else.
             let recomputed = digest_for(
+                &record.approver,
                 actor,
                 &request.capability,
                 target,
@@ -391,16 +418,10 @@ impl PolicyEngine {
                 }
                 Ok(false) => {}
             }
-            // An approval is honoured only for the human who gave it, so the
-            // gate names that human rather than the delegating actor kind.
-            let approver = match actor.authority_root() {
-                Some(user) => Actor::Human {
-                    user: user.clone(),
-                    via: orxnud_domain::actor::AuthChannel::LocalInteractive,
-                },
-                // Unreachable: step 0 already refused any actor without a root.
-                None => actor.clone(),
-            };
+            // The human who actually approved, read off the record. It used to be
+            // reconstructed from the proposer's authority root, which asserted a
+            // fact nobody had recorded.
+            let approver = record.approver.clone();
             return Ok(Decision::Gate {
                 risk,
                 required_digest: recomputed,
@@ -828,13 +849,22 @@ mod tests {
     fn approval_record(actor: &Actor, target: &str, issued: i64, expires: i64) -> ApprovalRecord {
         ApprovalRecord {
             actor_label: actor.label().to_owned(),
+            approver: actor.clone(),
             capability: cap().to_string(),
             target: target.to_owned(),
             params: params(),
             issued_at_ms: issued,
             expires_at_ms: expires,
             risk: RiskClass::High,
-            digest: digest_for(actor, &cap(), Some(target), &params(), issued, expires),
+            digest: digest_for(
+                actor,
+                actor,
+                &cap(),
+                Some(target),
+                &params(),
+                issued,
+                expires,
+            ),
         }
     }
 
@@ -1141,9 +1171,18 @@ mod tests {
         let decl =
             CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
-        let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 2_000);
+        let digest = digest_for(
+            &human(),
+            &human(),
+            &cap(),
+            Some("alice"),
+            &params(),
+            900,
+            2_000,
+        );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
+            approver: human(),
             capability: cap().to_string(),
             target: "alice".into(),
             params: params(),
@@ -1178,9 +1217,18 @@ mod tests {
         let decl =
             CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
-        let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 2_000);
+        let digest = digest_for(
+            &human(),
+            &human(),
+            &cap(),
+            Some("alice"),
+            &params(),
+            900,
+            2_000,
+        );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
+            approver: human(),
             capability: cap().to_string(),
             target: "alice".into(),
             params: params(),
@@ -1210,9 +1258,18 @@ mod tests {
         let decl =
             CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
-        let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 2_000);
+        let digest = digest_for(
+            &human(),
+            &human(),
+            &cap(),
+            Some("alice"),
+            &params(),
+            900,
+            2_000,
+        );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
+            approver: human(),
             capability: cap().to_string(),
             target: "alice".into(),
             params: params(),
@@ -1243,9 +1300,18 @@ mod tests {
         let decl =
             CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
         let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
-        let digest = digest_for(&human(), &cap(), Some("alice"), &params(), 900, 1_000);
+        let digest = digest_for(
+            &human(),
+            &human(),
+            &cap(),
+            Some("alice"),
+            &params(),
+            900,
+            1_000,
+        );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
+            approver: human(),
             capability: cap().to_string(),
             target: "alice".into(),
             params: params(),
@@ -1453,5 +1519,196 @@ mod tests {
             d.is_allowed(),
             "an AI actor within its human's grant should proceed: {d:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // ADR-0037 / V-69 — approval provenance
+    //
+    // Four properties, and they are separate on purpose. The digest binding the
+    // approver (P3) is necessary but not sufficient: a digest can bind a party that
+    // had no standing to consent, which is why P1 and P2 are independent checks and
+    // not consequences of the digest.
+    // ---------------------------------------------------------------------------
+
+    /// A High-risk declaration: the only kind that makes an approval mandatory, and
+    /// therefore the only kind for which a provenance check can be observed at all.
+    /// Testing provenance against a Low-risk capability would pass vacuously.
+    fn high_decl() -> CapabilityDeclaration {
+        CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0)
+    }
+
+    /// The delegated model actor: proposes, cannot grant.
+    fn ai_for(delegated_by: &str) -> Actor {
+        use orxnud_domain::actor::ModelProvenance;
+        Actor::Ai {
+            delegated_by: UserId::new(delegated_by),
+            run: orxnud_domain::ids::RunId::new("r-1"),
+            task: TaskId::new("t-1"),
+            provenance: ModelProvenance::new("m", "p", RequestId::new("q-1")),
+        }
+    }
+
+    /// A human other than `u-1`.
+    fn other_human() -> Actor {
+        Actor::Human {
+            user: UserId::new("u-2"),
+            via: AuthChannel::LocalInteractive,
+        }
+    }
+
+    #[test]
+    fn the_digest_binds_the_approver_so_one_consent_cannot_be_replayed_by_another() {
+        // P3. Same action, same proposer, same times; only the approver differs.
+        let actor = human();
+        let by_u1 = digest_for(
+            &human(),
+            &actor,
+            &cap(),
+            Some("alice"),
+            &params(),
+            900,
+            2_000,
+        );
+        let by_u2 = digest_for(
+            &other_human(),
+            &actor,
+            &cap(),
+            Some("alice"),
+            &params(),
+            900,
+            2_000,
+        );
+        assert_ne!(
+            by_u1, by_u2,
+            "an approval must commit to *who* consented, not only to what was consented to"
+        );
+    }
+
+    #[test]
+    fn an_approval_signed_by_something_that_cannot_grant_is_refused() {
+        // P1. The whole reason the approver is recorded rather than inferred: an `Ai`
+        // actor's consent is not consent, however well-formed the digest is.
+        let ai = ai_for("u-1");
+        let record = ApprovalRecord {
+            actor_label: ai.label().to_owned(),
+            // The AI signed its own approval. `issue_approval` refuses to mint this, so it
+            // is constructed literally here — which is the point: a record that reached
+            // storage any other way must still be refused at dispatch.
+            approver: ai.clone(),
+            capability: cap().to_string(),
+            target: "alice".to_owned(),
+            params: params(),
+            issued_at_ms: 900,
+            expires_at_ms: 2_000,
+            risk: RiskClass::High,
+            digest: digest_for(&ai, &ai, &cap(), Some("alice"), &params(), 900, 2_000),
+        };
+        let e = engine_with(
+            high_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
+        let d = e
+            .evaluate(
+                &request(DataClass::Personal, DataClass::Personal),
+                &ai,
+                Some("alice"),
+                &params(),
+                Some(&record),
+                1_000,
+            )
+            .expect("evaluate");
+        assert_eq!(
+            d.denial().map(|r| r.code()),
+            Some("approval_approver_cannot_grant"),
+            "a non-granting approver must be refused before anything else: {d:?}"
+        );
+    }
+
+    #[test]
+    fn an_approval_from_a_human_who_is_not_the_delegating_authority_is_refused() {
+        // P2. `u-2` consents on behalf of a delegation held by `u-1`. Without this check
+        // any human could approve any model's actions.
+        let ai = ai_for("u-1");
+        let record = ApprovalRecord {
+            actor_label: ai.label().to_owned(),
+            approver: other_human(),
+            capability: cap().to_string(),
+            target: "alice".to_owned(),
+            params: params(),
+            issued_at_ms: 900,
+            expires_at_ms: 2_000,
+            risk: RiskClass::High,
+            digest: digest_for(
+                &other_human(),
+                &ai,
+                &cap(),
+                Some("alice"),
+                &params(),
+                900,
+                2_000,
+            ),
+        };
+        let e = engine_with(
+            high_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
+        let d = e
+            .evaluate(
+                &request(DataClass::Personal, DataClass::Personal),
+                &ai,
+                Some("alice"),
+                &params(),
+                Some(&record),
+                1_000,
+            )
+            .expect("evaluate");
+        assert_eq!(
+            d.denial().map(|r| r.code()),
+            Some("approval_approver_not_authorised"),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn the_delegating_authority_may_approve_its_model_and_the_gate_names_them() {
+        // The positive case, so the two refusals above are refusals rather than a blanket
+        // "Ai can never be authorised".
+        let ai = ai_for("u-1");
+        let record = ApprovalRecord {
+            actor_label: ai.label().to_owned(),
+            approver: human(),
+            capability: cap().to_string(),
+            target: "alice".to_owned(),
+            params: params(),
+            issued_at_ms: 900,
+            expires_at_ms: 2_000,
+            risk: RiskClass::High,
+            digest: digest_for(&human(), &ai, &cap(), Some("alice"), &params(), 900, 2_000),
+        };
+        let mut e = engine_with(
+            high_decl(),
+            low_policy(),
+            BudgetLedger::empty().with_global(100),
+        );
+        let out = e
+            .authorise_for_dispatch(
+                request(DataClass::Personal, DataClass::Personal),
+                ai.clone(),
+                InvocationContext::new("k-1", 1_000, "c-1"),
+                Some("alice".to_owned()),
+                params(),
+                Some(&record),
+                1_000,
+            )
+            .expect("the delegating authority's approval must authorise the model");
+        // The gate names the human read off the record, not one reconstructed from the
+        // proposer's authority root — the two happen to agree here, and the difference is
+        // that this one is evidence.
+        match out.decision {
+            Decision::Gate { approver, .. } => assert_eq!(approver.label(), "human"),
+            other => panic!("expected a satisfied gate, got {other:?}"),
+        }
     }
 }

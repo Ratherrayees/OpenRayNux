@@ -211,6 +211,36 @@ CREATE INDEX IF NOT EXISTS idx_task_effects_task
 -- attempt's approval row even if the digest would otherwise match. Carrying an
 -- approval forward is not prevented by a check that could be bypassed -- it is
 -- structurally impossible.
+-- A governed action requested by a task, awaiting a human decision.
+--
+-- ADR-0038. A *proposal* is "this action is being requested"; an approval is "this
+-- action has been authorised" and lives in `task_approvals`. They are deliberately
+-- different tables and deliberately not the same row with a nullable digest: collapsing
+-- them would make "the task asked" and "permission was granted" indistinguishable in
+-- the audit trail, which is the distinction the trail exists to preserve.
+--
+-- `proposer` and `authority_root` are stored so the exact actor can be reconstructed
+-- at execution time without re-deriving it from anything transient. Note what is NOT
+-- here: the worker. The lease holder is execution ownership, and storing it beside the
+-- proposer is how a task lease would quietly become an authority token (V-71).
+--
+-- One proposal per attempt (`UNIQUE (task_id, attempt_no)`), because a human wait is
+-- not a retry: the same attempt that asked is the attempt that may execute.
+CREATE TABLE IF NOT EXISTS task_proposals (
+    proposal_id    TEXT    NOT NULL PRIMARY KEY,
+    task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_no     INTEGER NOT NULL,
+    capability     TEXT    NOT NULL,
+    target         TEXT,
+    params         TEXT    NOT NULL,
+    proposer       TEXT    NOT NULL,
+    authority_root TEXT,
+    created_at_ms  INTEGER NOT NULL,
+    status         TEXT    NOT NULL,
+    decided_at_ms  INTEGER,
+    CHECK (status IN ('pending', 'approved', 'rejected', 'expired'))
+);
+
 CREATE TABLE IF NOT EXISTS task_approvals (
     task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     attempt_no     INTEGER NOT NULL,
@@ -364,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_two_creates_exactly_the_seven_task_layer_tables() {
+    fn phase_two_creates_exactly_the_declared_tables() {
         // Named explicitly so a table added "just in case" fails this test.
         // `schema_meta` is added by the migration runner and so is absent here.
         let names = table_names(&migrated());
@@ -381,6 +411,7 @@ mod tests {
             "spent_approvals",
             "task_approvals",
             "task_attempts",
+            "task_proposals",
             "task_effects",
             "task_events",
             "tasks",
@@ -397,7 +428,7 @@ mod tests {
         for (_, sql) in MIGRATION_SQL {
             c.execute_batch(sql).expect("re-apply");
         }
-        assert_eq!(table_names(&c).len(), 9);
+        assert_eq!(table_names(&c).len(), 10);
     }
 
     #[test]
