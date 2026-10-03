@@ -47,6 +47,15 @@ pub enum TaskCommand {
         /// The worker identity holding the lease.
         worker: String,
     },
+    /// Cancel a task.
+    ///
+    /// No worker identity, because the engine does not want one: cancellation is a
+    /// decision about the task and clears whatever lease it holds, so a cancel that
+    /// had to name a worker could not cancel an unclaimed task at all.
+    Cancel {
+        /// The task id.
+        id: String,
+    },
 }
 
 /// Runs a task command and returns what to print.
@@ -80,11 +89,38 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             let reply = client.call("task/claim", json!({ "id": id, "worker": worker }))?;
             Ok(render_claim(&reply))
         }
+        TaskCommand::Cancel { id } => {
+            let reply = client.call("task/cancel", json!({ "id": id }))?;
+            Ok(render_cancel(&reply))
+        }
         TaskCommand::Complete { id, worker } => {
             let reply = client.call("task/complete", json!({ "id": id, "worker": worker }))?;
             Ok(render_task_field(&reply, "completed"))
         }
     }
+}
+
+/// Renders `task/cancel`.
+///
+/// The heading is chosen from the state the **daemon** reported, not from the fact
+/// that a cancel was requested. The two differ: cancelling an already-terminal task is
+/// a no-op that succeeds, so a client that printed `cancelled` unconditionally would be
+/// reporting something that is not true of a task that was already `completed`.
+///
+/// This is one comparison against a wire value, not a rule about which states are
+/// cancellable — that set belongs to the engine, and re-deriving it here is how a
+/// client starts disagreeing with its daemon.
+fn render_cancel(reply: &Value) -> String {
+    let cancelled = reply
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let heading = if cancelled { "cancelled" } else { "unchanged" };
+    let mut out = render_task_field(reply, heading);
+    if !cancelled {
+        out.push_str("  (the daemon reported this task as already terminal)\n");
+    }
+    out
 }
 
 /// Renders the fields of a single task, from the daemon's own projection.

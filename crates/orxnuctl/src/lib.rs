@@ -100,7 +100,7 @@ pub enum CliError {
     },
 
     /// A `task` verb that does not exist.
-    #[error("unknown task command {0:?}; expected create, list, claim or complete")]
+    #[error("unknown task command {0:?}; expected create, list, claim, complete or cancel")]
     UnknownTaskCommand(String),
 
     /// A global flag with no subcommand.
@@ -255,6 +255,14 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
             flags.reject_all("complete")?;
             TaskCommand::Complete { id, worker }
         }
+        "cancel" => {
+            // No `--worker`: cancellation is the engine's decision about a task, and
+            // requiring an identity here would make an unclaimed task uncancellable.
+            let id = flags.take("cancel", "--id")?;
+            flags.reject_all("cancel")?;
+            TaskCommand::Cancel { id }
+        }
+
         other => return Err(CliError::UnknownTaskCommand(other.to_owned())),
     };
     Ok((command, endpoint))

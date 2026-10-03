@@ -538,9 +538,11 @@ async fn route<S: SecretsContract>(
         Method::CapabilityDispatch => dispatch(request, governed).await,
         // First-party durable state, not capability execution. These go to the
         // TaskService and to nothing else.
-        Method::TaskCreate | Method::TaskList | Method::TaskClaim | Method::TaskComplete => {
-            tasks(method, request, governed).await
-        }
+        Method::TaskCreate
+        | Method::TaskList
+        | Method::TaskClaim
+        | Method::TaskComplete
+        | Method::TaskCancel => tasks(method, request, governed).await,
     }
 }
 
@@ -641,7 +643,27 @@ async fn tasks<S: SecretsContract>(
                 .map_err(task_fault)?;
             Ok(json!({ "task": task_json(&row) }))
         }
-        // Unreachable: the caller only routes the four task methods here, and the
+        Method::TaskCancel => {
+            let id = required_str(&params, "id")?;
+            check_len("id", &id, MAX_TASK_ID_BYTES)?;
+            // No worker identity: cancellation is a decision about the task, not a
+            // report from a lease holder, so requiring one would make an unclaimed
+            // task uncancellable. The engine owns that decision; this only asks.
+            //
+            // The reply is whatever the task is *now*. A cancel against an already
+            // terminal task is a no-op that succeeds, and reporting a hard-coded
+            // `cancelled` here would misreport a task that was already `completed`.
+            let row = tasks
+                .cancel_task(&TaskId::new(id), now)
+                .map_err(task_fault)?;
+            Ok(json!({
+                "task": task_json(&row),
+                // Derived from the state the daemon just reported, so a client can
+                // branch without re-deriving the engine's cancellable-state set.
+                "cancelled": row.state == TaskState::Cancelled,
+            }))
+        }
+        // Unreachable: the caller only routes the five task methods here, and the
         // match is exhaustive over them. Listed so adding a fifth is a compile error
         // rather than a silent fall-through to the governed path.
         _ => Err(RequestError::UnknownMethod(request.method.clone())),

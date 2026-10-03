@@ -198,7 +198,7 @@ process owning the user's time, data and integrations, with several surfaces
 
 Still absent by design: any capability (Phase 4+), any interface (Phase 6), and any
 provider integration. A **task** domain surface now exists over IPC
-(`task/create`, `task/list`, `task/claim`, `task/complete`) because the durable task
+(`task/create`, `task/list`, `task/claim`, `task/complete`, `task/cancel`) because the durable task
 engine was already there and correct; it manages first-party state and is
 deliberately not routed through the capability dispatcher.
 `docs/13-phase-1-contract.md` remains the record of what Phase 1 promised and

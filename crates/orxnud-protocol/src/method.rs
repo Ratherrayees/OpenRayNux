@@ -61,6 +61,14 @@ pub enum Method {
     /// Cannot turn a `pending` task into `completed`: the queue contract requires
     /// `running` first, and the method does not have a path that skips it.
     TaskComplete,
+    /// Cancel a task.
+    ///
+    /// Deliberately takes no worker identity, unlike [`Self::TaskComplete`]. That
+    /// asymmetry is the engine's, not this enum's: cancellation is a decision about
+    /// the *task* and clears whatever lease it holds, whereas completion is a report
+    /// from the holder of that lease and is fenced by it. A cancel that had to name a
+    /// worker could not cancel an unclaimed task at all.
+    TaskCancel,
 }
 
 impl Method {
@@ -68,7 +76,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -78,6 +86,7 @@ impl Method {
         Self::TaskList,
         Self::TaskClaim,
         Self::TaskComplete,
+        Self::TaskCancel,
     ];
 
     /// The wire name.
@@ -93,6 +102,7 @@ impl Method {
             Self::TaskList => "task/list",
             Self::TaskClaim => "task/claim",
             Self::TaskComplete => "task/complete",
+            Self::TaskCancel => "task/cancel",
         }
     }
 
@@ -115,6 +125,7 @@ impl Method {
             "task/list" => Some(Self::TaskList),
             "task/claim" => Some(Self::TaskClaim),
             "task/complete" => Some(Self::TaskComplete),
+            "task/cancel" => Some(Self::TaskCancel),
             _ => None,
         }
     }

@@ -682,6 +682,55 @@ impl TaskService {
             .ok_or(TaskFault::NotFound)
     }
 
+    /// Cancels a task, through the engine's existing cancellation path.
+    ///
+    /// # What the caller is told
+    ///
+    /// The returned row is the **authoritative state after the call**, read back from
+    /// storage rather than assumed. That matters because cancellation is not uniformly a
+    /// transition:
+    ///
+    /// * from `pending`, `running`, `waiting-for-user` or `waiting-for-external` it
+    ///   transitions to `cancelled`, immediately and in the same call;
+    /// * from a terminal state it is a **no-op that succeeds** — the repository returns
+    ///   `Ok(())` without writing an event, because a task that is already `cancelled`
+    ///   has nothing left to cancel and a second cancel must not manufacture a second
+    ///   terminal transition.
+    ///
+    /// So the honest contract is "here is the task now", and the caller decides what that
+    /// means. Turning the no-op into a refusal would be inventing a rule the engine does
+    /// not have; reporting `cancelled` unconditionally would be a lie about a task that
+    /// was already `completed`.
+    ///
+    /// No worker identity is required, and that is the engine's semantics rather than a
+    /// convenience: cancellation is a decision about the task and clears whatever lease it
+    /// holds, whereas completion is a *report* from a lease holder and is fenced by it.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::NotFound`] if there is no such task, or [`TaskFault::Engine`] if the
+    /// write fails. [`TaskFault::Stopped`] after [`Self::shutdown`].
+    pub fn cancel_task(&mut self, id: &TaskId, now_ms: i64) -> Result<TaskRow, TaskFault> {
+        self.guard_running()?;
+        // Existence first, because the repository reports "no such task" as a storage
+        // error kind and a caller has to be able to tell that from a genuine failure.
+        if self
+            .engine
+            .task(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .is_none()
+        {
+            return Err(TaskFault::NotFound);
+        }
+        self.engine
+            .cancel_task(id, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?;
+        self.engine
+            .task(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .ok_or(TaskFault::NotFound)
+    }
+
     fn guard_running(&self) -> Result<(), TaskFault> {
         if self.is_stopped() {
             return Err(TaskFault::Stopped);

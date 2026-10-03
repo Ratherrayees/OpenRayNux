@@ -116,6 +116,8 @@ phase gate).
 
 ## 2a. Amendments
 
+| **V-59** | **`request_cancel` refuses a `paused` task although `is_legal_transition` allows `Paused → Cancelled`** | `crates/orxnud-store/src/task_repo.rs::request_cancel` returns `Ok(())` for any state where `TaskState::is_terminal()` holds, and `is_terminal` includes `Paused` (`crates/orxnud-domain/src/task_state.rs:171`); but `is_legal_transition` maps `Paused => matches!(to, Running \| Cancelled)` (`task_state.rs:386`) | **release:** any change to `is_terminal` or to the transition relation | 2026-10-03 | **Low, and deliberately not changed.** The implementation refuses **more** than the transition relation requires, which is the fail-closed direction: a task that cannot be cancelled cannot be wrongly cancelled. Found while exposing cancellation over IPC, by reading the implementation rather than its comments — the CLI surface makes the question "which states can be cancelled?" one a user can now actually ask. Either `Paused` should be removed from `is_terminal` (it is a resting state, not an end) or `Paused → Cancelled` should be dropped from the transition relation; changing either alters established engine semantics, so it is recorded rather than fixed. Until then `paused` tasks are uncancellable and this is the documented, deliberate answer. |
+
 Recorded per operating rule 5: wrongness is worth recording, because it is how
 this register improves.
 

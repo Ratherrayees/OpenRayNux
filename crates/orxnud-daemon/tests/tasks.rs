@@ -691,7 +691,8 @@ fn task_management_is_not_a_capability_invocation() {
         let listed = send(&s.endpoint, "2", "task/list", json!({}));
         assert_eq!(listed["result"]["count"], 1);
 
-        // And the registry is still empty: no fake "task" capability was added.
+        // And no *task* capability exists: task management must not have registered
+        // itself as an adapter to get here.
         let caps = send(&s.endpoint, "3", "capability/list", json!({}));
         assert_eq!(
             caps["result"]["capabilities"].as_array().map(Vec::len),
@@ -716,4 +717,366 @@ fn task_management_is_not_a_capability_invocation() {
         );
         s.stop().await;
     });
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+//
+// The semantics under test were read out of `TaskRepository::request_cancel`, not
+// inferred from a comment: it is synchronous, it transitions
+// pending/running/waiting-for-user/waiting-for-external to `cancelled`, it is a
+// *silent no-op that succeeds* on an already-terminal task, and it is **not** fenced
+// — it clears the lease rather than checking it. Those four facts are what the tests
+// below pin, because they are what a caller has to be able to rely on.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pending_task_can_be_cancelled() {
+    rt().block_on(async {
+        let s = Serving::start(dir("cancel-pending")).await;
+        send(
+            &s.endpoint,
+            "1",
+            "task/create",
+            json!({"id": "t-1", "kind": "query", "content": "not needed"}),
+        );
+        assert_eq!(
+            state_of(&s, "t-1"),
+            "pending",
+            "precondition: a new task is pending"
+        );
+
+        let out = send(&s.endpoint, "2", "task/cancel", json!({"id": "t-1"}));
+        assert_eq!(out["result"]["cancelled"], true, "{out}");
+        assert_eq!(out["result"]["task"]["state"], "cancelled");
+        assert_eq!(
+            state_of(&s, "t-1"),
+            "cancelled",
+            "visible through task/list"
+        );
+        s.stop().await;
+    });
+}
+
+#[test]
+fn a_running_task_can_be_cancelled_and_its_lease_is_released() {
+    rt().block_on(async {
+        let s = Serving::start(dir("cancel-running")).await;
+        send(
+            &s.endpoint,
+            "1",
+            "task/create",
+            json!({"id": "t-1", "kind": "query", "content": "x"}),
+        );
+        let claimed = send(
+            &s.endpoint,
+            "2",
+            "task/claim",
+            json!({"id": "t-1", "worker": "w1"}),
+        );
+        assert_eq!(claimed["result"]["task"]["state"], "running");
+        assert!(
+            claimed["result"]["task"]["lease_holder"].is_string(),
+            "precondition: the lease is held"
+        );
+
+        // No worker identity: cancel is a decision about the task, not a report from
+        // the holder, so it does not have to name one.
+        let out = send(&s.endpoint, "3", "task/cancel", json!({"id": "t-1"}));
+        assert_eq!(out["result"]["cancelled"], true, "{out}");
+        assert_eq!(
+            out["result"]["task"]["lease_holder"],
+            Value::Null,
+            "cancelling must release the lease, not leave a dangling holder"
+        );
+        assert_eq!(out["result"]["task"]["state"], "cancelled");
+        s.stop().await;
+    });
+}
+
+#[test]
+fn a_waiting_task_can_be_cancelled() {
+    rt().block_on(async {
+        // `waiting-for-user` and `waiting-for-external` are not terminal and are not in
+        // step 2's exclusion list, so the engine cancels them. Reached here through the
+        // durable file rather than a new transition, because there is no IPC verb that
+        // puts a task into a waiting state and inventing one would be adding surface.
+        let root = dir("cancel-waiting");
+        {
+            let s = Serving::start(root.clone()).await;
+            send(
+                &s.endpoint,
+                "1",
+                "task/create",
+                json!({"id": "t-1", "kind": "query", "content": "x"}),
+            );
+            set_state(&root, "t-1", "waiting-for-user");
+
+            let out = send(&s.endpoint, "2", "task/cancel", json!({"id": "t-1"}));
+            assert_eq!(out["result"]["cancelled"], true, "{out}");
+            assert_eq!(out["result"]["task"]["state"], "cancelled");
+            s.stop().await;
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
+#[test]
+fn cancelling_a_terminal_task_is_a_no_op_that_succeeds_and_reports_the_truth() {
+    // The engine returns `Ok(())` without writing an event for a terminal task. So
+    // this is exit 0 — but it must NOT claim `cancelled`, because the task is
+    // `completed`. Reporting the authoritative state is the whole contract here.
+    rt().block_on(async {
+        let root = dir("cancel-terminal");
+        let s = Serving::start(root.clone()).await;
+        send(
+            &s.endpoint,
+            "1",
+            "task/create",
+            json!({"id": "t-1", "kind": "query", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "2",
+            "task/claim",
+            json!({"id": "t-1", "worker": "w1"}),
+        );
+        send(
+            &s.endpoint,
+            "3",
+            "task/complete",
+            json!({"id": "t-1", "worker": "w1"}),
+        );
+        let events_before = events_for(&root, "t-1").len();
+
+        let out = send(&s.endpoint, "4", "task/cancel", json!({"id": "t-1"}));
+        assert_eq!(
+            out["result"]["cancelled"], false,
+            "a completed task was not cancelled: {out}"
+        );
+        assert_eq!(
+            out["result"]["task"]["state"], "completed",
+            "the authoritative state must be reported, not assumed"
+        );
+
+        // And no second terminal event: a no-op must not manufacture one.
+        let events_after = events_for(&root, "t-1").len();
+        assert_eq!(
+            events_before, events_after,
+            "a refused cancel must leave the event log alone"
+        );
+        assert_eq!(
+            events_for(&root, "t-1").last().map(String::as_str),
+            Some("completed"),
+            "the last event is still the real terminal transition"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
+#[test]
+fn repeated_cancellation_is_idempotent_with_no_duplicate_event() {
+    rt().block_on(async {
+        let root = dir("cancel-twice");
+        let s = Serving::start(root.clone()).await;
+        send(
+            &s.endpoint,
+            "1",
+            "task/create",
+            json!({"id": "t-1", "kind": "query", "content": "x"}),
+        );
+
+        let first = send(&s.endpoint, "2", "task/cancel", json!({"id": "t-1"}));
+        assert_eq!(first["result"]["cancelled"], true, "{first}");
+        let after_first = events_for(&root, "t-1");
+        assert_eq!(
+            after_first.last().map(|e| e.as_str()),
+            Some("cancelled"),
+            "the first cancel is a real transition and says so"
+        );
+
+        // Three more, for good measure.
+        for i in 0..3 {
+            let again = send(
+                &s.endpoint,
+                &format!("{}", 10 + i),
+                "task/cancel",
+                json!({"id": "t-1"}),
+            );
+            assert!(
+                again["result"]["cancelled"].is_boolean(),
+                "each reply must still be well formed: {again}"
+            );
+        }
+
+        let after_repeats = events_for(&root, "t-1");
+        assert_eq!(
+            after_repeats.len(),
+            after_first.len(),
+            "repeating a cancel must not append events: {after_repeats:?}"
+        );
+        assert_eq!(
+            after_repeats.iter().filter(|e| *e == "cancelled").count(),
+            1,
+            "exactly one terminal transition, ever"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
+#[test]
+fn cancelling_a_task_that_does_not_exist_is_not_found() {
+    rt().block_on(async {
+        let s = Serving::start(dir("cancel-absent")).await;
+        let out = send(&s.endpoint, "1", "task/cancel", json!({"id": "ghost"}));
+        assert_eq!(out["error"]["code"], RpcErrorCode::INVALID_REQUEST.code());
+        assert_eq!(out["error"]["data"]["reason"], "not-found");
+        s.stop().await;
+    });
+}
+
+#[test]
+fn a_cancelled_task_cannot_be_resurrected_by_a_late_completion() {
+    // The race that matters: a worker holding a lease, and a cancel that clears it.
+    // Exactly one terminal transition may win, and a zombie must not be able to
+    // commit after the fact.
+    rt().block_on(async {
+        let s = Serving::start(dir("cancel-vs-complete")).await;
+        send(
+            &s.endpoint,
+            "1",
+            "task/create",
+            json!({"id": "t-1", "kind": "query", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "2",
+            "task/claim",
+            json!({"id": "t-1", "worker": "w1"}),
+        );
+
+        // Cancel wins: the lease is gone.
+        let cancelled = send(&s.endpoint, "3", "task/cancel", json!({"id": "t-1"}));
+        assert_eq!(cancelled["result"]["cancelled"], true);
+
+        // The lease holder now tries to report success. The fence must refuse,
+        // because the lease it was relying on no longer exists.
+        let late = send(
+            &s.endpoint,
+            "4",
+            "task/complete",
+            json!({"id": "t-1", "worker": "w1"}),
+        );
+        assert!(
+            late.get("error").is_some(),
+            "a completion after a cancel must be fenced out: {late}"
+        );
+
+        // And the state is still `cancelled` — not `completed`. No resurrection.
+        assert_eq!(state_of(&s, "t-1"), "cancelled");
+        s.stop().await;
+    });
+}
+
+#[test]
+fn a_cancelled_task_can_be_neither_claimed_nor_completed_afterwards() {
+    rt().block_on(async {
+        let s = Serving::start(dir("cancel-then-claim")).await;
+        send(
+            &s.endpoint,
+            "1",
+            "task/create",
+            json!({"id": "t-1", "kind": "query", "content": "x"}),
+        );
+        send(&s.endpoint, "2", "task/cancel", json!({"id": "t-1"}));
+
+        let claimed = send(
+            &s.endpoint,
+            "3",
+            "task/claim",
+            json!({"id": "t-1", "worker": "w1"}),
+        );
+        assert!(
+            claimed.get("error").is_some(),
+            "a cancelled task must not be claimable: {claimed}"
+        );
+        assert_eq!(state_of(&s, "t-1"), "cancelled");
+        s.stop().await;
+    });
+}
+
+#[test]
+fn a_cancelled_task_and_its_events_survive_a_restart() {
+    rt().block_on(async {
+        let root = dir("cancel-restart");
+        {
+            let s = Serving::start(root.clone()).await;
+            send(
+                &s.endpoint,
+                "1",
+                "task/create",
+                json!({"id": "t-1", "kind": "query", "content": "not needed"}),
+            );
+            let out = send(&s.endpoint, "2", "task/cancel", json!({"id": "t-1"}));
+            assert_eq!(out["result"]["cancelled"], true);
+            s.stop().await;
+        }
+
+        // On disk, before any restart.
+        let kinds = events_for(&root, "t-1");
+        assert_eq!(
+            kinds,
+            vec!["enqueued", "cancel-requested", "cancelled"],
+            "the engine records both halves of a cancellation"
+        );
+
+        // A brand new runtime over the same file.
+        let s = Serving::start(root.clone()).await;
+        assert_eq!(
+            state_of(&s, "t-1"),
+            "cancelled",
+            "cancellation must survive the restart, not be requeued by recovery"
+        );
+        s.stop().await;
+
+        assert_eq!(
+            events_for(&root, "t-1"),
+            vec!["enqueued", "cancel-requested", "cancelled"],
+            "the event history must survive too"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
+/// The task's state, as `task/list` reports it.
+///
+/// Read through the public `task/list` rather than the database: this asserts what a
+/// client can see, which is the property that matters. A caller wanting the stored row
+/// would use [`tasks_in_file`].
+fn state_of(s: &Serving, id: &str) -> String {
+    let listed = send(&s.endpoint, "999", "task/list", json!({}));
+    listed["result"]["tasks"]
+        .as_array()
+        .expect("tasks array")
+        .iter()
+        .find(|t| t["id"] == id)
+        .map(|t| t["state"].as_str().unwrap_or_default().to_owned())
+        .unwrap_or_else(|| panic!("{id} is not listed"))
+}
+
+/// Forcibly sets a task's state, to reach states no IPC verb can produce.
+///
+/// A test fixture, not a production path: it writes through the store's own adapter
+/// so the schema and pragmas are still verified, and it exists so cancellation can be
+/// tested from every state the engine claims to handle without inventing an IPC verb
+/// that would put a task there.
+fn set_state(root: &Path, id: &str, state: &str) {
+    let db = conn(root);
+    let changed = db
+        .conn()
+        .execute("UPDATE tasks SET state = ?2 WHERE id = ?1;", [id, state])
+        .expect("set the state");
+    assert_eq!(changed, 1, "the fixture must have found exactly one row");
 }

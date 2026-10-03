@@ -363,3 +363,206 @@ fn tasks_survive_a_restart_of_the_daemon() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The product loop with cancellation, driven entirely through the CLI.
+#[test]
+fn a_user_can_cancel_a_task_and_see_it_cancelled() {
+    let root = dir("cancel");
+    let d = Daemon::start(&root);
+
+    let out = d.cli(&["task", "create", "--id", "t-1", "no longer needed"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+
+    let out = d.cli(&["task", "cancel", "--id", "t-1"]);
+    assert!(out.status.success(), "cancel failed: {}", stderr_of(&out));
+    let cancelled = stdout_of(&out);
+    assert!(cancelled.contains("cancelled"), "{cancelled}");
+    assert!(cancelled.contains("t-1"), "{cancelled}");
+    assert!(cancelled.contains("no longer needed"), "{cancelled}");
+
+    // list shows the authoritative state.
+    let out = d.cli(&["task", "list"]);
+    let listed = stdout_of(&out);
+    assert!(listed.contains("cancelled"), "{listed}");
+    assert!(!listed.contains("pending"), "{listed}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Repeated cancellation follows the engine's semantics: a no-op that succeeds.
+///
+/// The point of this test is not the wording but the *state*: repeating a cancel must
+/// not resurrect the task, must not fail, and must not append a second terminal event.
+/// The CLI reports whatever state the daemon says, which after a repeat is still
+/// `cancelled` — and saying so is true, not a false claim of success.
+#[test]
+fn repeating_a_cancel_is_a_no_op_that_leaves_the_task_cancelled() {
+    let root = dir("cancel-twice");
+    let d = Daemon::start(&root);
+
+    d.cli(&["task", "create", "--id", "t-1", "x"]);
+
+    let first = d.cli(&["task", "cancel", "--id", "t-1"]);
+    assert!(first.status.success(), "{}", stderr_of(&first));
+    assert!(stdout_of(&first).contains("cancelled"));
+
+    // Three more times. All succeed, all report `cancelled`, none changes anything.
+    for _ in 0..3 {
+        let again = d.cli(&["task", "cancel", "--id", "t-1"]);
+        assert!(
+            again.status.success(),
+            "a repeated cancel must succeed: {}",
+            stderr_of(&again)
+        );
+        assert!(
+            stdout_of(&again).contains("cancelled"),
+            "the task is still cancelled, and that is what should be said"
+        );
+    }
+
+    let out = d.cli(&["task", "list"]);
+    let listed = stdout_of(&out);
+    assert_eq!(
+        listed.matches("cancelled").count(),
+        1,
+        "one task, one row, one state: {listed}"
+    );
+    assert!(!listed.contains("running"), "no resurrection: {listed}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The case where the CLI must NOT say `cancelled`: the task is already `completed`,
+/// so a cancel changes nothing and claiming otherwise would misreport it.
+#[test]
+fn cancelling_a_completed_task_reports_it_unchanged_rather_than_cancelled() {
+    let root = dir("cancel-completed");
+    let d = Daemon::start(&root);
+
+    d.cli(&["task", "create", "--id", "t-1", "x"]);
+    let out = d.cli(&["task", "claim", "--id", "t-1", "--worker", "w1"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let out = d.cli(&["task", "complete", "--id", "t-1", "--worker", "w1"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+
+    let out = d.cli(&["task", "cancel", "--id", "t-1"]);
+    assert!(
+        out.status.success(),
+        "the engine's no-op succeeds: {}",
+        stderr_of(&out)
+    );
+    let said = stdout_of(&out);
+    assert!(
+        said.contains("unchanged"),
+        "a completed task was not cancelled, so the CLI must not say it was: {said}"
+    );
+    assert!(
+        said.contains("completed"),
+        "and it must report the state that is actually true: {said}"
+    );
+
+    let out = d.cli(&["task", "list"]);
+    let listed = stdout_of(&out);
+    assert!(listed.contains("completed"), "{listed}");
+    assert!(!listed.contains("cancelled"), "{listed}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Cancelling a task that does not exist is a structured refusal, not a local guess.
+#[test]
+fn cancelling_a_missing_task_is_a_structured_refusal() {
+    let root = dir("cancel-absent");
+    let d = Daemon::start(&root);
+
+    let out = d.cli(&["task", "cancel", "--id", "ghost"]);
+    assert!(!out.status.success(), "must not exit 0");
+    let err = stderr_of(&out);
+    assert!(err.contains("not-found"), "{err}");
+    assert!(err.contains("refused"), "{err}");
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal must not print a task block"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A cancelled task cannot be claimed through the CLI either.
+#[test]
+fn a_cancelled_task_cannot_be_claimed_through_the_cli() {
+    let root = dir("cancel-then-claim");
+    let d = Daemon::start(&root);
+
+    d.cli(&["task", "create", "--id", "t-1", "x"]);
+    let out = d.cli(&["task", "cancel", "--id", "t-1"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+
+    let claimed = d.cli(&["task", "claim", "--id", "t-1", "--worker", "w1"]);
+    assert!(
+        !claimed.status.success(),
+        "a cancelled task must not be claimable"
+    );
+    assert!(
+        stderr_of(&claimed).contains("not-claimable"),
+        "{}",
+        stderr_of(&claimed)
+    );
+
+    // And the state is still `cancelled`, not resurrected into running.
+    let out = d.cli(&["task", "list"]);
+    let listed = stdout_of(&out);
+    assert!(listed.contains("cancelled"), "{listed}");
+    assert!(!listed.contains("running"), "{listed}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Cancellation survives a restart, through the CLI on both sides.
+#[test]
+fn a_cancelled_task_stays_cancelled_across_a_restart() {
+    let root = dir("cancel-restart");
+    {
+        let d = Daemon::start(&root);
+        let out = d.cli(&["task", "create", "--id", "t-1", "durable refusal"]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let out = d.cli(&["task", "cancel", "--id", "t-1"]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+    }
+    {
+        let d = Daemon::start(&root);
+        let out = d.cli(&["task", "list"]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let listed = stdout_of(&out);
+        assert!(listed.contains("cancelled"), "{listed}");
+        assert!(
+            listed.contains("durable refusal"),
+            "content must survive too: {listed}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Phase 11: no daemon, no backtrace, no SQL or path disclosure.
+#[test]
+fn cancelling_with_no_daemon_fails_cleanly() {
+    let root = dir("cancel-no-daemon");
+    let endpoint = root.join("orxnud.sock");
+
+    let out = Command::new(cli_bin())
+        .args(["task", "cancel", "--id", "x", "--endpoint"])
+        .arg(&endpoint)
+        .output()
+        .expect("run orxnuctl");
+
+    assert!(!out.status.success(), "must not exit 0");
+    let err = stderr_of(&out);
+    assert!(err.contains("cannot reach"), "{err}");
+    assert!(
+        !err.contains("panicked") && !err.contains("RUST_BACKTRACE"),
+        "{err}"
+    );
+    assert!(!err.contains("state.db") && !err.contains(".sql"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
