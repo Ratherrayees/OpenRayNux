@@ -57,6 +57,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod proposer;
 pub mod runtime;
 pub mod task_service;
 

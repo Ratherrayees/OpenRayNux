@@ -157,7 +157,7 @@ pub enum CliError {
 
     /// A `task` verb that does not exist.
     #[error(
-        "unknown task command {0:?}; expected create, list, claim, complete, cancel, propose or execute"
+        "unknown task command {0:?}; expected create, list, claim, complete, cancel, propose, execute or ai-propose"
     )]
     UnknownTaskCommand(String),
 
@@ -362,6 +362,12 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
                 params,
                 target,
             }
+        }
+        "ai-propose" => {
+            let task = flags.take("ai-propose", "--task")?;
+            let worker = flags.take("ai-propose", "--worker")?;
+            flags.reject_all("ai-propose")?;
+            TaskCommand::AiPropose { task, worker }
         }
         "execute" => {
             let proposal = flags.take("execute", "--proposal")?;

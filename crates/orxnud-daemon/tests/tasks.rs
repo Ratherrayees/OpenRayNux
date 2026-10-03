@@ -1735,3 +1735,200 @@ fn unreadable_stored_parameters_are_refused_rather_than_defaulted() {
         let _ = std::fs::remove_dir_all(&d);
     });
 }
+
+// ---------------------------------------------------------------------------
+// The AI task proposer
+// ---------------------------------------------------------------------------
+//
+// The milestone claim is narrow and worth stating exactly: **a model may propose an
+// action and nothing else.** These tests pin both halves — that a proposal reaches the
+// governed path, and that the model's route contains no path to approving, executing or
+// dispatching.
+
+/// The demonstration: a plain request becomes a proposal a human can approve.
+#[test]
+fn an_ai_proposal_becomes_a_governed_action() {
+    rt().block_on(async {
+        let d = dir("ai-happy");
+        let s = Serving::start(d.clone()).await;
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "ai1", "content": "Create final.txt containing delegated governance works"}),
+        );
+        send(&s.endpoint, "c", "task/claim", json!({"id": "ai1", "worker": "ai"}));
+        let p = send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "ai1", "worker": "ai"}),
+        );
+        assert_eq!(p["result"]["proposed_by"], "ai", "the proposer is the model actor");
+        assert_eq!(p["result"]["proposal"]["capability"], "filesystem/write-text");
+        assert_eq!(p["result"]["waiting_for"], "human-approval");
+
+        // Parked, and the file is NOT written: proposing is not doing.
+        let listed = send(&s.endpoint, "l", "task/list", json!({}));
+        assert_eq!(listed["result"]["tasks"][0]["state"], "waiting-for-user");
+        assert!(!workspace(&d).join("final.txt").exists());
+
+        // Only a human can finish it.
+        let pid = p["result"]["proposal"]["proposal_id"].as_str().unwrap().to_owned();
+        let early = send(&s.endpoint, "x", "task/execute", json!({"proposal": pid, "worker": "ai"}));
+        assert!(early.get("error").is_some(), "an unapproved proposal must not run");
+
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let done = send(&s.endpoint, "x", "task/execute", json!({"proposal": pid, "worker": "ai"}));
+        assert_eq!(done["result"]["verified"], true, "{done}");
+        assert_eq!(
+            std::fs::read_to_string(workspace(&d).join("final.txt")).expect("written"),
+            "delegated governance works"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The hard boundary, asserted rather than described.
+///
+/// Each of these is a way the model might *ask* to act. None is answerable: the model
+/// gets text in and text out, and the deterministic side decides. The refusals name
+/// themselves, so a reader can see which guard stopped each attempt.
+#[test]
+fn the_ai_route_offers_no_authority_to_the_model() {
+    rt().block_on(async {
+        let d = dir("ai-boundary");
+        let s = Serving::start(d.clone()).await;
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "ai2", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "ai2", "worker": "ai"}),
+        );
+
+        // (a) The model cannot approve. `capability/approve` derives its approver from
+        //     the trusted human, so a caller asserting one is simply ignored; there is no
+        //     field through which to supply a different one.
+        // The daemon ignores an `approver` the caller supplies: the field is not read
+        // from the request at all. Asserting the *absence* of a forged approver in the
+        // reply is the observable form of that.
+        let forged = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({
+                "capability": "filesystem/write-text",
+                "target": "x.txt",
+                "params": {"path": "x.txt", "contents": "x"},
+                "approver": "ai",
+            }),
+        );
+        let echoed = forged.to_string();
+        assert!(
+            !echoed.contains("\"ai\""),
+            "a caller must not be able to name its own approver: {forged}"
+        );
+
+        // (b) The model cannot reach a capability without a proposal and a human approval.
+        //     A direct dispatch of a High-risk capability is refused on approval alone.
+        let direct = send(
+            &s.endpoint,
+            "d",
+            "capability/dispatch",
+            json!({
+                "capability": "filesystem/write-text", "target": "x.txt",
+                "params": {"path": "x.txt", "contents": "x"},
+            }),
+        );
+        let reason = direct["error"]["data"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(reason.contains("approval-required"), "{direct}");
+        assert!(!workspace(&d).join("x.txt").exists());
+
+        // (c) The model cannot mutate policy; there is no verb that could.
+        assert!(
+            !orxnud_protocol::method::all_method_names()
+                .iter()
+                .any(|m| m.contains("policy") || m.contains("grant")),
+            "no protocol verb exposes policy mutation"
+        );
+
+        // (d) The proposal's authority comes from the delegating human, and the worker
+        //     string that happens to be "ai" is nowhere in it.
+        let p = send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "ai2", "worker": "ai"}),
+        );
+        assert_eq!(p["result"]["proposal"]["authority_root"], "local");
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// A proposal cannot be conjured for a task nobody holds, and one attempt gets one
+/// proposal — so a model cannot flood the approval queue.
+#[test]
+fn an_ai_proposal_requires_the_lease_and_is_once_per_attempt() {
+    rt().block_on(async {
+        let d = dir("ai-guard");
+        let s = Serving::start(d.clone()).await;
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "ai3", "content": "x"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "ai3", "worker": "ai"}),
+        );
+
+        let impostor = send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "ai3", "worker": "not-the-lease-holder"}),
+        );
+        assert!(impostor.get("error").is_some(), "{impostor}");
+
+        assert!(
+            send(
+                &s.endpoint,
+                "p",
+                "task/ai-propose",
+                json!({"task": "ai3", "worker": "ai"})
+            )
+            .get("result")
+            .is_some()
+        );
+        let second = send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "ai3", "worker": "ai"}),
+        );
+        assert!(
+            second.get("error").is_some(),
+            "one attempt gets one proposal: {second}"
+        );
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}

@@ -98,6 +98,16 @@ pub enum Method {
     /// capability is approved and current — dispatches it through the governed path.
     /// The worker named here gains execution ownership and no authority (V-71).
     TaskExecute,
+
+    /// Ask the configured AI proposer what it would do with a task.
+    ///
+    /// The model proposes; it does not act. This method runs the provider, validates
+    /// whatever text comes back, and — only if that text is a proposal this build can
+    /// act on — persists a durable proposal and parks the task in `WaitingForUser`.
+    ///
+    /// It cannot approve, cannot execute, and cannot reach a capability directly: there
+    /// is no path from this method to an `ApprovalRecord` or to a `Dispatcher`.
+    TaskAiPropose,
 }
 
 impl Method {
@@ -105,7 +115,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -119,6 +129,7 @@ impl Method {
         Self::CapabilityApprove,
         Self::TaskPropose,
         Self::TaskExecute,
+        Self::TaskAiPropose,
     ];
 
     /// The wire name.
@@ -138,6 +149,7 @@ impl Method {
             Self::CapabilityApprove => "capability/approve",
             Self::TaskPropose => "task/propose",
             Self::TaskExecute => "task/execute",
+            Self::TaskAiPropose => "task/ai-propose",
         }
     }
 
@@ -164,6 +176,7 @@ impl Method {
             "capability/approve" => Some(Self::CapabilityApprove),
             "task/propose" => Some(Self::TaskPropose),
             "task/execute" => Some(Self::TaskExecute),
+            "task/ai-propose" => Some(Self::TaskAiPropose),
             _ => None,
         }
     }

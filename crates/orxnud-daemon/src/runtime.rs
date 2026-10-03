@@ -552,6 +552,7 @@ async fn route<S: SecretsContract>(
         // routed separately rather than through `tasks`: it needs the capability registry
         // and the sandbox backend, which `tasks` deliberately has no access to.
         Method::TaskExecute => execute_proposal(request, governed).await,
+        Method::TaskAiPropose => ai_propose(request, governed).await,
     }
 }
 
@@ -566,6 +567,145 @@ fn local_actor() -> orxnud_domain::Actor {
         user: orxnud_domain::ids::UserId::new("local"),
         via: orxnud_domain::actor::AuthChannel::LocalInteractive,
     }
+}
+
+/// Asks the configured proposer what it would do with a task, and persists a proposal
+/// if — and only if — its answer is one this runtime can act on.
+///
+/// # The whole authority of this route
+///
+/// A model contributes exactly one thing: text. The capability allowlist, the parameter
+/// validation, the durable proposal, the decision and the dispatch are all this
+/// function's and the types it calls. There is no branch here that reaches an
+/// `ApprovalRecord`, a `Dispatcher`, the policy engine or the store outside
+/// `propose_action`, so "the model approved this" is not a state the code can represent
+/// (ADR-0012, ADR-0037, V-71).
+///
+/// # Errors
+///
+/// [`RequestError::Invalid`] for a malformed request, or a structured refusal when the
+/// model's output is not a proposal this build understands.
+async fn ai_propose<S: SecretsContract>(
+    request: &Request,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let task_id = required_str(&params, "task")?;
+    check_len("task", &task_id, MAX_TASK_ID_BYTES)?;
+    let worker = required_str(&params, "worker")?;
+    check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+
+    let mut g = governed.lock().await;
+    let now = g.2.clock_now_ms();
+
+    // The task's own words. Read here, from durable state, so the model is shown what
+    // was actually asked rather than what a caller says was asked.
+    let row =
+        g.2.task(&TaskId::new(task_id.as_str()))
+            .map_err(task_fault)?
+            .ok_or_else(|| RequestError::Invalid(format!("no task {task_id:?}")))?;
+
+    // The allowlist is built from what this daemon actually has *enabled*, so a model
+    // cannot be offered a capability that policy would refuse anyway.
+    let allowed: Vec<crate::proposer::AllowedCapability> =
+        vec![crate::proposer::AllowedCapability {
+            id: orxnud_capability::write_text::WRITE_TEXT_ID.to_owned(),
+            description: "Write a text file into the sandbox workspace".to_owned(),
+            params: vec!["path".to_owned(), "contents".to_owned()],
+        }];
+    let registered_ids: Vec<String> = allowed.iter().map(|c| c.id.clone()).collect();
+    let ctx = crate::proposer::ProposalContext {
+        task_id: task_id.clone(),
+        content: row.payload.clone().unwrap_or_default(),
+        attempt_no: row.attempts,
+        allowed,
+    };
+
+    let text = proposer_ref()
+        .complete(&ctx)
+        .map_err(|e| RequestError::Refused(e.to_string()))?;
+
+    let validated =
+        crate::proposer::validate(&text, &ctx, &|id| registered_ids.iter().any(|r| r == id))
+            .map_err(|e| RequestError::Declined {
+                reason: e.reason().to_owned(),
+                detail: Some("the model's output was not a proposal this runtime can act on"),
+            })?;
+
+    // From here the model is out of the picture. What follows is the same path a human
+    // worker would take, and the proposer is a `Actor::Ai` derived from the task — never
+    // from the worker holding the lease.
+    let canonical = orxnud_policy::canonical_params(&validated.params);
+    let proposal_id = format!("p-{task_id}-{now}");
+    let proposer = delegated_actor(&task_id);
+    let proposed =
+        g.2.propose_action(
+            &proposal_id,
+            &TaskId::new(task_id.as_str()),
+            &worker,
+            &orxnud_domain::CapabilityId::new(validated.capability.as_str()),
+            validated.target.as_deref(),
+            canonical.as_str(),
+            &proposer,
+            now,
+        )
+        .map_err(task_fault)?;
+
+    Ok(json!({
+        "proposal": proposal_json(&proposed),
+        "waiting_for": "human-approval",
+        // Restated for the caller, and not because it is a secret: the whole claim of
+        // this path is that a model asked and a person decides, so both facts belong in
+        // the reply rather than only in the database.
+        "proposed_by": proposer.label(),
+        "model": proposer_ref().model_id(),
+    }))
+}
+
+/// The proposer this daemon asks.
+///
+/// A `OnceLock` rather than a field on `Daemon` because `compose` must touch nothing,
+/// and `set_proposer` exists so a test can supply a deliberately malformed or
+/// out-of-allowlist response — the interesting failures are in the validation, and they
+/// cannot be reached through a provider that always answers correctly.
+static PROPOSER: std::sync::OnceLock<Box<dyn crate::proposer::ProposalProvider>> =
+    std::sync::OnceLock::new();
+
+/// The installed proposer, or the declared stand-in.
+///
+/// `pub` so the test suite can assert on the very provider a dispatch would use, rather
+/// than on a copy of it.
+#[must_use]
+pub fn proposer_ref() -> &'static dyn crate::proposer::ProposalProvider {
+    proposer()
+}
+
+/// Replaces the proposer. First call wins.
+///
+/// # Panics
+///
+/// If a proposer is already installed.
+pub fn set_proposer(provider: Box<dyn crate::proposer::ProposalProvider>) {
+    if PROPOSER.set(provider).is_err() {
+        panic!("a proposer is already installed");
+    }
+}
+
+/// The proposer to use: the installed one, or a declared non-model stand-in.
+///
+/// The default is [`ScriptedProvider`] with the demonstration proposal, because a build
+/// with no credentials must still be able to exercise the path, and because a silent
+/// "no provider configured" would make the boundary indistinguishable from a missing
+/// feature.
+fn proposer() -> &'static dyn crate::proposer::ProposalProvider {
+    // `&**`: the cell holds a `Box<dyn ProposalProvider>`, and the caller wants the
+    // trait object rather than the box.
+    &**PROPOSER.get_or_init(|| {
+        Box::new(crate::proposer::ScriptedProvider::returning(
+            "scripted/none",
+            r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"delegated governance works"}}"#,
+        )) as Box<dyn crate::proposer::ProposalProvider>
+    })
 }
 
 /// The delegated proposer for a task's governed action.

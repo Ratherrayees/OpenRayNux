@@ -1123,6 +1123,7 @@ dependencies = [
  "orxnud-store",
  "orxnud-task",
  "proptest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

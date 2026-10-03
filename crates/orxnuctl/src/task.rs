@@ -79,6 +79,17 @@ pub enum TaskCommand {
         /// The worker taking the fresh execution lease.
         worker: String,
     },
+    /// Ask the AI proposer what it would do with a task.
+    ///
+    /// The model proposes; it does not act. This persists a durable proposal and parks
+    /// the task for human approval, exactly as `propose` does — the only difference is
+    /// who composed the action.
+    AiPropose {
+        /// The task id.
+        task: String,
+        /// The worker holding the task's lease.
+        worker: String,
+    },
 }
 
 /// Runs a task command and returns what to print.
@@ -134,6 +145,19 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             }
             let reply = client.call("task/propose", payload)?;
             Ok(render_proposal(&reply))
+        }
+        TaskCommand::AiPropose { task, worker } => {
+            let reply =
+                client.call("task/ai-propose", json!({ "task": task, "worker": worker }))?;
+            let mut out = render_proposal(&reply);
+            // Stated plainly, because the reply's existence is not the interesting part:
+            // what matters is that a model asked and a person still has to decide.
+            for key in ["proposed_by", "model"] {
+                if let Some(v) = reply.get(key).and_then(Value::as_str) {
+                    out.push_str(&format!("  {key}: {v}\n"));
+                }
+            }
+            Ok(out)
         }
         TaskCommand::Execute { proposal, worker } => {
             let reply = client.call(

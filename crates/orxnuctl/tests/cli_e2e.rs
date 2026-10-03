@@ -1373,3 +1373,96 @@ fn the_governed_execution_is_audited_and_survives_a_restart() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The AI proposer through the real CLI.
+///
+/// The product claim is "ask the model what it would do, then let the deterministic
+/// runtime decide" — so both halves are driven here: the proposal arrives, the file does
+/// not exist yet, a human approves, and only then does anything happen.
+#[test]
+fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
+    let root = dir("ai-happy");
+    let daemon = Daemon::start(&root);
+
+    daemon.cli(&["task", "create", "--id", "e1", "Create", "final.txt"]);
+    assert!(
+        daemon
+            .cli(&["task", "claim", "--id", "e1", "--worker", "ai"])
+            .status
+            .success()
+    );
+
+    let proposed = daemon.cli(&["task", "ai-propose", "--task", "e1", "--worker", "ai"]);
+    assert!(proposed.status.success(), "{}", stderr_of(&proposed));
+    let out = stdout_of(&proposed);
+    assert!(out.contains("proposed_by: ai"), "{out}");
+    assert!(out.contains("waiting_for: human-approval"), "{out}");
+    let pid = propose_id(&proposed);
+
+    // Proposing is not doing.
+    assert!(!root.join("workspace").join("final.txt").exists());
+    assert!(stdout_of(&daemon.cli(&["task", "list"])).contains("waiting-for-user"));
+
+    // A human finishes it.
+    assert!(
+        daemon
+            .cli(&[
+                "capability",
+                "approve",
+                "--proposal",
+                &pid,
+                "--ttl-ms",
+                "60000"
+            ])
+            .status
+            .success()
+    );
+    let done = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "ai"]);
+    assert!(done.status.success(), "{}", stderr_of(&done));
+    assert!(stdout_of(&done).contains("verified: true"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("workspace").join("final.txt")).expect("written"),
+        "delegated governance works"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The AI route refuses the two things a caller would try next: inventing an approver,
+/// and executing before one exists.
+#[test]
+fn the_ai_proposer_cannot_approve_or_execute() {
+    let root = dir("ai-boundary");
+    let daemon = Daemon::start(&root);
+    daemon.cli(&["task", "create", "--id", "e2", "x"]);
+    daemon.cli(&["task", "claim", "--id", "e2", "--worker", "ai"]);
+    let proposed = daemon.cli(&["task", "ai-propose", "--task", "e2", "--worker", "ai"]);
+    let pid = propose_id(&proposed);
+
+    // Executing before approval.
+    let early = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "ai"]);
+    assert!(
+        !early.status.success(),
+        "an unapproved proposal must not run"
+    );
+    assert!(!root.join("workspace").join("final.txt").exists());
+
+    // A caller-supplied approver is not honoured.
+    let forged = daemon.cli(&[
+        "capability",
+        "approve",
+        "--proposal",
+        &pid,
+        "--ttl-ms",
+        "60000",
+    ]);
+    assert!(forged.status.success());
+    assert!(
+        stdout_of(&forged).contains("\"approver\": \"human\""),
+        "{}",
+        stdout_of(&forged)
+    );
+    assert!(!stdout_of(&forged).contains("\"approver\": \"ai\""));
+
+    let _ = std::fs::remove_dir_all(&root);
+}

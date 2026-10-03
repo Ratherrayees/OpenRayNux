@@ -27,6 +27,7 @@ orxnud-platform-secrets = { workspace = true }
 orxnud-platform-notify = { workspace = true }
 orxnud-platform-ipc = { workspace = true }
 orxnud-platform-sandbox = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
