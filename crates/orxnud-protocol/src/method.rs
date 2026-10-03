@@ -69,6 +69,20 @@ pub enum Method {
     /// from the holder of that lease and is fenced by it. A cancel that had to name a
     /// worker could not cancel an unclaimed task at all.
     TaskCancel,
+    /// Issue an approval for one capability invocation.
+    ///
+    /// Separate from [`Self::CapabilityDispatch`] because approving and performing are
+    /// different acts with different failure modes: an approval is a statement about a
+    /// *proposed* operation and can be refused on its own terms, while a dispatch either
+    /// happens or does not. Folding them together would mean the only way to learn an
+    /// operation was unacceptable is to attempt it.
+    ///
+    /// Carries no authority of its own. It returns the canonical tuple and its digest;
+    /// whether that approval is then *honoured* is decided at dispatch, by recomputing
+    /// the digest from the action about to run. So this method cannot widen what any
+    /// actor may do -- it can only produce the artefact the dispatcher's anti-Loopjacking
+    /// check compares against.
+    CapabilityApprove,
 }
 
 impl Method {
@@ -76,7 +90,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -87,6 +101,7 @@ impl Method {
         Self::TaskClaim,
         Self::TaskComplete,
         Self::TaskCancel,
+        Self::CapabilityApprove,
     ];
 
     /// The wire name.
@@ -103,6 +118,7 @@ impl Method {
             Self::TaskClaim => "task/claim",
             Self::TaskComplete => "task/complete",
             Self::TaskCancel => "task/cancel",
+            Self::CapabilityApprove => "capability/approve",
         }
     }
 
@@ -126,6 +142,7 @@ impl Method {
             "task/claim" => Some(Self::TaskClaim),
             "task/complete" => Some(Self::TaskComplete),
             "task/cancel" => Some(Self::TaskCancel),
+            "capability/approve" => Some(Self::CapabilityApprove),
             _ => None,
         }
     }

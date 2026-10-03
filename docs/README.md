@@ -196,8 +196,40 @@ process owning the user's time, data and integrations, with several surfaces
   bug that only this wiring could find.
 - `scripts/ci-gates.sh` — the twelve gates, runnable locally and in CI.
 
-Still absent by design: any capability (Phase 4+), any interface (Phase 6), and any
-provider integration. A **task** domain surface now exists over IPC
+Two capabilities exist. **`text/word-count`** is a pure in-process text measurement
+reachable through `orxnuctl capability run`; it was first because proving the governed
+pipeline needs no authority — it reads nothing, writes nothing, resolves no credential
+and spawns no process.
+
+**`filesystem/write-text`** is the first capability with a real side effect, and the
+first that the rest of the architecture exists to govern. It writes one text file into
+a sandbox-controlled workspace, and it is **High risk**, so policy refuses it unless a
+single-use, time-boxed, parameter-bound approval is presented. Everything else about it
+is narrow on purpose: one file, no directories, no deletion, no copy, no permission
+change, no shell, no network, and no option that widens any of those. It executes as
+**Tier 1** — a real subprocess under the host sandbox — and its `invoke` refuses
+outright, so the in-process path is a refusal rather than an unwitnessed fallback. A
+separate verifier re-reads the file and compares its bytes, so verification is a
+statement about the filesystem rather than about what the writer said.
+
+Approval issuance is exposed as `orxnuctl capability approve`, whose output is passed
+straight back as `capability run --approval`:
+
+```bash
+APPROVAL=$(orxnuctl capability approve \
+  --capability filesystem/write-text --target notes.txt \
+  --params '{"path":"notes.txt","contents":"hello"}' --ttl-ms 60000)
+
+orxnuctl capability run \
+  --capability filesystem/write-text --target notes.txt \
+  --params '{"path":"notes.txt","contents":"hello"}' \
+  --approval "$APPROVAL"
+```
+
+An approval is bound to the exact parameters it was issued for. Presenting it with
+`contents` changed is refused with `approval-digest-mismatch` before anything runs,
+which is the property the digest exists for. Still absent by design: any interface
+beyond the CLI, and any provider integration. A **task** domain surface now exists over IPC
 (`task/create`, `task/list`, `task/claim`, `task/complete`, `task/cancel`) because the durable task
 engine was already there and correct; it manages first-party state and is
 deliberately not routed through the capability dispatcher.
@@ -208,8 +240,12 @@ delivered.
 
 ## What does not exist yet
 
-No capability is registered, and none is reachable: `CapabilityRegistry` is empty
-and `CapabilityInvocation` cannot be constructed outside `orxnud-policy`. No
+`CapabilityRegistry` holds two entries — `text/word-count` and
+`filesystem/write-text` — and both are reachable only through the governed dispatcher.
+Neither reaches a sandbox by a second route, and neither has a general-purpose
+filesystem or shell capability behind it. `CapabilityInvocation` still cannot be
+constructed outside `orxnud-policy`, so declaring a capability is not the same as being
+able to run one. No
 interface exists beyond `orxnuctl --version` and `doctor`. No provider integration,
 no MCP surface, no Tauri or Svelte project. The task engine stores and transitions
 tasks; it performs no work, because performing work is a capability and capabilities

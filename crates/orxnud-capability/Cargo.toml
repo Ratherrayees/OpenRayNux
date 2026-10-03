@@ -20,6 +20,7 @@ orxnud-policy = { workspace = true }
 orxnud-audit = { workspace = true }
 # The execution backend: the only place a Tier-1 subprocess can be started. The
 # dependency is inward (capability sits above platform-*), so G2 permits it.
+orxnud-platform-fs = { workspace = true }
 orxnud-platform-sandbox = { workspace = true }
 
 [dev-dependencies]
@@ -36,3 +37,12 @@ orxnud-task = { workspace = true }
 # cannot be observed from either crate's own tests.
 orxnud-store = { workspace = true }
 proptest = { workspace = true }
+
+[[bin]]
+# The Tier-1 child for `filesystem/write-text`. A binary rather than an extra
+# `[[test]]` target (the pattern `orxnud-platform-sandbox` uses for its hostile
+# helper) because this one has to exist outside the test harness: the daemon
+# executes it as the sandboxed program, so it must be built by a plain
+# `cargo build`, not only by `cargo test`.
+name = "orxnud-fswrite"
+path = "src/bin/orxnud-fswrite.rs"

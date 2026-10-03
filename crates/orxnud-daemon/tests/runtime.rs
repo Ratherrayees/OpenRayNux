@@ -29,6 +29,7 @@ use orxnud_platform_ipc::{IpcError, endpoint_for};
 use orxnud_protocol::error::RpcErrorCode;
 use orxnud_protocol::frame::{Request, RequestId};
 use orxnud_protocol::method::Method;
+use orxnud_task::clock::{NowMs, SystemClock};
 use serde_json::{Value, json};
 
 /// A secret store with nothing in it, so a dispatch can never resolve a credential.
@@ -237,7 +238,9 @@ fn a_health_request_succeeds_over_a_real_socket() {
                 reply["result"]["durable_audit"], true,
                 "the runtime must report that it is serving durably"
             );
-            assert_eq!(reply["result"]["capabilities_enabled"], 0);
+            // Read from composition rather than hard-coded, so it stays true as the
+            // shipped set changes.
+            assert_eq!(reply["result"]["capabilities_enabled"], 2);
         })
         .await
     });
@@ -469,6 +472,103 @@ fn durable_state_survives_a_restart_and_the_chain_continues() {
         drop(runtime);
         let _ = std::fs::remove_dir_all(&d);
     });
+}
+
+/// A real dispatch is recorded with a real wall-clock instant, not a constant.
+///
+/// The defect this pins is not cosmetic. `now_ms` is what the dispatcher passes to
+/// `authorise_for_dispatch`, so with it pinned at `0` an approval's `expires_at_ms`
+/// compared against `0` and could never be expired — every approval, however old,
+/// verified. It also reached the verifier and both audit records. A journal whose
+/// timestamps are all `0` orders its records by sequence alone and cannot answer
+/// "when did this happen", which is most of what an audit log is for.
+#[test]
+fn a_dispatch_is_audited_with_a_real_wall_clock_instant() {
+    rt().block_on(async {
+        let d = dir("stamps");
+        let before = SystemClock::new().now_ms();
+        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+            .await
+            .expect("start");
+        let endpoint = runtime.endpoint().to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            let _ = runtime.serve(async move { let _ = rx.await; }).await;
+        });
+
+        // The shipped Low-risk capability, so this is a completed invocation with
+        // both an authorisation and a completion record rather than a refusal.
+        let r = call_raw(
+            &endpoint,
+            br#"{"jsonrpc":"2.0","id":"s1","method":"capability/dispatch","params":{"capability":"text/word-count","params":{"text":"hello world"}}}"#,
+        )
+        .expect("a response");
+        assert!(
+            r.get("error").is_none(),
+            "expected the shipped capability to dispatch: {r}"
+        );
+        let after = SystemClock::new().now_ms();
+
+        let stamps = audited_at_ms(&d);
+        assert!(
+            stamps.len() >= 2,
+            "expected an authorisation and a completion record, got {}",
+            stamps.len()
+        );
+        for ms in &stamps {
+            assert!(
+                *ms >= before && *ms <= after,
+                "audit stamp {ms} is outside the interval the dispatch ran in \
+                 ({before}..={after}); a constant or a second clock would do this"
+            );
+        }
+        // Ordering is preserved, which is the property a monotonic stamp buys.
+        assert!(
+            stamps.windows(2).all(|w| w[0] <= w[1]),
+            "audit stamps must not go backwards: {stamps:?}"
+        );
+
+        let _ = tx.send(());
+        let _ = serving.await;
+
+        // And they are durable: the instants are still there after the process is
+        // gone, read back through the store's own verified journal.
+        let persisted = audited_at_ms(&d);
+        assert_eq!(
+            persisted, stamps,
+            "restart must preserve the recorded instants, not restamp them"
+        );
+        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+            .await
+            .expect("restart: the journal must load and verify");
+        assert!(runtime.is_durable().await);
+        assert_eq!(
+            audited_at_ms(&d),
+            stamps,
+            "a restarted daemon must not rewrite history"
+        );
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The `at-ms` instant of every audited dispatch record, in chain order.
+fn audited_at_ms(d: &Path) -> Vec<i64> {
+    orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
+        .expect("open the journal the runtime wrote")
+        .entries()
+        .expect("entries")
+        .iter()
+        .filter_map(|e| {
+            let v: Value = serde_json::from_slice(&e.payload).ok()?;
+            let outcome = v.get("outcome")?;
+            outcome
+                .get("detail")
+                .and_then(|d| d.get("at-ms"))
+                .or_else(|| outcome.get("at-ms"))
+                .and_then(Value::as_i64)
+        })
+        .collect()
 }
 
 /// How many records the durable journal holds.

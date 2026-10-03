@@ -63,6 +63,7 @@ use orxnud_store::task_repo::NewTask;
 use serde_json::json;
 
 use orxnud_task::EngineLimits;
+use orxnud_task::clock::{NowMs, SystemClock};
 
 use crate::task_service::{TaskFault, TaskService};
 use crate::{Daemon, LifecycleError, Paths};
@@ -536,6 +537,9 @@ async fn route<S: SecretsContract>(
         }
         Method::Echo => Ok(request.params.clone().unwrap_or(json!({}))),
         Method::CapabilityDispatch => dispatch(request, governed).await,
+        Method::CapabilityApprove => approve(request, governed).await,
+        // First-party durable state, not capability execution. These go to the
+        // TaskService and to nothing else.
         // First-party durable state, not capability execution. These go to the
         // TaskService and to nothing else.
         Method::TaskCreate
@@ -544,6 +548,162 @@ async fn route<S: SecretsContract>(
         | Method::TaskComplete
         | Method::TaskCancel => tasks(method, request, governed).await,
     }
+}
+
+/// The single actor this runtime acts as.
+///
+/// Named, because it has to be *the same* actor at approval time and at dispatch time:
+/// the digest is computed over the actor's label and authority root, so two
+/// structurally identical actors that differed in either would produce approvals that
+/// never verify, and the symptom would be a mysterious refusal rather than a bug.
+fn local_actor() -> orxnud_domain::Actor {
+    orxnud_domain::Actor::Human {
+        user: orxnud_domain::ids::UserId::new("local"),
+        via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+    }
+}
+
+/// Issues an approval for one proposed invocation.
+///
+/// # What this does and does not do
+///
+/// It canonicalises the parameters, computes the digest, and returns the tuple. It
+/// grants nothing: no policy is consulted, no capability is enabled, and no ledger is
+/// touched. The result is an *artefact*, and whether it is honoured is decided later at
+/// dispatch, by recomputing the digest from the action that is actually about to run
+/// and comparing. That is what makes an approval bound to one operation rather than to
+/// a capability -- and it is why a caller cannot use this to widen its own authority:
+/// the worst it can do is produce an approval for something policy would refuse anyway.
+///
+/// # `ttl_ms`
+///
+/// Relative, and `0` is meaningful: it produces an approval that is already expired,
+/// which is how the expiry property is tested without sleeping. The daemon does not
+/// clamp it, because the caller approving its own action is the party the expiry exists
+/// to inform, not a party to overrule. A future consenting principal would decide the
+/// ceiling here rather than accepting one.
+///
+/// # Errors
+///
+/// [`RequestError::Invalid`] for a malformed request.
+async fn approve<S: SecretsContract>(
+    request: &Request,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let capability = params
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RequestError::Invalid("`capability` must be a string".to_owned()))?;
+    let target = params.get("target").and_then(|v| v.as_str());
+    let inner = params.get("params").cloned().unwrap_or(json!({}));
+    let ttl_ms = match params.get("ttl_ms") {
+        None | Some(serde_json::Value::Null) => 60_000,
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| RequestError::Invalid("`ttl_ms` must be an integer".to_owned()))?,
+    };
+
+    let g = governed.lock().await;
+    let now_ms = g.2.clock_now_ms();
+    drop(g);
+
+    let actor = local_actor();
+    let capability_id = orxnud_domain::CapabilityId::new(capability);
+    // Canonicalised through the one function dispatch canonicalises with. Building the
+    // canonical text here any other way is precisely the V-63 defect in a new place.
+    let canonical = orxnud_policy::canonical_params(&inner);
+    let record = orxnud_policy::issue_approval(
+        &actor,
+        &capability_id,
+        target,
+        &canonical,
+        now_ms,
+        now_ms.saturating_add(ttl_ms),
+        // Risk is not negotiated here. `authorise` derives risk from the capability's
+        // *declaration* and ignores this field, so putting the declared risk here would
+        // be a claim this method cannot make; it is recorded as the class the caller
+        // asked to be treated as, which the runtime does not rely on.
+        orxnud_domain::enums::RiskClass::High,
+    );
+
+    Ok(json!({
+        "approval": {
+            "actor_label": record.actor_label,
+            "capability": record.capability,
+            "target": record.target,
+            "params": record.params.as_str(),
+            "issued_at_ms": record.issued_at_ms,
+            "expires_at_ms": record.expires_at_ms,
+            "digest": digest_hex(&record.digest),
+        }
+    }))
+}
+
+/// The digest as hex, so a client can carry it without knowing the crate.
+fn digest_hex(digest: &orxnud_domain::ApprovalDigest) -> String {
+    digest
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Reads hex back into a digest.
+fn digest_from_hex(text: &str) -> Option<orxnud_domain::ApprovalDigest> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in text.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(orxnud_domain::ApprovalDigest::from_bytes(out))
+}
+
+/// Reconstructs an [`orxnud_domain::ApprovalRecord`] from a client's JSON.
+///
+/// The digest is carried through rather than recomputed *here*, and that is the whole
+/// anti-Loopjacking design: this function must not be able to produce a record that
+/// matches whatever it is handed, or the check at dispatch would compare a value
+/// against itself. `authorise` recomputes from the action and compares, so a client
+/// that alters the digest is refused and a client that alters the parameters is
+/// refused. A client that alters neither has presented a genuine approval.
+///
+/// [`RequestError::Invalid`] for anything malformed.
+fn approval_from_json(
+    value: &serde_json::Value,
+) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
+    let bad = |why: &str| RequestError::Invalid(format!("`approval` {why}"));
+    let object = value.as_object().ok_or_else(|| bad("must be an object"))?;
+    let text = |key: &str| -> Result<String, RequestError> {
+        object
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| bad(&format!("needs a string `{key}`")))
+    };
+    let number = |key: &str| -> Result<i64, RequestError> {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| bad(&format!("needs an integer `{key}`")))
+    };
+    let digest_text = text("digest")?;
+    let digest =
+        digest_from_hex(&digest_text).ok_or_else(|| bad("needs a 64-character hex `digest`"))?;
+    Ok(orxnud_domain::ApprovalRecord {
+        actor_label: text("actor_label")?,
+        capability: text("capability")?,
+        target: text("target")?,
+        params: orxnud_domain::NormalizedParams::canonical(text("params")?),
+        issued_at_ms: number("issued_at_ms")?,
+        expires_at_ms: number("expires_at_ms")?,
+        // Carried for display only; `authorise` derives risk from the declaration.
+        risk: orxnud_domain::enums::RiskClass::High,
+        digest,
+    })
 }
 
 /// The ceiling on a task's own human-visible content.
@@ -663,7 +823,7 @@ async fn tasks<S: SecretsContract>(
                 "cancelled": row.state == TaskState::Cancelled,
             }))
         }
-        // Unreachable: the caller only routes the five task methods here, and the
+        // Unreachable: the caller only routes the four task methods here, and the
         // match is exhaustive over them. Listed so adding a fifth is a compile error
         // rather than a silent fall-through to the governed path.
         _ => Err(RequestError::UnknownMethod(request.method.clone())),
@@ -773,6 +933,20 @@ fn check_len(field: &str, value: &str, max: usize) -> Result<(), RequestError> {
 ///
 /// [`RequestError::Invalid`] if the params are not the shape described below, or
 /// [`RequestError::Refused`] carrying the dispatcher's own reason.
+/// The parameters an approval for this action commits to.
+///
+/// This is a named function rather than an inline call because it is the exact
+/// seam where the two dispatch defects lived, and both were invisible: nothing in
+/// the dispatcher can tell that the `NormalizedParams` it was handed does not
+/// describe the `ActionRequest` it was also handed. If an approval digest is ever
+/// computed over a placeholder while the adapter runs the real parameters, the
+/// user approves one operation and a different one executes — and every stage
+/// still reports success. Deriving it from the action, in one named place, is what
+/// makes that failure impossible to reintroduce by accident.
+fn approval_params(action: &orxnud_domain::ActionRequest) -> orxnud_domain::NormalizedParams {
+    orxnud_policy::canonical_params(&action.params)
+}
+
 async fn dispatch<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
@@ -809,9 +983,24 @@ async fn dispatch<S: SecretsContract>(
         class,
         class,
     );
-    let actor = orxnud_domain::Actor::Human {
-        user: orxnud_domain::UserId::new("local"),
-        via: orxnud_domain::AuthChannel::LocalInteractive,
+    let actor = local_actor();
+    // An approval presented by the caller, if any. Reconstructed from the client's JSON
+    // rather than looked up: the daemon keeps no approval store, because the ledger it
+    // does keep records *spent digests*, and the digest is what binds an approval to an
+    // operation. Presenting the tuple again is not a privilege -- it can only ever be
+    // checked against the action about to run.
+    // The target is part of the tuple an approval commits to, so it has to travel from
+    // the request into dispatch rather than being dropped here. Passing `None` while
+    // `capability/approve` was given a target would make the two digests differ for
+    // every request -- a mismatch that looks like a security refusal but is really the
+    // runtime discarding half the tuple.
+    let target = params
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let approval = match params.get("approval") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(approval_from_json(value)?),
     };
     let context = orxnud_domain::InvocationContext::new(
         format!("ipc-{task}-{step}"),
@@ -822,21 +1011,63 @@ async fn dispatch<S: SecretsContract>(
     let mut g = governed.lock().await;
     let (daemon, secrets, _tasks) = &mut *g;
     let mut d: Dispatcher<'_, S> = daemon.dispatcher(secrets);
+    // Derived before `action` is moved into the call below.
+    let approval_params = approval_params(&action);
+    // The wall clock is read here, inside the governed lock, rather than at
+    // request parse time: the stamp has to describe when the action was actually
+    // authorised, which is after whatever the lock was waiting for.
+    let now_ms = SystemClock::new().now_ms();
     match d.dispatch(
         action,
         actor,
         context,
+        target,
+        approval_params,
+        approval.as_ref(),
         None,
-        orxnud_domain::NormalizedParams::canonical("{}"),
-        None,
-        None,
-        0,
+        now_ms,
     ) {
-        Ok(outcome) => Ok(json!({
-            "executed": false,
-            "verified": outcome.is_verified(),
-            "undetermined": outcome.is_undetermined(),
-        })),
+        Ok(outcome) => {
+            // The three-way distinction is reported as three fields rather than
+            // collapsed into a success flag: a refuted outcome and an undetermined one
+            // call for different next decisions, and `undetermined` in particular must
+            // never read as success.
+            //
+            // `result` is the adapter's own claim, carried through verbatim and
+            // clearly labelled as such. It has already been through independent
+            // verification by the time it appears here — but it is the *adapter's*
+            // output, so naming it honestly matters more than how convenient it is.
+            let (claimed, failure) = match &outcome.execution {
+                orxnud_capability::verification::ExecutionOutcome::Succeeded { output } => (
+                    output
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+                    None,
+                ),
+                // A failed execution's own message, carried separately from the
+                // verification verdict. A rejected parameter is the common case and the
+                // reason is what makes it actionable, so it is reported here rather
+                // than being flattened into "nothing was verified".
+                orxnud_capability::verification::ExecutionOutcome::Failed { detail } => {
+                    (None, Some(detail.clone()))
+                }
+                orxnud_capability::verification::ExecutionOutcome::Unknown { detail } => {
+                    (None, Some(detail.clone()))
+                }
+            };
+            Ok(json!({
+                "executed": matches!(
+                    outcome.execution,
+                    orxnud_capability::verification::ExecutionOutcome::Succeeded { .. }
+                ),
+                "verified": outcome.is_verified(),
+                "undetermined": outcome.is_undetermined(),
+                "refuted": outcome.verification.is_refuted(),
+                "capability": outcome.capability.as_str(),
+                "result": claimed,
+                "failure": failure,
+            }))
+        }
         Err(DispatchError::NoImplementation(_)) => {
             // The expected answer while the registry is empty. Named distinctly so
             // a caller can tell "nothing is registered" from "something went wrong".
@@ -859,6 +1090,57 @@ async fn write_response(stream: &mut LocalStream, response: &Response) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seam that decides what an approval commits to.
+    ///
+    /// This is the test that pins the wiring rather than the helper: `approval_params`
+    /// delegating correctly is worthless if some future edit passes a constant at the
+    /// call site again, so the assertion is on the *result* for a real request.
+    #[test]
+    fn the_approval_parameters_are_derived_from_the_action_not_a_placeholder() {
+        let action = orxnud_domain::ActionRequest::new(
+            TaskId::new("t-1"),
+            orxnud_domain::ids::RunId::new("r-1"),
+            0,
+            orxnud_domain::CapabilityId::new("text/word-count"),
+            json!({"text": "hello world"}),
+            orxnud_domain::DataClass::Public,
+            orxnud_domain::DataClass::Public,
+        );
+        let derived = approval_params(&action);
+
+        assert_ne!(
+            derived.as_str(),
+            "{}",
+            "the parameters a user approves must not be a constant"
+        );
+        assert!(
+            derived.as_str().contains("hello world"),
+            "the real parameters must be what an approval commits to, got {}",
+            derived.as_str()
+        );
+    }
+
+    /// The same request written with its object keys in a different order is the
+    /// same operation, so it must produce the identical approval parameters.
+    #[test]
+    fn the_approval_parameters_ignore_object_key_order() {
+        let build = |raw: &str| {
+            approval_params(&orxnud_domain::ActionRequest::new(
+                TaskId::new("t-1"),
+                orxnud_domain::ids::RunId::new("r-1"),
+                0,
+                orxnud_domain::CapabilityId::new("text/word-count"),
+                serde_json::from_str(raw).expect("json"),
+                orxnud_domain::DataClass::Public,
+                orxnud_domain::DataClass::Public,
+            ))
+        };
+        assert_eq!(
+            build(r#"{"text":"hi","n":1}"#).as_str(),
+            build(r#"{"n":1,"text":"hi"}"#).as_str(),
+        );
+    }
 
     #[test]
     fn the_transport_limit_is_far_below_the_protocol_frame_limit() {

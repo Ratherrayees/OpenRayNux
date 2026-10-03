@@ -172,7 +172,10 @@ impl AdapterBundle for HelperBundle {
     fn verifier(&self) -> &dyn Verifier {
         &ReportVerifier
     }
-    fn sandbox_plan(&self) -> Option<SandboxPlan> {
+    fn sandbox_plan(
+        &self,
+        _invocation: &orxnud_domain::invocation::CapabilityInvocation,
+    ) -> Option<SandboxPlan> {
         let (ro, rw) = self.grants.clone();
         Some(SandboxPlan {
             program: helper_path().display().to_string(),
@@ -225,6 +228,7 @@ impl Verifier for ReportVerifier {
     fn verify(
         &self,
         execution: &ExecutionOutcome,
+        _params: &serde_json::Value,
         _at: i64,
     ) -> Result<VerificationOutcome, VerifyError> {
         let ExecutionOutcome::Succeeded { output: Some(text) } = execution else {
@@ -469,6 +473,7 @@ fn a_tier0_capability_still_runs_in_process() {
         fn verify(
             &self,
             _e: &ExecutionOutcome,
+            _params: &serde_json::Value,
             _a: i64,
         ) -> Result<VerificationOutcome, VerifyError> {
             Ok(VerificationOutcome::Verified {
@@ -1147,7 +1152,10 @@ mod v46 {
         fn verifier(&self) -> &dyn Verifier {
             &ReportVerifier
         }
-        fn sandbox_plan(&self) -> Option<SandboxPlan> {
+        fn sandbox_plan(
+            &self,
+            _invocation: &orxnud_domain::invocation::CapabilityInvocation,
+        ) -> Option<SandboxPlan> {
             Some(SandboxPlan {
                 program: helper_path().display().to_string(),
                 args: vec![

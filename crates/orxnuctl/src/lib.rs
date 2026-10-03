@@ -37,6 +37,54 @@ pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The name used in help output and error messages.
 pub const PROGRAM: &str = "orxnuctl";
 
+/// The `capability` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityCommand {
+    /// Invoke a capability through the governed dispatcher.
+    ///
+    /// Carries the capability id and its parameters as **untrusted input**, and
+    /// deliberately nothing else: no assessed risk, no policy version, no approval, no
+    /// credential and no authorisation proof. Those are the daemon's to decide, and a
+    /// client able to assert them would be asserting authority it was never granted — so
+    /// their absence here is the anti-forgery property, not an omission.
+    Run {
+        /// Which capability to invoke.
+        capability: String,
+        /// The capability's parameters, verbatim JSON.
+        params: String,
+        /// The human-readable target the operation concerns, if any.
+        ///
+        /// Part of the tuple an approval commits to, so it cannot be defaulted past:
+        /// an approval issued for one target does not carry to another.
+        target: Option<String>,
+        /// An approval obtained from [`Self::Approve`], as JSON.
+        ///
+        /// Carried verbatim and untrusted. The daemon recomputes the digest from the
+        /// parameters it is actually about to run and compares, so an approval that has
+        /// been edited here is refused rather than believed — which is what makes it
+        /// safe for the client to hold this at all.
+        approval: Option<String>,
+    },
+    /// Ask the daemon for an approval of one proposed operation.
+    ///
+    /// Separate from [`Self::Run`] because approving and performing are different acts:
+    /// this one produces the canonical tuple and its digest, and can be refused on its
+    /// own terms, whereas a run either happens or does not.
+    Approve {
+        /// Which capability the approval would be for.
+        capability: String,
+        /// The parameters the approval would commit to, verbatim JSON.
+        params: String,
+        /// The human-readable target, if any.
+        target: Option<String>,
+        /// How long the approval should live, in milliseconds.
+        ///
+        /// `0` produces an approval that has already expired, which is how the expiry
+        /// behaviour is demonstrated without waiting for a clock.
+        ttl_ms: Option<i64>,
+    },
+}
+
 /// The subcommands that exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -46,6 +94,8 @@ pub enum Command {
     Doctor,
     /// Manage tasks, through the local daemon.
     Task(TaskCommand),
+    /// Invoke capabilities, through the local daemon.
+    Capability(CapabilityCommand),
 }
 
 /// Why a command line could not be understood.
@@ -103,6 +153,24 @@ pub enum CliError {
     #[error("unknown task command {0:?}; expected create, list, claim, complete or cancel")]
     UnknownTaskCommand(String),
 
+    /// A `capability` verb that does not exist.
+    #[error("unknown capability command {0:?}; expected run or approve")]
+    UnknownCapabilityCommand(String),
+
+    /// A flag whose value could not be used.
+    ///
+    /// Says what was wrong with the value rather than only that it was rejected, so a
+    /// mistyped duration does not read as a mysterious refusal.
+    #[error("{flag}={value:?} is not usable: {why}")]
+    UnusableFlagValue {
+        /// The flag, spelled as the user should type it.
+        flag: &'static str,
+        /// What was supplied.
+        value: String,
+        /// Why it could not be used.
+        why: String,
+    },
+
     /// A global flag with no subcommand.
     #[error("{0} requires a subcommand; try `{PROGRAM} --help`")]
     MissingCommand(String),
@@ -114,6 +182,7 @@ impl fmt::Display for Command {
             Self::Version => "version",
             Self::Doctor => "doctor",
             Self::Task(_) => "task",
+            Self::Capability(_) => "capability",
         };
         f.write_str(s)
     }
@@ -150,7 +219,16 @@ pub fn help() -> String {
          Commands:\n  \
            version   Print the version and exit\n  \
            doctor    Report this build: capabilities, config, storage\n  \
-           task      Manage tasks through the local daemon\n\
+           task      Manage tasks through the local daemon\n  \
+           capability\n             Invoke a capability through the governed dispatcher\n\
+         \n\
+         Capability verbs:\n\
+           run     --capability <ID> [--params <JSON>] [--target <T>] [--approval <JSON>]\n\
+           approve --capability <ID> [--params <JSON>] [--target <T>] [--ttl-ms <N>]\n\
+         \n\
+         A High-risk capability needs an approval for its exact parameters:\n\
+           APPROVAL=$(orxnuctl capability approve --capability <ID> --params <JSON>)\n\
+           orxnuctl capability run --capability <ID> --params <JSON> --approval \"$APPROVAL\"\n\
          \n\
          Task commands accept --endpoint <PATH> to reach a daemon that is not\n\
          on the default state root.\n\
@@ -206,6 +284,13 @@ where
                     endpoint: endpoint.map(Into::into),
                 })
             }
+            "capability" => {
+                let (command, endpoint) = parse_capability(rest)?;
+                Ok(Invocation {
+                    command: Command::Capability(command),
+                    endpoint: endpoint.map(Into::into),
+                })
+            }
             "--help" | "-h" | "help" => Err(CliError::MissingCommand("--help".to_owned())),
             other => Err(CliError::UnknownCommand(other.to_owned())),
         },
@@ -225,7 +310,7 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
     let Some((verb, rest)) = rest.split_first() else {
         return Err(CliError::MissingFlag {
             command: "task",
-            flag: "a command: create, list, claim or complete",
+            flag: "a command: create, list, claim, complete or cancel",
         });
     };
     let mut flags = Flags::parse(verb, rest)?;
@@ -266,6 +351,72 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
         other => return Err(CliError::UnknownTaskCommand(other.to_owned())),
     };
     Ok((command, endpoint))
+}
+
+/// Parses the arguments after `capability`.
+fn parse_capability(args: &[String]) -> Result<(CapabilityCommand, Option<String>), CliError> {
+    let (endpoint, rest) = lift_endpoint(args)?;
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(CliError::MissingFlag {
+            command: "capability",
+            flag: "a command: run",
+        });
+    };
+    let mut flags = Flags::parse(verb, rest)?;
+    if endpoint.is_some() && flags.take_optional("--endpoint").is_some() {
+        return Err(CliError::RepeatedFlag { flag: "--endpoint" });
+    }
+    match verb.as_str() {
+        "run" => {
+            // Generic on purpose: the CLI names no capability and holds no parameter
+            // schema, so adding a capability needs no change here — and cannot, since
+            // holding a schema would make this a second definition of what a capability
+            // accepts. The daemon validates.
+            let capability = flags.take("run", "--capability")?;
+            let params = flags.take("run", "--params")?;
+            let target = flags.take_optional("--target");
+            let approval = flags.take_optional("--approval");
+            flags.reject_all("run")?;
+            Ok((
+                CapabilityCommand::Run {
+                    capability,
+                    params,
+                    target,
+                    approval,
+                },
+                endpoint,
+            ))
+        }
+        "approve" => {
+            let capability = flags.take("approve", "--capability")?;
+            let params = flags.take("approve", "--params")?;
+            let target = flags.take_optional("--target");
+            let ttl_ms = match flags.take_optional("--ttl-ms") {
+                None => None,
+                Some(text) => {
+                    Some(
+                        text.parse::<i64>()
+                            .map_err(|_| CliError::UnusableFlagValue {
+                                flag: "--ttl-ms",
+                                value: text,
+                                why: "must be a whole number of milliseconds".to_owned(),
+                            })?,
+                    )
+                }
+            };
+            flags.reject_all("approve")?;
+            Ok((
+                CapabilityCommand::Approve {
+                    capability,
+                    params,
+                    target,
+                    ttl_ms,
+                },
+                endpoint,
+            ))
+        }
+        other => Err(CliError::UnknownCapabilityCommand(other.to_owned())),
+    }
 }
 
 /// Removes every `--endpoint` from `args`, returning it and what is left.
@@ -318,7 +469,25 @@ impl Flags {
     fn parse(verb: &str, args: &[String]) -> Result<Self, CliError> {
         // `--endpoint` is absent on purpose: `lift_endpoint` has already removed it,
         // so seeing one here would mean the same flag was accepted twice.
-        const KNOWN: [&str; 3] = ["--id", "--kind", "--worker"];
+        // The CLI's entire flag vocabulary, in one place so "which flags exist at all"
+        // has a single answer. Which of them any given verb accepts is a separate
+        // question, answered by what that verb `take`s and by `reject_all` refusing
+        // whatever is left -- so `task create --target x` parses here and is then
+        // refused by the verb, rather than being invisible to the task parser.
+        const KNOWN: [&str; 8] = [
+            "--id",
+            "--kind",
+            "--worker",
+            "--capability",
+            "--params",
+            // Part of the tuple an approval commits to, so it is carried rather than
+            // derived: an approval for one target must not carry to another.
+            "--target",
+            // An approval produced by `capability approve`, carried verbatim. The daemon
+            // recomputes its digest, so holding one grants nothing by itself.
+            "--approval",
+            "--ttl-ms",
+        ];
 
         let mut values: Vec<(&'static str, String)> = Vec::new();
         let mut bare: Vec<String> = Vec::new();
@@ -451,8 +620,13 @@ pub struct DoctorReport {
     pub cli_version: &'static str,
     /// The local protocol version this build speaks.
     pub protocol_version: u16,
-    /// How many capabilities are enabled. Always zero in Phase 1.
-    pub enabled_capabilities: usize,
+    /// How many capabilities the daemon reports as enabled.
+    ///
+    /// `None` when no daemon was reachable. This used to be a hard-coded `0`, which was
+    /// true while the build shipped nothing and became a lie the moment it shipped
+    /// something — a `doctor` that reports a number it cannot observe is worse than one
+    /// that admits it does not know.
+    pub enabled_capabilities: Option<usize>,
     /// Whether the audit chain is wired.
     pub audit_wired: bool,
     /// Whether the store is wired.
@@ -468,28 +642,38 @@ impl DoctorReport {
         let mut s = String::new();
         s.push_str(&format!("{} {}\n", PROGRAM, self.cli_version));
         s.push_str(&format!("local protocol: {}\n", self.protocol_version));
-        s.push_str(&format!(
-            "capabilities enabled: {}\n",
-            self.enabled_capabilities
-        ));
+        match self.enabled_capabilities {
+            Some(n) => s.push_str(&format!("capabilities enabled: {n}\n")),
+            None => s.push_str("capabilities enabled: unknown (no daemon reachable)\n"),
+        }
         s.push_str(&format!("store wired: {}\n", self.store_wired));
         s.push_str(&format!("audit wired: {}\n", self.audit_wired));
         s.push_str(&format!("commands: {}\n", self.commands.join(", ")));
-        s.push_str("\nNo capability is enabled. This is the expected Phase 1 state.\n");
+        s.push_str(
+            "\nCapability state is the daemon's to report; this build asks it when one \
+             is running.\n",
+        );
         s
     }
 }
 
-/// The report for this build.
+/// The report for this build, with no daemon observation.
 ///
-/// Reports from the CLI's own knowledge, not by starting a daemon: `doctor` must
-/// work when nothing is running, which is exactly when a user runs it.
+/// Reports from the CLI's own knowledge and never starts a daemon: `doctor` must work
+/// when nothing is running, which is exactly when a user runs it. `main` fills in
+/// [`DoctorReport::enabled_capabilities`] when a daemon does answer.
 #[must_use]
 pub fn doctor() -> DoctorReport {
+    doctor_with(None)
+}
+
+/// [`doctor`], with the enabled-capability count a running daemon reported.
+#[must_use]
+pub fn doctor_with(enabled_capabilities: Option<usize>) -> DoctorReport {
     DoctorReport {
         cli_version: CLI_VERSION,
         protocol_version: PROTOCOL_VERSION.as_u16(),
-        enabled_capabilities: 0,
+        enabled_capabilities,
         audit_wired: true,
         store_wired: true,
         commands: vec![
@@ -499,6 +683,8 @@ pub fn doctor() -> DoctorReport {
             "task list",
             "task claim",
             "task complete",
+            "task cancel",
+            "capability run",
         ],
     }
 }
@@ -593,11 +779,32 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_zero_enabled_capabilities() {
+    fn doctor_admits_when_it_cannot_see_the_daemon() {
+        // Was `capabilities enabled: 0`, asserted as a fact. It was true while nothing
+        // shipped and became false the moment something did, which is exactly the kind
+        // of stale claim `doctor` is run to disprove.
         let r = doctor();
-        assert_eq!(r.enabled_capabilities, 0);
-        assert!(r.render().contains("capabilities enabled: 0"));
-        assert!(r.render().contains("expected Phase 1 state"));
+        assert_eq!(r.enabled_capabilities, None);
+        assert!(
+            r.render().contains("unknown (no daemon reachable)"),
+            "{}",
+            r.render()
+        );
+        assert!(
+            !r.render().contains("No capability is enabled"),
+            "a stale Phase-1 claim must not survive: {}",
+            r.render()
+        );
+    }
+
+    #[test]
+    fn doctor_reports_the_count_a_daemon_gave_it() {
+        let r = doctor_with(Some(3));
+        assert!(
+            r.render().contains("capabilities enabled: 3"),
+            "{}",
+            r.render()
+        );
     }
 
     #[test]
@@ -611,7 +818,9 @@ mod tests {
                 "task create",
                 "task list",
                 "task claim",
-                "task complete"
+                "task complete",
+                "task cancel",
+                "capability run",
             ],
             "doctor must not list a command that does not parse"
         );
@@ -638,6 +847,8 @@ mod tests {
             vec!["task", "list"],
             vec!["task", "claim", "--id", "x", "--worker", "w"],
             vec!["task", "complete", "--id", "x", "--worker", "w"],
+            vec!["task", "cancel", "--id", "x"],
+            vec!["capability", "run", "--capability", "x", "--params", "{}"],
         ];
         assert_eq!(
             invocations.len(),
@@ -700,6 +911,28 @@ mod tests {
                 worker: "w1".to_owned(),
             })
         );
+        assert_eq!(
+            parse(["task", "cancel", "--id", "t1"])
+                .expect("parses")
+                .command,
+            Command::Task(TaskCommand::Cancel {
+                id: "t1".to_owned(),
+            }),
+            "cancel takes no worker: the engine does not want one"
+        );
+    }
+
+    #[test]
+    fn cancel_does_not_accept_a_worker() {
+        // The asymmetry with `complete` is deliberate. Cancellation decides about the
+        // task and clears its lease; completion reports from a lease holder and is
+        // fenced by it. Accepting a worker here would suggest cancel is fenced too.
+        let err =
+            parse(["task", "cancel", "--id", "t1", "--worker", "w"]).expect_err("must refuse");
+        assert!(
+            matches!(&err, CliError::UnknownFlag { flag, .. } if flag == "--worker"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -728,6 +961,7 @@ mod tests {
             (["task", "claim", "--id", "t"].as_slice(), "--worker"),
             (["task", "claim", "--worker", "w"].as_slice(), "--id"),
             (["task", "complete", "--id", "t"].as_slice(), "--worker"),
+            (["task", "cancel"].as_slice(), "--id"),
         ] {
             let err = parse(args.to_vec()).expect_err("must refuse");
             assert!(
@@ -780,7 +1014,7 @@ mod tests {
             "{err:?}"
         );
         let rendered = err.to_string();
-        for expected in ["create", "list", "claim", "complete"] {
+        for expected in ["create", "list", "claim", "complete", "cancel"] {
             assert!(
                 rendered.contains(expected),
                 "the refusal must say what exists: {rendered}"

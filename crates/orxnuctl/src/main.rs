@@ -16,7 +16,18 @@ use std::process::ExitCode;
 
 use orxnuctl::CliError;
 use orxnuctl::client::Client;
-use orxnuctl::{Command, doctor, help, parse, task, version_line};
+use orxnuctl::{Command, help, parse, task, version_line};
+
+/// The one place the endpoint is decided, so no command body can forget the override.
+///
+/// `None` means the daemon's own default derivation, computed by the same function it
+/// uses — so a client cannot end up looking somewhere the daemon is not.
+fn client_for(endpoint: &Option<std::path::PathBuf>) -> Client {
+    match endpoint {
+        Some(path) => Client::new(path.clone()),
+        None => Client::with_default_endpoint(),
+    }
+}
 
 fn main() -> ExitCode {
     match parse(std::env::args().skip(1)) {
@@ -26,17 +37,78 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Command::Doctor => {
-                print!("{}", doctor().render());
+                // Ask a daemon if one answers, and say so plainly if not. Starting one
+                // to find out would be absurd, so `doctor` never spawns.
+                let client = client_for(&invocation.endpoint);
+                let observed = client
+                    .call("capability/list", serde_json::json!({}))
+                    .ok()
+                    .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_u64))
+                    .and_then(|n| usize::try_from(n).ok());
+                print!("{}", orxnuctl::doctor_with(observed).render());
                 ExitCode::SUCCESS
+            }
+            Command::Capability(ref capability) => {
+                let client = client_for(&invocation.endpoint);
+                match capability {
+                    orxnuctl::CapabilityCommand::Run {
+                        capability,
+                        params,
+                        target,
+                        approval,
+                    } => {
+                        match task::run_capability(
+                            capability,
+                            params,
+                            target.as_deref(),
+                            approval.as_deref(),
+                            &client,
+                        ) {
+                            Ok((output, succeeded)) => {
+                                print!("{output}");
+                                if succeeded {
+                                    ExitCode::SUCCESS
+                                } else {
+                                    ExitCode::FAILURE
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("{}", task::describe_refusal(&e));
+                                ExitCode::FAILURE
+                            }
+                        }
+                    }
+                    orxnuctl::CapabilityCommand::Approve {
+                        capability,
+                        params,
+                        target,
+                        ttl_ms,
+                    } => match task::approve_capability(
+                        capability,
+                        params,
+                        target.as_deref(),
+                        *ttl_ms,
+                        &client,
+                    ) {
+                        Ok(text) => {
+                            // To stdout and nothing else: the output is an artefact meant
+                            // for another command's `--approval`, so any commentary here
+                            // would have to be stripped by the next shell.
+                            println!("{text}");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("{}", task::describe_refusal(&e));
+                            ExitCode::FAILURE
+                        }
+                    },
+                }
             }
             Command::Task(ref verb) => {
                 // The one place the endpoint is decided, so no command body can
                 // forget the override. `None` means the daemon's own default
                 // derivation, computed by the same function it uses.
-                let client = match invocation.endpoint {
-                    Some(path) => Client::new(path),
-                    None => Client::with_default_endpoint(),
-                };
+                let client = client_for(&invocation.endpoint);
                 match task::run(verb, &client) {
                     Ok(output) => {
                         print!("{output}");

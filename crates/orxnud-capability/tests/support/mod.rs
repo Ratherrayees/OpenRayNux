@@ -85,6 +85,7 @@ impl Verifier for ModeVerifier {
     fn verify(
         &self,
         execution: &ExecutionOutcome,
+        _params: &serde_json::Value,
         _at_ms: i64,
     ) -> Result<VerificationOutcome, VerifyError> {
         // A verifier that ignored the execution outcome could confirm an effect that
@@ -112,9 +113,10 @@ impl<A: CapabilityAdapter + 'static> Verifier for Bundle<A> {
     fn verify(
         &self,
         execution: &ExecutionOutcome,
+        params: &serde_json::Value,
         at_ms: i64,
     ) -> Result<VerificationOutcome, VerifyError> {
-        ModeVerifier(self.mode).verify(execution, at_ms)
+        ModeVerifier(self.mode).verify(execution, params, at_ms)
     }
 }
 

@@ -888,11 +888,19 @@ pub trait AdapterBundle {
     /// The adapter.
     fn adapter(&self) -> &dyn CapabilityAdapter;
 
-    /// The sandbox plan, for a Tier-1 adapter.
+    /// The sandbox plan for this invocation, for a Tier-1 adapter.
     ///
     /// `None` for Tier 0, and for a Tier-1 adapter it is a configuration error the
     /// dispatcher refuses rather than guessing.
-    fn sandbox_plan(&self) -> Option<SandboxPlan> {
+    ///
+    /// Takes the invocation because a Tier-1 adapter's `invoke` is **never called** —
+    /// the dispatcher executes the contract built from this plan instead — so this is
+    /// the only place a Tier-1 capability's parameters can reach its child. A plan
+    /// that ignored them would make every parameterised Tier-1 capability
+    /// unimplementable, or worse, implementable only by smuggling data through the
+    /// credential environment variable, which is for credentials and is redacted
+    /// accordingly.
+    fn sandbox_plan(&self, _invocation: &CapabilityInvocation) -> Option<SandboxPlan> {
         None
     }
 
@@ -1074,14 +1082,14 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
     /// runtime failure.
     fn contract_for(
         &self,
-        _invocation: &CapabilityInvocation,
+        invocation: &CapabilityInvocation,
         capability: &CapabilityId,
     ) -> Result<ExecutionContract, DispatchError> {
         let bundle = self
             .bundles
             .get(capability)
             .ok_or_else(|| DispatchError::NoImplementation(capability.clone()))?;
-        let sandboxed = bundle.sandbox_plan().ok_or_else(|| {
+        let sandboxed = bundle.sandbox_plan(invocation).ok_or_else(|| {
             DispatchError::SandboxRefused(SandboxRefusal {
                 capability: capability.clone(),
                 reason: "the adapter is Tier-1 but declares no sandbox plan".to_owned(),
@@ -1242,7 +1250,7 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
                 let plan_resources = self
                     .bundles
                     .get(&capability)
-                    .and_then(|b| b.sandbox_plan())
+                    .and_then(|b| b.sandbox_plan(&invocation))
                     .map(|p| p.resources)
                     .ok_or_else(|| {
                         DispatchError::SandboxRefused(SandboxRefusal {
@@ -1321,7 +1329,13 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
         // Distinct from execution, and evaluated even when the adapter reported
         // success. An adapter that returns `Ok` has said "I ran"; it has not said
         // "it worked".
-        let verification = match bundle.verifier().verify(&execution, now_ms) {
+        // The verifier gets the validated parameters, not just the adapter's output:
+        // without the input it could only check the adapter against itself. See
+        // `Verifier::verify`.
+        let verification = match bundle
+            .verifier()
+            .verify(&execution, invocation.params(), now_ms)
+        {
             Ok(v) => v,
             // A verifier that cannot run produces "undetermined", never "verified"
             // and never "refuted".

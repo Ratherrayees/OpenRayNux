@@ -170,6 +170,7 @@ impl Verifier for Confirming {
     fn verify(
         &self,
         execution: &ExecutionOutcome,
+        _params: &serde_json::Value,
         _at_ms: i64,
     ) -> Result<VerificationOutcome, VerifyError> {
         match execution {

@@ -89,13 +89,13 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             let reply = client.call("task/claim", json!({ "id": id, "worker": worker }))?;
             Ok(render_claim(&reply))
         }
-        TaskCommand::Cancel { id } => {
-            let reply = client.call("task/cancel", json!({ "id": id }))?;
-            Ok(render_cancel(&reply))
-        }
         TaskCommand::Complete { id, worker } => {
             let reply = client.call("task/complete", json!({ "id": id, "worker": worker }))?;
             Ok(render_task_field(&reply, "completed"))
+        }
+        TaskCommand::Cancel { id } => {
+            let reply = client.call("task/cancel", json!({ "id": id }))?;
+            Ok(render_cancel(&reply))
         }
     }
 }
@@ -261,6 +261,140 @@ fn scalar(v: &Value) -> String {
         Value::String(s) => s.replace(['\n', '\r'], " "),
         other => other.to_string(),
     }
+}
+
+/// Runs `capability run` and returns what to print.
+///
+/// # What the CLI does not decide
+///
+/// Whether the capability exists, is enabled, is granted, is permitted, needs an
+/// approval or has a credential is **entirely** the daemon's answer. This function
+/// builds a request from two strings and renders a reply; it holds no capability list,
+/// no risk table and no idea what any particular capability's parameters mean. That is
+/// what keeps "the CLI is not a second policy engine" structural rather than aspirational.
+///
+/// # Parameters are passed through verbatim
+///
+/// `--params` is forwarded as written and the *daemon* parses it. The CLI does not
+/// validate the JSON against a schema, because it has no schema and inventing one would
+/// be the second definition this design exists to avoid. A malformed value is the
+/// daemon's structured refusal to report.
+pub fn run_capability(
+    capability: &str,
+    params: &str,
+    target: Option<&str>,
+    approval: Option<&str>,
+    client: &Client,
+) -> Result<(String, bool), ClientError> {
+    let params: Value = serde_json::from_str(params).map_err(|e| ClientError::InvalidParams {
+        detail: format!("`--params` is not valid JSON: {e}"),
+    })?;
+    // Parsed here so a malformed approval is a local, explanatory error rather than a
+    // round trip that fails somewhere inside the daemon. It is still untrusted: the
+    // daemon recomputes the digest from the parameters it is about to run.
+    let approval: Option<Value> = match approval {
+        None => None,
+        Some(text) => Some(
+            serde_json::from_str(text).map_err(|e| ClientError::InvalidParams {
+                detail: format!("`--approval` is not valid JSON: {e}"),
+            })?,
+        ),
+    };
+    client.negotiate()?;
+
+    let mut payload = json!({ "capability": capability, "params": params });
+    if let Some(t) = target {
+        payload["target"] = json!(t);
+    }
+    if let Some(a) = approval {
+        payload["approval"] = a;
+    }
+    let reply = client.call("capability/dispatch", payload)?;
+
+    // The exit status follows the **daemon's** verdict rather than anything decided
+    // here. Reporting exit 0 for an execution that failed or was never verified would
+    // make a script believe a capability ran when it did not, which is the failure mode
+    // the whole verification stage exists to prevent. This is not a policy judgement:
+    // the server already decided, and this only propagates what it said.
+    // `failure` is always present in the reply and is null when there is none, so the
+    // test is for a non-null value rather than for the key being absent.
+    let succeeded = reply.get("verified").and_then(Value::as_bool) == Some(true)
+        && reply.get("failure").is_none_or(Value::is_null);
+    Ok((render_capability(capability, &reply), succeeded))
+}
+
+/// Asks the daemon for an approval of one proposed operation.
+///
+/// Returns the approval object as JSON text, which is what `--approval` on
+/// [`run_capability`] takes. Deliberately not interpreted here: the client cannot
+/// evaluate a digest it has no business computing, and printing a decoded digest would
+/// invite someone to hand-assemble one. The object is carried, not understood.
+///
+/// Nothing is granted by this. The daemon consults no policy and touches no ledger; the
+/// result is an artefact whose digest the dispatcher will later recompute from the
+/// action it is actually about to run.
+pub fn approve_capability(
+    capability: &str,
+    params: &str,
+    target: Option<&str>,
+    ttl_ms: Option<i64>,
+    client: &Client,
+) -> Result<String, ClientError> {
+    let params: Value = serde_json::from_str(params).map_err(|e| ClientError::InvalidParams {
+        detail: format!("`--params` is not valid JSON: {e}"),
+    })?;
+    client.negotiate()?;
+
+    let mut payload = json!({ "capability": capability, "params": params });
+    if let Some(t) = target {
+        payload["target"] = json!(t);
+    }
+    if let Some(ttl) = ttl_ms {
+        payload["ttl_ms"] = json!(ttl);
+    }
+    let reply = client.call("capability/approve", payload)?;
+
+    let approval = reply.get("approval").ok_or_else(|| {
+        ClientError::Malformed("the daemon's approval reply carried no `approval` field".to_owned())
+    })?;
+    // Round-tripped rather than concatenated, so the text handed to `--approval` is
+    // exactly the structure the daemon produced.
+    serde_json::to_string_pretty(approval)
+        .map_err(|e| ClientError::Malformed(format!("the approval could not be re-rendered: {e}")))
+}
+
+/// Renders a `capability/dispatch` reply.
+///
+/// The three verification states are printed distinctly, because they are not the same
+/// answer: `verified` means an independent check agreed, `refuted` means it disagreed,
+/// and `undetermined` means nobody could tell. Collapsing them into a boolean would
+/// discard the distinction the pipeline exists to preserve.
+///
+/// No policy internals, no approval internals and no audit hashes are printed — none of
+/// them are in the reply, and inventing them for display would mean the CLI
+/// reconstructing server-side state.
+fn render_capability(capability: &str, reply: &Value) -> String {
+    let mut out = format!("capability: {capability}\n");
+    let flag = |k: &str| reply.get(k).and_then(Value::as_bool).unwrap_or(false);
+    out.push_str(&format!("verified: {}\n", flag("verified")));
+    if flag("undetermined") {
+        out.push_str("undetermined: true\n");
+    }
+    if flag("refuted") {
+        out.push_str("refuted: true\n");
+    }
+    // A failed execution's own reason, which is where a rejected parameter shows up.
+    // Reported separately from the verdict so "your input was wrong" is not reported
+    // as "the effect was disproved".
+    if let Some(reason) = reply.get("failure").and_then(Value::as_str) {
+        out.push_str(&format!("failure: {reason}\n"));
+    }
+    if let Some(Value::Object(fields)) = reply.get("result") {
+        for (key, value) in fields {
+            out.push_str(&format!("{key}: {}\n", scalar(value)));
+        }
+    }
+    out
 }
 
 /// Turns a refusal into the line a user reads.

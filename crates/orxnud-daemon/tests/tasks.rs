@@ -691,15 +691,33 @@ fn task_management_is_not_a_capability_invocation() {
         let listed = send(&s.endpoint, "2", "task/list", json!({}));
         assert_eq!(listed["result"]["count"], 1);
 
-        // And no *task* capability exists: task management must not have registered
-        // itself as an adapter to get here.
+        // And no *task* capability exists. The registry is no longer empty — this
+        // build ships `text/word-count` — so the assertion is now the sharper one: the
+        // capability set contains nothing whose name suggests tasks, and task
+        // management did not smuggle itself in as an adapter.
         let caps = send(&s.endpoint, "3", "capability/list", json!({}));
+        let mut ids: Vec<&str> = caps["result"]["capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| v.as_str().expect("id"))
+            .collect();
+        ids.sort_unstable();
+        // Exactly the shipped set. The point of this test is that *no* capability id
+        // mentions a task -- task methods are not capability invocations -- and that
+        // holds whatever the set contains, so the assertion is the set rather than a
+        // count.
         assert_eq!(
-            caps["result"]["capabilities"].as_array().map(Vec::len),
-            Some(0),
-            "task management must not register a capability"
+            ids,
+            vec!["filesystem/write-text", "text/word-count"],
+            "only the shipped capabilities exist"
         );
-        assert_eq!(caps["result"]["enabled"], 0);
+        for id in &ids {
+            assert!(
+                !id.contains("task"),
+                "task management must not register a capability: {id}"
+            );
+        }
 
         // The governed path is unchanged: still refuses, still for its own reason.
         let dispatched = send(

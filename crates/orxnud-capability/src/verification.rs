@@ -126,9 +126,22 @@ impl VerificationOutcome {
 pub trait Verifier {
     /// Checks whether the intended effect actually occurred.
     ///
-    /// Receives the execution outcome, because verification is meaningless without
+    /// /// Receives the execution outcome, because verification is meaningless without
     /// it: if nothing ran, there is nothing to confirm, and a verifier that returns
     /// `Verified` for a `Failed` execution is itself broken.
+    ///
+    /// Receives the invocation's **validated parameters** as well, and that is not a
+    /// convenience. A verifier is independent only if it can reach an expected answer
+    /// by a route the adapter did not take; for a capability whose entire effect is a
+    /// deterministic function of its input, the only such route is to compute the
+    /// answer again from the input and compare. Without the parameters a verifier can
+    /// do nothing but inspect the adapter's own output — the adapter marking its own
+    /// homework — and would return `Verified` for any well-formed output, including a
+    /// wrong one.
+    ///
+    /// The parameters reach here already validated and normalised by policy, so a
+    /// verifier never parses untrusted input; and they come from the invocation's
+    /// actor-free view, so nothing here can learn *who* asked.
     ///
     /// # Errors
     ///
@@ -138,6 +151,7 @@ pub trait Verifier {
     fn verify(
         &self,
         execution: &ExecutionOutcome,
+        params: &serde_json::Value,
         at_ms: i64,
     ) -> Result<VerificationOutcome, VerifyError>;
 }
@@ -225,6 +239,7 @@ mod tests {
         fn verify(
             &self,
             execution: &ExecutionOutcome,
+            _params: &serde_json::Value,
             _at_ms: i64,
         ) -> Result<VerificationOutcome, VerifyError> {
             // Proves the verifier actually reads the execution outcome: for a failed
@@ -245,12 +260,20 @@ mod tests {
     fn a_verifier_sees_the_execution_outcome() {
         let v = AlwaysRefutes;
         let out = v
-            .verify(&ExecutionOutcome::Succeeded { output: None }, 0)
+            .verify(
+                &ExecutionOutcome::Succeeded { output: None },
+                &serde_json::json!({}),
+                0,
+            )
             .expect("verify");
         assert!(out.is_refuted());
 
         let out = v
-            .verify(&ExecutionOutcome::Failed { detail: "d".into() }, 0)
+            .verify(
+                &ExecutionOutcome::Failed { detail: "d".into() },
+                &serde_json::json!({}),
+                0,
+            )
             .expect("verify");
         assert!(out.is_undetermined(), "a failed run has nothing to verify");
     }

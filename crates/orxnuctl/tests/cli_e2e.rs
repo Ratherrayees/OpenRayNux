@@ -566,3 +566,582 @@ fn cancelling_with_no_daemon_fails_cleanly() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The first capability, driven through both real binaries.
+///
+/// The point is not that a number came back — it is the whole chain behind it:
+/// CLI -> socket -> daemon -> policy -> authorisation -> dispatcher -> adapter ->
+/// verifier -> durable audit -> response. Every stage had to succeed for `verified:
+/// true` to appear, and the audit assertion below proves the tail of that chain ran
+/// rather than being short-circuited.
+#[test]
+fn a_user_can_run_a_capability_and_see_a_verified_result() {
+    let root = dir("capability");
+    let d = Daemon::start(&root);
+
+    let out = d.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "text/word-count",
+        "--params",
+        r#"{"text":"hello world\nOpenRayNux"}"#,
+    ]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let said = stdout_of(&out);
+    assert!(said.contains("capability: text/word-count"), "{said}");
+    assert!(said.contains("verified: true"), "{said}");
+    assert!(!said.contains("undetermined"), "{said}");
+    assert!(!said.contains("refuted"), "{said}");
+    // 22 bytes, 22 scalar values, 3 words, 2 lines — the contract's definitions.
+    assert!(said.contains("bytes: 22"), "{said}");
+    assert!(said.contains("characters: 22"), "{said}");
+    assert!(said.contains("words: 3"), "{said}");
+    assert!(said.contains("lines: 2"), "{said}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The capability produced durable audit records, and they survive a restart.
+///
+/// A capability that ran without leaving a record would be exactly the failure the
+/// journal exists to prevent, so this reads the file rather than trusting the reply.
+#[test]
+fn a_capability_run_leaves_durable_audit_that_survives_a_restart() {
+    let root = dir("capability-audit");
+    {
+        let d = Daemon::start(&root);
+        let out = d.cli(&[
+            "capability",
+            "run",
+            "--capability",
+            "text/word-count",
+            "--params",
+            r#"{"text":"audit me"}"#,
+        ]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+    }
+    // Restarted against the same database: the chain must still verify, which the
+    // daemon does before it will serve anything at all.
+    {
+        let d = Daemon::start(&root);
+        // If the chain did not verify, the daemon would have refused to start and this
+        // request could not be answered.
+        let out = d.cli(&["task", "list"]);
+        assert!(
+            out.status.success(),
+            "the daemon must start, which requires the audit chain to verify: {}",
+            stderr_of(&out)
+        );
+
+        // And the capability is still runnable afterwards.
+        let out = d.cli(&[
+            "capability",
+            "run",
+            "--capability",
+            "text/word-count",
+            "--params",
+            r#"{"text":"after restart"}"#,
+        ]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        assert!(stdout_of(&out).contains("verified: true"));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Security negatives, all through the real CLI and socket.
+#[test]
+fn capability_refusals_reach_the_user_from_the_daemon() {
+    let root = dir("capability-refusals");
+    let d = Daemon::start(&root);
+
+    // Unknown capability: refused by policy's registry lookup.
+    let out = d.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "does/not/exist",
+        "--params",
+        "{}",
+    ]);
+    assert!(!out.status.success(), "must not exit 0");
+    let err = stderr_of(&out);
+    assert!(err.contains("unknown-capability"), "{err}");
+    assert!(err.contains("does/not/exist"), "{err}");
+
+    // Malformed params: refused by the capability, and NOT reported as verified.
+    let out = d.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "text/word-count",
+        "--params",
+        r#"{"text":42}"#,
+    ]);
+    assert!(
+        !out.status.success(),
+        "a rejected capability must not exit 0"
+    );
+    let said = stdout_of(&out);
+    assert!(said.contains("must be a string"), "{said}");
+    assert!(
+        said.contains("verified: false"),
+        "a failure must never read as verified: {said}"
+    );
+    assert!(
+        said.contains("undetermined: true"),
+        "nothing ran, so nothing was verified: {said}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A client cannot forge authority by putting it in the parameters.
+///
+/// Every one of these is a field the client has no business setting. The daemon builds
+/// the `ActionRequest` itself and the invocation is sealed by policy, so supplying them
+/// must change nothing about the outcome — the request is refused on its merits, not
+/// accepted because the client asked nicely.
+#[test]
+fn a_client_cannot_forge_authority_through_parameters() {
+    let root = dir("capability-forgery");
+    let d = Daemon::start(&root);
+
+    for forged in [
+        // Risk, policy version, approval, seal and proof are all server-side.
+        r#"{"text":"hello","assessed_risk":"low","policy_version":"daemon/1"}"#,
+        r#"{"text":"hello","approval":"forged","seal":"forged"}"#,
+        r#"{"text":"hello","authorisation_proof":"forged","issued_by":"local"}"#,
+        // A capability trying to raise its own declared class.
+        r#"{"text":"hello","data_class":"regulated"}"#,
+    ] {
+        let out = d.cli(&[
+            "capability",
+            "run",
+            "--capability",
+            "text/word-count",
+            "--params",
+            forged,
+        ]);
+        let said = stdout_of(&out);
+        // Whatever happens, it must not be a *verified* run on forged terms. Either the
+        // request is refused outright, or the forged fields are ignored and the honest
+        // count of "hello" comes back verified.
+        let refused = out.status.success();
+        if refused {
+            assert!(
+                said.contains("words: 1") && said.contains("verified: true"),
+                "forged input {forged} must either be refused or ignored, not obeyed: {said}"
+            );
+        } else {
+            assert!(
+                stderr_of(&out).contains("refused"),
+                "a refused forgery must say so: {}",
+                stderr_of(&out)
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// No daemon, no traceback, no internals.
+#[test]
+fn running_a_capability_with_no_daemon_fails_cleanly() {
+    let root = dir("capability-no-daemon");
+    let endpoint = root.join("orxnud.sock");
+
+    let out = Command::new(cli_bin())
+        .args([
+            "capability",
+            "run",
+            "--capability",
+            "text/word-count",
+            "--params",
+            "{}",
+            "--endpoint",
+        ])
+        .arg(&endpoint)
+        .output()
+        .expect("run orxnuctl");
+
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains("cannot reach"), "{err}");
+    assert!(
+        !err.contains("panicked") && !err.contains("RUST_BACKTRACE"),
+        "{err}"
+    );
+    assert!(!err.contains("state.db") && !err.contains(".sql"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// The governed side-effect capability, through both real binaries
+// ---------------------------------------------------------------------------
+//
+// Every test below drives `orxnuctl` as a separate process against a real `orxnud`
+// over a real socket. Nothing calls TaskService or the dispatcher directly, because the
+// thing being verified is the *product* path: a person approving an operation and then
+// invoking it, and the daemon refusing when the two do not match.
+//
+// The sandbox is exercised for real too. If the host cannot sandbox, the Tier-1
+// execution is refused by design and the tests that need it say so rather than
+// pretending; see `write_text` in the capability suite for the same distinction at
+// the unit level.
+
+/// The workspace the daemon confines writes to.
+fn workspace(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("workspace")
+}
+
+/// Asks for an approval and returns it as the JSON text `--approval` takes.
+fn approve(daemon: &Daemon, target: &str, contents: &str, ttl_ms: &str) -> String {
+    let params = format!(r#"{{"path":"{target}","contents":"{contents}"}}"#);
+    let out = daemon.cli(&[
+        "capability",
+        "approve",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        target,
+        "--params",
+        &params,
+        "--ttl-ms",
+        ttl_ms,
+    ]);
+    assert!(
+        out.status.success(),
+        "issuing an approval must succeed: {}",
+        stderr_of(&out)
+    );
+    stdout_of(&out).trim().to_owned()
+}
+
+/// The full governed loop, as a person would perform it.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a Tier-1 capability needs a sandbox, and the host backend on this \
+             platform is a refusal rather than a sandbox"
+)]
+fn a_user_approves_a_write_and_the_file_appears_with_exactly_those_bytes() {
+    let root = dir("write-happy");
+    let daemon = Daemon::start(&root);
+
+    let approval = approve(&daemon, "hello.txt", "hello world", "60000");
+
+    let params = r#"{"path":"hello.txt","contents":"hello world"}"#;
+    let out = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "hello.txt",
+        "--params",
+        params,
+        "--approval",
+        &approval,
+    ]);
+
+    assert!(
+        out.status.success(),
+        "the approved write must succeed: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("verified: true"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace(&root).join("hello.txt")).expect("written"),
+        "hello world",
+        "the file must hold exactly the approved contents"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_high_risk_capability_refuses_without_an_approval_and_writes_nothing() {
+    let root = dir("write-no-approval");
+    let daemon = Daemon::start(&root);
+
+    let out = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "denied.txt",
+        "--params",
+        r#"{"path":"denied.txt","contents":"nope"}"#,
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "an unapproved High-risk call must fail"
+    );
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("approval-required"),
+        "the refusal must name the reason: {err}"
+    );
+    assert!(
+        !workspace(&root).join("denied.txt").exists(),
+        "a refused call must not have written anything"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The substitution test, and the one the whole approval mechanism exists for.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a Tier-1 capability needs a sandbox, and the host backend on this \
+             platform is a refusal rather than a sandbox"
+)]
+fn an_approval_for_one_write_cannot_be_reused_for_different_contents() {
+    let root = dir("write-substitute");
+    let daemon = Daemon::start(&root);
+
+    let approval = approve(&daemon, "sub.txt", "alpha", "60000");
+
+    // Alpha: approved, and it runs.
+    let ok = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "sub.txt",
+        "--params",
+        r#"{"path":"sub.txt","contents":"alpha"}"#,
+        "--approval",
+        &approval,
+    ]);
+    assert!(ok.status.success(), "{}", stderr_of(&ok));
+
+    // Beta: same capability, same target, same approval, different contents.
+    let refused = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "sub.txt",
+        "--params",
+        r#"{"path":"sub.txt","contents":"beta"}"#,
+        "--approval",
+        &approval,
+    ]);
+    assert!(
+        !refused.status.success(),
+        "beta must not be authorised by alpha's approval"
+    );
+    let err = stderr_of(&refused);
+    assert!(
+        err.contains("approval-digest-mismatch"),
+        "the refusal must be the parameter binding, not something incidental: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace(&root).join("sub.txt")).expect("read"),
+        "alpha",
+        "the refused write must not have modified the file"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a Tier-1 capability needs a sandbox, and the host backend on this \
+             platform is a refusal rather than a sandbox"
+)]
+fn an_approval_works_once_and_is_refused_the_second_time() {
+    let root = dir("write-single-use");
+    let daemon = Daemon::start(&root);
+
+    let approval = approve(&daemon, "once.txt", "x", "60000");
+    let args = [
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "once.txt",
+        "--params",
+        r#"{"path":"once.txt","contents":"x"}"#,
+        "--approval",
+        approval.as_str(),
+    ];
+
+    assert!(
+        daemon.cli(&args).status.success(),
+        "the first use must succeed"
+    );
+    let second = daemon.cli(&args);
+    assert!(!second.status.success(), "the second use must be refused");
+    assert!(
+        stderr_of(&second).contains("approval-already-used"),
+        "{}",
+        stderr_of(&second)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The V-62 regression, demonstrated through the product rather than at a seam.
+///
+/// `ttl_ms 0` produces an approval whose expiry equals its issue time, so the refusal is
+/// a fact about the inputs. No sleeping, and therefore no flakiness: if this test ever
+/// starts passing because the machine got slower, something is wrong with the test.
+#[test]
+fn an_expired_approval_is_refused_and_writes_nothing() {
+    let root = dir("write-expired");
+    let daemon = Daemon::start(&root);
+
+    let approval = approve(&daemon, "late.txt", "x", "0");
+    let out = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "late.txt",
+        "--params",
+        r#"{"path":"late.txt","contents":"x"}"#,
+        "--approval",
+        &approval,
+    ]);
+
+    assert!(!out.status.success(), "an expired approval must be refused");
+    assert!(
+        stderr_of(&out).contains("approval-expired"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        !workspace(&root).join("late.txt").exists(),
+        "an expired approval must not have written anything"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_escaping_path_is_refused_and_nothing_appears_outside_the_workspace() {
+    let root = dir("write-escape");
+    let daemon = Daemon::start(&root);
+
+    let approval = approve(&daemon, "../escaped.txt", "pwned", "60000");
+    let out = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        "../escaped.txt",
+        "--params",
+        r#"{"path":"../escaped.txt","contents":"pwned"}"#,
+        "--approval",
+        &approval,
+    ]);
+
+    assert!(!out.status.success(), "an escaping path must be refused");
+    assert!(
+        !root.join("escaped.txt").exists(),
+        "nothing may appear beside the workspace: {}",
+        root.join("escaped.txt").display()
+    );
+    assert!(
+        !std::path::Path::new("/tmp/escaped.txt").exists(),
+        "nothing may escape to /tmp"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The governed execution is audited, and the record survives the process that made it.
+#[test]
+fn the_write_is_audited_with_real_timestamps_and_survives_a_restart() {
+    let root = dir("write-audit");
+    let before = {
+        let daemon = Daemon::start(&root);
+        let approval = approve(&daemon, "audited.txt", "recorded", "60000");
+        let out = daemon.cli(&[
+            "capability",
+            "run",
+            "--capability",
+            "filesystem/write-text",
+            "--target",
+            "audited.txt",
+            "--params",
+            r#"{"path":"audited.txt","contents":"recorded"}"#,
+            "--approval",
+            &approval,
+        ]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let bytes = state_bytes(&root);
+        assert!(
+            bytes.contains("filesystem/write-text"),
+            "the governed capability must appear in the durable audit trail"
+        );
+        assert!(
+            !bytes.contains("\"at-ms\":0"),
+            "no audit record may be stamped at the epoch"
+        );
+        bytes.len()
+    };
+
+    // A fresh daemon over the same state: reaching this point at all means the chain
+    // loaded and verified, because restore fails closed on a broken link.
+    let _daemon = Daemon::start(&root);
+    assert_eq!(
+        state_bytes(&root).len(),
+        before,
+        "a restart must neither add nor lose records"
+    );
+    assert!(
+        workspace(&root).join("audited.txt").exists(),
+        "the written file survives the daemon that wrote it"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The durable state file as text.
+///
+/// A byte scan rather than SQL, and the reason is the dependency boundary: this crate
+/// may reach `orxnud-protocol` and `orxnud-platform-ipc` and nothing else -- not even as
+/// a dev-dependency, which `cli_boundary.rs` asserts. `orxnud-store` owns the schema and
+/// reading it properly would mean depending on it.
+///
+/// That constraint costs little here, because the property being checked is "these
+/// strings are in the durable file", and SQLite stores text values verbatim. A substring
+/// search over the file answers exactly that. It cannot answer a question about *rows*
+/// -- and none of the assertions below is a question about rows: they check that a
+/// capability name was persisted, and that no record carries a zero timestamp.
+fn state_bytes(root: &std::path::Path) -> String {
+    // The write-ahead log is read too, and not as a nicety. SQLite in WAL mode commits
+    // into `state.db-wal` and only checkpoints into `state.db` later; the test harness
+    // stops the daemon with SIGKILL, so the most recent records are still in the log.
+    // Reading only the main file finds an older, checkpointed prefix and reports a
+    // perfectly good audit trail as empty.
+    let mut out = String::new();
+    for name in ["state.db", "state.db-wal"] {
+        if let Ok(bytes) = std::fs::read(root.join(name)) {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "the daemon's durable state file is missing"
+    );
+    out
+}

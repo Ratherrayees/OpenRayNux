@@ -281,7 +281,12 @@ fn the_declaration_only_points_are_named_explicitly() {
 struct Confirming;
 
 impl Verifier for Confirming {
-    fn verify(&self, _e: &ExecutionOutcome, _at: i64) -> Result<VerificationOutcome, VerifyError> {
+    fn verify(
+        &self,
+        _e: &ExecutionOutcome,
+        _params: &serde_json::Value,
+        _at: i64,
+    ) -> Result<VerificationOutcome, VerifyError> {
         Ok(VerificationOutcome::Verified {
             evidence: "contract fixture".into(),
         })

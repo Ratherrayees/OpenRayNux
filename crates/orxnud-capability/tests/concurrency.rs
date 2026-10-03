@@ -136,6 +136,7 @@ impl orxnud_capability::verification::Verifier for Confirm {
     fn verify(
         &self,
         _e: &ExecutionOutcome,
+        _params: &serde_json::Value,
         _at: i64,
     ) -> Result<
         orxnud_capability::verification::VerificationOutcome,

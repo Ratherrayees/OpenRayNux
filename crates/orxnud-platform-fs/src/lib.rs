@@ -198,6 +198,84 @@ impl FsContract for OsFs {
     }
 }
 
+/// Finds an executable named `stem` beside the running program.
+///
+/// # Why this lives here
+///
+/// Two questions have to be answered together and neither is portable: what a
+/// runnable file is *called* on this platform (`.exe` and friends), and whether a
+/// given file is runnable *at all* (an execute permission bit, which Unix has and
+/// Windows does not). Answering either in a portable crate would put an OS opinion
+/// outside the boundary this crate exists to hold, which is what gate G3 checks.
+///
+/// # Why beside the current program
+///
+/// A capability that needs a helper must find the one that was built alongside it,
+/// and the only reliable way to say "alongside" is relative to a known executable.
+/// An environment variable would be the alternative and is deliberately not offered:
+/// it would let whoever starts the process choose which program later runs, which is
+/// a redirection of the capability rather than a convenience.
+///
+/// # The second candidate
+///
+/// Cargo writes a package's binaries to `target/<profile>/` and its test harnesses to
+/// `target/<profile>/deps/` beneath it. So a production daemon looks beside itself,
+/// and a test binary has to look one level up. Both are tried; a caller cannot tell
+/// which situation it is in, and neither should have to.
+///
+/// # Nonexistence is not an error
+///
+/// A missing helper is reported as `None` so the caller can decide what it means.
+/// For `filesystem/write-text` it means the capability is simply not registered, and
+/// a dispatch names it as unimplemented — which is more useful than a sandbox failure
+/// at execution time naming a path.
+///
+/// [`std::path::PathBuf`]: std::path::PathBuf
+#[must_use]
+pub fn sibling_executable(stem: &str) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    // Both spellings, tried rather than chosen: asking the OS which suffix is
+    // correct is a question with no portable answer, and a wrong guess here would
+    // silently produce a capability that cannot run.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for dir in [dir.to_path_buf(), dir.parent()?.to_path_buf()] {
+        for name in [stem.to_owned(), format!("{stem}.exe")] {
+            candidates.push(dir.join(name));
+        }
+    }
+    candidates.into_iter().find(|c| is_runnable(c))
+}
+
+/// Whether the kernel would execute this path.
+///
+/// Executability, not existence, and the distinction is load-bearing: a build directory
+/// contains, beside each binary, a `.d` dep-info text file and an `.rmeta` metadata
+/// file whose names share the binary's prefix. A name-based filter matches those too,
+/// and the "executable" it returns is a few hundred bytes of text that cannot be run —
+/// which surfaces much later as a sandbox refusing to exec it.
+fn is_runnable(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Any execute bit, not the owner-only one: a binary built by another user and
+        // made group-executable is runnable, and refusing it would be surprising.
+        meta.permissions().mode() & 0o111 != 0
+    }
+    // Elsewhere, a regular file at a plausible path is the best answer available.
+    // Windows has no execute bit; the loader decides, and it will say so itself.
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

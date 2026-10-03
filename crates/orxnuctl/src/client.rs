@@ -66,6 +66,16 @@ pub enum ClientError {
     #[error("the daemon sent something this client cannot read: {0}")]
     Malformed(String),
 
+    /// The client could not build a valid request.
+    ///
+    /// Local, before anything is sent: `--params` that is not JSON is a typo, and
+    /// reporting it as a server refusal would send the user looking in the wrong place.
+    #[error("{detail}")]
+    InvalidParams {
+        /// What was wrong with the arguments.
+        detail: String,
+    },
+
     /// The daemon's protocol version is not one this build can speak.
     #[error("the daemon speaks protocol {daemon}, but this build speaks {client}")]
     VersionMismatch {
