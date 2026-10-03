@@ -209,6 +209,17 @@ pub struct Runtime<S: SecretsContract> {
     backend: &'static str,
     /// The endpoint removal to perform on shutdown, if any.
     cleanup: Option<PathBuf>,
+    /// The proposer this daemon asks.
+    ///
+    /// Owned per runtime rather than held in a process-wide slot. The slot was tried
+    /// first and it is wrong: it cannot be scoped against concurrency, so a test that
+    /// installed a deliberately malformed provider changed the answer for every other
+    /// test running at the same time — which the suite demonstrated by failing a test
+    /// that had nothing to do with it. A process-global mutable value is only safe when
+    /// there is exactly one value for the life of the process, and a test seam needs the
+    /// opposite. Per-runtime also makes the real thing simpler: two daemons in one process
+    /// can legitimately be configured differently.
+    proposer: Arc<dyn crate::proposer::ProposalProvider>,
 }
 
 impl<S: SecretsContract> std::fmt::Debug for Runtime<S> {
@@ -244,6 +255,19 @@ impl<S: SecretsContract> Runtime<S> {
     /// [`RuntimeError::Endpoint`] if the local transport cannot be bound. In every
     /// case **no endpoint is left behind**.
     pub async fn start(paths: Paths, secrets: S) -> Result<Self, RuntimeError> {
+        Self::start_with(paths, secrets, default_proposer()).await
+    }
+
+    /// Starts a runtime that asks `proposer`.
+    ///
+    /// The public form of the test seam: a caller supplies a provider and gets a daemon
+    /// that uses it, with no global state and nothing to clean up afterwards. Prefer
+    /// [`Runtime::with_proposer`] where a builder reads better.
+    pub async fn start_with(
+        paths: Paths,
+        secrets: S,
+        proposer: Arc<dyn crate::proposer::ProposalProvider>,
+    ) -> Result<Self, RuntimeError> {
         // 1 + 2 + 3. Durable security state, verified, attached.
         let mut daemon = Daemon::compose(paths.clone());
         daemon
@@ -273,7 +297,29 @@ impl<S: SecretsContract> Runtime<S> {
             governed: tokio::sync::Mutex::new((daemon, secrets, tasks)),
             backend: orxnud_platform_ipc::backend_name(),
             cleanup: Some(endpoint),
+            proposer,
         })
+    }
+
+    /// Returns this runtime with `proposer` as the proposer it asks.
+    ///
+    /// Available after [`Runtime::start`] because the proposer is only read while
+    /// serving, and the endpoint is already bound by then. Takes and returns `Self` so it
+    /// composes as `Runtime::start(..).await?.with_proposer(p)` without a mutable
+    /// borrow, which matters because `serve` consumes the runtime.
+    #[must_use]
+    pub fn with_proposer(mut self, proposer: Arc<dyn crate::proposer::ProposalProvider>) -> Self {
+        self.proposer = proposer;
+        self
+    }
+
+    /// The proposer this runtime asks.
+    ///
+    /// `pub` so a test can assert on the very provider a dispatch would use, rather than
+    /// on a copy of it.
+    #[must_use]
+    pub fn proposer(&self) -> &Arc<dyn crate::proposer::ProposalProvider> {
+        &self.proposer
     }
 
     /// The bound endpoint.
@@ -350,7 +396,7 @@ impl<S: SecretsContract> Runtime<S> {
                     // spawned task. The governed path is single-writer anyway, so
                     // overlapping connections would only queue on the same mutex --
                     // and handling them here means the loop cannot outlive `self`.
-                    let served = handle_connection(&mut stream, &self.governed).await;
+                    let served = handle_connection(&mut stream, &self.governed, &self.proposer).await;
                     if let Err(IpcError::Disconnected) = served {
                         // A client that opened and closed is not a failure, and
                         // neither is one that vanished while we were answering it.
@@ -412,6 +458,7 @@ impl Drop for EndpointRelease {
 async fn handle_connection<S: SecretsContract>(
     stream: &mut LocalStream,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
 ) -> Result<(), IpcError> {
     let bytes = match stream.read_line_bounded(MAX_REQUEST_BYTES).await {
         Ok(b) => b,
@@ -447,7 +494,7 @@ async fn handle_connection<S: SecretsContract>(
     };
 
     let id = request.id.clone();
-    let outcome = route(&request, governed).await;
+    let outcome = route(&request, governed, provider).await;
     let response = match outcome {
         Ok(result) => Response::ok(id, result),
         Err(e) => Response::err(id, e.to_rpc()),
@@ -506,6 +553,7 @@ fn extract_id(bytes: &[u8]) -> Option<RequestId> {
 async fn route<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
 ) -> Result<serde_json::Value, RequestError> {
     let Some(method) = Method::from_wire(&request.method) else {
         return Err(RequestError::UnknownMethod(request.method.clone()));
@@ -552,7 +600,7 @@ async fn route<S: SecretsContract>(
         // routed separately rather than through `tasks`: it needs the capability registry
         // and the sandbox backend, which `tasks` deliberately has no access to.
         Method::TaskExecute => execute_proposal(request, governed).await,
-        Method::TaskAiPropose => ai_propose(request, governed).await,
+        Method::TaskAiPropose => ai_propose(request, governed, provider).await,
     }
 }
 
@@ -588,6 +636,7 @@ fn local_actor() -> orxnud_domain::Actor {
 async fn ai_propose<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
     let task_id = required_str(&params, "task")?;
@@ -605,15 +654,50 @@ async fn ai_propose<S: SecretsContract>(
             .map_err(task_fault)?
             .ok_or_else(|| RequestError::Invalid(format!("no task {task_id:?}")))?;
 
-    // The allowlist is built from what this daemon actually has *enabled*, so a model
-    // cannot be offered a capability that policy would refuse anyway.
+    // The menu is walked out of the capability registry: what exists, what parameters
+    // each one declares, and whether it is enabled. Nothing here names a capability.
+    //
+    // The previous version listed `filesystem/write-text` literally, which meant adding
+    // a capability required remembering to edit the proposer — a second list that would
+    // drift the moment a capability was registered and nobody remembered the other file.
+    // One list now: the registry. A capability that is registered and enabled is
+    // proposable, with its own declared shape and its own target semantics, and the
+    // schema the proposal is checked against is the schema the capability was declared
+    // with rather than a copy of it.
+    let registered_ids: Vec<String> =
+        g.0.registry()
+            .ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
     let allowed: Vec<crate::proposer::AllowedCapability> =
-        vec![crate::proposer::AllowedCapability {
-            id: orxnud_capability::write_text::WRITE_TEXT_ID.to_owned(),
-            description: "Write a text file into the sandbox workspace".to_owned(),
-            params: vec!["path".to_owned(), "contents".to_owned()],
-        }];
-    let registered_ids: Vec<String> = allowed.iter().map(|c| c.id.clone()).collect();
+        g.0.registry()
+            .enabled()
+            .into_iter()
+            .map(|declaration| crate::proposer::AllowedCapability {
+                id: declaration.id.to_string(),
+                // Risk is included because the model should know what it is asking for: a
+                // High-risk capability needs a human to say yes, and a proposer that cannot
+                // see that will confidently propose work that is always going to wait.
+                // `{:?}` until `RiskClass` grows a display form of its own.
+                description: format!(
+                    "{} — risk {:?}, isolation {:?}. {}",
+                    declaration.display_name,
+                    declaration.risk,
+                    declaration.isolation,
+                    declaration.params.description
+                ),
+                params: declaration
+                    .params()
+                    .schema
+                    .field_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                schema: declaration.params().schema.clone(),
+                target: declaration.target(),
+            })
+            .collect();
     let ctx = crate::proposer::ProposalContext {
         task_id: task_id.clone(),
         content: row.payload.clone().unwrap_or_default(),
@@ -621,7 +705,7 @@ async fn ai_propose<S: SecretsContract>(
         allowed,
     };
 
-    let text = proposer_ref()
+    let text = provider
         .complete(&ctx)
         .map_err(|e| RequestError::Refused(e.to_string()))?;
 
@@ -658,54 +742,21 @@ async fn ai_propose<S: SecretsContract>(
         // this path is that a model asked and a person decides, so both facts belong in
         // the reply rather than only in the database.
         "proposed_by": proposer.label(),
-        "model": proposer_ref().model_id(),
+        "model": provider.model_id(),
     }))
 }
 
-/// The proposer this daemon asks.
+/// The proposer a daemon with no configured provider asks.
 ///
-/// A `OnceLock` rather than a field on `Daemon` because `compose` must touch nothing,
-/// and `set_proposer` exists so a test can supply a deliberately malformed or
-/// out-of-allowlist response — the interesting failures are in the validation, and they
-/// cannot be reached through a provider that always answers correctly.
-static PROPOSER: std::sync::OnceLock<Box<dyn crate::proposer::ProposalProvider>> =
-    std::sync::OnceLock::new();
-
-/// The installed proposer, or the declared stand-in.
-///
-/// `pub` so the test suite can assert on the very provider a dispatch would use, rather
-/// than on a copy of it.
+/// A declared non-model stand-in rather than an error, because a build with no
+/// credentials must still exercise the whole path, and because a silent "no provider
+/// configured" would make the boundary indistinguishable from a missing feature.
 #[must_use]
-pub fn proposer_ref() -> &'static dyn crate::proposer::ProposalProvider {
-    proposer()
-}
-
-/// Replaces the proposer. First call wins.
-///
-/// # Panics
-///
-/// If a proposer is already installed.
-pub fn set_proposer(provider: Box<dyn crate::proposer::ProposalProvider>) {
-    if PROPOSER.set(provider).is_err() {
-        panic!("a proposer is already installed");
-    }
-}
-
-/// The proposer to use: the installed one, or a declared non-model stand-in.
-///
-/// The default is [`ScriptedProvider`] with the demonstration proposal, because a build
-/// with no credentials must still be able to exercise the path, and because a silent
-/// "no provider configured" would make the boundary indistinguishable from a missing
-/// feature.
-fn proposer() -> &'static dyn crate::proposer::ProposalProvider {
-    // `&**`: the cell holds a `Box<dyn ProposalProvider>`, and the caller wants the
-    // trait object rather than the box.
-    &**PROPOSER.get_or_init(|| {
-        Box::new(crate::proposer::ScriptedProvider::returning(
-            "scripted/none",
-            r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"delegated governance works"}}"#,
-        )) as Box<dyn crate::proposer::ProposalProvider>
-    })
+pub fn default_proposer() -> Arc<dyn crate::proposer::ProposalProvider> {
+    Arc::new(crate::proposer::ScriptedProvider::returning(
+        "scripted/none",
+        r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"delegated governance works"}}"#,
+    )) as Arc<dyn crate::proposer::ProposalProvider>
 }
 
 /// The delegated proposer for a task's governed action.
@@ -1616,6 +1667,74 @@ async fn write_response(stream: &mut LocalStream, response: &Response) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With no provider configured, a daemon asks the declared stand-in.
+    ///
+    /// A build with no credentials must still exercise the whole path, and a silent
+    /// "no provider configured" would make the boundary indistinguishable from a missing
+    /// feature.
+    #[test]
+    fn the_default_proposer_is_the_declared_stand_in_and_says_so() {
+        let p = default_proposer();
+        assert_eq!(p.model_id(), "scripted/none");
+    }
+
+    /// The menu a model is shown is the registry, walked — not a list written next to the
+    /// proposer. Asserted against the real registry so a capability that is registered
+    /// and enabled appears without an edit here.
+    #[test]
+    fn the_proposal_menu_is_derived_from_the_registry() {
+        let mut registry = orxnud_capability::CapabilityRegistry::empty();
+        registry
+            .register(orxnud_capability::write_text::declaration())
+            .expect("write-text registers");
+        registry
+            .register(orxnud_capability::text::declaration())
+            .expect("word-count registers");
+
+        let menu: Vec<&str> = registry
+            .enabled()
+            .into_iter()
+            .map(|d| {
+                // The same projection `ai_propose` performs.
+                let _ = d.params().schema.field_names();
+                d.id.to_string()
+            })
+            .map(|id| Box::leak(id.into_boxed_str()) as &str)
+            .collect();
+
+        assert!(
+            menu.contains(&"filesystem/write-text"),
+            "an enabled capability must be proposable with no edit to the proposer: {menu:?}"
+        );
+        assert!(menu.contains(&"text/word-count"));
+    }
+
+    /// Every enabled declaration carries a usable shape, and one that needs a target says
+    /// so. A capability that forgot to declare would otherwise be proposable with an
+    /// empty shape and silently accept nothing.
+    #[test]
+    fn every_enabled_capability_declares_its_parameters() {
+        let mut registry = orxnud_capability::CapabilityRegistry::empty();
+        registry
+            .register(orxnud_capability::write_text::declaration())
+            .expect("write-text registers");
+        registry
+            .register(orxnud_capability::text::declaration())
+            .expect("word-count registers");
+
+        for declaration in registry.enabled() {
+            let id = &declaration.id.to_string();
+            assert!(
+                !declaration.params().schema.fields().is_empty(),
+                "{id} is enabled but declares no parameters"
+            );
+            assert!(
+                !declaration.params().description.is_empty(),
+                "{id} is enabled but has no parameter description to show a model"
+            );
+        }
+    }
 
     /// The seam that decides what an approval commits to.
     ///

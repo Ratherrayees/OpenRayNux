@@ -35,6 +35,7 @@
 
 pub mod credential;
 pub mod dispatch;
+pub mod schema;
 pub mod subprocess;
 pub mod text;
 pub mod verification;
@@ -73,6 +74,14 @@ pub struct CapabilityDeclaration {
     /// task layer must treat an uncertain outcome as `NeedsVerification` rather
     /// than retrying. See TP-2 and TP-12.
     pub idempotent: bool,
+    /// What parameters it accepts, described for a model and checkable at runtime.
+    ///
+    /// The shape only. Value rules live with the capability that understands the world,
+    /// so this can never become a second implementation of them — see
+    /// `orxnud_domain::schema` for why that boundary is drawn there.
+    pub params: orxnud_domain::ParamSpec,
+    /// Whether the capability acts on a named target.
+    pub target: orxnud_domain::TargetSemantics,
     /// Whether the capability is switched on.
     ///
     /// A disabled capability has **zero operational cost**: it is not started, it
@@ -97,6 +106,12 @@ impl CapabilityDeclaration {
             reads: DataClass::Public,
             writes: DataClass::Public,
             isolation: IsolationTier::default(),
+            // Defaults chosen so a capability that forgets to declare is *visibly*
+            // undeclared rather than silently permissive: no parameters, and a target it
+            // does not claim to act on. A declaration is a promise, and the default
+            // should be the one least likely to be believed.
+            params: orxnud_domain::ParamSpec::new("", orxnud_domain::ParamSchema::empty()),
+            target: orxnud_domain::TargetSemantics::None,
             idempotent: false,
             enabled: false,
         }
@@ -129,6 +144,32 @@ impl CapabilityDeclaration {
     pub fn idempotent(mut self) -> Self {
         self.idempotent = true;
         self
+    }
+
+    /// Declares the parameters.
+    #[must_use]
+    pub fn with_params(mut self, params: orxnud_domain::ParamSpec) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Declares the target semantics.
+    #[must_use]
+    pub fn with_target(mut self, target: orxnud_domain::TargetSemantics) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// The declared parameters.
+    #[must_use]
+    pub fn params(&self) -> &orxnud_domain::ParamSpec {
+        &self.params
+    }
+
+    /// The declared target semantics.
+    #[must_use]
+    pub fn target(&self) -> orxnud_domain::TargetSemantics {
+        self.target
     }
 
     /// Enables the capability.

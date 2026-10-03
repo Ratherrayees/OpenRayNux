@@ -24,6 +24,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use orxnud_daemon::Paths;
@@ -132,9 +133,21 @@ struct Serving {
 
 impl Serving {
     async fn start(root: PathBuf) -> Self {
+        Self::start_with(root, orxnud_daemon::runtime::default_proposer()).await
+    }
+
+    /// A daemon that asks `provider`.
+    ///
+    /// The seam is per-daemon and constructor-supplied, so there is nothing to install,
+    /// nothing to restore, and nothing for a concurrently running test to inherit.
+    async fn start_with(
+        root: PathBuf,
+        provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
+    ) -> Self {
         let runtime = Runtime::start(Paths::under(&root), NoSecrets)
             .await
-            .expect("the runtime must start");
+            .expect("the runtime must start")
+            .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -1792,6 +1805,282 @@ fn an_ai_proposal_becomes_a_governed_action() {
         );
         s.stop().await;
         let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// A malformed response is refused by the real daemon, and no proposal is written.
+///
+/// Reachable only because the proposer slot is scoped: under the old one-shot
+/// installation this test would have poisoned every other proposer test in the process,
+/// so the suite had exactly one provider scenario and this one could not exist. That is
+/// the whole argument for the seam — not elegance, but being able to write the test.
+#[test]
+fn a_malformed_ai_response_is_refused_without_writing_a_proposal() {
+    use orxnud_daemon::proposer::ScriptedProvider;
+
+    rt().block_on(async {
+        let d = dir("ai-malformed");
+        let s = Serving::start_with(
+            d.clone(),
+            Arc::new(ScriptedProvider::returning(
+                "scripted/malformed",
+                r#"{"capability":"filesystem/write-text","target":"a.txt","params":{"path":"a.txt"}}"#,
+            )),
+        )
+        .await;
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "m1", "content": "write something"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "m1", "worker": "ai"}),
+        );
+
+        // `path` with no `contents`: a shape the capability declares but this request
+        // does not satisfy. The refusal must happen at propose time, before a durable
+        // proposal exists and before anyone is asked to approve anything.
+        let refused = send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "m1", "worker": "ai"}),
+        );
+        let reason = refused["error"]["data"]["reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a refusal, got {refused}"));
+        assert_eq!(reason, "proposal-schema-mismatch", "{refused}");
+
+        // The task is untouched and still claimable by the human path, because a
+        // refused proposal is not a partial success.
+        let listed = send(&s.endpoint, "l", "task/list", json!({}));
+        assert_eq!(listed["result"]["tasks"][0]["state"], "running");
+        assert!(!workspace(&d).join("a.txt").exists());
+
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// A capability the model was never offered is refused, and the refusal names the
+/// capability. The menu is walked from the registry, so this asserts the walk rather than
+/// a list: `text/word-count` *is* enabled, so refusing it proves the menu is not
+/// everything in the build.
+#[test]
+fn an_enabled_but_unoffered_capability_is_refused() {
+    use orxnud_daemon::proposer::ScriptedProvider;
+
+    rt().block_on(async {
+        let d = dir("ai-unoffered");
+        let s = Serving::start_with(
+            d.clone(),
+            Arc::new(ScriptedProvider::returning(
+                "scripted/unoffered",
+                r#"{"capability":"email/send","params":{"to":"a@b.test"}}"#,
+            )),
+        )
+        .await;
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "u1", "content": "count"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "u1", "worker": "ai"}),
+        );
+
+        let refused = send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "u1", "worker": "ai"}),
+        );
+        assert_eq!(
+            refused["error"]["data"]["reason"], "proposal-capability-not-allowed",
+            "{refused}"
+        );
+
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The menu offered to a model is the registry, walked.
+///
+/// `text/word-count` is enabled in this build and has never been named in the proposer.
+/// If it appears in the menu a provider is handed, then "register a capability and it
+/// becomes proposable" is a fact about the code rather than a claim about it — and its
+/// declared parameter name comes from its own declaration, since the string `text` was
+/// never written in the daemon either.
+#[test]
+fn every_enabled_capability_is_offered_to_the_model_with_its_declared_parameters() {
+    use orxnud_daemon::proposer::{ProposalContext, ProposalProvider, ProviderError};
+    use std::sync::Mutex;
+
+    /// Records the context it is handed, and answers with a proposal it cannot make — so
+    /// the test is about what the model was *shown*, not about what came back.
+    struct Recorder {
+        seen: Arc<Mutex<Option<ProposalContext>>>,
+    }
+    impl ProposalProvider for Recorder {
+        fn model_id(&self) -> &str {
+            "recorder/none"
+        }
+        fn complete(&self, ctx: &ProposalContext) -> Result<String, ProviderError> {
+            *self.seen.lock().expect("recorder poisoned") = Some(ctx.clone());
+            Ok(r#"{"capability":"no/such","params":{}}"#.to_owned())
+        }
+    }
+
+    rt().block_on(async {
+        let d = dir("ai-menu");
+        let seen: Arc<Mutex<Option<ProposalContext>>> = Arc::new(Mutex::new(None));
+        let s = Serving::start_with(
+            d.clone(),
+            Arc::new(Recorder {
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .await;
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "n1", "content": "count words"}),
+        );
+        send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "n1", "worker": "ai"}),
+        );
+        send(
+            &s.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "n1", "worker": "ai"}),
+        );
+
+        let ctx = seen
+            .lock()
+            .expect("recorder poisoned")
+            .clone()
+            .expect("the provider ran");
+        let menu: Vec<(&str, Vec<&str>)> = ctx
+            .allowed
+            .iter()
+            .map(|c| (c.id.as_str(), c.params.iter().map(String::as_str).collect()))
+            .collect();
+
+        assert!(
+            menu.contains(&("text/word-count", vec!["text"])),
+            "word-count is enabled and must be offered with its own declared parameter: \
+             {menu:?}"
+        );
+        assert!(
+            menu.contains(&("filesystem/write-text", vec!["path", "contents"])),
+            "{menu:?}"
+        );
+
+        // The declaration's prose reaches the model too, or the menu is a list of names
+        // and a model still cannot tell what anything does.
+        let write_text = ctx
+            .allowed
+            .iter()
+            .find(|c| c.id == "filesystem/write-text")
+            .expect("offered");
+        assert!(
+            write_text.description.contains("Write one text file"),
+            "the declaration's own description must be shown: {:?}",
+            write_text.description
+        );
+        assert!(
+            write_text.description.to_lowercase().contains("high"),
+            "the model must be able to see that this needs a human: {:?}",
+            write_text.description
+        );
+
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// Two daemons in one process, asking different providers, at the same time.
+///
+/// This is the test the process-global slot could not pass. It failed the suite the
+/// moment it was written: a scoped install in one test changed the answer another test
+/// was getting at the same moment, so scoping was necessary but not sufficient — the
+/// value had to stop being global. Per-runtime configuration makes the interference
+/// structurally impossible rather than merely unlikely, which is the only version of
+/// this worth having.
+#[test]
+fn two_daemons_keep_separate_proposers() {
+    use orxnud_daemon::proposer::ScriptedProvider;
+
+    rt().block_on(async {
+        let good_dir = dir("ai-two-good");
+        let bad_dir = dir("ai-two-bad");
+        let good = Serving::start_with(
+            good_dir.clone(),
+            Arc::new(ScriptedProvider::returning(
+                "scripted/good",
+                r#"{"capability":"filesystem/write-text","target":"ok.txt","params":{"path":"ok.txt","contents":"ok"}}"#,
+            )),
+        )
+        .await;
+        let bad = Serving::start_with(
+            bad_dir.clone(),
+            Arc::new(ScriptedProvider::returning(
+                "scripted/bad",
+                r#"{"capability":"filesystem/write-text","target":"no.txt","params":{"path":"no.txt"}}"#,
+            )),
+        )
+        .await;
+
+        for (id, endpoint) in [("g1", &good.endpoint), ("b1", &bad.endpoint)] {
+            send(
+                endpoint,
+                "c",
+                "task/create",
+                json!({"id": id, "content": "write a file"}),
+            );
+            send(endpoint, "c", "task/claim", json!({"id": id, "worker": "ai"}));
+        }
+
+        // Interleaved on purpose: if there were shared state, this is where it would
+        // show. Each daemon must answer with its own provider's verdict.
+        let bad_reply = send(
+            &bad.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "b1", "worker": "ai"}),
+        );
+        assert_eq!(
+            bad_reply["error"]["data"]["reason"], "proposal-schema-mismatch",
+            "{bad_reply}"
+        );
+
+        let good_reply = send(
+            &good.endpoint,
+            "p",
+            "task/ai-propose",
+            json!({"task": "g1", "worker": "ai"}),
+        );
+        assert_eq!(good_reply["result"]["proposed_by"], "ai", "{good_reply}");
+        assert_eq!(good_reply["result"]["model"], "scripted/good");
+
+        good.stop().await;
+        bad.stop().await;
+        let _ = std::fs::remove_dir_all(&good_dir);
+        let _ = std::fs::remove_dir_all(&bad_dir);
     });
 }
 

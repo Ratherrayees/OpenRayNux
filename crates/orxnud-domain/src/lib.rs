@@ -37,6 +37,7 @@ pub mod ids;
 pub mod intent;
 pub mod invocation;
 pub mod platform;
+pub mod schema;
 pub mod security_state;
 pub mod task_state;
 
@@ -56,6 +57,7 @@ pub use invocation::{
     InvocationContext, PolicySeal,
 };
 pub use platform::{FsContract, NotificationRequest, NotifyContract, SecretRef, SecretsContract};
+pub use schema::{ParamField, ParamKind, ParamSchema, ParamSpec, TargetSemantics};
 pub use security_state::{
     ApprovalLedger, AuditJournal, InMemoryApprovals, JournalEntry, JournalError, LedgerError,
 };
