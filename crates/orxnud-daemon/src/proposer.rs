@@ -40,9 +40,130 @@ use serde::Deserialize;
 /// A provider that cannot be reached.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    /// The provider was asked and could not answer.
+    /// No provider is configured for this daemon.
+    ///
+    /// A distinct refusal rather than a fallback. A daemon with no provider answering
+    /// `task/ai-propose` with a scripted proposal would be indistinguishable from a
+    /// working model, which is the one confusion this whole path must not have.
+    #[error("no proposal provider is configured (provider-not-configured)")]
+    NotConfigured,
+    /// The provider is configured but its credential is not present.
+    #[error("the proposal provider has no credential stored: {0}")]
+    CredentialAbsent(String),
+    /// The credential store could not be reached.
+    ///
+    /// Never carries the credential itself, and never the store's error verbatim if that
+    /// error might quote the value it failed to handle.
+    #[error("the credential store is unavailable: {0}")]
+    CredentialStore(String),
+    /// The provider was asked and could not be reached at all: no route, refused
+    /// connection, DNS failure.
+    ///
+    /// Split from [`Self::Tls`] on purpose. "The host is down" and "the certificate did
+    /// not verify" call for different operator responses, and a caller deciding whether to
+    /// retry needs to tell them apart — retrying a certificate failure just fails again,
+    /// and retrying a refused connection is legitimate.
     #[error("the proposal provider could not be reached: {0}")]
-    Unavailable(String),
+    Unreachable(String),
+    /// A TLS handshake, certificate chain check or hostname check failed.
+    ///
+    /// Never answered by retrying without encryption, and never by trying another
+    /// endpoint. That would turn a failed authentication of the far side into a plaintext
+    /// request carrying a credential.
+    #[error("{0}")]
+    Tls(String),
+    /// A plaintext provider was configured and plaintext is not permitted.
+    ///
+    /// A refusal rather than a warning, and it exists because a credential must never
+    /// travel unencrypted: `http://` remains available only for a loopback test server,
+    /// which is explicitly opted into and refuses to carry an `Authorization` header.
+    #[error("a plaintext provider cannot be used here ({0}); use https")]
+    PlaintextRefused(String),
+    /// The provider did not answer within the deadline.
+    ///
+    /// Its own variant rather than `Unavailable` because the two call for different
+    /// operator responses and collapsing them tells an operator nothing useful.
+    #[error("the proposal provider did not answer within {millis}ms")]
+    Timeout {
+        /// The deadline that elapsed.
+        millis: u64,
+    },
+    /// The provider answered with a non-success status.
+    ///
+    /// Only the status code is retained. The response body is dropped unread: it is
+    /// attacker-influenced text, and putting it in an error string is how untrusted
+    /// content ends up in logs and audit records.
+    #[error("the proposal provider answered HTTP {status} ({kind:?})")]
+    Status {
+        /// The HTTP status code.
+        status: u16,
+        /// What that status means for a caller.
+        kind: StatusKind,
+    },
+    /// The provider answered, but not in a shape this adapter understands.
+    #[error("the proposal provider's response was not in the expected shape: {0}")]
+    MalformedResponse(String),
+    /// The configured transport is not implemented.
+    ///
+    /// Refused rather than downgraded. Silently dropping TLS would turn a configured
+    /// `https://` endpoint into a plaintext attempt at the same host, which is the kind
+    /// of quiet downgrade nobody notices until it matters.
+    #[error("{0} is not supported by this provider (provider-transport-unsupported)")]
+    TransportUnsupported(String),
+}
+
+impl ProviderError {
+    /// A fixed word for the wire, so a client branches on a vocabulary rather than on
+    /// prose that may change.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NotConfigured => "provider-not-configured",
+            Self::CredentialAbsent(_) => "provider-credential-absent",
+            Self::CredentialStore(_) => "provider-credential-store-unavailable",
+            Self::Unreachable(_) => "provider-unreachable",
+            Self::Tls(_) => "provider-tls-failed",
+            Self::PlaintextRefused(_) => "provider-plaintext-refused",
+            Self::Timeout { .. } => "provider-timeout",
+            Self::Status { kind, .. } => match kind {
+                StatusKind::Authentication => "provider-authentication-failed",
+                StatusKind::RateLimited => "provider-rate-limited",
+                StatusKind::Server => "provider-server-error",
+                StatusKind::Other => "provider-http-error",
+            },
+            Self::MalformedResponse(_) => "provider-response-malformed",
+            Self::TransportUnsupported(_) => "provider-transport-unsupported",
+        }
+    }
+}
+
+/// What an HTTP status means to a caller.
+///
+/// Grouped rather than passed through raw, because 401 and 503 are both "the provider
+/// did not do what was asked" and an operator's next step differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    /// 401, 403: the credential was rejected.
+    Authentication,
+    /// 429: too many requests.
+    RateLimited,
+    /// 5xx: the provider failed.
+    Server,
+    /// Any other non-success status.
+    Other,
+}
+
+impl StatusKind {
+    /// Classifies a status code.
+    #[must_use]
+    pub const fn of(status: u16) -> Self {
+        match status {
+            401 | 403 => Self::Authentication,
+            429 => Self::RateLimited,
+            500..=599 => Self::Server,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// One capability the model is permitted to ask for.
@@ -158,7 +279,11 @@ struct RawProposal {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProposalRejected {
     /// The text was not the expected JSON object.
-    #[error("the model's output was not a proposal this runtime understands")]
+    ///
+    /// Prose wrapped around a JSON object is refused, and so is a second object after a
+    /// valid one. Guessing which action was meant is exactly the ambiguity the
+    /// deterministic side exists to refuse.
+    #[error("the model's output was not a single proposal object this runtime understands")]
     Unreadable,
     /// It named a capability that is not on the allowlist.
     #[error("the model asked for a capability it was not offered: {0:?}")]
@@ -191,9 +316,12 @@ impl ProposalRejected {
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::Unreadable => "proposal-unreadable",
-            Self::CapabilityNotAllowed(_) => "proposal-capability-not-allowed",
-            Self::UnknownCapability(_) => "proposal-unknown-capability",
+            Self::Unreadable => "proposal-malformed",
+            // The menu is walked from `Registry::enabled()`, so "not on the menu" and
+            // "unknown to this build" are the same observation a model can make, and it
+            // gets the name that says so.
+            Self::CapabilityNotAllowed(_) => "proposal-capability-unknown",
+            Self::UnknownCapability(_) => "proposal-capability-not-implemented",
             Self::MissingTarget { .. } => "proposal-target-missing",
             Self::SchemaMismatch { .. } => "proposal-schema-mismatch",
         }
@@ -395,7 +523,7 @@ mod tests {
             err,
             ProposalRejected::UnknownCapability("email/send".into())
         );
-        assert_eq!(err.reason(), "proposal-unknown-capability");
+        assert_eq!(err.reason(), "proposal-capability-not-implemented");
     }
 
     /// The declared shape is enforced at propose time, so a malformed request never
@@ -504,7 +632,7 @@ mod tests {
             &|id| id == "text/word-count",
         )
         .expect_err("not offered");
-        assert_eq!(err.reason(), "proposal-capability-not-allowed");
+        assert_eq!(err.reason(), "proposal-capability-unknown");
     }
 
     /// The context handed to a provider is inert: it names the worker for correlation

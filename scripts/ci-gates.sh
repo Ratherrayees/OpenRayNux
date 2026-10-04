@@ -181,11 +181,20 @@ gate_G2() {
 
   # The internal crates an interface (`orxnuctl`) is allowed to name.
   #
-  # Transport and wire vocabulary only. Everything that could carry a domain rule --
-  # domain, store, task engine, policy, capability, daemon -- is absent on purpose,
-  # because the whole point of the check is that the CLI cannot reimplement a rule it
-  # cannot see (docs-03 §2, IR-2).
-  local CLI_ALLOWED_INTERNAL="orxnud-platform-ipc orxnud-protocol"
+  # Transport and wire vocabulary, plus the two crates that own the provider credential.
+  #
+  # Everything that could carry a *domain rule* -- store, task engine, policy,
+  # capability, daemon -- is absent on purpose, because the whole point of the check is
+  # that the CLI cannot reimplement a rule it cannot see (docs-03 §2, IR-2).
+  #
+  # `orxnud-domain` and `orxnud-platform-secrets` were added for one command,
+  # `provider credential`, and the reasoning is the gate's own: that command must use the
+  # authoritative `SecretRef` and `SecretsContract` rather than hand-roll a reference
+  # format, because a CLI that invented its own would silently write a credential the
+  # provider cannot read. Naming the real types is the safer arrangement, not the
+  # dangerous one -- and the CLI still cannot decide anything, because a `SecretRef` is a
+  # name and the authority to read it lives in the store.
+  local CLI_ALLOWED_INTERNAL="orxnud-platform-ipc orxnud-protocol orxnud-domain orxnud-platform-secrets"
 
   # --- (a) the domain has no I/O or runtime dependency ---
   local domain_deps

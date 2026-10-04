@@ -133,7 +133,7 @@ struct Serving {
 
 impl Serving {
     async fn start(root: PathBuf) -> Self {
-        Self::start_with(root, orxnud_daemon::runtime::default_proposer()).await
+        Self::start_with(root, orxnud_daemon::runtime::scripted_proposer()).await
     }
 
     /// A daemon that asks `provider`.
@@ -1904,7 +1904,7 @@ fn an_enabled_but_unoffered_capability_is_refused() {
             json!({"task": "u1", "worker": "ai"}),
         );
         assert_eq!(
-            refused["error"]["data"]["reason"], "proposal-capability-not-allowed",
+            refused["error"]["data"]["reason"], "proposal-capability-unknown",
             "{refused}"
         );
 

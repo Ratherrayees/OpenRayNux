@@ -524,15 +524,29 @@ fn render_capability(capability: &str, reply: &Value) -> String {
 
 /// Turns a refusal into the line a user reads.
 ///
-/// The structured reason is preferred over the daemon's prose, because the daemon sends
-/// `reason` as a fixed word for exactly this purpose. The code is included so a script
-/// can see what happened without parsing the message.
+/// The **reason** is shown, not the most specific string available. `reason` is the fixed
+/// vocabulary word the daemon sends for exactly this purpose, and a client — or a person —
+/// is meant to be able to branch on it. Preferring the detail hides the vocabulary
+/// behind prose, which is the opposite of what a reason is for. The detail is appended
+/// when it says something the reason does not.
 #[must_use]
 pub fn describe_refusal(error: &ClientError) -> String {
     match error {
-        ClientError::Refused { code, message, .. } => {
-            let reason = error.structured_reason().unwrap_or("refused");
-            format!("error: the daemon refused the request ({code}, {reason}): {message}")
+        ClientError::Refused {
+            code,
+            message,
+            reason,
+            detail,
+        } => {
+            let reason = reason.as_deref().unwrap_or("refused");
+            let line =
+                format!("error: the daemon refused the request ({code}, {reason}): {message}");
+            match detail {
+                Some(detail) if detail != message && !detail.is_empty() => {
+                    format!("{line}\n  {detail}")
+                }
+                _ => line,
+            }
         }
         other => format!("error: {other}"),
     }

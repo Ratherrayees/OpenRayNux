@@ -57,9 +57,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod http_provider;
 pub mod proposer;
 pub mod runtime;
 pub mod task_service;
+pub mod transport;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -994,8 +996,19 @@ impl Daemon {
 mod tests {
     use super::*;
 
+    /// A state root unique to this process *and* this call.
+    ///
+    /// One fixed path for every test in this binary meant two tests running in parallel
+    /// shared it, and whichever created the directory first made the other's
+    /// "compose created nothing" assertion fail. That is a test-isolation bug rather than a
+    /// product bug, and it was firing roughly one run in five.
     fn paths() -> Paths {
-        Paths::under(std::env::temp_dir().join("orxnud-daemon-test"))
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        Paths::under(
+            std::env::temp_dir().join(format!("orxnud-daemon-test-{}-{n}", std::process::id())),
+        )
     }
 
     fn daemon() -> Daemon {

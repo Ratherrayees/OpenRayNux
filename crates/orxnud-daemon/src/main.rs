@@ -35,16 +35,46 @@ const USAGE: &str = "\
 orxnud -- the OpenRayNux daemon
 
 USAGE:
-    orxnud [--state-root <DIR>]
+    orxnud [--state-root <DIR>] [--provider-base-url <URL> --provider-model <NAME>]
 
 OPTIONS:
-    --state-root <DIR>   Where state lives. Defaults to $XDG_STATE_HOME/orxnud,
-                         or ~/.local/state/orxnud.
-    --version            Print the version and exit.
-    --doctor             Print a diagnosis of the configured paths and exit.
-    --help               Print this and exit.
+    --state-root <DIR>          Where state lives. Defaults to
+                                $XDG_STATE_HOME/orxnud, or ~/.local/state/orxnud.
+    --provider-base-url <URL>   An OpenAI-compatible base URL, e.g.
+                                https://api.openai.com/v1. Both provider options must
+                                be given together; with neither, `task/ai-propose`
+                                answers `provider-not-configured`. https is the only
+                                scheme that may carry a credential: a plaintext endpoint
+                                is refused rather than used.
+    --provider-model <NAME>     The model to ask for, e.g. gpt-4o-mini.
+    --provider-scripted         Use the built-in non-model script instead of a real
+                                provider. For deterministic testing on a host with no
+                                credentials; it answers one fixed proposal and records
+                                scripted/none in the audit record. Cannot be combined with
+                                the two options above.
+    --version                   Print the version and exit.
+    --doctor                    Print a diagnosis of the configured paths and exit.
+    --help                      Print this and exit.
 
-The daemon serves a local endpoint only. It never opens a network socket.
+PROVIDER CREDENTIAL:
+    Read from the platform credential store, never from the command line or the
+    environment: key `provider-api-key`, account `local`. An argument or an
+    environment variable is visible to every process of the same user and ends up in
+    `ps` output and crash dumps, so neither is accepted for a secret here. Store one with
+
+        orxnuctl provider credential set < key.txt
+
+    Until a key is stored, a configured provider answers `provider-credential-absent`.
+
+PROVIDER SELECTION:
+    Manual, and authoritative. The provider and model given here are exactly what the
+    runtime uses. If they fail, the failure is reported: there is no automatic retry,
+    no second provider, and no fallback to the scripted one. A provider outage is an
+    outage, and a task's text may be private, so it is not permission to send the same
+    context somewhere else.
+
+The daemon serves a local endpoint only. Its single outbound connection is the
+provider request above, and nothing else.
 ";
 
 /// Argument parsing, hand-written.
@@ -54,6 +84,12 @@ The daemon serves a local endpoint only. It never opens a network socket.
 /// `clap`.
 fn parse_args() -> Result<Action, String> {
     let mut root: Option<String> = None;
+    // Non-secret provider settings. The credential is *not* here and cannot be: it is
+    // read from the platform secret store by reference, because an argument is visible
+    // in `ps` output and in the shell history.
+    let mut base_url: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut scripted = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -69,20 +105,90 @@ fn parse_args() -> Result<Action, String> {
             other if other.starts_with("--state-root=") => {
                 root = Some(other["--state-root=".len()..].to_owned());
             }
+            "--provider-base-url" => {
+                base_url = Some(
+                    args.next()
+                        .ok_or_else(|| "--provider-base-url needs a URL".to_owned())?,
+                );
+            }
+            other if other.starts_with("--provider-base-url=") => {
+                base_url = Some(other["--provider-base-url=".len()..].to_owned());
+            }
+            "--provider-scripted" => {
+                scripted = true;
+            }
+            "--provider-model" => {
+                model = Some(
+                    args.next()
+                        .ok_or_else(|| "--provider-model needs a model name".to_owned())?,
+                );
+            }
+            other if other.starts_with("--provider-model=") => {
+                model = Some(other["--provider-model=".len()..].to_owned());
+            }
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
-    Ok(Action::Serve(root.map_or_else(
-        orxnud_platform_ipc::default_state_root,
-        std::path::PathBuf::from,
-    )))
+    Ok(Action::Serve {
+        root: root.map_or_else(
+            orxnud_platform_ipc::default_state_root,
+            std::path::PathBuf::from,
+        ),
+        provider: ProviderChoice::new(base_url, model, scripted),
+    })
 }
 
+/// What the process was asked to do.
 enum Action {
+    /// Print the version and exit.
     Version,
+    /// Print usage and exit.
     Help,
+    /// Print the state layout and exit.
     Doctor,
-    Serve(std::path::PathBuf),
+    /// Serve, optionally with a proposal provider configured.
+    Serve {
+        /// Durable state root.
+        root: std::path::PathBuf,
+        /// Which provider, if any.
+        provider: ProviderChoice,
+    },
+}
+
+/// Which proposal provider a daemon was asked to use.
+///
+/// Three states and no default, because every default here is a way to be wrong
+/// unnoticeably: a missing model name would be substituted, or a missing provider would be
+/// filled with a script that answers a fixed string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderChoice {
+    /// Nothing configured. `task/ai-propose` answers `provider-not-configured`.
+    None,
+    /// A fixed, non-model provider, for deterministic testing without credentials.
+    Scripted,
+    /// An OpenAI-compatible endpoint.
+    Remote {
+        /// The base URL.
+        base_url: String,
+        /// The model to ask for.
+        model: String,
+    },
+    /// `--provider-scripted` together with a real endpoint: contradictory.
+    Conflicted,
+    /// One of the two remote settings without the other.
+    Incomplete,
+}
+
+impl ProviderChoice {
+    fn new(base_url: Option<String>, model: Option<String>, scripted: bool) -> Self {
+        match (base_url, model, scripted) {
+            (None, None, false) => Self::None,
+            (None, None, true) => Self::Scripted,
+            (Some(base_url), Some(model), false) => Self::Remote { base_url, model },
+            (_, _, true) => Self::Conflicted,
+            _ => Self::Incomplete,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -94,7 +200,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let root = match &action {
+    let (root, provider) = match &action {
         Action::Version => {
             println!("orxnud {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -107,7 +213,7 @@ fn main() -> ExitCode {
             doctor(&Paths::under(orxnud_platform_ipc::default_state_root()));
             return ExitCode::SUCCESS;
         }
-        Action::Serve(root) => root.clone(),
+        Action::Serve { root, provider } => (root.clone(), provider.clone()),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -121,19 +227,81 @@ fn main() -> ExitCode {
         }
     };
 
-    runtime.block_on(async move { serve(Paths::under(&root)).await })
+    runtime.block_on(async move { serve(Paths::under(&root), provider).await })
 }
 
-async fn serve(paths: Paths) -> ExitCode {
+/// Serves, with a proposal provider when one was chosen.
+///
+/// A provider is built only from a complete, unambiguous choice. Half a configuration is a
+/// refusal at startup rather than a guess here, because a default model name silently
+/// substituted for a missing one is a daemon that reports proposals from a model nobody
+/// chose.
+async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
+    let provider: Option<std::sync::Arc<dyn orxnud_daemon::proposer::ProposalProvider>> =
+        match choice {
+            ProviderChoice::None => {
+                eprintln!(
+                    "orxnud: no proposal provider configured; task/ai-propose will answer \
+                     provider-not-configured"
+                );
+                None
+            }
+            ProviderChoice::Scripted => {
+                eprintln!(
+                    "orxnud: proposal provider is the built-in SCRIPT (not a model); it will \
+                     answer one fixed proposal and record scripted/none in the audit record"
+                );
+                Some(orxnud_daemon::runtime::scripted_proposer())
+            }
+            ProviderChoice::Conflicted => {
+                eprintln!(
+                    "orxnud: --provider-scripted cannot be combined with \
+                     --provider-base-url or --provider-model"
+                );
+                return ExitCode::FAILURE;
+            }
+            ProviderChoice::Incomplete => {
+                eprintln!(
+                    "orxnud: --provider-base-url and --provider-model must be given together"
+                );
+                return ExitCode::FAILURE;
+            }
+            ProviderChoice::Remote { base_url, model } => {
+                match orxnud_daemon::http_provider::provider_from_settings(
+                    Some(&base_url),
+                    Some(&model),
+                    KeyringSecrets::default(),
+                ) {
+                    Ok(p) => {
+                        eprintln!(
+                            "orxnud: proposal provider configured ({} model {})",
+                            p.config().base_url,
+                            p.config().model
+                        );
+                        Some(std::sync::Arc::new(p))
+                    }
+                    Err(e) => {
+                        eprintln!("orxnud: proposal provider not usable: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        };
+
     // The ordering that matters is inside `Runtime::start`: durable security state is
     // attached before the endpoint exists. If it fails here, nothing was bound.
-    let runtime = match Runtime::start(paths.clone(), KeyringSecrets::default()).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("orxnud: refusing to start: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut runtime =
+        match Runtime::start_unconfigured(paths.clone(), KeyringSecrets::default()).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("orxnud: refusing to start: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    if let Some(provider) = provider {
+        runtime = runtime.with_proposer(provider);
+    }
 
     let endpoint = runtime.endpoint().to_path_buf();
     eprintln!(

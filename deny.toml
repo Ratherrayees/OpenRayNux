@@ -67,6 +67,13 @@ allow = [
     # crate offering one *alone* does not fail on a technicality.
     "CC0-1.0",
     "MIT-0",
+    # Added with the provider TLS stack (ADR-0040). `rustls-webpki` and `untrusted` are
+    # ISC-only, and `ring` is `Apache-2.0 AND ISC` -- an AND, not a choice, so ISC has to
+    # be acceptable for `ring` to be usable at all. ISC is a permissive licence with the
+    # same effect as MIT for this project: attribution only, no copyleft, no
+    # distribution condition. `subtle` is BSD-3-Clause for the same reason.
+    "ISC",                             # `rustls-webpki`, `untrusted`, `ring`
+    "BSD-3-Clause",                    # `subtle`
 ]
 confidence-threshold = 0.93
 # # The copyleft prohibition
