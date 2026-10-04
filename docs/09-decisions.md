@@ -3260,9 +3260,25 @@ failures are a distinct wire error from a declined proposal: "the model was unre
 must not read as "the model's proposal was refused", or an outage starts looking like a
 policy decision.
 
+### Amendment: detection has to be asked for by name
+
+`KeyringSecrets` no longer implements `Default`. It had one, derived over a single
+`available: bool`, so `default()` built a store that reported "no secret store" without
+consulting the platform -- and all three production call sites used it. The credential path
+was therefore inoperable on every host, while every test passed, because every test builds
+its store with `assume_available()` and so never exercised detection at all (V-79).
+
+The lesson is recorded because it is not specific to this bug: **a test suite that skips
+the code under repair cannot report it broken.** Detection now returns a three-way
+`Probe`, availability comes from the write alone, a leftover probe entry is its own outcome
+rather than a false "unavailable", and `clippy::new_without_default` is refused on purpose
+with the reasoning in the source. `new()` probes; `assume_available()` does not; the caller
+has to mean one.
+
 ### Amendment trigger
 
 Re-read when TLS lands (V-77); when a user can store a provider credential (V-78); if a
 second provider is added, at which point the question is whether `ProviderConfig` was the
-right place for the shared parts; or if a provider ever needs to be reachable without a
-credential.
+right place for the shared parts; if a provider ever needs to be reachable without a
+credential; or if anything else in the tree grows a `Default` that quietly decides whether
+a platform capability is present.
