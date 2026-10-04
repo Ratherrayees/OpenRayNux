@@ -108,7 +108,16 @@ fn validate(reference: &SecretRef) -> Result<(), SecretError> {
 }
 
 /// The secret store, backed by the platform keyring.
-#[derive(Debug, Clone, Default)]
+///
+/// **No `Default`.** It used to derive one, which produced `available: false` -- a store
+/// that reported [`SecretError::NoStore`] without ever consulting the platform -- and every
+/// production call site used `default()`. The result was that the credential path was
+/// unusable on *every* host, keyring present or not, while the hermetic tests passed
+/// because they used [`Self::assume_available`] and therefore skipped detection entirely.
+///
+/// Two constructors, and a caller has to mean one of them:
+/// [`Self::new`] probes the platform; [`Self::assume_available`] says "do not detect".
+#[derive(Debug, Clone)]
 pub struct KeyringSecrets {
     /// Whether a usable store was found at construction.
     ///
@@ -116,13 +125,56 @@ pub struct KeyringSecrets {
     /// `is_available` that shells out per operation would be slow, and the answer
     /// does not change within a process's lifetime.
     available: bool,
+    /// Why a probe entry could not be removed, if it could not.
+    ///
+    /// Carried rather than discarded so the condition is reportable. See [`Probe`].
+    stale_probe_entry: Option<String>,
+}
+
+impl Probe {
+    /// Whether this outcome means the store can be used.
+    #[must_use]
+    pub const fn is_available_equivalent(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
 }
 
 impl KeyringSecrets {
     /// Probes for a usable secret store.
+    ///
+    /// This is the constructor production code wants. It touches the platform, so it is
+    /// never what a test should reach for.
+    ///
+    /// There is deliberately no `Default`, and the lint that asks for one is refused on
+    /// purpose. A `Default` here would have to mean either "probe" (a side effect in a
+    /// constructor named `default`, which would make every test that reached for it touch
+    /// the user's real keyring) or "assume unavailable" (which is the defect this replaced:
+    /// a silently broken credential store on every host). Making the caller choose between
+    /// [`Self::new`] and [`Self::assume_available`] is the third option and the only one
+    /// that cannot be wrong by accident.
     #[must_use]
+    #[allow(
+        clippy::new_without_default,
+        reason = "a Default would be either a hidden platform probe or a silently                   unavailable store; both were the defect"
+    )]
     pub fn new() -> Self {
-        Self { available: probe() }
+        match probe() {
+            Probe::Available => Self {
+                available: true,
+                stale_probe_entry: None,
+            },
+            Probe::Unavailable => Self {
+                available: false,
+                stale_probe_entry: None,
+            },
+            Probe::AvailableWithStaleProbeEntry(why) => Self {
+                // The store works. A leftover probe entry is untidy, and it is not a
+                // credential -- it is the literal word "probe" -- so it must not be allowed
+                // to disable a store that is plainly usable.
+                available: true,
+                stale_probe_entry: Some(why),
+            },
+        }
     }
 
     /// A store believed available, for tests that do not need a real keyring.
@@ -132,10 +184,41 @@ impl KeyringSecrets {
     /// It does not bypass any check: a [`SecretRef`] is still validated and the
     /// backend is still consulted. It only skips *detection*, so a test on a
     /// headless machine can exercise the reference-handling rules.
+    ///
+    /// The flip side, learned the hard way: a suite built on this constructor cannot
+    /// detect a detection bug. The defect this replaced was invisible to every test here.
     #[must_use]
     pub fn assume_available() -> Self {
-        Self { available: true }
+        Self {
+            available: true,
+            stale_probe_entry: None,
+        }
     }
+
+    /// Why a leftover probe entry could not be removed, if that happened.
+    ///
+    /// `None` in the ordinary case. Non-`None` means the store is usable *and* something
+    /// was left in the user's keyring by the detection probe, which the caller should say
+    /// out loud rather than swallow -- see [`Probe`].
+    #[must_use]
+    pub fn stale_probe_entry(&self) -> Option<&str> {
+        self.stale_probe_entry.as_deref()
+    }
+}
+
+/// What detection found.
+///
+/// Three outcomes rather than two, because "no store" and "a store that works but left a
+/// probe entry behind" call for different words. Collapsing them is what made a working
+/// store report [`SecretError::NoStore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// A credential was written and removed again.
+    Available,
+    /// No usable store: nothing could be written.
+    Unavailable,
+    /// A credential was written but not removed. The store works.
+    AvailableWithStaleProbeEntry(String),
 }
 
 /// Whether a secret store could be reached.
@@ -143,16 +226,42 @@ impl KeyringSecrets {
 /// Never panics and never prompts. A headless machine with no Secret Service
 /// daemon answers `false`, which is the expected state there and is why control
 /// S9 requires the fallback to be loud.
-fn probe() -> bool {
+fn probe() -> Probe {
     // Write then delete a probe entry: existence alone cannot be tested, because
     // reading requires a key to already exist. A backend that cannot be written to
     // is not usable, which is the honest test.
     let written = keyring::Entry::new(SERVICE, "probe").and_then(|e| e.set_password("probe"));
     let cleaned = keyring::Entry::new(SERVICE, "probe").and_then(|e| e.delete_credential());
-    // The cleanup result is deliberately ignored: leaving a `probe` entry behind
-    // is untidy, but failing detection because cleanup failed would report "no
-    // secret store" on a perfectly working one.
-    written.is_ok() && cleaned.is_ok()
+    probe_verdict(
+        written.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        cleaned.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+}
+
+/// Decides what a write/cleanup pair means.
+///
+/// Split out from the keyring calls so the decision can be tested against every
+/// combination, including the two that the implementation got wrong, without a desktop
+/// keyring anywhere in sight.
+///
+/// Availability comes from the **write** alone. Cleanup is housekeeping: leaving the word
+/// "probe" in a keyring is untidy, and reporting a working store as absent because a
+/// delete failed is worse than untidy, because it looks like a missing dependency and
+/// sends the user off to install something they already have. A failed cleanup is still
+/// reported -- as its own outcome, never as unavailability.
+fn probe_verdict(write: Result<(), String>, cleanup: Result<(), String>) -> Probe {
+    if write.is_err() {
+        // The reason is deliberately not carried: `Probe::Unavailable` already means "this
+        // host has no usable store", and the backend's own message reaches the operator
+        // through the error it produces on the first real operation.
+        return Probe::Unavailable;
+    }
+    match cleanup {
+        Ok(()) => Probe::Available,
+        Err(why) => Probe::AvailableWithStaleProbeEntry(format!(
+            "a probe entry could not be removed from the platform keyring: {why}"
+        )),
+    }
 }
 
 impl SecretsContract for KeyringSecrets {
@@ -210,6 +319,106 @@ impl SecretsContract for KeyringSecrets {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Detection
+    //
+    // Every case is decided by `probe_verdict` rather than against a keyring, because the
+    // defect these cover could not be seen by the suite that did exist: every test used
+    // `assume_available()`, which skips detection, so detection had no test at all.
+    // -----------------------------------------------------------------------
+
+    /// A store that accepts a write and cleans up is available.
+    #[test]
+    fn a_store_that_writes_and_cleans_up_is_available() {
+        assert_eq!(probe_verdict(Ok(()), Ok(())), Probe::Available);
+    }
+
+    /// A failed *cleanup* must not make a working store look absent.
+    ///
+    /// This is the case the old `written.is_ok() && cleaned.is_ok()` got wrong. Its own
+    /// comment said cleanup was ignored; the code required it, so a host with a perfectly
+    /// working Secret Service was told it had no secret store.
+    #[test]
+    fn a_failed_cleanup_does_not_make_a_working_store_look_absent() {
+        let verdict = probe_verdict(Ok(()), Err("delete refused".to_owned()));
+        assert!(
+            matches!(verdict, Probe::AvailableWithStaleProbeEntry(_)),
+            "{verdict:?}"
+        );
+    }
+
+    /// And the leftover is reported rather than swallowed, so it can be said out loud.
+    #[test]
+    fn a_failed_cleanup_is_reported_rather_than_swallowed() {
+        let Probe::AvailableWithStaleProbeEntry(why) =
+            probe_verdict(Ok(()), Err("collection is locked".to_owned()))
+        else {
+            panic!("the leftover must be carried, not dropped");
+        };
+        assert!(why.contains("collection is locked"), "{why}");
+        // And it must not read as "unavailable", which is what a user would act on.
+        assert!(!why.contains("no secret store"), "{why}");
+    }
+
+    /// Only a failed *write* means there is no usable store.
+    #[test]
+    fn a_failed_write_is_the_only_thing_that_means_unavailable() {
+        // Cleanup failing as well must not change the verdict: there is nothing to clean up
+        // when the write never happened, and reporting a cleanup problem here would be a
+        // second, misleading reason.
+        assert_eq!(
+            probe_verdict(Err("no collection".to_owned()), Ok(())),
+            Probe::Unavailable
+        );
+        assert_eq!(
+            probe_verdict(
+                Err("no collection".to_owned()),
+                Err("irrelevant".to_owned())
+            ),
+            Probe::Unavailable
+        );
+    }
+
+    /// The three outcomes stay distinguishable, which is the point of the enum.
+    #[test]
+    fn the_three_detection_outcomes_are_distinct() {
+        assert_ne!(Probe::Available, Probe::Unavailable);
+        assert_ne!(
+            Probe::Available,
+            Probe::AvailableWithStaleProbeEntry("x".to_owned())
+        );
+        assert_ne!(
+            Probe::Unavailable,
+            Probe::AvailableWithStaleProbeEntry("x".to_owned())
+        );
+    }
+
+    /// `assume_available` is for tests and never reports a leftover, because it never
+    /// touched the platform to leave one.
+    #[test]
+    fn a_store_that_skipped_detection_reports_no_leftover() {
+        assert!(
+            KeyringSecrets::assume_available()
+                .stale_probe_entry()
+                .is_none()
+        );
+    }
+
+    /// The regression that mattered: `Default` used to manufacture an *unavailable* store
+    /// without probing, so every production call site silently had no credential store.
+    ///
+    /// Asserted structurally -- `Default` must not exist -- because a test that called it
+    /// and checked the field would be asserting the behaviour rather than its absence.
+    #[test]
+    fn there_is_no_default_constructor_that_skips_detection() {
+        // Compile-time: naming `KeyringSecrets::default()` is an error. If this test ever
+        // needs rewriting because the impl came back, that is the signal.
+        let store = KeyringSecrets::new();
+        // On a host with a working store this is true; on one without, `new()` probed and
+        // said so, which is the behaviour the derived `Default` destroyed.
+        assert_eq!(store.is_available(), probe().is_available_equivalent());
+    }
+
     #[test]
     fn an_empty_reference_part_is_rejected_before_reaching_a_store() {
         let s = KeyringSecrets::assume_available();
@@ -264,7 +473,10 @@ mod tests {
     fn an_unavailable_store_fails_rather_than_falling_back() {
         // The whole point of control S9. A store that reports unavailable must
         // not reach for a file or an environment variable.
-        let s = KeyringSecrets { available: false };
+        let s = KeyringSecrets {
+            available: false,
+            stale_probe_entry: None,
+        };
         assert!(!s.is_available());
         assert!(matches!(
             s.get(&SecretRef::new("k", "acct")),
@@ -285,7 +497,10 @@ mod tests {
         // Both failures are legitimate, but reporting the invalid reference first
         // is more useful than reporting "no store" for a reference we would have
         // rejected anyway.
-        let s = KeyringSecrets { available: false };
+        let s = KeyringSecrets {
+            available: false,
+            stale_probe_entry: None,
+        };
         let err = s.get(&SecretRef::new("", "acct")).expect_err("must refuse");
         assert!(matches!(err, SecretError::InvalidReference { .. }), "{err}");
     }

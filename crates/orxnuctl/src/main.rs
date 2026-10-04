@@ -112,7 +112,7 @@ fn main() -> ExitCode {
                 // the daemon: a credential has no business crossing an IPC socket, and
                 // asking the daemon to hold one would put it in a process that does not
                 // need it.
-                let secrets = orxnud_platform_secrets::KeyringSecrets::default();
+                let secrets = orxnud_platform_secrets::KeyringSecrets::new();
                 match provider::run(verb, &secrets) {
                     Ok(output) => {
                         println!("{output}");

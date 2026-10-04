@@ -270,7 +270,7 @@ async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
                 match orxnud_daemon::http_provider::provider_from_settings(
                     Some(&base_url),
                     Some(&model),
-                    KeyringSecrets::default(),
+                    KeyringSecrets::new(),
                 ) {
                     Ok(p) => {
                         eprintln!(
@@ -288,19 +288,26 @@ async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
             }
         };
 
+    // One store instance for both the startup report and the runtime, so the availability
+    // reported cannot come from a different probe than the one that is used.
+    let secrets = KeyringSecrets::new();
+
     // The ordering that matters is inside `Runtime::start`: durable security state is
     // attached before the endpoint exists. If it fails here, nothing was bound.
-    let mut runtime =
-        match Runtime::start_unconfigured(paths.clone(), KeyringSecrets::default()).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("orxnud: refusing to start: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let mut runtime = match Runtime::start_unconfigured(paths.clone(), secrets.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("orxnud: refusing to start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     if let Some(provider) = provider {
         runtime = runtime.with_proposer(provider);
+    }
+
+    if let Some(why) = secrets.stale_probe_entry() {
+        eprintln!("orxnud: warning: {why}");
     }
 
     let endpoint = runtime.endpoint().to_path_buf();
