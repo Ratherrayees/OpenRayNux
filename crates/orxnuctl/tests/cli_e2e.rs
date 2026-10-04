@@ -25,6 +25,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A temporary state directory, unique per test and per process.
 fn dir(tag: &str) -> PathBuf {
@@ -64,15 +66,133 @@ struct Daemon {
     root: PathBuf,
 }
 
+/// A one-shot OpenAI-compatible provider, in this process, on a loopback port.
+///
+/// These tests spawn the real `orxnud` binary, so the provider has to exist outside the
+/// test binary. Pointing the daemon at a real HTTP endpoint proves more than a test-only
+/// flag on the product would: the binary's argument handling, the configuration contract,
+/// the HTTP client and the parser are all exercised as shipped.
+///
+/// It also keeps the product free of a `--provider-scripted` switch, which would be a test
+/// affordance in a user-facing binary and a way for a deployment to believe it has a model
+/// when it does not.
+struct FakeProvider {
+    address: String,
+    contacted: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeProvider {
+    fn answering(content: &str) -> Self {
+        use std::io::{Read as _, Write as _};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port for the provider");
+        let address = listener.local_addr().expect("an address").to_string();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&contacted);
+        let content = content.to_owned();
+        let handle = std::thread::spawn(move || {
+            // Two connections: readiness does not touch the provider, but a retried or
+            // duplicated request must not hang the test either.
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                flag.store(true, Ordering::SeqCst);
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                    }
+                    if raw.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion",
+                    "model": "fake-model-1",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": content },
+                        "finish_reason": "stop",
+                    }],
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            address,
+            contacted,
+            handle: Some(handle),
+        }
+    }
+
+    /// Whether anything has connected.
+    ///
+    /// A non-blocking check, so a test never waits for something that should not happen.
+    fn was_contacted(&self) -> bool {
+        self.contacted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for FakeProvider {
+    fn drop(&mut self) {
+        // The listener is owned by the thread; detaching is fine because it exits after
+        // its accept loop, and the test process is short-lived either way.
+        let _ = self.handle.take();
+    }
+}
+
 impl Daemon {
     /// Starts a real daemon on `root` and waits until it answers.
     ///
     /// Readiness is a request the daemon can only answer once `serve` is polling, so
     /// this waits for a fact rather than sleeping a guessed interval.
     fn start(root: &Path) -> Self {
-        let child = Command::new(daemon_bin())
-            .arg("--state-root")
-            .arg(root)
+        // Explicit opt-in to the non-model script, so the scripted CLI path stays green on
+        // a host with no credentials. Never a default: a daemon started without this
+        // refuses, which `a_daemon_with_no_provider_flags_refuses_to_propose` asserts.
+        Self::start_with_flags(root, &["--provider-scripted"])
+    }
+
+    /// Starts a daemon with no provider at all, as a user would start it.
+    fn start_unconfigured(root: &Path) -> Self {
+        Self::start_with_flags(root, &[])
+    }
+
+    fn start_with_flags(root: &Path, flags: &[&str]) -> Self {
+        Self::start_with_provider(root, None, flags)
+    }
+
+    /// Starts a daemon pointed at `provider`.
+    ///
+    /// With `None` the daemon has no proposal provider at all, and `task/ai-propose`
+    /// answers `provider-not-configured` — the same as a production daemon started
+    /// without the two provider flags.
+    fn start_with_provider(root: &Path, provider: Option<&FakeProvider>, extra: &[&str]) -> Self {
+        let mut command = Command::new(daemon_bin());
+        command.arg("--state-root").arg(root);
+        if let Some(p) = provider {
+            command
+                .arg("--provider-base-url")
+                .arg(format!("http://{}/v1", p.address))
+                .arg("--provider-model")
+                .arg("fake-model-1");
+        }
+        for flag in extra {
+            command.arg(flag);
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1399,6 +1519,78 @@ fn the_governed_execution_is_audited_and_survives_a_restart() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The two provider flags reach the provider, and the request stops at the credential.
+///
+/// This is as far as the binary can be driven hermetically: the daemon reads its key from
+/// the platform credential store, and a spawned process on a build host has none. The
+/// refusal is therefore asserted rather than worked around, and both honest reasons are
+/// accepted because which one applies depends on the host — a machine with a keyring and
+/// no key says `provider-credential-absent`, one with neither says
+/// `provider-credential-store-unavailable`.
+///
+/// What it proves is the wiring: the flags are parsed, a provider is constructed, and the
+/// credential is required before any request leaves. The HTTP path itself is covered
+/// against a real socket in the daemon's own suite, with a hermetic store.
+#[test]
+fn the_provider_flags_are_wired_and_the_credential_is_required_before_any_request() {
+    let root = dir("ai-credential");
+    let provider = FakeProvider::answering(
+        r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"delegated governance works"}}"#,
+    );
+    let daemon = Daemon::start_with_provider(&root, Some(&provider), &[]);
+    daemon.cli(&["task", "create", "--id", "k1", "x"]);
+    assert!(
+        daemon
+            .cli(&["task", "claim", "--id", "k1", "--worker", "ai"])
+            .status
+            .success()
+    );
+
+    let refused = daemon.cli(&["task", "ai-propose", "--task", "k1", "--worker", "ai"]);
+    assert!(!refused.status.success(), "no credential means no proposal");
+    let said = format!("{}{}", stdout_of(&refused), stderr_of(&refused));
+    assert!(
+        said.contains("provider-credential-absent")
+            || said.contains("provider-credential-store-unavailable"),
+        "the refusal must be a credential reason: {said}"
+    );
+
+    // And the provider was never contacted: no connection means the credential is checked
+    // first, so a deployment cannot leak a request it could not authenticate.
+    assert!(
+        !provider.was_contacted(),
+        "the provider must not be contacted without a credential"
+    );
+}
+
+/// A daemon started the way a user starts it — no provider flags — must refuse.
+///
+/// This is the assertion that keeps the scripted provider from becoming a silent
+/// production fallback. There is no flag that makes `orxnud` pretend to have a model.
+#[test]
+fn a_daemon_with_no_provider_flags_refuses_to_propose() {
+    let root = dir("ai-unconfigured");
+    let daemon = Daemon::start_unconfigured(&root);
+    daemon.cli(&["task", "create", "--id", "u1", "x"]);
+    assert!(
+        daemon
+            .cli(&["task", "claim", "--id", "u1", "--worker", "ai"])
+            .status
+            .success()
+    );
+
+    let refused = daemon.cli(&["task", "ai-propose", "--task", "u1", "--worker", "ai"]);
+    assert!(
+        !refused.status.success(),
+        "an unconfigured daemon must not propose"
+    );
+    let said = format!("{}{}", stdout_of(&refused), stderr_of(&refused));
+    assert!(
+        said.contains("provider-not-configured"),
+        "the refusal must name the reason: {said}"
+    );
 }
 
 /// The AI proposer through the real CLI.

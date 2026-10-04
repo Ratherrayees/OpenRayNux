@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use orxnuctl::CliError;
 use orxnuctl::client::Client;
-use orxnuctl::{Command, help, parse, task, version_line};
+use orxnuctl::{Command, ProviderCommand, help, parse, provider, task, version_line};
 
 /// The one place the endpoint is decided, so no command body can forget the override.
 ///
@@ -104,6 +104,24 @@ fn main() -> ExitCode {
                             ExitCode::FAILURE
                         }
                     },
+                }
+            }
+            Command::Provider(ProviderCommand::Credential(ref verb)) => {
+                // The only command that touches a secret store, and the only one that
+                // reads stdin. It reaches the platform store directly rather than through
+                // the daemon: a credential has no business crossing an IPC socket, and
+                // asking the daemon to hold one would put it in a process that does not
+                // need it.
+                let secrets = orxnud_platform_secrets::KeyringSecrets::default();
+                match provider::run(verb, &secrets) {
+                    Ok(output) => {
+                        println!("{output}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(why) => {
+                        eprintln!("error: {why}");
+                        ExitCode::FAILURE
+                    }
                 }
             }
             Command::Task(ref verb) => {

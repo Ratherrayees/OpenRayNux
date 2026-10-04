@@ -25,6 +25,12 @@ thiserror = { workspace = true }
 # the protocol's own vocabulary, and `orxnud-protocol` speaks it in its public API.
 serde_json = { workspace = true }
 orxnud-protocol = { workspace = true }
+# The credential command talks to the platform store directly. The daemon depends on it
+# too, so this is not a new edge in the graph -- but the layering gate is checked, so it
+# is declared rather than assumed.
+orxnud-domain = { workspace = true }
+orxnud-platform-secrets = { workspace = true }
+zeroize = { workspace = true }
 orxnud-platform-ipc = { workspace = true }
 # For one current-thread runtime to drive the transport's async client. A blocking
 # client would mean a second implementation of the socket, and the two would then

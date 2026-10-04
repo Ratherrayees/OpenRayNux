@@ -13,6 +13,15 @@ publish.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# The API key is wrapped in `Zeroizing` so it is wiped on drop rather than left in
+# freed heap. The workspace already depends on it; this is the first daemon-side use.
+zeroize = { workspace = true }
+# The provider's single outbound connection may be TLS. Nothing else in the daemon
+# opens a socket to the network, so the dependency is confined to `http_provider`.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-native-certs = { workspace = true }
 orxnud-domain = { workspace = true }
 orxnud-protocol = { workspace = true }
 orxnud-store = { workspace = true }
@@ -32,6 +41,13 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Generates the self-signed certificate the HTTPS suite needs. A committed PEM would
+# fail G10 (no private keys in the tree) and a hand-rolled generator would be a
+# second implementation of X.509 that nobody here should maintain.
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 # The runtime integration suite opens the runtime's own SQLite file to count the
 # records it persisted, so it uses the real store rather than a re-implementation
 # of the query.

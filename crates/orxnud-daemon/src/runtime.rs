@@ -137,8 +137,12 @@ pub enum RequestError {
     Declined {
         /// A fixed vocabulary word, never prose.
         reason: String,
-        /// A second fixed word, when the first is not specific enough.
-        detail: Option<&'static str>,
+        /// Why, when the reason alone is not specific enough.
+        ///
+        /// Owned rather than `&'static str` because the most useful refinement is
+        /// frequently dynamic — which parameter the model got wrong — and a refusal that
+        /// cannot name the offending field sends an operator to the logs instead.
+        detail: Option<String>,
     },
 
     /// The method does not exist.
@@ -153,6 +157,21 @@ pub enum RequestError {
     /// set of reasons to keep in step.
     #[error("dispatch refused: {0}")]
     Refused(String),
+
+    /// The proposal provider could not be asked, or could not answer.
+    ///
+    /// Separate from [`Self::Declined`] because the two mean opposite things to a
+    /// caller: a decline is the deterministic pipeline working correctly on a bad
+    /// proposal, while this is the pipeline never reaching a verdict. Collapsing them
+    /// would let "the model was unreachable" be reported as "the model's proposal was
+    /// refused", which is how an outage starts looking like a policy decision.
+    #[error("proposal provider failed: {reason}")]
+    ProviderRefused {
+        /// A fixed vocabulary word, never prose.
+        reason: String,
+        /// The provider's own words, already free of any credential.
+        detail: Option<String>,
+    },
 }
 
 impl RequestError {
@@ -175,6 +194,17 @@ impl RequestError {
                 RpcError::new(RpcErrorCode::INVALID_REQUEST, "invalid request").with_data(data)
             }
             Self::UnknownMethod(m) => RpcError::method_not_found(m),
+            Self::ProviderRefused { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(
+                    RpcErrorCode::INTERNAL_ERROR,
+                    "the proposal provider could not be used",
+                )
+                .with_data(data)
+            }
             Self::Refused(why) => {
                 RpcError::new(RpcErrorCode::INTERNAL_ERROR, "the request was refused")
                     .with_data(json!({ "reason": why }))
@@ -219,7 +249,9 @@ pub struct Runtime<S: SecretsContract> {
     /// there is exactly one value for the life of the process, and a test seam needs the
     /// opposite. Per-runtime also makes the real thing simpler: two daemons in one process
     /// can legitimately be configured differently.
-    proposer: Arc<dyn crate::proposer::ProposalProvider>,
+    /// `None` means no provider is configured, and that is a refusal rather than a
+    /// fallback. See [`scripted_proposer`].
+    proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
 }
 
 impl<S: SecretsContract> std::fmt::Debug for Runtime<S> {
@@ -255,18 +287,33 @@ impl<S: SecretsContract> Runtime<S> {
     /// [`RuntimeError::Endpoint`] if the local transport cannot be bound. In every
     /// case **no endpoint is left behind**.
     pub async fn start(paths: Paths, secrets: S) -> Result<Self, RuntimeError> {
-        Self::start_with(paths, secrets, default_proposer()).await
+        Self::start_unconfigured(paths, secrets).await
+    }
+
+    /// Starts a runtime with **no** proposal provider.
+    ///
+    /// What [`Runtime::start`] does. Named separately so the absence is visible at the
+    /// call site: `task/ai-propose` on such a runtime answers `provider-not-configured`.
+    pub async fn start_unconfigured(paths: Paths, secrets: S) -> Result<Self, RuntimeError> {
+        Self::build(paths, secrets, None).await
     }
 
     /// Starts a runtime that asks `proposer`.
     ///
-    /// The public form of the test seam: a caller supplies a provider and gets a daemon
-    /// that uses it, with no global state and nothing to clean up afterwards. Prefer
-    /// [`Runtime::with_proposer`] where a builder reads better.
+    /// The public form of the configuration seam: a caller supplies a provider and gets
+    /// a daemon that uses it, with no global state and nothing to clean up afterwards.
     pub async fn start_with(
         paths: Paths,
         secrets: S,
         proposer: Arc<dyn crate::proposer::ProposalProvider>,
+    ) -> Result<Self, RuntimeError> {
+        Self::build(paths, secrets, Some(proposer)).await
+    }
+
+    async fn build(
+        paths: Paths,
+        secrets: S,
+        proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
     ) -> Result<Self, RuntimeError> {
         // 1 + 2 + 3. Durable security state, verified, attached.
         let mut daemon = Daemon::compose(paths.clone());
@@ -309,7 +356,7 @@ impl<S: SecretsContract> Runtime<S> {
     /// borrow, which matters because `serve` consumes the runtime.
     #[must_use]
     pub fn with_proposer(mut self, proposer: Arc<dyn crate::proposer::ProposalProvider>) -> Self {
-        self.proposer = proposer;
+        self.proposer = Some(proposer);
         self
     }
 
@@ -318,8 +365,16 @@ impl<S: SecretsContract> Runtime<S> {
     /// `pub` so a test can assert on the very provider a dispatch would use, rather than
     /// on a copy of it.
     #[must_use]
-    pub fn proposer(&self) -> &Arc<dyn crate::proposer::ProposalProvider> {
-        &self.proposer
+    pub fn proposer(&self) -> Option<&Arc<dyn crate::proposer::ProposalProvider>> {
+        self.proposer.as_ref()
+    }
+
+    /// Whether this runtime has a proposal provider.
+    ///
+    /// `false` means `task/ai-propose` answers `provider-not-configured`.
+    #[must_use]
+    pub fn has_proposer(&self) -> bool {
+        self.proposer.is_some()
     }
 
     /// The bound endpoint.
@@ -458,7 +513,7 @@ impl Drop for EndpointRelease {
 async fn handle_connection<S: SecretsContract>(
     stream: &mut LocalStream,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
-    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+    provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
 ) -> Result<(), IpcError> {
     let bytes = match stream.read_line_bounded(MAX_REQUEST_BYTES).await {
         Ok(b) => b,
@@ -553,7 +608,7 @@ fn extract_id(bytes: &[u8]) -> Option<RequestId> {
 async fn route<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
-    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+    provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
 ) -> Result<serde_json::Value, RequestError> {
     let Some(method) = Method::from_wire(&request.method) else {
         return Err(RequestError::UnknownMethod(request.method.clone()));
@@ -600,7 +655,7 @@ async fn route<S: SecretsContract>(
         // routed separately rather than through `tasks`: it needs the capability registry
         // and the sandbox backend, which `tasks` deliberately has no access to.
         Method::TaskExecute => execute_proposal(request, governed).await,
-        Method::TaskAiPropose => ai_propose(request, governed, provider).await,
+        Method::TaskAiPropose => ai_propose(request, governed, provider.as_ref()).await,
     }
 }
 
@@ -636,8 +691,21 @@ fn local_actor() -> orxnud_domain::Actor {
 async fn ai_propose<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
-    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
 ) -> Result<serde_json::Value, RequestError> {
+    // No provider configured is a refusal with its own reason, never a scripted answer.
+    // A daemon that cannot reach a model says so; it does not pretend the model agreed.
+    let Some(provider) = provider else {
+        return Err(RequestError::ProviderRefused {
+            reason: crate::proposer::ProviderError::NotConfigured
+                .reason()
+                .to_owned(),
+            detail: Some(
+                "this daemon has no proposal provider; start it with a provider configured"
+                    .to_owned(),
+            ),
+        });
+    };
     let params = request.params.clone().unwrap_or(json!({}));
     let task_id = required_str(&params, "task")?;
     check_len("task", &task_id, MAX_TASK_ID_BYTES)?;
@@ -705,15 +773,39 @@ async fn ai_propose<S: SecretsContract>(
         allowed,
     };
 
-    let text = provider
-        .complete(&ctx)
-        .map_err(|e| RequestError::Refused(e.to_string()))?;
+    // The provider trait is synchronous, and a synchronous network call inside an async
+    // task would occupy a runtime worker for the length of a model call. Handing it to the
+    // blocking pool keeps the trait free of async -- which is what stops every implementor
+    // and every test from needing a runtime -- without holding a worker thread hostage
+    // meanwhile.
+    let asker = Arc::clone(provider);
+    let for_call = ctx.clone();
+    let answered = tokio::task::spawn_blocking(move || asker.complete(&for_call))
+        .await
+        .map_err(|e| RequestError::ProviderRefused {
+            reason: crate::proposer::ProviderError::Unreachable(String::new())
+                .reason()
+                .to_owned(),
+            detail: Some(format!("the provider task did not finish: {e}")),
+        })?;
+    let text = answered.map_err(|e| {
+        // A provider failure is not a declined request: the caller did nothing wrong and
+        // the deterministic reason is preserved so a client can tell "the model said no"
+        // from "the model could not be asked".
+        RequestError::ProviderRefused {
+            reason: e.reason().to_owned(),
+            detail: Some(e.to_string()),
+        }
+    })?;
 
     let validated =
         crate::proposer::validate(&text, &ctx, &|id| registered_ids.iter().any(|r| r == id))
             .map_err(|e| RequestError::Declined {
                 reason: e.reason().to_owned(),
-                detail: Some("the model's output was not a proposal this runtime can act on"),
+                // The refusal's own words, not a fixed string: "which field was wrong" is
+                // the only thing that lets an operator tell a model that misunderstood the
+                // shape from a capability that has drifted from its declaration.
+                detail: Some(e.to_string()),
             })?;
 
     // From here the model is out of the picture. What follows is the same path a human
@@ -746,13 +838,15 @@ async fn ai_propose<S: SecretsContract>(
     }))
 }
 
-/// The proposer a daemon with no configured provider asks.
+/// The provider a deterministic test uses when it does not care which one.
 ///
-/// A declared non-model stand-in rather than an error, because a build with no
-/// credentials must still exercise the whole path, and because a silent "no provider
-/// configured" would make the boundary indistinguishable from a missing feature.
+/// **Not a default.** [`Runtime::start`] leaves the runtime unconfigured and
+/// `task/ai-propose` answers `provider-not-configured`; only a test that explicitly asks
+/// for a scripted provider gets one. A production daemon quietly answering with a fixed
+/// string would report a working intelligence loop that does not exist, and the failure
+/// would only surface as an unexplained absence of judgement.
 #[must_use]
-pub fn default_proposer() -> Arc<dyn crate::proposer::ProposalProvider> {
+pub fn scripted_proposer() -> Arc<dyn crate::proposer::ProposalProvider> {
     Arc::new(crate::proposer::ScriptedProvider::returning(
         "scripted/none",
         r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"delegated governance works"}}"#,
@@ -841,7 +935,7 @@ async fn execute_proposal<S: SecretsContract>(
                 // A fixed word, not a formatted sentence: `detail` is a second term in a
                 // vocabulary a client branches on, and putting a task id in it would make
                 // the value unpredictable.
-                detail: Some("no approval is recorded for this proposal's attempt"),
+                detail: Some("no approval is recorded for this proposal's attempt".to_owned()),
             })?;
     let record = approval_record_from_row(&approval_row, &proposer, &proposal)?;
 
@@ -865,7 +959,7 @@ async fn execute_proposal<S: SecretsContract>(
         Err(_) => {
             return Err(RequestError::Declined {
                 reason: "proposal-corrupt".to_owned(),
-                detail: Some("the stored parameters are not readable JSON"),
+                detail: Some("the stored parameters are not readable JSON".to_owned()),
             });
         }
     };
@@ -959,7 +1053,7 @@ fn approval_record_from_row(
 ) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
     let digest = digest_from_hex(&row.digest_hex).ok_or_else(|| RequestError::Declined {
         reason: "approval-corrupt".to_owned(),
-        detail: Some("the stored digest is not 64 hex characters"),
+        detail: Some("the stored digest is not 64 hex characters".to_owned()),
     })?;
     // The approval must be *for this action*. Cheap pre-check so the refusal names the
     // mismatch instead of surfacing as a digest failure deep in the dispatcher.
@@ -969,7 +1063,7 @@ fn approval_record_from_row(
     {
         return Err(RequestError::Declined {
             reason: "approval-action-mismatch".to_owned(),
-            detail: Some("the approval was issued for a different action"),
+            detail: Some("the approval was issued for a different action".to_owned()),
         });
     }
     Ok(orxnud_domain::ApprovalRecord {
@@ -1029,7 +1123,7 @@ async fn approve_proposal<S: SecretsContract>(
     if !proposal.is_pending() {
         return Err(RequestError::Declined {
             reason: "proposal-already-decided".to_owned(),
-            detail: Some("only a pending proposal can be approved"),
+            detail: Some("only a pending proposal can be approved".to_owned()),
         });
     }
     let proposer = proposal
@@ -1423,7 +1517,7 @@ fn task_fault(fault: TaskFault) -> RequestError {
         | TaskFault::NotClaimable(_)
         | TaskFault::Fenced => RequestError::Declined {
             reason: reason.to_owned(),
-            detail: fault.detail(),
+            detail: fault.detail().map(str::to_owned),
         },
         TaskFault::Stopped | TaskFault::Engine(_) => RequestError::Refused(reason.to_owned()),
     }
@@ -1674,8 +1768,8 @@ mod tests {
     /// "no provider configured" would make the boundary indistinguishable from a missing
     /// feature.
     #[test]
-    fn the_default_proposer_is_the_declared_stand_in_and_says_so() {
-        let p = default_proposer();
+    fn the_scripted_provider_is_available_and_identifies_itself() {
+        let p = scripted_proposer();
         assert_eq!(p.model_id(), "scripted/none");
     }
 

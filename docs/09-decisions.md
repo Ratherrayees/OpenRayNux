@@ -3134,3 +3134,135 @@ Re-read if a capability needs a parameter constraint the shape cannot express (a
 point the split between shape and semantics is being tested rather than respected); if a
 second consumer needs the schema to be something other than prose plus structure; or if
 the model is ever handed the schema itself.
+
+## ADR-0040 — One real provider, over HTTP, with the credential in the secret store
+
+**Status.** **Implemented.** V-77 and V-78 are closed: TLS via `rustls` with certificate
+chain and hostname verification, and `orxnuctl provider credential set` as the user-facing
+path into the platform secret store. Provider selection is **manual and authoritative** —
+there is no automatic fallback of any kind, and a future one is a separate decision.
+
+**Amendment: manual selection, and no fallback.** The originally selected provider and model
+are exactly what the runtime uses. If that provider fails, the failure is reported; no other
+provider, model, endpoint or script is tried. This is deliberate rather than merely
+unimplemented. A provider outage is an outage, and a task's text may be personal or
+sensitive, so "the configured provider is unavailable" is not permission to transmit the same
+context to a different company. Automatic fallback is deferred until several real providers
+exist and there is evidence about their behaviour; if it is ever built, it will be an explicit
+opt-in policy with its own data-boundary rules (public context may fall back freely,
+regulated context may not), not a default.
+
+**Amendment: the credential has one supported path.** `orxnuctl provider credential set`
+reads the value from **stdin** and writes it through `SecretsContract::set`. No spelling of
+the command takes a credential as an argument — an argument is visible in `ps` output and in
+shell history — and the argument parser is tested against every plausible attempt to pass
+one. Nothing echoes the value back, not even a prefix, because a prefix is four characters of
+a credential in every scrollback and CI log.
+
+**Amendment: TLS, and no downgrade.** `https://` is TLS or it is nothing. There is no
+configuration that turns it into plaintext, no retry from TLS to plain when a handshake
+fails, and no redirect following — an `https://` endpoint answering `302 http://…` would
+otherwise be a downgrade delivered by the far side rather than by us, which is the same
+failure with the blame moved. `http://` remains reachable only when explicitly permitted,
+which only a loopback test server does, and the transport refuses to attach an
+`Authorization` header over plaintext at all. That last rule is what makes the permission
+safe to have in the codebase: it cannot be used to prove a credential path works over
+`http://` and then carry that expectation to a real host differing by one character.
+
+`orxnud-config` and gate G2(b) were both amended deliberately. The CLI's permitted internal
+crates gained `orxnud-domain` and `orxnud-platform-secrets`, because the credential command
+must use the authoritative `SecretRef` and `SecretsContract` rather than hand-roll a
+reference format that would write a credential the provider cannot read. That is the gate's
+own reasoning applied: naming the real types is safer than inventing copies. The licence
+allowlist gained `ISC` and `BSD-3-Clause`, required by `rustls-webpki`, `untrusted`, `ring`
+and `subtle`; all four are permissive, and `ring` is `Apache-2.0 AND ISC` so ISC had to be
+acceptable for `rustls` to be usable at all. `webpki-roots` was rejected: it is MPL-2.0, and
+bundled roots also go stale. `rustls-native-certs` reads the host trust store instead.
+
+One HTTP bug was fixed on the way. The response reader waited for the peer to close, which
+was wrong twice: a provider answering `Connection: close` with a kept-alive connection would
+hang until the deadline, and a TLS peer closing without `close_notify` looked like a
+truncation error. The reader now delimits the body by HTTP framing — `Content-Length` where
+declared — so the end of a response is a fact about the response rather than about the peer's
+manners.
+
+`OpenAiCompatibleProvider<S>` speaks
+OpenAI-compatible `chat/completions` over HTTP/1.1, is injected per `Runtime`, resolves its
+credential through `SecretsContract`, and returns text only. `ProviderError` grew from one
+variant to eight, each with a fixed reason and no retry. `Runtime::start` now leaves the
+provider **unconfigured** and `task/ai-propose` answers `provider-not-configured`. Cites
+V-77 and V-78.
+
+**Context.** V-75 shipped the pipeline and the boundary with a scripted provider, and said
+plainly that the interesting half — a real model producing a sensible proposal — was
+unproven. This slice is that half, minus the part no credential can reach.
+
+**Decision.** One provider, no framework. `ProposalProvider` was not redesigned: it stays
+synchronous and takes a context by reference. A synchronous network call inside the
+daemon's async task would occupy a runtime worker for the length of a model call, and making
+the trait `async` would push a runtime into every implementor and every test — so the call
+site hands the provider to `tokio::task::spawn_blocking` instead. The provider drives a
+private current-thread runtime. One call is in flight per daemon, so this costs a thread.
+
+The transport is HTTP/1.1 written on `tokio`'s socket types rather than a new dependency.
+`http://` is complete; **`https://` is refused**, not downgraded (V-77). Silently dropping
+TLS would turn a configured `https://` endpoint into a plaintext attempt at the same host
+with the credential in the clear, and nothing in a log would show it. The refusal is a
+refusal precisely because it is inconvenient.
+
+The credential is a `SecretRef`, never a `String` in a struct, resolved per request into a
+`Zeroizing`. `orxnud-config` states that an environment variable must never be treated as a
+secret store — it is visible to every process of the same user and ends up in `ps` output
+and crash dumps — so the key comes from `SecretsContract` and the two provider settings come
+from arguments. The key is dereferenced to `&str` for the `Authorization` header and
+nowhere else, which means there is no expression that can put it in a log line: `Zeroizing`
+has no `Display`. Third-party error strings are passed through a deliberately crude
+redactor, because a credential store that fails while quoting the secret must not launder it
+into a daemon log through us.
+
+`Runtime::start` no longer installs the scripted provider. A daemon with no provider answers
+`provider-not-configured`, and `--provider-scripted` is an explicit opt-in that announces
+itself on stderr and records `scripted/none` in the audit record. The previous arrangement
+would have let a production daemon quietly answer with a fixed string and report a working
+intelligence loop that did not exist.
+
+**Alternatives rejected.**
+
+* *`https` via a TLS dependency (`ureq` + `rustls`).* Deferred, not rejected: it is the
+  right answer and it is roughly fifteen crates into a repository that holds its domain
+  layer to serde and thiserror alone. It deserves its own decision and its own licence
+  review under G8, not a side effect of adding a provider.
+* *An environment variable for the API key.* Rejected by the repository's own stated
+  position on secrets, before any other consideration.
+* *A transport trait so tests could mock HTTP.* Rejected in favour of a real loopback
+  server. A mocked transport cannot catch a malformed request line, a wrong
+  `Content-Length`, or a body limit that never engages — which are precisely the parts that
+  have never been executed.
+* *Retrying, or falling back to the scripted provider on failure.* Rejected. A retry is a
+  second proposal attempt with different text, and a fallback is a daemon reporting a model
+  that is not there.
+* *Handing the model the `ParamSchema`.* Rejected for the reason ADR-0039 gives: it invites
+  a model to contrive a shape-satisfying request rather than an honest one.
+
+**Consequences.** The model is told the menu, the parameter names, and the risk class, and
+nothing else; the request body is asserted to contain no dispatcher, task service, policy
+engine, store handle or credential. The system prompt states the output contract and asks
+for no safety behaviour, because a model that follows instructions is not a security
+control. Every refusal is enforced after the text returns, and fifteen adversarial outputs
+are refused by the parser while three semantic ones — a traversing path, an absolute path, a
+nested path — are asserted to satisfy the *shape* and be refused by the capability, because
+`ParamSchema` is shape-only and a test claiming otherwise would be claiming a job the
+schema does not do.
+
+`orxnuctl` now shows the `reason` word rather than the most specific string available,
+because a reason exists to be branched on and hiding it behind prose defeats that. Provider
+failures are a distinct wire error from a declined proposal: "the model was unreachable"
+must not read as "the model's proposal was refused", or an outage starts looking like a
+policy decision.
+
+### Amendment trigger
+
+Re-read when TLS lands (V-77); when a user can store a provider credential (V-78); if a
+second provider is added, at which point the question is whether `ProviderConfig` was the
+right place for the shared parts; or if a provider ever needs to be reachable without a
+credential.

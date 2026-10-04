@@ -26,6 +26,7 @@
 use std::fmt;
 
 pub mod client;
+pub mod provider;
 pub mod task;
 
 use orxnud_protocol::{PROTOCOL_VERSION, RpcErrorCode};
@@ -91,6 +92,21 @@ pub enum CapabilityCommand {
     },
 }
 
+/// The `capability` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCommand {
+    /// Store, remove or inspect the provider credential.
+    Credential(provider::CredentialCommand),
+}
+
+/// Whether a provider credential subcommand was recognised.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnknownProviderCommand {
+    /// The subcommand word was not one of the three.
+    #[error("unknown provider command: {0}")]
+    Command(String),
+}
+
 /// The subcommands that exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -102,6 +118,8 @@ pub enum Command {
     Task(TaskCommand),
     /// Invoke capabilities, through the local daemon.
     Capability(CapabilityCommand),
+    /// Manage the proposal provider's credential, in the platform secret store.
+    Provider(ProviderCommand),
 }
 
 /// Why a command line could not be understood.
@@ -122,6 +140,10 @@ pub enum CliError {
         /// What was supplied.
         extra: String,
     },
+
+    /// The arguments were not a command this program accepts.
+    #[error("{0}")]
+    BadArgument(String),
 
     /// A required flag was not supplied.
     #[error("{command} needs {flag}")]
@@ -191,6 +213,7 @@ impl fmt::Display for Command {
             Self::Doctor => "doctor",
             Self::Task(_) => "task",
             Self::Capability(_) => "capability",
+            Self::Provider(_) => "provider",
         };
         f.write_str(s)
     }
@@ -228,7 +251,15 @@ pub fn help() -> String {
            version   Print the version and exit\n  \
            doctor    Report this build: capabilities, config, storage\n  \
            task      Manage tasks through the local daemon\n  \
-           capability\n             Invoke a capability through the governed dispatcher\n\
+           capability\n             Invoke a capability through the governed dispatcher\n  \
+           provider    Manage the proposal provider's credential\n\
+         \n\
+         Provider credential:\n\
+           orxnuctl provider credential set < key.txt   Store it in the platform secret store\n\
+           orxnuctl provider credential status           Report present/absent, never the value\n\
+           orxnuctl provider credential delete           Remove it\n\
+           The value is read from stdin, never from an argument: an argument is visible\n\
+           in `ps` output and in shell history. Nothing echoes it back, not even a prefix.\n\
          \n\
          Capability verbs:\n\
            run     --capability <ID> [--params <JSON>] [--target <T>] [--approval <JSON>]\n\
@@ -297,6 +328,46 @@ where
                 Ok(Invocation {
                     command: Command::Capability(command),
                     endpoint: endpoint.map(Into::into),
+                })
+            }
+            "provider" => {
+                // No endpoint: this command talks to the platform credential store, not to
+                // a daemon, so there is no socket for `--endpoint` to name.
+                let Some((verb, rest)) = rest.split_first() else {
+                    return Err(CliError::MissingFlag {
+                        command: "provider",
+                        flag: "a command: credential",
+                    });
+                };
+                if verb != "credential" {
+                    return Err(CliError::UnknownCommand(format!("provider {verb}")));
+                }
+                let Some((action, rest)) = rest.split_first() else {
+                    return Err(CliError::MissingFlag {
+                        command: "provider credential",
+                        flag: "one of: set, delete, status",
+                    });
+                };
+                let action = action.clone();
+                let inner = provider::parse(std::slice::from_ref(&action))
+                    .map_err(CliError::BadArgument)
+                    .and_then(|c| {
+                        if rest.is_empty() {
+                            Ok(c)
+                        } else {
+                            // Anything after the verb is refused rather than ignored: a
+                            // silently-dropped `--api-key` is exactly the mistake this
+                            // command exists to make impossible.
+                            Err(CliError::BadArgument(format!(
+                                "unexpected argument {:?}; the credential is read from \
+                                 stdin, never from an argument",
+                                rest[0]
+                            )))
+                        }
+                    })?;
+                Ok(Invocation {
+                    command: Command::Provider(ProviderCommand::Credential(inner)),
+                    endpoint: None,
                 })
             }
             "--help" | "-h" | "help" => Err(CliError::MissingCommand("--help".to_owned())),
