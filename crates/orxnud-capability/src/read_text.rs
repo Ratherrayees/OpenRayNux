@@ -194,7 +194,7 @@ pub fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
 /// # Why `invoke` refuses
 ///
 /// A Tier-1 adapter's `invoke` is never called: the dispatcher builds a contract from the
-/// bundle's [`AdapterBundle::sandbox_plan`] and hands that to the execution backend. This
+/// bundle's `sandbox_plan` and hands that to the execution backend. This
 /// body is unreachable in normal operation, and it refuses rather than reading anything.
 /// An in-process read would be an unsandboxed read of the workspace, which is the exact
 /// bypass the tier exists to close -- and for a *read* that bypass is disclosure.
