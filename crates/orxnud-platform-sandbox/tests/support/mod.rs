@@ -87,9 +87,33 @@ pub fn helper_path() -> PathBuf {
 /// one a name filter was approximating badly. Cargo's sidecar files are readable
 /// text, which is exactly why they slipped through.
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    std::fs::metadata(path).is_ok_and(|meta| {
+        if !meta.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        }
+        // Not a Unix target, so there is no mode bit to read and
+        // `PermissionsExt` does not exist. The property is still decidable: what
+        // separates the helper from cargo's sidecars here is the extension, since the
+        // binary is `hostile_helper-<hash>.exe` and the sidecars are `.d` and
+        // `.rmeta`.
+        //
+        // This module is Linux evidence either way -- it locates a `bwrap` helper and
+        // runs it under `/bin/sh` -- so this arm only has to be *correct enough to
+        // compile*, which is what the MSVC `--all-targets` check in `windows-check`
+        // requires. The `windows-portability` lane runs `--lib`, never this
+        // integration test, so nothing asserts against this answer at runtime.
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            path.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        }
+    })
 }
 
 /// When `path` was last modified, or the epoch if that cannot be read.

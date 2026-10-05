@@ -2926,6 +2926,76 @@ for, fetched one deliberate call at a time.
 
 ---
 
+<a id="adr-0045"></a>
+
+## ADR-0045 — One approval, two acts: a read and its disclosure to a provider identity
+
+**Status.** **Decided. Governance core implemented; runtime wiring deliberately absent.**
+
+This record exists because `crates/orxnud-daemon/src/observation.rs` cites it, and the
+decision is not covered by any earlier ADR. It was made and implemented in Stage 4c; this
+entry registers it. Nothing here is being decided for the first time — the rationale is the
+module's own documentation (`observation.rs:1-35`) and the evidence is its 29 tests.
+
+**Context.** ADR-0044 established that `filesystem/read-text` is `RiskClass::High` and
+requires human approval, and that `PriorStepContext` carries metadata only. That leaves the
+content with nowhere to go: the model can *propose* a read and then has no channel to receive
+what it read. Solving that is what forces the question this ADR answers.
+
+**Decision 1 — one approval covers two acts: the local read, and the disclosure of its
+result to the provider identity that asked for the read.**
+
+This is the project's first case of a single human approval authorising both an action on
+this machine and an egress to a third party. It is stated explicitly because the alternative
+is the more defensible-looking design: a *separate* approval for the disclosure. That was
+rejected for a specific reason rather than a general one — a second prompt for the same bytes
+trains the user to click through prompts, and the two acts are not independently
+separable: the bytes exist only because the read happened, and withholding them would make
+the approved read pointless. The cost is accepted and is the same cost ADR-0044 Decision 1
+accepts: a human round trip per observation, paid on purpose.
+
+**Decision 2 — the authorisation is bound to `(endpoint, model)`, not to the model string.**
+
+Comparing the model alone would let a re-pointed endpoint inherit an approval given to the
+old one, which is precisely the substitution the rule exists to prevent. `ProviderIdentity`
+canonicalises endpoint spellings so cosmetic differences do not refuse a legitimate match,
+and `matches()` requires both halves.
+
+**Decision 3 — the disclosure gets its own audit correlation, minted internally.**
+
+`DisclosureRecord` renders as an audit record with `capability = "orxnud.policy/disclose"`,
+the **human who approved the read** as the actor, and a correlation distinct from the read's
+own. Minting it inside the record is what makes it unforgeable from outside:
+`a_disclosure_correlation_cannot_be_made_to_equal_its_parent` asserts the invariant, so a
+disclosure can neither close nor be closed by the read's authorisation record. The audit
+detail is bounded and content-free — identifiers, a byte count, and the canonical
+destination.
+
+**Decision 4 — nothing here is durable.**
+
+Observations live in daemon process memory, are consumed by exactly one proposal, and expire
+on a TTL (15 min, 8 entries per task, 32 KiB whole-blob ceiling; a truncated blob is dropped
+rather than released). A restart destroys them and the model re-proposes the read. That is
+fail-safe: retaining workspace content across restarts is the thing this design exists to
+avoid. `PriorStepContext` and `EphemeralObservation` are deliberately two channels and are
+not conflated — the first is durable metadata, the second is memory-only content.
+
+**Evidence.** 29 tests in `observation.rs` — 19 for the store, 8 for disclosure, 2 for the
+ceiling — covering task isolation, `(endpoint, model)` binding including a re-pointed
+endpoint and a changed model, consume-once, whole-blob budget, TTL, and correlation
+distinctness.
+
+**Consequences.**
+
+* Approving a read is approving its transmission. The prompt and the register entry for this
+  capability must say so; a user who does not know is not consenting to what was asked.
+* `orxnud-daemon`'s runtime does not yet read or write an `ObservationStore`, so this
+  mechanism is unreachable today. That is deliberate and is the rollback point immediately
+  before the most sensitive change in the project. Until the wiring lands, no workspace
+  content can reach a provider, and the ADR-0044 Decision 2 boundary is intact in practice.
+
+---
+
 ## ADR-0043 — Continuation is an explicit operation, not a widened claim
 
 **Status.** **Decided and implemented.** `AwaitingNextStep` is advanced only by
