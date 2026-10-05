@@ -927,7 +927,12 @@ pub fn observed_only_limits() -> ResourceLimits {
     }
 }
 
-#[cfg(test)]
+// `#[cfg(unix)]`, and this is the one place the `cfg` is both necessary and legal: every
+// test below asserts Linux kernel behaviour -- `bwrap` argv, a tmpfs root, a network
+// namespace, an empty environment -- and none of it exists on another platform. Gating the
+// module rather than each test is honest about that, and `cfg` is permitted here because
+// this crate is an `orxnud-platform-*`; outside one, G3 forbids it.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
