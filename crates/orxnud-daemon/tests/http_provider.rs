@@ -1,21 +1,18 @@
-//! The real provider, against a real socket.
+//! Unix-socket evidence, recorded as such per test rather than per file.
 //!
-//! Every test here starts an actual TCP listener and speaks HTTP/1.1 to it. Nothing is
-//! mocked: the request the adapter writes, the status line it reads, the body limit it
-//! enforces and the deadline it applies are all the production code paths. A mocked
-//! transport would let a broken header or a wrong content-length pass, and those are
-//! exactly the parts that have never been run.
+//! Every test here reaches the daemon through a real Unix domain socket, and
+//! `std::os::unix::net::UnixStream` has no Windows equivalent -- the local IPC
+//! transport *refuses* there rather than binding a named pipe
+//! (`crates/orxnud-platform-ipc`, ADR-0035). So each test carries
+//! `#[cfg_attr(not(target_os = "linux"), ignore = ...)]` naming that reason, and
+//! this file still *compiles* for MSVC, which is what the `windows-check` lane's
+//! `--all-targets` proves.
 //!
-//! No test needs a credential, a network, or a model.
+//! Per test rather than a whole-file `#![cfg(unix)]`, and the reason is gate G3:
+//! `cfg` may appear only inside a `orxnud-platform-*` crate, so a file-level gate
+//! here would fail the boundary check that keeps the portable core portable. What
+//! it proved stays Linux evidence either way -- V-29.
 //!
-//! # Why the calls are not awaited
-//!
-//! [`ProposalProvider::complete`] is synchronous: it drives a private current-thread
-//! runtime, because a synchronous network call inside the daemon's async task would
-//! occupy a runtime worker for the length of a model call, and making the trait async
-//! would push a runtime into every implementor and every test. So these tests prepare a
-//! socket under `block_on` and then call the provider from ordinary synchronous code —
-//! calling it from inside a runtime would panic.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -59,7 +56,7 @@ fn rt() -> tokio::runtime::Runtime {
 
 fn send_raw(endpoint: &Path, line: &[u8]) -> Option<serde_json::Value> {
     use std::io::{BufRead as _, BufReader, Write as _};
-    let mut s = std::os::unix::net::UnixStream::connect(endpoint).ok()?;
+    let mut s = orxnud_platform_ipc::connect_blocking(endpoint)?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
     let _ = s.write_all(line);
     let _ = s.write_all(b"\n");
@@ -334,6 +331,12 @@ fn registered(id: &str) -> bool {
 /// property that matters here: a test cannot prove a credential path works over `http://`
 /// and then carry that expectation to a host differing by one character. Sending it is
 /// proved over TLS instead.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_well_formed_response_comes_back_as_text() {
     let rt = rt();
@@ -364,6 +367,12 @@ fn a_well_formed_response_comes_back_as_text() {
 }
 
 /// The request must contain the menu and the task, and nothing that could act.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_request_carries_the_menu_and_the_task_and_nothing_else() {
     let rt = rt();
@@ -444,6 +453,12 @@ fn the_request_carries_the_menu_and_the_task_and_nothing_else() {
 // ---------------------------------------------------------------------------
 
 /// Each non-success status is classified, and none of them returns a proposal.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn non_success_statuses_are_classified_and_never_parsed() {
     let rt = rt();
@@ -472,6 +487,12 @@ fn non_success_statuses_are_classified_and_never_parsed() {
 ///
 /// The task must come back; a proposal path that waits forever is a task that can never
 /// be cancelled or reported on.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_provider_that_never_answers_times_out() {
     let rt = rt();
@@ -488,6 +509,12 @@ fn a_provider_that_never_answers_times_out() {
 }
 
 /// Nothing is listening on a port that was bound and dropped.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_unreachable_provider_is_refused() {
     let dead = {
@@ -503,6 +530,12 @@ fn an_unreachable_provider_is_refused() {
 }
 
 /// An unbounded body is refused at the ceiling rather than read into memory.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_oversized_response_is_refused() {
     let rt = rt();
@@ -519,6 +552,12 @@ fn an_oversized_response_is_refused() {
 
 /// Every shape a provider might answer with is refused with its own reason, and none
 /// produces a proposal.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn malformed_and_unexpected_responses_are_refused() {
     let rt = rt();
@@ -551,6 +590,12 @@ fn malformed_and_unexpected_responses_are_refused() {
 // ---------------------------------------------------------------------------
 
 /// No credential configured is its own reason, not a request with an empty header.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_absent_credential_stops_before_any_request() {
     // No server at all: if this reached the network the test would fail to connect, which
@@ -570,6 +615,12 @@ fn an_absent_credential_stops_before_any_request() {
 }
 
 /// An empty credential is treated as absent rather than sent as a bare `Bearer`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_empty_credential_is_treated_as_absent() {
     let p = OpenAiCompatibleProvider::new(
@@ -587,6 +638,12 @@ fn an_empty_credential_is_treated_as_absent() {
 }
 
 /// A store that fails while quoting the secret must not get it into our error.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_credential_store_failure_cannot_launder_the_credential() {
     let p = OpenAiCompatibleProvider::new(
@@ -610,6 +667,12 @@ fn a_credential_store_failure_cannot_launder_the_credential() {
 }
 
 /// Configuration is all-or-nothing, with no default model quietly substituted.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn incomplete_configuration_is_not_configured() {
     for (base, model) in [
@@ -639,6 +702,12 @@ fn incomplete_configuration_is_not_configured() {
 /// task text, or for a task to be crafted to elicit. Every one is refused, and none
 /// reaches a proposal. This is the property the whole design exists for: the model is
 /// untrusted input, and nothing it says can become an approval.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn adversarial_model_output_never_becomes_authority() {
     // Refused by the deterministic parser: envelope, allowlist, target or shape. No
@@ -747,6 +816,12 @@ fn adversarial_model_output_never_becomes_authority() {
 ///
 /// `validate` is the same function either way; what this adds is proof that the provider
 /// hands its text over verbatim rather than sanitising it into something acceptable.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn hostile_text_from_a_socket_is_refused_by_the_same_rules() {
     let rt = rt();
@@ -769,6 +844,12 @@ fn hostile_text_from_a_socket_is_refused_by_the_same_rules() {
 }
 
 /// One legitimate proposal still passes, so the refusals above are not a blanket ban.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_conforming_proposal_from_a_socket_is_accepted() {
     let rt = rt();
@@ -792,6 +873,12 @@ fn a_conforming_proposal_from_a_socket_is_accepted() {
 /// `String`. The context has no dispatcher, no task service, no policy engine, no store
 /// handle and no approval ledger, so there is no argument through which authority could
 /// be passed even by a future implementor.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_provider_boundary_has_no_handle_to_authority() {
     let c = ctx();
@@ -820,6 +907,12 @@ fn the_provider_boundary_has_no_handle_to_authority() {
 ///
 /// An endpoint that routes `gpt-4o-mini` elsewhere would otherwise have its own claim
 /// written into an audit record by a process that never verified it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_model_identifier_is_the_configured_one() {
     let p = OpenAiCompatibleProvider::new(
@@ -834,6 +927,12 @@ fn the_model_identifier_is_the_configured_one() {
 }
 
 /// Status classification is total: every code maps to exactly one kind.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn every_status_classifies() {
     assert_eq!(StatusKind::of(200), StatusKind::Other);
@@ -844,6 +943,12 @@ fn every_status_classifies() {
 }
 
 /// Provider errors carry a reason, and none of them carries a credential.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn provider_errors_are_vocabulary_and_never_credentials() {
     let errors = [
@@ -882,6 +987,12 @@ fn provider_errors_are_vocabulary_and_never_credentials() {
 /// not something the proposer invented. Together they close the gap a real model fell
 /// into: enforced semantics that were never announced, and an announced menu that could
 /// have disagreed with what is enforced.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_context_a_provider_receives_carries_the_declared_target_semantics() {
     use orxnud_daemon::Paths;
@@ -1003,6 +1114,12 @@ fn recorder_with(
 ///
 /// Asserted from the durable row rather than from the reply, because the reply was always
 /// right — `model: openai/gpt-oss-120b` — and it was the journal that lied.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_durable_proposal_names_the_model_that_actually_answered() {
     use orxnud_daemon::Paths;
@@ -1083,6 +1200,12 @@ fn the_durable_proposal_names_the_model_that_actually_answered() {
 /// This is the per-Runtime isolation property restated over provenance. If provenance were
 /// derived from anything global — configuration, a process-wide default, a constant — this
 /// would fail, because the two proposals would carry the same model.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn two_daemons_record_their_own_providers_model() {
     use orxnud_daemon::Paths;
@@ -1180,6 +1303,12 @@ fn recorded_provenance(root: &std::path::Path) -> String {
 ///
 /// The scripted path in the task suite proves the governed pipeline. This proves the same
 /// pipeline with a provider that actually made a request over a socket.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_real_provider_proposes_through_a_real_daemon() {
     use orxnud_daemon::Paths;
@@ -1245,6 +1374,12 @@ fn a_real_provider_proposes_through_a_real_daemon() {
 /// Without this, a refactor that made `proposer` default to the scripted provider would
 /// pass every other test in the suite and quietly turn the product's AI feature into a
 /// tape recorder.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_unconfigured_daemon_refuses_rather_than_using_the_scripted_provider() {
     use orxnud_daemon::Paths;
@@ -1314,6 +1449,12 @@ fn an_unconfigured_daemon_refuses_rather_than_using_the_scripted_provider() {
 ///
 /// This is what makes "provider failures create no executable proposal" a property rather
 /// than an aspiration.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_provider_failure_leaves_the_task_executable_by_nobody() {
     use orxnud_daemon::Paths;

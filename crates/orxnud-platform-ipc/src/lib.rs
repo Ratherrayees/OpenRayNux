@@ -488,6 +488,144 @@ pub fn endpoint_for(root: &Path) -> PathBuf {
     root.join("orxnud.sock")
 }
 
+/// A blocking client connection to a bound endpoint.
+///
+/// One named type rather than an opaque `impl Read + Write`, because callers also need
+/// `set_read_timeout` and `shutdown`, which no trait bound in that list provides. The
+/// wrapper is what lets the daemon's end-to-end tests speak to a live socket without naming
+/// a platform type: see [`connect_blocking`].
+#[derive(Debug)]
+pub struct BlockingClient {
+    #[cfg(unix)]
+    inner: std::os::unix::net::UnixStream,
+}
+
+impl BlockingClient {
+    /// Sets a read deadline, so a caller cannot block forever on a silent peer.
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.inner.set_read_timeout(timeout)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = timeout;
+            Ok(())
+        }
+    }
+
+    /// Duplicates the handle, so a reader and a writer can share one connection.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                inner: self.inner.try_clone()?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no local IPC backend is implemented for this platform",
+            ))
+        }
+    }
+
+    /// Closes the read direction, so a blocked reader returns rather than hanging.
+    ///
+    /// Named for what a caller needs -- the half it wants to interrupt -- because
+    /// `std::net::Shutdown` cannot appear in this crate's signature off Unix.
+    pub fn shutdown_read(&self) {
+        #[cfg(unix)]
+        {
+            let _ = self.inner.shutdown(std::net::Shutdown::Read);
+        }
+    }
+}
+
+impl std::io::Read for BlockingClient {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            self.inner.read(buf)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = buf;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no local IPC backend is implemented for this platform",
+            ))
+        }
+    }
+}
+
+impl std::io::Write for BlockingClient {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            self.inner.write(buf)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = buf;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no local IPC backend is implemented for this platform",
+            ))
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.inner.flush()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+}
+
+/// Connects a **blocking** client to a bound endpoint, or `None` where there is none.
+///
+/// # Why this exists
+///
+/// Test suites that drive the daemon end to end need to speak to its socket from
+/// synchronous code, with a read timeout, and they were doing it by naming
+/// `std::os::unix::net::UnixStream` directly. That is an OS facility named outside the one
+/// crate allowed to name it, so the `windows-check` lane's `--all-targets` failed with
+/// `E0433: cannot find 'unix' in 'os'` on three daemon test binaries.
+///
+/// Per-test `#[cfg_attr(..., ignore)]` does not fix that: `ignore` stops a test *running*,
+/// while the code still has to *compile*. Only removing the code from the non-Unix build
+/// does, and gate **G3** permits `cfg` solely inside a `platform-*` crate. So the platform
+/// decision lives here and the tests ask for a socket rather than naming one -- the same
+/// inversion as [`bind`] and [`connect`].
+///
+/// `None` off Unix, which is the refusal posture rather than a second mechanism: there is
+/// no transport to connect to, and returning `None` says so without pretending.
+#[cfg(unix)]
+#[must_use]
+pub fn connect_blocking(path: &Path) -> Option<BlockingClient> {
+    std::os::unix::net::UnixStream::connect(path)
+        .ok()
+        .map(|inner| BlockingClient { inner })
+}
+
+/// Non-Unix: there is no local transport here, so there is nothing to connect to.
+///
+/// `None` for the same reason [`bind`] refuses rather than binding something else. The
+/// paired type is what lets a caller compile on either platform and handle `None`
+/// identically.
+#[cfg(not(unix))]
+#[must_use]
+pub fn connect_blocking(path: &Path) -> Option<BlockingClient> {
+    let _ = path;
+    None
+}
+
 /// Releases an endpoint this process created, on shutdown.
 ///
 /// The runtime calls this when it stops serving, so the socket file cannot outlive

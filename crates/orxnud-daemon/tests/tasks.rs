@@ -1,26 +1,18 @@
-//! The task workflow, end to end, over a real socket.
+//! Unix-socket evidence, recorded as such per test rather than per file.
 //!
-//! # What is actually exercised
+//! Every test here reaches the daemon through a real Unix domain socket, and
+//! `std::os::unix::net::UnixStream` has no Windows equivalent -- the local IPC
+//! transport *refuses* there rather than binding a named pipe
+//! (`crates/orxnud-platform-ipc`, ADR-0035). So each test carries
+//! `#[cfg_attr(not(target_os = "linux"), ignore = ...)]` naming that reason, and
+//! this file still *compiles* for MSVC, which is what the `windows-check` lane's
+//! `--all-targets` proves.
 //!
-//! An **external client** — a separate connection to a real Unix domain socket,
-//! speaking JSON-RPC — against a real `Runtime` over a real SQLite file. Nothing in
-//! this file calls `TaskService` or `DurableEngine` directly. That is the whole
-//! point: the properties worth protecting here are arrangement properties (a task
-//! survives a restart, a lease fences a stranger out, `pending` cannot jump to
-//! `completed`), and none of them is observable from a test that skips the transport
-//! and the daemon's routing.
+//! Per test rather than a whole-file `#![cfg(unix)]`, and the reason is gate G3:
+//! `cfg` may appear only inside a `orxnud-platform-*` crate, so a file-level gate
+//! here would fail the boundary check that keeps the portable core portable. What
+//! it proved stays Linux evidence either way -- V-29.
 //!
-//! The one place this file reads the database directly is to *check durability*
-//! after the runtime has gone — reading `task_events` and `tasks` back out of the
-//! file is how "it was really written down" is distinguished from "the reply said
-//! so". That is an assertion about storage, not a substitute for the request path.
-//!
-//! # Why there is no fixed sleep
-//!
-//! Readiness is established by asking the daemon a question it can only answer once
-//! `serve` is polling, and by waiting for the socket to appear — never by sleeping a
-//! guessed interval. A fixed sleep is either slower than it needs to be or flaky, and
-//! usually both at once.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -81,7 +73,7 @@ fn rt() -> tokio::runtime::Runtime {
 /// how the malformed cases are expressed. Every literal is one line: the transport is
 /// newline-delimited, so a newline inside the JSON arrives as a truncated frame.
 fn send_raw(endpoint: &Path, line: &[u8]) -> Option<Value> {
-    let mut s = std::os::unix::net::UnixStream::connect(endpoint).ok()?;
+    let mut s = orxnud_platform_ipc::connect_blocking(endpoint)?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
     let _ = s.write_all(line);
     let _ = s.write_all(b"\n");
@@ -223,6 +215,12 @@ fn events_for(root: &Path, task_id: &str) -> Vec<String> {
 // The workflow
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn create_list_claim_complete_runs_over_the_socket() {
     rt().block_on(async {
@@ -293,6 +291,12 @@ fn create_list_claim_complete_runs_over_the_socket() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_completed_task_and_its_events_survive_a_restart() {
     rt().block_on(async {
@@ -352,6 +356,12 @@ fn a_completed_task_and_its_events_survive_a_restart() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_crashed_run_leaves_a_lease_that_the_next_run_reclaims() {
     rt().block_on(async {
@@ -413,6 +423,12 @@ fn a_crashed_run_leaves_a_lease_that_the_next_run_reclaims() {
 // Security and negative cases
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_pending_task_cannot_be_completed_without_being_claimed() {
     // The state machine's whole point, over the wire. `Pending -> Completed` is not
@@ -449,6 +465,12 @@ fn a_pending_task_cannot_be_completed_without_being_claimed() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_worker_cannot_complete_a_task_it_does_not_hold() {
     rt().block_on(async {
@@ -490,6 +512,12 @@ fn a_worker_cannot_complete_a_task_it_does_not_hold() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_duplicate_task_id_is_refused_rather_than_overwriting() {
     rt().block_on(async {
@@ -522,6 +550,12 @@ fn a_duplicate_task_id_is_refused_rather_than_overwriting() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn claiming_what_cannot_be_claimed_is_refused_with_a_reason() {
     rt().block_on(async {
@@ -565,6 +599,12 @@ fn claiming_what_cannot_be_claimed_is_refused_with_a_reason() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn malformed_and_oversized_parameters_are_refused() {
     rt().block_on(async {
@@ -647,6 +687,12 @@ fn malformed_and_oversized_parameters_are_refused() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn listing_is_deterministic_and_starts_empty() {
     rt().block_on(async {
@@ -686,6 +732,12 @@ fn listing_is_deterministic_and_starts_empty() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn task_management_is_not_a_capability_invocation() {
     // The architectural claim, asserted rather than asserted-in-prose: a task
@@ -765,6 +817,12 @@ fn task_management_is_not_a_capability_invocation() {
 // below pin, because they are what a caller has to be able to rely on.
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_pending_task_can_be_cancelled() {
     rt().block_on(async {
@@ -793,6 +851,12 @@ fn a_pending_task_can_be_cancelled() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_running_task_can_be_cancelled_and_its_lease_is_released() {
     rt().block_on(async {
@@ -829,6 +893,12 @@ fn a_running_task_can_be_cancelled_and_its_lease_is_released() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_waiting_task_can_be_cancelled() {
     rt().block_on(async {
@@ -856,6 +926,12 @@ fn a_waiting_task_can_be_cancelled() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn cancelling_a_terminal_task_is_a_no_op_that_succeeds_and_reports_the_truth() {
     // The engine returns `Ok(())` without writing an event for a terminal task. So
@@ -910,6 +986,12 @@ fn cancelling_a_terminal_task_is_a_no_op_that_succeeds_and_reports_the_truth() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn repeated_cancellation_is_idempotent_with_no_duplicate_event() {
     rt().block_on(async {
@@ -961,6 +1043,12 @@ fn repeated_cancellation_is_idempotent_with_no_duplicate_event() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn cancelling_a_task_that_does_not_exist_is_not_found() {
     rt().block_on(async {
@@ -972,6 +1060,12 @@ fn cancelling_a_task_that_does_not_exist_is_not_found() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_cancelled_task_cannot_be_resurrected_by_a_late_completion() {
     // The race that matters: a worker holding a lease, and a cancel that clears it.
@@ -1015,6 +1109,12 @@ fn a_cancelled_task_cannot_be_resurrected_by_a_late_completion() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_cancelled_task_can_be_neither_claimed_nor_completed_afterwards() {
     rt().block_on(async {
@@ -1042,6 +1142,12 @@ fn a_cancelled_task_can_be_neither_claimed_nor_completed_afterwards() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_cancelled_task_and_its_events_survive_a_restart() {
     rt().block_on(async {
@@ -1181,6 +1287,12 @@ fn propose(s: &Serving, task: &str, worker: &str, file: &str, contents: &str) ->
 /// The load-bearing assertion is that the task reaches `completed` **only after** the
 /// verifier confirmed the file. A refuted effect must leave the task running, because
 /// "we do not know whether it happened" is not "it happened".
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_proposed_action_is_approved_executed_verified_and_completes_its_task() {
     rt().block_on(async {
@@ -1233,6 +1345,12 @@ fn a_proposed_action_is_approved_executed_verified_and_completes_its_task() {
 }
 
 /// The approval is single-use, and the second use is refused before any side effect.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_approval_cannot_be_executed_twice() {
     rt().block_on(async {
@@ -1270,6 +1388,12 @@ fn an_approval_cannot_be_executed_twice() {
 }
 
 /// An expired approval is refused, deterministically, with nothing written.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_expired_approval_is_refused_and_writes_nothing() {
     rt().block_on(async {
@@ -1305,6 +1429,12 @@ fn an_expired_approval_is_refused_and_writes_nothing() {
 /// ownership check — and the proposal that results records a proposer derived from the
 /// task, never from the worker. Changing which worker holds the lease must therefore
 /// leave the proposer, its authority root, and the eventual approval untouched.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_lease_holder_does_not_become_the_proposer() {
     rt().block_on(async {
@@ -1380,6 +1510,12 @@ fn the_lease_holder_does_not_become_the_proposer() {
 /// empty. It also covers the accident the design had to avoid: `recover` reclaims leases
 /// on `running` tasks, so if the proposal path had left the task `running` with a dead
 /// lease, a restart would have silently reset it to `pending`.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_proposal_and_its_waiting_task_survive_a_restart_unchanged() {
     rt().block_on(async {
@@ -1439,6 +1575,12 @@ fn a_proposal_and_its_waiting_task_survive_a_restart_unchanged() {
 /// A wait is not a retry: TP-6 requires a fresh approval after a *retry*, so the attempt
 /// that asked must be the attempt that executes. If this regressed, the approval and the
 /// execution it authorises would sit on different attempt numbers.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_attempt_does_not_advance_across_the_approval_wait() {
     rt().block_on(async {
@@ -1487,6 +1629,12 @@ fn the_attempt_does_not_advance_across_the_approval_wait() {
 /// the stored value, and execution replays the stored value — so a consistently-wrong
 /// canonicalisation is self-consistent and invisible. What catches it is comparing the
 /// stored canonical text against the request that produced it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_proposal_commits_to_the_parameters_that_were_requested() {
     rt().block_on(async {
@@ -1526,6 +1674,12 @@ fn the_proposal_commits_to_the_parameters_that_were_requested() {
 }
 
 /// An unapproved proposal cannot be executed, and a decided proposal cannot be re-approved.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_unapproved_or_already_decided_proposal_is_refused() {
     rt().block_on(async {
@@ -1569,6 +1723,12 @@ fn an_unapproved_or_already_decided_proposal_is_refused() {
 /// approval" could be expressed. That is the right design, but "hard by construction" is
 /// a claim about code, not a test, so the invariant is asserted here directly: B executes
 /// only under B's own approval, and never against A's.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_approval_for_one_proposal_does_not_execute_another() {
     rt().block_on(async {
@@ -1674,6 +1834,12 @@ fn an_approval_for_one_proposal_does_not_execute_another() {
 /// well-meaning "let's sort everything" later: `{"a":1,"b":2}` and `{"b":2,"a":1}` are the
 /// same request written twice, while `["a","b"]` and `["b","a"]` are different arguments
 /// to almost any capability.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn key_order_is_canonicalised_but_array_order_is_meaningful() {
     // The property is about the canonical form the approval commits to, so it is asserted
@@ -1703,6 +1869,12 @@ fn key_order_is_canonicalised_but_array_order_is_meaningful() {
 /// The regression for the fail-open this slice removed: the stored text is what the
 /// digest is computed over, so defaulting a corrupt row to `{}` used to produce a
 /// *verified* execution of parameters nobody approved.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn unreadable_stored_parameters_are_refused_rather_than_defaulted() {
     rt().block_on(async {
@@ -1763,6 +1935,12 @@ fn unreadable_stored_parameters_are_refused_rather_than_defaulted() {
 // dispatching.
 
 /// The demonstration: a plain request becomes a proposal a human can approve.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_ai_proposal_becomes_a_governed_action() {
     rt().block_on(async {
@@ -1818,6 +1996,12 @@ fn an_ai_proposal_becomes_a_governed_action() {
 /// installation this test would have poisoned every other proposer test in the process,
 /// so the suite had exactly one provider scenario and this one could not exist. That is
 /// the whole argument for the seam — not elegance, but being able to write the test.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_malformed_ai_response_is_refused_without_writing_a_proposal() {
     use orxnud_daemon::proposer::ScriptedProvider;
@@ -1874,6 +2058,12 @@ fn a_malformed_ai_response_is_refused_without_writing_a_proposal() {
 /// capability. The menu is walked from the registry, so this asserts the walk rather than
 /// a list: `text/word-count` *is* enabled, so refusing it proves the menu is not
 /// everything in the build.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_enabled_but_unoffered_capability_is_refused() {
     use orxnud_daemon::proposer::ScriptedProvider;
@@ -1924,6 +2114,12 @@ fn an_enabled_but_unoffered_capability_is_refused() {
 /// becomes proposable" is a fact about the code rather than a claim about it — and its
 /// declared parameter name comes from its own declaration, since the string `text` was
 /// never written in the daemon either.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn every_enabled_capability_is_offered_to_the_model_with_its_declared_parameters() {
     use orxnud_daemon::proposer::{ProposalContext, ProposalProvider, ProviderError};
@@ -2025,6 +2221,12 @@ fn every_enabled_capability_is_offered_to_the_model_with_its_declared_parameters
 /// value had to stop being global. Per-runtime configuration makes the interference
 /// structurally impossible rather than merely unlikely, which is the only version of
 /// this worth having.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn two_daemons_keep_separate_proposers() {
     use orxnud_daemon::proposer::ScriptedProvider;
@@ -2093,6 +2295,12 @@ fn two_daemons_keep_separate_proposers() {
 /// Each of these is a way the model might *ask* to act. None is answerable: the model
 /// gets text in and text out, and the deterministic side decides. The refusals name
 /// themselves, so a reader can see which guard stopped each attempt.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_ai_route_offers_no_authority_to_the_model() {
     rt().block_on(async {
@@ -2175,6 +2383,12 @@ fn the_ai_route_offers_no_authority_to_the_model() {
 
 /// A proposal cannot be conjured for a task nobody holds, and one attempt gets one
 /// proposal — so a model cannot flood the approval queue.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_ai_proposal_requires_the_lease_and_is_once_per_attempt() {
     rt().block_on(async {
