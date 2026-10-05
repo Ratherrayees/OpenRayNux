@@ -381,6 +381,10 @@ fn stderr_of(out: &Output) -> String {
 }
 
 /// The whole product loop, driven through the CLI.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_user_can_create_list_claim_and_complete_a_task() {
     let root = dir("workflow");
@@ -437,6 +441,10 @@ fn a_user_can_create_list_claim_and_complete_a_task() {
 /// The CLI must not pre-judge this — it sends the request and shows the daemon's
 /// answer. So the proof that it does not is that the refusal arrives *from the
 /// daemon*, with the daemon's own structured reason.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_wrong_worker_is_refused_by_the_daemon_not_by_the_cli() {
     let root = dir("wrong-worker");
@@ -477,6 +485,10 @@ fn a_wrong_worker_is_refused_by_the_daemon_not_by_the_cli() {
 }
 
 /// A pending task cannot be completed at all, through the CLI.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_never_claimed_task_cannot_be_completed_through_the_cli() {
     let root = dir("pending");
@@ -493,6 +505,10 @@ fn a_never_claimed_task_cannot_be_completed_through_the_cli() {
 }
 
 /// Phase 11: no daemon, no backtrace, no internal detail, non-zero exit.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn with_no_daemon_the_cli_says_so_and_exits_non_zero() {
     let root = dir("no-daemon");
@@ -528,6 +544,10 @@ fn with_no_daemon_the_cli_says_so_and_exits_non_zero() {
 }
 
 /// Phase 15: an empty database is a clean success, not an error and not a crash.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn an_empty_task_list_is_a_clean_success() {
     let root = dir("empty");
@@ -540,6 +560,10 @@ fn an_empty_task_list_is_a_clean_success() {
 
 /// A duplicate id, and a claim for something that does not exist: both refusals, both
 /// with the daemon's own reason rather than a CLI paraphrase.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn refusals_reach_the_user_as_the_daemons_structured_reason() {
     let root = dir("refusals");
@@ -572,6 +596,10 @@ fn refusals_reach_the_user_as_the_daemons_structured_reason() {
 
 /// Over-long content is refused by the daemon's bound, and the CLI must not pre-empt
 /// it with a different rule.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn oversized_content_is_refused_by_the_daemon() {
     let root = dir("oversize");
@@ -590,6 +618,10 @@ fn oversized_content_is_refused_by_the_daemon() {
 }
 
 /// The whole thing survives a restart, driven through the CLI on both sides.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn tasks_survive_a_restart_of_the_daemon() {
     let root = dir("restart");
@@ -616,6 +648,10 @@ fn tasks_survive_a_restart_of_the_daemon() {
 }
 
 /// The product loop with cancellation, driven entirely through the CLI.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_user_can_cancel_a_task_and_see_it_cancelled() {
     let root = dir("cancel");
@@ -646,6 +682,10 @@ fn a_user_can_cancel_a_task_and_see_it_cancelled() {
 /// not resurrect the task, must not fail, and must not append a second terminal event.
 /// The CLI reports whatever state the daemon says, which after a repeat is still
 /// `cancelled` — and saying so is true, not a false claim of success.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn repeating_a_cancel_is_a_no_op_that_leaves_the_task_cancelled() {
     let root = dir("cancel-twice");
@@ -685,6 +725,10 @@ fn repeating_a_cancel_is_a_no_op_that_leaves_the_task_cancelled() {
 
 /// The case where the CLI must NOT say `cancelled`: the task is already `completed`,
 /// so a cancel changes nothing and claiming otherwise would misreport it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn cancelling_a_completed_task_reports_it_unchanged_rather_than_cancelled() {
     let root = dir("cancel-completed");
@@ -721,6 +765,10 @@ fn cancelling_a_completed_task_reports_it_unchanged_rather_than_cancelled() {
 }
 
 /// Cancelling a task that does not exist is a structured refusal, not a local guess.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn cancelling_a_missing_task_is_a_structured_refusal() {
     let root = dir("cancel-absent");
@@ -740,6 +788,10 @@ fn cancelling_a_missing_task_is_a_structured_refusal() {
 }
 
 /// A cancelled task cannot be claimed through the CLI either.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_cancelled_task_cannot_be_claimed_through_the_cli() {
     let root = dir("cancel-then-claim");
@@ -770,6 +822,10 @@ fn a_cancelled_task_cannot_be_claimed_through_the_cli() {
 }
 
 /// Cancellation survives a restart, through the CLI on both sides.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_cancelled_task_stays_cancelled_across_a_restart() {
     let root = dir("cancel-restart");
@@ -795,6 +851,10 @@ fn a_cancelled_task_stays_cancelled_across_a_restart() {
 }
 
 /// Phase 11: no daemon, no backtrace, no SQL or path disclosure.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn cancelling_with_no_daemon_fails_cleanly() {
     let root = dir("cancel-no-daemon");
@@ -825,6 +885,10 @@ fn cancelling_with_no_daemon_fails_cleanly() {
 /// verifier -> durable audit -> response. Every stage had to succeed for `verified:
 /// true` to appear, and the audit assertion below proves the tail of that chain ran
 /// rather than being short-circuited.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_user_can_run_a_capability_and_see_a_verified_result() {
     let root = dir("capability");
@@ -857,6 +921,10 @@ fn a_user_can_run_a_capability_and_see_a_verified_result() {
 ///
 /// A capability that ran without leaving a record would be exactly the failure the
 /// journal exists to prevent, so this reads the file rather than trusting the reply.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_capability_run_leaves_durable_audit_that_survives_a_restart() {
     let root = dir("capability-audit");
@@ -901,6 +969,10 @@ fn a_capability_run_leaves_durable_audit_that_survives_a_restart() {
 }
 
 /// Security negatives, all through the real CLI and socket.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn capability_refusals_reach_the_user_from_the_daemon() {
     let root = dir("capability-refusals");
@@ -953,6 +1025,10 @@ fn capability_refusals_reach_the_user_from_the_daemon() {
 /// the `ActionRequest` itself and the invocation is sealed by policy, so supplying them
 /// must change nothing about the outcome — the request is refused on its merits, not
 /// accepted because the client asked nicely.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_client_cannot_forge_authority_through_parameters() {
     let root = dir("capability-forgery");
@@ -1024,6 +1100,10 @@ fn a_client_cannot_forge_authority_through_parameters() {
 }
 
 /// No daemon, no traceback, no internals.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn running_a_capability_with_no_daemon_fails_cleanly() {
     let root = dir("capability-no-daemon");
@@ -1113,6 +1193,10 @@ fn approve(daemon: &Daemon, target: &str, contents: &str, ttl_ms: &str) -> Strin
 /// refusal that creates nothing where it is not. Neither branch is a skip, neither is
 /// mocked, and neither weakens the contract — a host that cannot isolate cannot run the
 /// capability, by design (ADR-0035, V-49).
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_user_approves_a_write_and_the_file_appears_with_exactly_those_bytes() {
     let root = dir("write-happy");
@@ -1149,6 +1233,10 @@ fn a_user_approves_a_write_and_the_file_appears_with_exactly_those_bytes() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_high_risk_capability_refuses_without_an_approval_and_writes_nothing() {
     let root = dir("write-no-approval");
@@ -1183,6 +1271,10 @@ fn a_high_risk_capability_refuses_without_an_approval_and_writes_nothing() {
 }
 
 /// The substitution test, and the one the whole approval mechanism exists for.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1239,6 +1331,10 @@ fn an_approval_for_one_write_cannot_be_reused_for_different_contents() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn an_approval_works_once_and_is_refused_the_second_time() {
     let root = dir("write-single-use");
@@ -1291,6 +1387,10 @@ fn an_approval_works_once_and_is_refused_the_second_time() {
 /// `ttl_ms 0` produces an approval whose expiry equals its issue time, so the refusal is
 /// a fact about the inputs. No sleeping, and therefore no flakiness: if this test ever
 /// starts passing because the machine got slower, something is wrong with the test.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn an_expired_approval_is_refused_and_writes_nothing() {
     let root = dir("write-expired");
@@ -1324,6 +1424,10 @@ fn an_expired_approval_is_refused_and_writes_nothing() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn an_escaping_path_is_refused_and_nothing_appears_outside_the_workspace() {
     let root = dir("write-escape");
@@ -1358,6 +1462,10 @@ fn an_escaping_path_is_refused_and_nothing_appears_outside_the_workspace() {
 }
 
 /// The governed execution is audited, and the record survives the process that made it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn the_write_is_audited_with_real_timestamps_and_survives_a_restart() {
     let root = dir("write-audit");
@@ -1454,6 +1562,10 @@ fn propose_id(out: &Output) -> String {
 }
 
 /// The whole loop as a person performs it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_user_proposes_a_governed_action_approves_it_and_executes_it() {
     let root = dir("governed-happy");
@@ -1537,6 +1649,10 @@ fn a_user_proposes_a_governed_action_approves_it_and_executes_it() {
 }
 
 /// The refusals a person will actually hit, and they must be non-zero exits.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn the_governed_refusals_reach_the_cli_as_failures() {
     let root = dir("governed-refusals");
@@ -1620,6 +1736,10 @@ fn the_governed_refusals_reach_the_cli_as_failures() {
 }
 
 /// The governed execution is audited durably, with real timestamps.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn the_governed_execution_is_audited_and_survives_a_restart() {
     let root = dir("governed-audit");
@@ -1690,6 +1810,10 @@ fn the_governed_execution_is_audited_and_survives_a_restart() {
 /// What it proves is the wiring: the flags are parsed, a provider is constructed, and the
 /// credential is required before any request leaves. The HTTP path itself is covered
 /// against a real socket in the daemon's own suite, with a hermetic store.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn the_provider_flags_are_wired_and_the_credential_is_required_before_any_request() {
     let root = dir("ai-credential");
@@ -1745,6 +1869,10 @@ fn the_provider_flags_are_wired_and_the_credential_is_required_before_any_reques
 ///
 /// This is the assertion that keeps the scripted provider from becoming a silent
 /// production fallback. There is no flag that makes `orxnud` pretend to have a model.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_daemon_with_no_provider_flags_refuses_to_propose() {
     let root = dir("ai-unconfigured");
@@ -1781,6 +1909,10 @@ fn a_daemon_with_no_provider_flags_refuses_to_propose() {
 /// this loop executes a Tier-1 capability, and a host that cannot isolate refuses it.
 /// The proposal and approval stages are host-independent, so they are asserted
 /// unconditionally; only the execution stage branches.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
     let root = dir("ai-happy");
@@ -1854,6 +1986,10 @@ fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
 
 /// The AI route refuses the two things a caller would try next: inventing an approver,
 /// and executing before one exists.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
 #[test]
 fn the_ai_proposer_cannot_approve_or_execute() {
     let root = dir("ai-boundary");
