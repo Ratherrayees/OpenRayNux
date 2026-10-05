@@ -174,23 +174,91 @@ impl BwrapRunner {
 
     /// Whether an unprivileged PID namespace can actually be created.
     fn namespace_probe() -> bool {
-        Command::new(BWRAP)
-            .args([
-                "--unshare-pid",
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-            ])
+        Self::namespace_probe_command()
             .args(["--", "/bin/true"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// The probe's command, before the program is supplied.
+    ///
+    /// Extracted so [`Self::namespace_probe`] and [`Self::probe_identity`] run the *same*
+    /// namespaces. A diagnostic that built its own would be measuring a different
+    /// configuration from the one that decides whether a capability runs.
+    fn namespace_probe_command() -> Command {
+        let mut c = Command::new(BWRAP);
+        c.args([
+            "--unshare-pid",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+        ]);
+        c
+    }
+
+    /// The identity observed **inside** the probe sandbox: `(uid_map, CapEff)`.
+    ///
+    /// # Why this exists
+    ///
+    /// "Can this host sandbox a Tier-1 capability?" is one question. "Is the sandbox that
+    /// just answered it the sandbox users run?" is a different one, and the answer
+    /// distinguishes two environments that both report success:
+    ///
+    /// * **Production.** The caller is unprivileged, so `bwrap` has to create a nested
+    ///   user namespace to gain any capability. Inside, `uid_map` is a single-entry map
+    ///   such as `1000 0 1` and `CapEff` is zero.
+    /// * **Not production.** The caller already holds `CAP_SYS_ADMIN` (a `--privileged`
+    ///   or `--cap-add=SYS_ADMIN` container). `bwrap` then runs *without* nesting:
+    ///   `uid_map` is the full identity map `0 0 4294967295` and the sandbox inherits the
+    ///   caller's capabilities.
+    ///
+    /// The second is a materially weaker claim about the security boundary, so a test run
+    /// in it is not evidence that the production path works. Measured on both, rather
+    /// than assumed.
+    ///
+    /// `None` when the probe cannot run at all, which is the incapable-host case.
+    #[must_use]
+    pub fn probe_identity() -> Option<(String, String)> {
+        let out = Self::namespace_probe_command()
+            .args([
+                "--",
+                "/bin/sh",
+                "-c",
+                "cat /proc/self/uid_map; grep CapEff /proc/self/status",
+            ])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let uid_map = text
+            .lines()
+            // `uid_map` lines are right-aligned and begin with padding, so a line has to
+            // be trimmed before it can be recognised as three numbers.
+            .map(str::trim)
+            .find(|l| {
+                let f: Vec<_> = l.split_whitespace().collect();
+                f.len() == 3
+                    && f.iter()
+                        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            })
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|| "unreadable".to_owned());
+        let cap_eff = text
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .map(|v| v.trim().to_owned())
+            .unwrap_or_else(|| "unreadable".to_owned());
+        Some((uid_map, cap_eff))
     }
 }
 

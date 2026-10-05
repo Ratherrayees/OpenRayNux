@@ -40,12 +40,12 @@ fn main() -> ExitCode {
                 // Ask a daemon if one answers, and say so plainly if not. Starting one
                 // to find out would be absurd, so `doctor` never spawns.
                 let client = client_for(&invocation.endpoint);
-                let observed = client
-                    .call("capability/list", serde_json::json!({}))
-                    .ok()
-                    .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_u64))
-                    .and_then(|n| usize::try_from(n).ok());
-                print!("{}", orxnuctl::doctor_with(observed).render());
+                // One call, two observations. `daemon/status` is the answer that
+                // matters here: the sandbox capability is a property of the *host the
+                // daemon dispatches on*, and asking a second endpoint would risk
+                // observing a different one.
+                let observed = client.call("daemon/status", serde_json::json!({})).ok();
+                print!("{}", orxnuctl::doctor_with(observed.as_ref()).render());
                 ExitCode::SUCCESS
             }
             Command::Capability(ref capability) => {

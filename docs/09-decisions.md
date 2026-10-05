@@ -2996,6 +2996,108 @@ distinctness.
 
 ---
 
+<a id="adr-0046"></a>
+
+## ADR-0046 — A missing host guarantee is a refusal to assert, not a test to skip
+
+**Status.** **Decided and implemented.** The capability report, the preflight, the
+environment-aware end-to-end assertions, and the container lane are all in the tree. The
+positive Tier-1 evidence depends on the container reproducing the production configuration,
+which CI verifies on every run of that lane and fails if it stops doing so.
+
+**Context.** Two end-to-end tests failed on `origin/main` with
+
+```text
+the execution backend cannot establish the required sandbox guarantees
+(missing: the requested sandbox guarantees)
+```
+
+and nothing in the log said why. The cause is not a defect: a GitHub-hosted Linux runner
+ships `bwrap` and cannot use it, so `BwrapRunner::probe()` reports no guarantees and every
+Tier-1 dispatch is correctly refused. Three things were wrong with how that surfaced.
+
+1. `host_backend_name()` answers a **compile-time** question, so the runner reported
+   `sandbox backend: bwrap` while being able to isolate nothing. A host-level
+   `bwrap --version` check would have reported success too.
+2. The tests asserted **successful execution unconditionally**, so a correct refusal was
+   recorded as a failure — and CI fail-fasts, so two failures were hiding six more.
+3. The gate those tests carried was `#[cfg_attr(not(target_os = "linux"), ignore)]`, which
+   asks a *platform* question rather than a *capability* one, and is an `ignore`. A skip
+   teaches nothing, and the interesting host state — a Linux machine that cannot sandbox —
+   was therefore untested everywhere.
+
+**Decision 1 — the sandbox contract is unchanged, and nothing here may weaken it.**
+
+No default is relaxed, no requirement becomes `BestEffort`, and no host is exempted. A
+host that cannot isolate still refuses every Tier-1 capability, before a credential
+resolves and before a process exists (ADR-0035, V-49). What changes is only which
+assertion the test suite makes about a given host.
+
+**Decision 2 — the test asserts the property that is true of the host it is running on.**
+
+Where isolation is available: successful, verified, sandboxed execution, unchanged. Where it
+is not: a **positively asserted** refusal — non-zero exit, the missing guarantee named, and
+nothing written. Not a skip, not a tolerated failure, not a mock. The refusal branch checks
+*why* it failed, so "it failed somehow" can never be mistaken for "it refused because it
+could not isolate", and that branch is exercised on every incapable host.
+
+The invariant this preserves:
+
+> OpenRayNux never executes Tier-1 work merely because CI wants the test to pass.
+
+It holds structurally rather than by convention: on a host that cannot isolate, the
+assertable outcome *is* the refusal, so the code path that would execute Tier-1 work is
+unreachable and unasserted.
+
+**Decision 3 — one source of truth for the capability answer, surfaced where it is needed.**
+
+`orxnud-platform-sandbox::host_capability()` reads the runner's own
+`available_guarantees()` and runs the same `AvailableGuarantees::check` the dispatcher runs.
+It adds no second probe, because a diagnostic that could disagree with the dispatch that
+refused a capability would be worse than none. It is reported through `daemon/status`,
+`orxnud daemon --doctor` and `orxnuctl doctor`, and read by the tests from the same place a
+user would.
+
+**Decision 4 — positive Tier-1 evidence runs in a container that must look like
+production, and the lane fails if it does not.**
+
+The obvious fix — run the Tier-1 suites in a `--privileged` container — was measured and
+rejected. `--cap-add=SYS_ADMIN` and `--privileged` both make the probe pass, and inside
+either, `bwrap` creates **no user namespace**: the identity is the full map
+`0 0 4294967295` with the container's capabilities, against the production
+`1000 0 1` with none. That is a materially weaker claim about the boundary and is not
+evidence that the path users run works.
+
+What works, and is used instead, grants nothing: `--security-opt seccomp=unconfined`
+(Docker's default seccomp returns EPERM for `unshare(CLONE_NEWUSER)`) and
+`--security-opt systempaths=unconfined` (Docker's masked `/proc` paths make a nested procfs
+mount illegal). The tests then run as an unprivileged uid with every capability dropped, so
+`bwrap` has no choice but to nest a user namespace. `preflight --require` runs first in that
+lane and exits non-zero unless a Tier-1 capability can be sandboxed there **and** the
+observed identity is the nested shape, so the lane cannot pass quietly in a weaker
+configuration.
+
+**Decision 5 — the host lane reports rather than gates.**
+
+The `linux-gates` job prints the capability **before** the gates, because a diagnostic
+after a failing step is a diagnostic nobody reads. It is not `--require`: that host is
+allowed to be incapable, and its Tier-1 result is a correct refusal.
+
+**Consequences.**
+
+* Two tests stopped being platform-gated and are now asserted on every platform, including
+  the ones that previously skipped.
+* `orxnuctl doctor` now answers "can this host run a Tier-1 capability", which is the
+  question an operator with a refusal actually has. It says `unknown` when no daemon
+  answers, never `no`.
+* `doctor` accepts `--endpoint`. `main` already read `invocation.endpoint` on that path, so
+  the parser had been refusing a flag the code depended on and `doctor` could only observe
+  the default endpoint.
+* Windows remains **NOT_PROVEN** for isolation, and none of this changes that. The container
+  is Linux evidence about the Linux configuration.
+
+---
+
 ## ADR-0043 — Continuation is an explicit operation, not a widened claim
 
 **Status.** **Decided and implemented.** `AwaitingNextStep` is advanced only by

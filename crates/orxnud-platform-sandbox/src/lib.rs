@@ -68,4 +68,7 @@ pub use contract::{
     IsolationRequirements, NetworkPolicy, Resource, ResourceLimits, SandboxRunner, SandboxSpec,
     SandboxUnavailable, TreeLifetime, Visibility,
 };
-pub use platform::{UnsupportedRunner, host_backend, host_backend_mechanism, host_backend_name};
+pub use platform::{
+    HostCapability, UnsupportedRunner, host_backend, host_backend_mechanism, host_backend_name,
+    host_capability,
+};
