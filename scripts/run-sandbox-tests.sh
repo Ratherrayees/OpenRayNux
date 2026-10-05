@@ -163,7 +163,9 @@ docker run --rm \
     # build creates root-owned files under /target, and the unprivileged `cargo run` then
     # cannot open `/target/debug/.cargo-build-lock`. Chowning before the build is not
     # enough, because the build is what makes the files root-owned again.
-    cargo nextest build $(for s in '"${SUITES[*]}"'; do echo $s; done) >/dev/null
+    # `cargo test --no-run` rather than `cargo nextest build`: nextest 0.9.146 has no
+    # `build` subcommand, and this only needs the test binaries compiled.
+    cargo test --workspace --no-run >/dev/null
     chown -R orxnud /target
 
     exec setpriv --reuid=1000 --regid=1000 --clear-groups \
