@@ -550,9 +550,16 @@ mod tests {
         sorted.dedup();
         assert_eq!(versions, sorted, "versions must ascend with no repeats");
         assert_eq!(*versions.last().expect("non-empty"), CURRENT_VERSION);
-        // And the last entry must be the one this module needs.
-        let last = crate::migration::MIGRATIONS.last().expect("last");
-        assert_eq!(last.name, "security_state");
+        // `security_state` must be applied, but it is no longer *last*: composition
+        // landed after it. Pinning the position rather than the name is what lets a later
+        // migration exist without either silently reordering the list or requiring this
+        // assertion to be rewritten.
+        assert!(
+            crate::migration::MIGRATIONS
+                .iter()
+                .any(|m| m.name == "security_state"),
+            "security_state must still be a registered migration"
+        );
     }
 
     #[test]

@@ -111,6 +111,16 @@ pub enum TaskState {
     /// A side effect may or may not have occurred. **Terminal until a human
     /// adjudicates.** Never automatically retried.
     NeedsVerification,
+    /// A step finished and verified, and the task has more steps to run.
+    /// Claimable, so the next step takes a **fresh** lease rather than inheriting the
+    /// previous step's.
+    ///
+    /// Distinct from `Pending` on purpose. `Pending` means "accepted, never started";
+    /// this means "step N is done and step N+1 has not begun", and a task that has run
+    /// five steps has not gone back to being un-started. Allowing `Running -> Pending`
+    /// instead would erase that distinction in the database and in the audit, making
+    /// deliberate step progression indistinguishable from a task bouncing back to life.
+    AwaitingNextStep,
 }
 
 impl TaskState {
@@ -121,7 +131,7 @@ impl TaskState {
     /// round-trip tests. Three hand-written lists of ten strings would drift, and
     /// the drift would be invisible -- a row the state machine considers
     /// impossible would pass a database constraint.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Pending,
         Self::Running,
         Self::WaitingForUser,
@@ -132,6 +142,7 @@ impl TaskState {
         Self::Failed,
         Self::DeadLettered,
         Self::NeedsVerification,
+        Self::AwaitingNextStep,
     ];
 
     /// The persisted spelling. Matches serde's `kebab-case` and the SQL CHECK.
@@ -148,6 +159,7 @@ impl TaskState {
             Self::Failed => "failed",
             Self::DeadLettered => "dead-lettered",
             Self::NeedsVerification => "needs-verification",
+            Self::AwaitingNextStep => "awaiting-next-step",
         }
     }
 
@@ -178,9 +190,13 @@ impl TaskState {
     }
 
     /// Whether a worker may claim this state.
+    ///
+    /// `AwaitingNextStep` is claimable because the next step needs a fresh lease: a step
+    /// boundary is the one place where inheriting the previous step's lease would be
+    /// wrong, since that lease was taken for a different action.
     #[must_use]
     pub fn is_claimable(self) -> bool {
-        matches!(self, Self::Pending)
+        matches!(self, Self::Pending | Self::AwaitingNextStep)
     }
 
     /// Whether this state means "we do not know what happened".
@@ -341,8 +357,8 @@ pub struct ScheduleFire {
 #[must_use]
 pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
     use TaskState::{
-        Cancelled, Completed, DeadLettered, Failed, NeedsVerification, Paused, Pending, Running,
-        WaitingForExternal, WaitingForUser,
+        AwaitingNextStep, Cancelled, Completed, DeadLettered, Failed, NeedsVerification, Paused,
+        Pending, Running, WaitingForExternal, WaitingForUser,
     };
 
     // Terminal is terminal. This is the invariant that stops a resurrected task.
@@ -363,6 +379,8 @@ pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
             to,
             Running | Cancelled | WaitingForUser | WaitingForExternal | Paused
         ),
+        // Note what is absent: `Pending`. A verified step advances to
+        // `AwaitingNextStep`, never back to "not yet started".
         Running => matches!(
             to,
             Completed
@@ -373,6 +391,7 @@ pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
                 | Paused
                 | NeedsVerification
                 | DeadLettered
+                | AwaitingNextStep
         ),
         // A retry.
         Failed => matches!(to, Running),
@@ -382,6 +401,11 @@ pub fn is_legal_transition(from: TaskState, to: TaskState) -> bool {
         WaitingForExternal => {
             matches!(to, Running | Cancelled)
         }
+        // A step boundary. The only way in is a verified step, and the only ways out are a
+        // fresh claim, a retry that runs out of budget, or a human stopping it. There is no
+        // edge back to `Pending` from here either: a task with completed steps has not
+        // become un-started.
+        AwaitingNextStep => matches!(to, Running | Failed | Cancelled),
         // An explicit resume.
         Paused => matches!(to, Running | Cancelled),
         // Terminal states go nowhere. Notably `Completed` cannot become
@@ -485,6 +509,120 @@ mod tests {
         TaskState::DeadLettered,
         TaskState::NeedsVerification,
     ];
+
+    // -----------------------------------------------------------------------
+    // The step boundary
+    //
+    // Bounded linear composition needs exactly one new edge: a verified step advances
+    // rather than finishing. These pin the shape of that edge and, just as importantly,
+    // pin the edges that must *not* exist.
+    // -----------------------------------------------------------------------
+
+    /// A verified step can advance to the next one.
+    ///
+    /// `AwaitingNextStep` is deliberately not `Pending`: a task that has run three steps
+    /// has not become un-started, and the audit should be able to say which it is.
+    #[test]
+    fn a_verified_step_can_advance_to_the_next_one() {
+        assert!(is_legal_transition(
+            TaskState::Running,
+            TaskState::AwaitingNextStep
+        ));
+    }
+
+    /// `Running -> Pending` stays illegal.
+    ///
+    /// This is the edge that would erase the distinction between "never started" and "step
+    /// N finished". It is asserted explicitly because it is the shortcut someone would reach
+    /// for when implementing composition, and it would pass every other test while making
+    /// step progression invisible.
+    #[test]
+    fn a_running_task_cannot_go_back_to_pending() {
+        assert!(
+            !is_legal_transition(TaskState::Running, TaskState::Pending),
+            "step progression must not reuse the un-started state"
+        );
+    }
+
+    /// From a step boundary: claim the next step, give up, or be stopped.
+    ///
+    /// No edge to `Completed`, because reaching the end of the sequence is the caller's
+    /// decision at the boundary -- and no edge to `Pending`, for the reason above.
+    #[test]
+    fn a_step_boundary_leads_only_to_a_fresh_claim_a_failure_or_a_stop() {
+        for to in [TaskState::Running, TaskState::Failed, TaskState::Cancelled] {
+            assert!(
+                is_legal_transition(TaskState::AwaitingNextStep, to),
+                "{to:?} must be reachable from a step boundary"
+            );
+        }
+        for forbidden in [
+            TaskState::Pending,
+            TaskState::Completed,
+            TaskState::WaitingForUser,
+            TaskState::Paused,
+        ] {
+            assert!(
+                !is_legal_transition(TaskState::AwaitingNextStep, forbidden),
+                "{forbidden:?} must not be reachable from a step boundary"
+            );
+        }
+    }
+
+    /// A step boundary is not terminal and is claimable.
+    ///
+    /// Not terminal because the task has work left; claimable because the next step needs
+    /// its own lease. A lease taken for step 1's action must not carry over to step 2's.
+    #[test]
+    fn a_step_boundary_is_neither_terminal_nor_final() {
+        assert!(!TaskState::AwaitingNextStep.is_terminal());
+        assert!(TaskState::AwaitingNextStep.is_claimable());
+        assert!(!TaskState::AwaitingNextStep.is_uncertain());
+        assert!(!TaskState::AwaitingNextStep.is_waiting());
+    }
+
+    /// `Completed` stays terminal, including against the new state.
+    ///
+    /// TP-1 depends on it: a completed task must not be resumable, and adding a
+    /// non-terminal state must not quietly reopen that door.
+    #[test]
+    fn a_completed_task_cannot_reach_a_step_boundary() {
+        assert!(!is_legal_transition(
+            TaskState::Completed,
+            TaskState::AwaitingNextStep
+        ));
+        assert!(!is_legal_transition(
+            TaskState::AwaitingNextStep,
+            TaskState::Completed
+        ));
+    }
+
+    /// A cancelled or dead-lettered task stops at a step boundary like anywhere else.
+    #[test]
+    fn a_stopped_task_cannot_advance() {
+        for from in [
+            TaskState::Cancelled,
+            TaskState::DeadLettered,
+            TaskState::NeedsVerification,
+            TaskState::Paused,
+        ] {
+            assert!(
+                !is_legal_transition(from, TaskState::AwaitingNextStep),
+                "{from:?} must not advance"
+            );
+        }
+    }
+
+    /// Every step boundary is reachable from somewhere, and terminal states are still
+    /// entered from somewhere. Without this a state could be added that nothing reaches.
+    #[test]
+    fn the_step_boundary_is_reachable_and_does_not_orphan_the_graph() {
+        assert!(
+            TaskState::ALL
+                .iter()
+                .any(|from| is_legal_transition(*from, TaskState::AwaitingNextStep))
+        );
+    }
 
     #[test]
     fn terminal_states_have_no_outgoing_transitions() {

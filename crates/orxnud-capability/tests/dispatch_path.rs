@@ -372,7 +372,7 @@ fn gated_policy() -> PolicyEngine {
 }
 
 fn approval_for(actor: &Actor, target: &str, p: &NormalizedParams, now: i64) -> ApprovalRecord {
-    let digest = digest_for(actor, actor, &cap(), Some(target), p, now, now + 60_000);
+    let digest = digest_for(actor, actor, &cap(), Some(target), p, now, now + 60_000, 1);
     ApprovalRecord {
         approver: human(),
         actor_label: actor.label().to_owned(),
@@ -382,6 +382,7 @@ fn approval_for(actor: &Actor, target: &str, p: &NormalizedParams, now: i64) -> 
         issued_at_ms: now,
         expires_at_ms: now + 60_000,
         risk: RiskClass::High,
+        step_no: 1,
         digest,
     }
 }

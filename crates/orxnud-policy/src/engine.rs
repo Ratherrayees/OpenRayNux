@@ -386,6 +386,10 @@ impl PolicyEngine {
             }
             // Recomputed over BOTH parties, so an approval minted for one approver
             // cannot be presented by, or on behalf of, anyone else.
+            // Recomputed with the step recorded on the approval, not one supplied by the
+            // caller: the durable record is the authority on which step is authorised,
+            // and a caller-chosen step would let an approval minted for one step be
+            // presented as authorisation for another.
             let recomputed = digest_for(
                 &record.approver,
                 actor,
@@ -394,6 +398,7 @@ impl PolicyEngine {
                 params,
                 record.issued_at_ms,
                 record.expires_at_ms,
+                record.step_no,
             );
             if recomputed != record.digest {
                 return Ok(Decision::Deny {
@@ -856,6 +861,7 @@ mod tests {
             issued_at_ms: issued,
             expires_at_ms: expires,
             risk: RiskClass::High,
+            step_no: 1,
             digest: digest_for(
                 actor,
                 actor,
@@ -864,6 +870,7 @@ mod tests {
                 &params(),
                 issued,
                 expires,
+                1,
             ),
         }
     }
@@ -1179,6 +1186,7 @@ mod tests {
             &params(),
             900,
             2_000,
+            1,
         );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
@@ -1189,6 +1197,7 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
+            step_no: 1,
             digest,
         };
         let d = e
@@ -1210,6 +1219,78 @@ mod tests {
         }
     }
 
+    /// The engine must verify against the step recorded on the approval.
+    ///
+    /// Written to fail if the recomputation ever hardcodes a step instead of reading the
+    /// record's own: an approval minted for step 2 has to keep working (proving the step
+    /// is read, not assumed to be 1), while the same approval presented as step 1 must
+    /// not (proving the step is bound at all).
+    #[test]
+    fn the_step_on_the_record_is_the_step_that_is_verified() {
+        let decl =
+            CapabilityDeclaration::new(cap(), RiskClass::High, DataClass::Personal, false, 0);
+        let e = engine_with(decl, low_policy(), BudgetLedger::empty().with_global(100));
+        let req = request(DataClass::Personal, DataClass::Personal);
+
+        let minted_for_step_two = ApprovalRecord {
+            actor_label: "human".into(),
+            approver: human(),
+            capability: cap().to_string(),
+            target: "alice".into(),
+            params: params(),
+            issued_at_ms: 900,
+            expires_at_ms: 2_000,
+            risk: RiskClass::High,
+            step_no: 2,
+            digest: digest_for(
+                &human(),
+                &human(),
+                &cap(),
+                Some("alice"),
+                &params(),
+                900,
+                2_000,
+                2,
+            ),
+        };
+
+        let d = e
+            .evaluate(
+                &req,
+                &human(),
+                Some("alice"),
+                &params(),
+                Some(&minted_for_step_two),
+                NOW,
+            )
+            .expect("evaluate");
+        assert!(
+            d.is_gated(),
+            "an approval recorded for step 2 must verify as step 2, got {d:?}"
+        );
+
+        // The same approval relabelled as step 1 no longer matches its own digest, so it
+        // must be refused rather than honoured under a step it was never minted for.
+        let relabelled = ApprovalRecord {
+            step_no: 1,
+            ..minted_for_step_two
+        };
+        let d = e
+            .evaluate(
+                &req,
+                &human(),
+                Some("alice"),
+                &params(),
+                Some(&relabelled),
+                NOW,
+            )
+            .expect("evaluate");
+        assert!(
+            matches!(d, Decision::Deny { .. }),
+            "an approval must not be re-pointed at another step by editing the field, got {d:?}"
+        );
+    }
+
     #[test]
     fn an_approval_for_a_different_target_is_a_digest_mismatch() {
         // THE anti-Loopjacking test: the user approved "alice"; the action is
@@ -1225,6 +1306,7 @@ mod tests {
             &params(),
             900,
             2_000,
+            1,
         );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
@@ -1235,6 +1317,7 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
+            step_no: 1,
             digest,
         };
         let d = e
@@ -1266,6 +1349,7 @@ mod tests {
             &params(),
             900,
             2_000,
+            1,
         );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
@@ -1276,6 +1360,7 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
+            step_no: 1,
             digest,
         };
         let other = NormalizedParams::canonical("{\"to\":\"bob\"}");
@@ -1308,6 +1393,7 @@ mod tests {
             &params(),
             900,
             1_000,
+            1,
         );
         let approval = ApprovalRecord {
             actor_label: "human".into(),
@@ -1318,6 +1404,7 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 1_000,
             risk: RiskClass::High,
+            step_no: 1,
             digest,
         };
         let d = e
@@ -1568,6 +1655,7 @@ mod tests {
             &params(),
             900,
             2_000,
+            1,
         );
         let by_u2 = digest_for(
             &other_human(),
@@ -1577,6 +1665,7 @@ mod tests {
             &params(),
             900,
             2_000,
+            1,
         );
         assert_ne!(
             by_u1, by_u2,
@@ -1601,7 +1690,8 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
-            digest: digest_for(&ai, &ai, &cap(), Some("alice"), &params(), 900, 2_000),
+            step_no: 1,
+            digest: digest_for(&ai, &ai, &cap(), Some("alice"), &params(), 900, 2_000, 1),
         };
         let e = engine_with(
             high_decl(),
@@ -1639,6 +1729,7 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
+            step_no: 1,
             digest: digest_for(
                 &other_human(),
                 &ai,
@@ -1647,6 +1738,7 @@ mod tests {
                 &params(),
                 900,
                 2_000,
+                1,
             ),
         };
         let e = engine_with(
@@ -1685,7 +1777,17 @@ mod tests {
             issued_at_ms: 900,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
-            digest: digest_for(&human(), &ai, &cap(), Some("alice"), &params(), 900, 2_000),
+            step_no: 1,
+            digest: digest_for(
+                &human(),
+                &ai,
+                &cap(),
+                Some("alice"),
+                &params(),
+                900,
+                2_000,
+                1,
+            ),
         };
         let mut e = engine_with(
             high_decl(),

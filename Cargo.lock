@@ -1219,6 +1219,7 @@ dependencies = [
 name = "orxnud-capability"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "orxnud-audit",
  "orxnud-domain",
  "orxnud-platform-fs",

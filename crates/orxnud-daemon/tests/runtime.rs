@@ -239,8 +239,21 @@ fn a_health_request_succeeds_over_a_real_socket() {
                 "the runtime must report that it is serving durably"
             );
             // Read from composition rather than hard-coded, so it stays true as the
-            // shipped set changes.
-            assert_eq!(reply["result"]["capabilities_enabled"], 2);
+            // shipped set changes. The shipped declarations are the single source of that
+            // set, and the runtime is built from exactly them.
+            let expected = [
+                orxnud_capability::text::declaration(),
+                orxnud_capability::write_text::declaration(),
+                orxnud_capability::read_text::declaration(),
+            ]
+            .iter()
+            .filter(|d| d.enabled)
+            .count();
+            assert_eq!(
+                reply["result"]["capabilities_enabled"].as_u64(),
+                Some(expected as u64),
+                "the runtime must report the composed count"
+            );
         })
         .await
     });

@@ -2878,6 +2878,89 @@ provides the property, so the governed test cannot distinguish them, and that th
 record is redundancy.
 ---
 
+## ADR-0044 — Observation is governed: approved reads, and a context that carries no content
+
+**Status.** **Decided. Implementation begins in Stage 4.**
+
+**Context.** Stage 3 gave a task multiple logical steps, each with a durable result. Until
+now the model was blind after its first proposal: it could not see what an earlier step
+produced, so a second step was a guess. Stage 4 closes that with two mechanisms — a
+`filesystem/read-text` capability, and a `PriorStepContext` carrying earlier steps into the
+proposal prompt.
+
+Either one alone is insufficient. `read-text` with no context is a capability the model has
+no reason to call; context with no `read-text` would have to push content to the model.
+
+**Decision 1 — `filesystem/read-text` is `RiskClass::High` and requires human approval.**
+
+The same posture as `filesystem/write-text`, and deliberately so. Reading is disclosure. A
+file's contents are workspace data, and `read-text` is *the* mechanism by which the model
+observes prior-step output, so a lower risk class would create the project's first
+capability whose entire purpose is to release information to a party that has not been
+individually asked. The cost is a human round trip per observation, paid on purpose.
+
+**Decision 2 — `PriorStepContext` carries step number, status and artifact paths. Never
+file contents, never prior `structured_output`, never prior `verification` text.**
+
+This is the first egress of task-derived data to a remote provider, so the default is what
+the model needs to *decide* rather than what it might want to *have*. Step numbers and
+statuses say what happened; artifact paths say what exists. The content behind those paths
+is reached by `read-text`, which means every byte of it passes the approval path in
+Decision 1.
+
+The alternative — including `structured_output` — was rejected for a specific reason rather
+than a general one: `structured_output` is **untrusted content by construction**. It is
+whatever an adapter claimed, and adapters can lie. Forwarding it into a prompt makes it
+prompt material, and prompt material is instruction-shaped. Excluding it means the only
+workspace content that ever reaches the model is content a human approved a specific read
+for, fetched one deliberate call at a time.
+
+**Consequences.**
+
+* The model learns *that* step 1 produced `a.txt`, then pulls `a.txt` deliberately. More
+  round trips; the content boundary stays inside the approval path.
+* Prior steps cannot be summarised by the runtime on the model's behalf, because a summary
+  would reintroduce the content this decision excludes.
+* `PriorStepContext` is derived from `task_step_results` at request time and is **not
+  durable**: it is a projection of committed state, not a new record of it.
+
+---
+
+## ADR-0043 — Continuation is an explicit operation, not a widened claim
+
+**Status.** **Decided and implemented.** `AwaitingNextStep` is advanced only by
+`TaskRepository::claim_next_step()`. The generic claim path (`claim()` / `take_lease()` /
+`claim_specific()`) remains `Pending`-only, and `idx_tasks_claimable` was not widened.
+
+**Context.** Stage 3d made `AwaitingNextStep -> Running` claimable. The obvious alternative
+was to extend the existing claim query so a polling worker would pick boundaries up
+alongside fresh work. That is one line of SQL and a much larger decision.
+
+**Decision.** Continuation stays a separate, explicit operation.
+
+**Why.** Widening the generic claim would assert that *any* worker which sees a boundary is
+entitled to advance it. That is a new scheduling contract, not a composition detail, and it
+would drag in three questions the composition work never had to answer: what
+`Pending`/`AwaitingNextStep` coexistence means for priority and ordering, whether every
+existing worker implementation understands a state it was not written for, and whether
+automatic discovery is desirable at all. It also fails the rule this project keeps applying
+to authority — new behaviour should not appear merely because an existing generic path was
+widened.
+
+The two paths are now deliberately asymmetric, and the asymmetry is the point:
+
+```text
+Pending            -> generic worker claim()
+AwaitingNextStep   -> explicit claim_next_step()
+```
+
+**Consequence, recorded as an orchestration requirement.** A production execution loop must
+explicitly resume `AwaitingNextStep` and must never rely on `claim()` polling to find a
+boundary. Until such a loop exists, a multi-step task stops at the boundary by design rather
+than by accident. See V-84.
+
+---
+
 ## ADR-0037 — An approval names its approver, and the digest binds them
 
 **Status.** **Implemented.** `ApprovalRecord` carries an explicit `approver: Actor`;
@@ -2887,6 +2970,35 @@ digest cannot verify; `authorise` refuses a non-granting approver
 root (`approval_approver_not_authorised`); and `issue_approval` asserts
 `approver.can_grant()` at minting. The minting path re-derives the approver from the
 trusted local-human boundary and never reads it from the request. Cites V-69 and V-70.
+
+**Amendment — the digest binds the logical step (`v2` -> `v3`).** `canonical_bytes` now
+appends `step_no` as its final field and its prefix moved `v2` -> `v3`. `ApprovalRecord`
+carries `step_no: u32`, and `authorise` recomputes with **the step recorded on the
+approval**, never one supplied by the caller: a record that does not say which step it
+speaks for cannot be told apart from one that speaks for another, so under `v2` a single
+human approval would authorise the same action at *every* step of a multi-step task.
+
+The field is **required, not defaulted**. Every production call site supplies an explicit
+step: the task path reads it from the durable proposal (`task_proposals.step_no`) and
+`runtime` refuses an approval whose step disagrees with the proposal it is recorded
+against (`approval-step-mismatch`); the standalone `capability approve` path, which
+governs no task and therefore has exactly one step, uses the named constant
+`STANDALONE_APPROVAL_STEP`.
+
+Appending rather than inserting keeps every previously-bound field in its
+previously-hashed position, so the entire difference from `v2` is one prefix and one
+field.
+
+**There is no version to read out of a stored digest.** `ApprovalDigest` is a bare
+32-byte blake3 hash; the `v2` marker lives *inside* the hashed bytes and is not
+recoverable. A superseded `v2` digest and a malformed `v3` one are therefore genuinely
+indistinguishable, and both are refused through the same `approval_digest_mismatch`
+denial — inventing a distinction would mean parsing hash bytes, which would be a guess
+dressed as a check. The authorization result is identical either way.
+
+Historical `v2` approvals fail closed. They remain readable and structurally verifiable
+in the audit chain, because the digest is stored as an opaque hash: **no migration shim
+was added, and none should be**, since one would only obscure the transition. See V-83.
 
 **Context.** ADR-0012 committed this project to "the model proposes; the deterministic
 engine disposes", and ADR-0034 later proved one of its structural claims false in the
@@ -3275,10 +3387,42 @@ rather than a false "unavailable", and `clippy::new_without_default` is refused 
 with the reasoning in the source. `new()` probes; `assume_available()` does not; the caller
 has to mean one.
 
+### Amendment: the answering provider is the authority on who answered
+
+`delegated_actor` takes the model identity as a parameter rather than naming one. It used to
+pass the literal `openraynux/task-agent`, and so every AI actor in the signed audit journal
+claimed that model whatever replied. The first live run made the cost concrete: the API
+response said `openai/gpt-oss-120b` while `task_proposals.proposer` and both `audit_log`
+records said something else entirely.
+
+The rule this establishes: **the model recorded in an audit record is supplied by the
+component that actually executed the request**, read from the answering object rather than
+from configuration, so it cannot name a model that did not answer. Where no model
+participates — the direct `task/propose` path — the record says `none/direct-proposal`
+rather than borrowing a name. This is the same posture as `scripted/none` in V-75: the
+audit's job is to say what happened, and a confident wrong value is the failure mode.
+
+`prompt_hash` is still the literal `phase-2`. It is a placeholder for a prompt-framing
+version this code does not version, and left alone deliberately: inventing a hash of nothing
+would look like provenance while being exactly the kind of confident fiction this amendment
+exists to remove (V-81).
+
+### Amendment: the menu must state everything the validator enforces
+
+The capability menu now announces each capability's target requirement, derived from
+`TargetSemantics`. It did not, and a real model was asked for a `target` field it had never
+been told about, then refused three times for omitting it (V-80).
+
+The general rule: **a component that enforces a requirement is responsible for announcing
+it.** A validator that refuses output for omitting a field the model was never told about
+has found its own information gap, not the model's disobedience. The parser was not made
+more permissive to accommodate the model; the description was made complete.
+
 ### Amendment trigger
 
 Re-read when TLS lands (V-77); when a user can store a provider credential (V-78); if a
 second provider is added, at which point the question is whether `ProviderConfig` was the
 right place for the shared parts; if a provider ever needs to be reachable without a
-credential; or if anything else in the tree grows a `Default` that quietly decides whether
-a platform capability is present.
+credential; if anything else in the tree grows a `Default` that quietly decides whether a
+platform capability is present; or if the prompt framing is actually versioned, at which
+point `prompt_hash` becomes a real hash rather than the placeholder it is today.

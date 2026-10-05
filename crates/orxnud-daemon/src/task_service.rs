@@ -768,6 +768,53 @@ impl TaskService {
             .map_err(|e| TaskFault::Engine(e.to_string()))
     }
 
+    /// Completes one verified logical step, advancing the task if another step remains.
+    ///
+    /// A thin pass-through: the result, the counter, the state and the lease release are
+    /// one repository transaction, and this layer adds no decision to it.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Engine`] carrying the repository's reason -- a lost lease, a step that
+    /// is not the one being worked on, or a counter that would pass `max_steps`.
+    pub fn complete_verified_step(
+        &mut self,
+        done: &orxnud_store::task_repo::VerifiedStep<'_>,
+    ) -> Result<orxnud_store::task_repo::StepAdvance, TaskFault> {
+        self.engine
+            .complete_verified_step(done)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// The logical step currently being worked on: the task's `steps_completed + 1`.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Engine`] if the task does not exist or its counters are impossible.
+    pub fn next_step_no(&mut self, id: &TaskId) -> Result<u32, TaskFault> {
+        self.engine
+            .next_step_no(id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// The durable results of a task's completed logical steps, oldest step first.
+    ///
+    /// A read-only projection, used to build the proposal context the model is shown. It
+    /// carries no authority and mutates nothing. Ordered by `step_no` in the store, so
+    /// anything derived from it is deterministic.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::Engine`] if the store cannot be read.
+    pub fn step_results_for(
+        &mut self,
+        task_id: &TaskId,
+    ) -> Result<Vec<orxnud_store::task_repo::StepResultRow>, TaskFault> {
+        self.engine
+            .step_results_for(task_id)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
     /// Reads a proposal.
     ///
     /// # Errors

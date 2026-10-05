@@ -72,6 +72,7 @@ pub const TASK_STATES: &[&str] = &[
     "failed",
     "dead-lettered",
     "needs-verification",
+    "awaiting-next-step",
 ];
 
 /// The effect statuses the `task_effects.status` column accepts.
@@ -122,7 +123,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- verifier accepts.
     CHECK (state IN (
         'pending','running','waiting-for-user','waiting-for-external','paused',
-        'cancelled','completed','failed','dead-lettered','needs-verification'
+        'cancelled','completed','failed','dead-lettered','needs-verification',
+        'awaiting-next-step'
     )),
 
     -- A lease is an indivisible pair. A holder with no expiry could never be
@@ -360,6 +362,182 @@ pub const MIGRATION_SQL: &[(&str, &str)] = &[
     ("schedules", MIGRATION_SCHEDULES),
     ("security_state", MIGRATION_SECURITY_STATE),
 ];
+
+// ---------------------------------------------------------------------------
+// Bounded linear composition: durable representation only (stage 2)
+// ---------------------------------------------------------------------------
+//
+// # What this migration adds, and what it deliberately does not
+//
+// Columns and one table, so the durable model can *represent* a sequence of governed
+// steps. Nothing reads them yet: claim, lease, proposal, approval and execution behave
+// exactly as they did at stage 1. A task created after this migration still takes one
+// action, because `max_steps` defaults to 1.
+//
+// # Why existing rows are backfilled from `attempts` rather than from 1
+//
+// The obvious default -- `step_no = 1` for every existing row -- is wrong, and not
+// harmlessly so. A task may already hold several proposals, one per attempt, and
+// `UNIQUE (task_id, step_no)` would then fail to apply to a perfectly valid database.
+//
+// Today `attempt_no` *is* the logical step identity: each claim opens an attempt, each
+// attempt may propose once, and a task that has been claimed three times has three
+// governed steps' worth of history. So the faithful mapping is `step_no := attempt_no`,
+// and it is derived from the existing creation semantics rather than guessed.
+//
+// The same reasoning fixes the task counters:
+//
+//   max_steps       = max(attempts, 1)
+//   steps_completed = max(attempts, 1) when the task is Completed, else 0
+//
+// so a finished task reads as "N of N steps done" and an unfinished one as "0 of N", with
+// no task ever claiming to have completed more steps than it was allowed. A task with no
+// attempts yet is `0 of 1`, which is exactly a fresh single-step task.
+//
+// # Traps
+//
+// * `ALTER TABLE ... ADD COLUMN` cannot add a CHECK constraint in SQLite, so the new
+//   counters carry no `>= 0` guarantee the way `attempts >= 0` does. That is deferred to
+//   stage 3, which is where anything first writes these columns; it needs a trigger or a
+//   write-path check, and adding one here would enforce behaviour in a stage meant to
+//   change none.
+// * `ALTER TABLE` is not `IF NOT EXISTS`-shaped. Idempotency comes from the runner, which
+//   applies each version once and records it in `schema_meta`.
+// * Fresh and migrated databases converge, because migration 2 still creates `tasks`
+//   without these columns and migration 7 adds them either way.
+///
+/// The correction to [`MIGRATION_COMPOSITION`].
+///
+/// # What stage 2 got wrong
+///
+/// It treated `attempt_no` as the step identity, backfilling `step_no := attempt_no` and
+/// declaring `UNIQUE (task_id, step_no)`. Both are wrong under the settled semantics:
+///
+/// * `step_no` is the **logical step**; `attempt_no` is the **retry within** it. A step
+///   that fails and is retried produces two proposals on the *same* step, so
+///   `UNIQUE (task_id, step_no)` cannot represent a retry -- it would refuse it.
+/// * Reading a legacy row's `attempt_no` as its step number invents a multi-step history
+///   that never happened. Every task before composition existed was **one** logical step,
+///   however many times it was retried.
+///
+/// # What this does
+///
+/// * Drops the per-step unique index and replaces it with a plain lookup index over
+///   `(task_id, step_no, attempt_no)`. No new uniqueness is introduced: the
+///   proposal-per-attempt rule stays where it already lives, in the daemon's state guard.
+/// * Renumbers every historical proposal and approval to logical step 1.
+/// * Sets `max_steps = 1` for every legacy task and `steps_completed = 1` only where the
+///   task is `Completed`.
+///
+/// `task_step_results` keeps `PRIMARY KEY (task_id, step_no)`: one durable final result
+/// per logical step, with failed and retried attempts represented by the existing attempt
+/// and audit records rather than by extra rows.
+///
+/// A forward migration rather than an edit to stage 2, because a database that already
+/// applied stage 2 holds the bad index and the attempt-derived numbering, and editing the
+/// old version would leave both in place while claiming they were never created.
+///
+/// Nothing is deleted: only `step_no`, `max_steps` and `steps_completed` are rewritten,
+/// and `attempt_no` -- the record of what actually happened -- is not touched.
+pub const MIGRATION_COMPOSITION_CORRECTION: &str = r#"
+DROP INDEX IF EXISTS idx_task_proposals_step;
+
+CREATE INDEX IF NOT EXISTS idx_task_proposals_step_attempt
+    ON task_proposals (task_id, step_no, attempt_no);
+
+UPDATE task_proposals SET step_no = 1;
+UPDATE task_approvals  SET step_no = 1;
+UPDATE tasks SET max_steps = 1;
+UPDATE tasks SET steps_completed = CASE WHEN state = 'completed' THEN 1 ELSE 0 END;
+"#;
+
+/// The SQL itself.
+pub const MIGRATION_COMPOSITION: &str = r#"
+ALTER TABLE tasks ADD COLUMN max_steps       INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE tasks ADD COLUMN steps_completed INTEGER NOT NULL DEFAULT 0;
+
+UPDATE tasks SET max_steps = MAX(attempts, 1);
+UPDATE tasks SET steps_completed = CASE WHEN state = 'completed' THEN MAX(attempts, 1) ELSE 0 END;
+
+ALTER TABLE task_proposals ADD COLUMN step_no INTEGER NOT NULL DEFAULT 1;
+UPDATE task_proposals SET step_no = attempt_no;
+
+ALTER TABLE task_approvals ADD COLUMN step_no INTEGER NOT NULL DEFAULT 1;
+UPDATE task_approvals SET step_no = attempt_no;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_proposals_step
+    ON task_proposals (task_id, step_no);
+
+-- The recorded outcome of one step.
+--
+-- Deliberately free of execution semantics: no lease, no worker, no approval, no digest.
+-- Those are owned by `task_proposals`, `task_approvals` and the governed dispatcher, and a
+-- second copy of any of them here would be a second thing to keep in step. This table
+-- records what happened and what was produced; it authorises nothing.
+--
+-- `verification` is free text rather than a closed vocabulary, because the verifier's own
+-- verdict string is the authoritative rendering and inventing a second one here would
+-- create a vocabulary that stage 3 has to keep in step with `ExecutionOutcome`. A
+-- `status` vocabulary is closed, because the step lifecycle is this table's own business.
+CREATE TABLE IF NOT EXISTS task_step_results (
+    task_id           TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    step_no           INTEGER NOT NULL,
+    status            TEXT    NOT NULL,
+    verification      TEXT,
+    structured_output TEXT,
+    artifacts         TEXT,
+    recorded_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (task_id, step_no),
+    CHECK (step_no >= 1),
+    CHECK (status IN ('verified', 'refuted', 'undetermined', 'failed'))
+);
+"#;
+
+/// Migration 9: `task_attempts` is keyed per logical step.
+///
+/// `attempts` counts attempts **within the current logical step**, so step 2's first
+/// execution is attempt 1 of step 2. Under `PRIMARY KEY (task_id, attempt_no)` every step
+/// after the first collided with step 1 on the same `attempt_no`, which made the settled
+/// counter meaning unrepresentable rather than merely untidy.
+///
+/// A forward migration rather than an edit to an earlier version, because a database that
+/// already applied version 1 holds the old key and rewriting that version's `CREATE TABLE`
+/// would leave existing databases with the old shape while claiming they never had it.
+///
+/// The table is rebuilt rather than altered: SQLite cannot drop or narrow a primary key, so
+/// the only way to widen one is to create the new table, copy, drop the old and rename. The
+/// row order below matters -- copy before drop.
+///
+/// Backfill is `step_no = 1` for every existing row, which is the same legacy mapping
+/// migration 8 applies to `tasks` and `task_proposals`: an attempt recorded before
+/// composition existed was a retry of step 1, not a step of its own. Nothing is deleted and
+/// `attempt_no` is not rewritten.
+pub const MIGRATION_ATTEMPT_STEP_SCOPE: &str = r#"
+CREATE TABLE task_attempts_scoped (
+    task_id       TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    step_no       INTEGER NOT NULL DEFAULT 1,
+    attempt_no    INTEGER NOT NULL,
+    worker        TEXT    NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    finished_at_ms INTEGER,
+    outcome       TEXT,
+    error         TEXT,
+    actor_label   TEXT,
+    PRIMARY KEY (task_id, step_no, attempt_no),
+    CHECK (step_no >= 1)
+);
+
+INSERT INTO task_attempts_scoped
+    (task_id, step_no, attempt_no, worker, started_at_ms, finished_at_ms, outcome, error,
+     actor_label)
+SELECT task_id, 1, attempt_no, worker, started_at_ms, finished_at_ms, outcome, error,
+       actor_label
+  FROM task_attempts;
+
+DROP TABLE task_attempts;
+
+ALTER TABLE task_attempts_scoped RENAME TO task_attempts;
+"#;
 
 #[cfg(test)]
 mod tests {

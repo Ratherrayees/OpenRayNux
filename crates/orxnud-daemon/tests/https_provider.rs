@@ -209,6 +209,7 @@ fn ctx() -> orxnud_daemon::proposer::ProposalContext {
         content: "Write final.txt containing hello".into(),
         attempt_no: 1,
         allowed: vec![],
+        prior_steps: Default::default(),
     }
 }
 

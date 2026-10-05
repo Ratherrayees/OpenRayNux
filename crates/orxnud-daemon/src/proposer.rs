@@ -190,6 +190,192 @@ pub struct AllowedCapability {
     pub target: orxnud_domain::TargetSemantics,
 }
 
+/// How a prior logical step concluded, as the model is allowed to see it.
+///
+/// The **closed** four-value vocabulary, never free text. `task_step_results.verification`
+/// holds prose written by a verifier — for a read it names a path, a byte count and a digest,
+/// and in general it is whatever that verifier chose to say. Forwarding it would put
+/// workspace-derived text into a prompt, so it stays in the durable record and is not
+/// carried here. The status is the bounded summary instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorStepStatus {
+    /// The step's effect was observed and verified.
+    Verified,
+    /// Verification established the effect did not occur.
+    Refuted,
+    /// Verification could not decide.
+    Undetermined,
+    /// The step failed.
+    Failed,
+}
+
+impl PriorStepStatus {
+    /// The label rendered into the prompt.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Refuted => "refuted",
+            Self::Undetermined => "undetermined",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One prior logical step, as the model is shown it.
+///
+/// Metadata only. There is no field here that could hold file contents, capability output or
+/// helper stdout, which is the property the type exists to guarantee: adding one would be a
+/// visible change to this struct rather than a quiet widening of a `String`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorStep {
+    /// The 1-based logical step. Durable, and never inferred from an attempt number.
+    pub step_no: u32,
+    /// How it concluded, from the closed vocabulary.
+    pub status: PriorStepStatus,
+    /// Workspace-relative paths this step produced, bounded in count and length.
+    ///
+    /// Relative because the capability contract already speaks in workspace-relative paths
+    /// and an absolute host path is both useless to a model and a disclosure of the host's
+    /// directory layout.
+    pub artifacts: Vec<String>,
+}
+
+/// Bounded prior-step metadata, derived at request time and never persisted.
+///
+/// The whole of what a model learns about earlier steps. It exists only for the duration of
+/// one provider request: it is a projection of `task_step_results`, not a new record, so
+/// there is no table, no schema change and nothing to keep consistent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PriorStepContext {
+    /// Steps in ascending `step_no` order. Ascending because that is what the store returns,
+    /// and never a hash-map iteration order.
+    pub steps: Vec<PriorStep>,
+}
+
+impl PriorStepContext {
+    /// Whether there is anything to say.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// The most recent `keep` steps, oldest first.
+    ///
+    /// Trimming drops the **oldest** steps and keeps the most recent, because the most recent
+    /// is the one whose output the next step is most likely to build on. Selection is by
+    /// position in an ascending list, so it is deterministic.
+    #[must_use]
+    pub fn most_recent(&self, keep: usize) -> Self {
+        if self.steps.len() <= keep {
+            return self.clone();
+        }
+        Self {
+            steps: self.steps[self.steps.len() - keep..].to_vec(),
+        }
+    }
+}
+
+/// Builds the model-facing context from durable step rows.
+///
+/// # What is deliberately not carried across
+///
+/// * `structured_output` — for `filesystem/read-text` this is the file's bytes. It is already
+///   dropped before it reaches a step result (see `AdapterBundle::output_is_ephemeral`), and
+///   it is dropped again here so a future capability cannot reintroduce the leak by writing
+///   output into that column.
+/// * `verification` — verifier prose, workspace-derived for a read. It stays in the durable
+///   record for audit and is replaced here by the bounded `status`.
+/// * the row's `recorded_at_ms` and the worker/lease identity behind the step.
+pub fn prior_step_context_from(
+    rows: &[orxnud_store::task_repo::StepResultRow],
+) -> PriorStepContext {
+    PriorStepContext {
+        steps: rows
+            .iter()
+            .map(|row| PriorStep {
+                step_no: row.step_no,
+                status: match row.status {
+                    orxnud_store::task_repo::StepStatus::Verified => PriorStepStatus::Verified,
+                    orxnud_store::task_repo::StepStatus::Refuted => PriorStepStatus::Refuted,
+                    orxnud_store::task_repo::StepStatus::Undetermined => {
+                        PriorStepStatus::Undetermined
+                    }
+                    orxnud_store::task_repo::StepStatus::Failed => PriorStepStatus::Failed,
+                },
+                artifacts: bounded_artifacts(row.artifacts.as_deref()),
+            })
+            .collect(),
+    }
+}
+
+/// Longest artifact path forwarded. Long enough for any real workspace path, short enough
+/// that a pathological one cannot dominate the request.
+const MAX_ARTIFACT_PATH: usize = 256;
+
+/// How many artifact paths one step may contribute.
+const MAX_ARTIFACTS_PER_STEP: usize = 32;
+
+/// Extracts workspace-relative artifact paths from a step row.
+///
+/// # Why this parses rather than forwards
+///
+/// `task_step_results.artifacts` is a free-form column, and this is where the guarantee
+/// "no arbitrary metadata reaches the model" is actually enforced. Anything that is not
+/// recognisably a relative path — an absolute path, a `..` component, an empty segment — is
+/// **dropped**, not sanitised: a rewritten path would be a different path, and quietly
+/// changing what a model is told about is worse than telling it less.
+///
+/// Entries are read as JSON when the column holds a JSON array, which is how the runtime
+/// writes it, and as a single path otherwise so a hand-written row still yields something
+/// useful. Both forms still go through the same checks below.
+fn bounded_artifacts(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    if raw.is_empty() || raw.len() > MAX_ARTIFACT_PATH * MAX_ARTIFACTS_PER_STEP {
+        return Vec::new();
+    }
+
+    let candidates: Vec<String> = match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(list) => list,
+        Err(_) => vec![raw.to_owned()],
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for candidate in candidates {
+        if out.len() >= MAX_ARTIFACTS_PER_STEP {
+            break;
+        }
+        if let Some(clean) = safe_relative_path(&candidate) {
+            out.push(clean);
+        }
+    }
+    out
+}
+
+/// Accepts a workspace-relative path, or refuses it.
+///
+/// The same rules the capability contract uses: not absolute, no `..`, no empty, and not so
+/// long that it could be used to fill a request.
+fn safe_relative_path(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_ARTIFACT_PATH {
+        return None;
+    }
+    let path = std::path::Path::new(trimmed);
+    if path.is_absolute() {
+        return None;
+    }
+    for component in path.components() {
+        // Anything that is not a plain name is refused: `..`, `.`, and on Windows a prefix.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+    }
+    Some(trimmed.to_owned())
+}
+
 /// What the model is shown about the task.
 ///
 /// Read-only by construction: there is no handle here to anything. Note that
@@ -204,6 +390,12 @@ pub struct ProposalContext {
     pub attempt_no: u32,
     /// What may be asked for.
     pub allowed: Vec<AllowedCapability>,
+    /// What earlier steps of this task did, as metadata.
+    ///
+    /// Defaulted so every existing construction site keeps compiling and, more importantly,
+    /// keeps behaving as it did: a task with no prior steps renders exactly the message it
+    /// rendered before this field existed.
+    pub prior_steps: PriorStepContext,
 }
 
 /// A source of proposal text.
@@ -436,6 +628,7 @@ mod tests {
             content: "Create final.txt containing 'delegated governance works'.".into(),
             attempt_no: 1,
             allowed: vec![write_text()],
+            prior_steps: Default::default(),
         }
     }
 
@@ -646,5 +839,231 @@ mod tests {
         let _: String = c.content;
         let _: u32 = c.attempt_no;
         assert!(!c.allowed.is_empty());
+    }
+}
+
+/// Stage 4b: the prior-step context the model is shown.
+///
+/// The governing property is negative: this is metadata, and the type is built so that
+/// content cannot be put into it by accident. Each test below pins one way content could
+/// arrive, because "the model is only told metadata" is a claim about every field.
+#[cfg(test)]
+mod prior_step_tests {
+    use super::*;
+    use orxnud_store::task_repo::{StepResultRow, StepStatus};
+
+    /// Unmistakable in a prompt, a request body or a log.
+    const SENTINEL: &str = "SENTINEL-PRIOR-CONTENT-MUST-NOT-LEAK-71ac3f";
+
+    fn row(step: u32, status: StepStatus) -> StepResultRow {
+        StepResultRow {
+            task_id: orxnud_domain::ids::TaskId::new("t"),
+            step_no: step,
+            status,
+            verification: Some(format!("{SENTINEL} held 42 bytes (deadbeef)")),
+            // The column a read *could* have used to carry content. It must not be forwarded.
+            structured_output: Some(format!("{{\"contents\":\"{SENTINEL}\"}}")),
+            artifacts: None,
+            recorded_at_ms: NOW_MS,
+        }
+    }
+
+    const NOW_MS: i64 = 1_767_225_600_000;
+
+    fn rendered(ctx: &PriorStepContext) -> String {
+        format!("{ctx:?}")
+    }
+
+    // ------------------------------------------------ derivation
+
+    #[test]
+    fn context_is_derived_from_durable_rows_in_step_order() {
+        let rows = vec![row(1, StepStatus::Verified), row(2, StepStatus::Refuted)];
+        let ctx = prior_step_context_from(&rows);
+        assert_eq!(
+            ctx.steps.iter().map(|s| s.step_no).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn every_status_maps_to_the_closed_vocabulary() {
+        let rows = vec![
+            row(1, StepStatus::Verified),
+            row(2, StepStatus::Refuted),
+            row(3, StepStatus::Undetermined),
+            row(4, StepStatus::Failed),
+        ];
+        let ctx = prior_step_context_from(&rows);
+        assert_eq!(
+            ctx.steps
+                .iter()
+                .map(|s| s.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["verified", "refuted", "undetermined", "failed"]
+        );
+    }
+
+    /// The load-bearing exclusion: verifier prose is workspace-derived for a read.
+    #[test]
+    fn verifier_evidence_is_not_forwarded() {
+        let ctx = prior_step_context_from(&[row(1, StepStatus::Verified)]);
+        let text = rendered(&ctx);
+        assert!(
+            !text.contains("deadbeef"),
+            "the durable digest leaked into the context: {text}"
+        );
+        assert!(
+            !text.contains(SENTINEL),
+            "verifier evidence leaked into the context: {text}"
+        );
+    }
+
+    /// And the column a read's bytes would have used.
+    #[test]
+    fn structured_output_is_not_forwarded() {
+        let ctx = prior_step_context_from(&[row(1, StepStatus::Verified)]);
+        let text = rendered(&ctx);
+        assert!(
+            !text.contains(SENTINEL),
+            "structured_output leaked into the context: {text}"
+        );
+    }
+
+    #[test]
+    fn the_step_number_is_the_durable_logical_step() {
+        // Step 3 on its third attempt is still step 3; nothing here consults an attempt.
+        let ctx = prior_step_context_from(&[row(3, StepStatus::Verified)]);
+        assert_eq!(ctx.steps[0].step_no, 3);
+    }
+
+    // ---------------------------------------------------- artifacts
+
+    #[test]
+    fn artifacts_are_read_as_workspace_relative_paths() {
+        let mut r = row(1, StepStatus::Verified);
+        r.artifacts = Some(r#"["a.txt","sub/b.txt"]"#.to_owned());
+        let ctx = prior_step_context_from(&[r]);
+        assert_eq!(
+            ctx.steps[0].artifacts,
+            vec!["a.txt".to_owned(), "sub/b.txt".to_owned()]
+        );
+    }
+
+    /// Absolute host paths are dropped, not sanitised: a rewritten path is a different path.
+    #[test]
+    fn absolute_host_paths_are_dropped() {
+        let mut r = row(1, StepStatus::Verified);
+        r.artifacts = Some(r#"["/home/rayees/Projects/secret.env","a.txt"]"#.to_owned());
+        let ctx = prior_step_context_from(&[r]);
+        assert_eq!(ctx.steps[0].artifacts, vec!["a.txt".to_owned()]);
+        assert!(
+            !rendered(&ctx).contains("rayees"),
+            "a host path leaked: {:?}",
+            ctx.steps[0].artifacts
+        );
+    }
+
+    #[test]
+    fn traversing_and_empty_artifact_paths_are_dropped() {
+        for bad in ["../escape.txt", "a/../../b.txt", "", "   ", "."] {
+            let mut r = row(1, StepStatus::Verified);
+            r.artifacts = Some(serde_json::json!([bad]).to_string());
+            let ctx = prior_step_context_from(&[r]);
+            assert!(
+                ctx.steps[0].artifacts.is_empty(),
+                "{bad:?} must be dropped, got {:?}",
+                ctx.steps[0].artifacts
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_path_is_accepted_without_json() {
+        let mut r = row(1, StepStatus::Verified);
+        r.artifacts = Some("a.txt".to_owned());
+        assert_eq!(
+            prior_step_context_from(&[r]).steps[0].artifacts,
+            vec!["a.txt"]
+        );
+    }
+
+    #[test]
+    fn the_artifact_count_and_length_are_bounded() {
+        let mut r = row(1, StepStatus::Verified);
+        r.artifacts = Some(
+            serde_json::json!((0..200).map(|i| format!("f{i}.txt")).collect::<Vec<_>>())
+                .to_string(),
+        );
+        let ctx = prior_step_context_from(&[r]);
+        assert!(
+            ctx.steps[0].artifacts.len() <= 32,
+            "artifact count is unbounded: {}",
+            ctx.steps[0].artifacts.len()
+        );
+
+        let mut r2 = row(1, StepStatus::Verified);
+        r2.artifacts = Some(serde_json::json!(["x".repeat(4096)]).to_string());
+        assert!(
+            prior_step_context_from(&[r2]).steps[0].artifacts.is_empty(),
+            "an absurdly long path must be dropped, not forwarded"
+        );
+    }
+
+    #[test]
+    fn an_absurdly_large_artifacts_column_is_dropped_whole() {
+        let mut r = row(1, StepStatus::Verified);
+        r.artifacts = Some("x".repeat(100_000));
+        assert!(prior_step_context_from(&[r]).steps[0].artifacts.is_empty());
+    }
+
+    // -------------------------------------------------- ephemerality
+
+    #[test]
+    fn the_context_carries_no_handle_to_anything() {
+        // A structural check rather than a behavioural one: the type has no field that could
+        // reach the store, the filesystem, policy or the dispatcher.
+        let ctx = prior_step_context_from(&[row(1, StepStatus::Verified)]);
+        let _: &PriorStep = &ctx.steps[0];
+        // Compiles only because there is nothing else to hold.
+        let _clone = ctx.clone();
+    }
+
+    // ------------------------------------------------ determinism
+
+    #[test]
+    fn selection_keeps_the_most_recent_steps_in_order() {
+        let rows: Vec<StepResultRow> = (1..=5).map(|n| row(n, StepStatus::Verified)).collect();
+        let ctx = prior_step_context_from(&rows);
+        assert_eq!(
+            ctx.most_recent(2)
+                .steps
+                .iter()
+                .map(|s| s.step_no)
+                .collect::<Vec<_>>(),
+            vec![4, 5],
+            "the newest steps survive, still ascending"
+        );
+        assert_eq!(
+            ctx.most_recent(99).steps.len(),
+            5,
+            "asking for more is not lossy"
+        );
+        assert!(ctx.most_recent(0).is_empty());
+    }
+
+    #[test]
+    fn derivation_is_deterministic_across_repeated_calls() {
+        let rows: Vec<StepResultRow> = (1..=4).map(|n| row(n, StepStatus::Failed)).collect();
+        let first = rendered(&prior_step_context_from(&rows));
+        for _ in 0..8 {
+            assert_eq!(rendered(&prior_step_context_from(&rows)), first);
+        }
+    }
+
+    #[test]
+    fn no_rows_is_an_empty_context() {
+        assert!(prior_step_context_from(&[]).is_empty());
+        assert_eq!(prior_step_context_from(&[]), PriorStepContext::default());
     }
 }

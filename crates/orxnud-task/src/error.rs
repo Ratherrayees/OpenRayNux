@@ -194,7 +194,10 @@ impl From<TaskRepoError> for EngineError {
             TaskRepoError::AlreadyExists(_)
             | TaskRepoError::NotFound(_)
             | TaskRepoError::NoSuchProposal(_)
-            | TaskRepoError::ProposalNotInState { .. } => EngineErrorKind::InvalidInput,
+            | TaskRepoError::ProposalNotInState { .. }
+            // A composition field outside the range its task allows is likewise bad input,
+            // not a storage failure: the caller named a step the task does not have.
+            | TaskRepoError::InvalidComposition(_) => EngineErrorKind::InvalidInput,
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => {
                 EngineErrorKind::Invariant
             }

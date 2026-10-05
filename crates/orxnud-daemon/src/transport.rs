@@ -285,17 +285,24 @@ impl TlsConfig {
         allow_plaintext: bool,
     ) -> Result<Connection, ProviderError> {
         let address = target.socket_authority();
+
+        // Refuse plaintext *before* opening a socket, not after.
+        //
+        // The credential is never written over plaintext either way, so nothing leaked in
+        // the previous ordering -- but it did dial the host first, which means a daemon
+        // configured with an `http://` endpoint would still make an outbound connection to
+        // it before declining. Deciding from the scheme needs no I/O, so it happens first
+        // and a refused plaintext endpoint is never contacted at all.
+        if matches!(target.scheme, Scheme::PlainHttp) && !allow_plaintext {
+            return Err(ProviderError::PlaintextRefused(address));
+        }
+
         let tcp = TcpStream::connect(&address)
             .await
             .map_err(|e| ProviderError::Unreachable(format!("connect to {address} failed: {e}")))?;
 
         match target.scheme {
-            Scheme::PlainHttp => {
-                if !allow_plaintext {
-                    return Err(ProviderError::PlaintextRefused(address));
-                }
-                Ok(Connection::Plain(tcp))
-            }
+            Scheme::PlainHttp => Ok(Connection::Plain(tcp)),
             Scheme::Tls => {
                 let config = self.client_config()?;
                 let server_name = rustls_pki_types::ServerName::try_from(target.tls_server_name())

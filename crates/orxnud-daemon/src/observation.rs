@@ -1,0 +1,1093 @@
+//! Stage 4c: handing an approved, verified observation to the next proposal.
+//!
+//! # The gap this closes
+//!
+//! `filesystem/read-text` is a correct governed observation capability: high risk, approved,
+//! sandboxed, independently verified, durable result carrying metadata only. But its bytes
+//! are dropped at the end of the request that read them, so the model can *propose* a read and
+//! then has nowhere to receive what it read. `PriorStepContext` cannot fix that, and must not:
+//! it is durable metadata and stays that way.
+//!
+//! So there are two channels, deliberately not conflated:
+//!
+//! ```text
+//! PriorStepContext        durable metadata, never content
+//! EphemeralObservation    approved read output, memory only, one proposal
+//! ```
+//!
+//! # What authorises this
+//!
+//! A human approving `filesystem/read-text` authorises the resulting bytes to be sent to the
+//! provider identity that asked for the read -- and to that identity only. This is the first
+//! time one approval is read as covering two acts: a local read, and a disclosure to a
+//! third-party endpoint. ADR-0045 states that explicitly so it is a decision rather than an
+//! implementation convention.
+//!
+//! The binding is `(endpoint, model)`, not the model string. Re-pointing the endpoint while
+//! keeping the same model name would otherwise send approved content to a new destination
+//! under a rule written to prevent exactly that.
+//!
+//! # What is deliberately absent
+//!
+//! Nothing here is durable. Observations live in daemon process memory, are consumed by one
+//! proposal, and expire on a TTL. A restart destroys them, and the model re-proposes the read.
+//! That is fail-safe: the alternative — retaining workspace content across restarts — is the
+//! thing this whole design exists to avoid.
+
+use orxnud_audit::{AuditOutcome, AuditRecord, OutcomeKind};
+use orxnud_domain::Actor;
+use orxnud_domain::enums::{DataClass, RiskClass};
+use orxnud_domain::ids::{RequestId, TaskId};
+
+/// Longest a retained observation may wait for a proposal before it is discarded.
+///
+/// A backstop, not the mechanism: consumption normally happens first.
+pub const DEFAULT_TTL_MS: i64 = 15 * 60 * 1_000;
+
+/// How many observations one task may hold at once.
+///
+/// Retention is newest-per-path, so this bounds distinct paths rather than read count.
+pub const DEFAULT_MAX_ENTRIES: usize = 8;
+
+/// Default ceiling on observation bytes released into one provider request.
+pub const DEFAULT_MAX_CONTENT_BYTES: usize = 32 * 1024;
+
+/// Who an observation may be shown to.
+///
+/// Both parts matter. Comparing the model string alone would let a re-pointed endpoint
+/// inherit an approval given to the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderIdentity {
+    endpoint: String,
+    model: String,
+}
+
+impl ProviderIdentity {
+    /// Derives an identity from a provider's own configuration.
+    ///
+    /// Canonicalised on construction so two spellings of one endpoint compare equal: a
+    /// trailing slash, a default port, and case in the scheme and host are all normalised.
+    /// Identity that compared raw strings would refuse legitimate reuse for cosmetic reasons
+    /// and — worse — could be made to differ deliberately.
+    #[must_use]
+    pub fn new(endpoint: impl AsRef<str>, model: impl Into<String>) -> Self {
+        Self {
+            endpoint: canonical_endpoint(endpoint.as_ref()),
+            model: model.into(),
+        }
+    }
+
+    /// The canonical endpoint. Exposed for audit records, which must agree with the check.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The model id.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Whether content may be released to this provider.
+    ///
+    /// Exact on both fields. Not "same model name", and not "same host": a different model on
+    /// the same endpoint is a different destination for a different computation, and the same
+    /// model name on a different endpoint is a different operator entirely.
+    #[must_use]
+    pub fn matches(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint && self.model == other.model
+    }
+}
+
+/// Reduces an endpoint to a comparable form.
+///
+/// Deliberately conservative: it normalises only what cannot change which operator is being
+/// addressed. It does **not** resolve DNS or follow redirects, because a name that resolves
+/// differently later is a trust decision this layer has no business making.
+fn canonical_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let (scheme, rest) = trimmed.split_once("://").unwrap_or(("https", trimmed));
+    let scheme = scheme.to_ascii_lowercase();
+
+    // Host and optional port, then the path. A default port for the scheme is dropped so
+    // `https://h/v1` and `https://h:443/v1` are one destination.
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let (host, port) = authority
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map_or((authority, None), |(h, p)| (h, Some(p)));
+    let host = host.to_ascii_lowercase();
+    let default_port = matches!(
+        (scheme.as_str(), port),
+        ("https", Some("443")) | ("http", Some("80"))
+    );
+    let authority = match port {
+        Some(p) if !default_port => format!("{host}:{p}"),
+        _ => host,
+    };
+
+    // Trailing slashes are noise on a base URL; interior ones are not.
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}{path}")
+    }
+}
+
+/// One approved, verified observation awaiting a proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    /// The task whose approved read produced it. Observations never cross tasks.
+    pub task_id: TaskId,
+    /// The workspace-relative path that was read.
+    pub path: String,
+    /// The provider identity allowed to receive it.
+    pub provider: ProviderIdentity,
+    /// The bytes. Never durable.
+    pub bytes: Vec<u8>,
+    /// When the read was verified.
+    pub recorded_at_ms: i64,
+}
+
+/// An observation handed to a proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedObservation {
+    /// The workspace-relative path.
+    pub path: String,
+    /// Where it is going, for the disclosure audit record.
+    pub provider: ProviderIdentity,
+    /// How many bytes are going. Recorded, never the bytes themselves.
+    pub byte_count: usize,
+    /// The content.
+    pub bytes: Vec<u8>,
+}
+
+/// In-memory retention of approved observations, for one daemon process.
+///
+/// # Why a `Vec` and not a map
+///
+/// Release order has to be deterministic and newest-first, and eviction has to be
+/// deterministic too. A hash map would make both depend on iteration order, which is exactly
+/// the kind of hidden nondeterminism that turns into "it worked on my machine". A vector
+/// scanned in reverse insertion order gives both for free; the lookup cost is irrelevant at
+/// `DEFAULT_MAX_ENTRIES`.
+#[derive(Debug, Clone)]
+pub struct ObservationStore {
+    ttl_ms: i64,
+    max_entries: usize,
+    max_content_bytes: usize,
+    entries: Vec<Observation>,
+}
+
+impl ObservationStore {
+    /// A store with the documented defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_TTL_MS,
+            DEFAULT_MAX_ENTRIES,
+            DEFAULT_MAX_CONTENT_BYTES,
+        )
+    }
+
+    /// A store with explicit limits, for tests and for an operator who wants them tighter.
+    #[must_use]
+    pub fn with_limits(ttl_ms: i64, max_entries: usize, max_content_bytes: usize) -> Self {
+        Self {
+            ttl_ms,
+            max_entries,
+            max_content_bytes,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Retains an observation, replacing any older one for the same `(task_id, path)`.
+    ///
+    /// Replacement rather than accumulation: re-reading a file should leave the newer bytes,
+    /// and a stale version of the same path is never what a proposal wants.
+    pub fn retain(&mut self, observation: Observation) {
+        self.expire(observation.recorded_at_ms);
+        self.entries
+            .retain(|e| !(e.task_id == observation.task_id && e.path == observation.path));
+        self.entries.push(observation);
+        // Bounded by count, dropping the oldest first, so the store cannot grow without limit.
+        while self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+    }
+
+    /// Removes and returns the observations eligible for one proposal.
+    ///
+    /// Eligible means: not expired, same task, same provider identity. Ordered newest-first.
+    /// Whole observations only -- a file is never truncated to fit, because a prefix presented
+    /// as a whole file is the one outcome a model cannot detect.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` — the task being proposed for. Observations from other tasks are never
+    ///   visible, which is what stops one task's approved read reaching another's prompt.
+    /// * `provider` — the identity asking. Compared on `(endpoint, model)`.
+    /// * `now_ms` — for expiry.
+    /// * `budget` — a per-request ceiling from the caller.
+    ///
+    ///   The effective ceiling is the **smaller** of this and the store's own
+    ///   `max_content_bytes`, so a caller cannot widen the store's limit by passing a large
+    ///   number. The store's ceiling is the one that holds when nobody supplies one.
+    pub fn take_for(
+        &mut self,
+        task_id: &TaskId,
+        provider: &ProviderIdentity,
+        now_ms: i64,
+        budget: usize,
+    ) -> Vec<ReleasedObservation> {
+        let budget = budget.min(self.max_content_bytes);
+        self.expire(now_ms);
+
+        // Newest first. Reverse insertion order is the total order, so equal timestamps still
+        // resolve deterministically rather than by chance.
+        let mut candidates: Vec<usize> = (0..self.entries.len()).rev().collect();
+        candidates.retain(|&i| {
+            let e = &self.entries[i];
+            e.task_id == *task_id && e.provider.matches(provider)
+        });
+
+        let mut released = Vec::new();
+        let mut used = 0usize;
+        let mut consumed: Vec<usize> = Vec::new();
+        for i in candidates {
+            let e = &self.entries[i];
+            // Whole-observation only. An observation that does not fit is left retained
+            // rather than partially released: it may fit a later request with a larger
+            // budget, and it expires on the TTL regardless.
+            if used.saturating_add(e.bytes.len()) > budget {
+                continue;
+            }
+            used += e.bytes.len();
+            released.push(ReleasedObservation {
+                path: e.path.clone(),
+                provider: e.provider.clone(),
+                byte_count: e.bytes.len(),
+                bytes: e.bytes.clone(),
+            });
+            consumed.push(i);
+        }
+
+        // Consume exactly what was released. An observation skipped for budget stays for a
+        // later proposal; one that is released is gone, so it cannot inform a second prompt.
+        //
+        // `consumed` is already in **descending** index order — candidates were built by
+        // walking the vector backwards — and removing from the highest index down keeps every
+        // remaining index valid. Reversing here would remove the wrong entries once more than
+        // one was consumed, which is exactly what the determinism test caught.
+        for i in consumed {
+            self.entries.remove(i);
+        }
+        released
+    }
+
+    /// Drops everything older than the TTL.
+    pub fn expire(&mut self, now_ms: i64) {
+        self.entries
+            .retain(|e| now_ms.saturating_sub(e.recorded_at_ms) <= self.ttl_ms);
+    }
+
+    /// How many observations are currently retained.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for ObservationStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stage 4c: the disclosure audit record.
+///
+/// # Why this exists and why it is shaped this way
+///
+/// Disclosing approved workspace bytes to a remote provider is the highest-consequence event
+/// in this slice. The existing audit records that a *read* happened, with metadata only; it
+/// does not, and would not, record that the bytes then left the machine. Without this,
+/// "the model saw the file" is invisible to anyone reviewing afterwards.
+///
+/// It reuses [`AuditOutcome::Finished`] rather than adding a `Disclosed` variant. `Finished`
+/// is a terminal marker, and disclosure *is* terminal — the event is complete once the bytes
+/// have been handed over. What makes that truthful rather than a stretch is that the
+/// disclosure rides its **own correlation**, so it neither closes the read's nor is closed
+/// by it.
+///
+/// # Why the disclosure correlation cannot be supplied
+///
+/// The correlation id is **private and minted inside** [`Self::from_verified_read`]. The
+/// caller supplies the *parent read* correlation; it never supplies the disclosure's.
+///
+/// That is not fastidiousness. A disclosure sharing a read's correlation silently closes that
+/// read's authorisation, and the read then disappears from
+/// `unresolved_authorisations` — so a crash during the read would stop being visible. That
+/// failure is quiet, it survives code review, and nothing about the call site looks wrong.
+/// Leaving it to every future caller to remember is exactly the kind of invariant that gets
+/// violated during a refactor.
+///
+/// So the property `disclosure_request != parent_read_request` holds **structurally**: the
+/// caller has no way to make them equal. The test that demonstrates the hazard is
+/// `a_disclosure_correlation_cannot_be_made_to_equal_its_parent`.
+///
+/// # What is never recorded
+///
+/// The bytes. Not a prefix, not a content digest, not an excerpt. The record answers *what
+/// was disclosed, where, and how much* — never *what it said*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureRecord {
+    parent_read_request: RequestId,
+    disclosure_request: RequestId,
+    parent_proposal_id: String,
+    task_id: TaskId,
+    step_no: u32,
+    path: String,
+    provider: crate::observation::ProviderIdentity,
+    byte_count: usize,
+    at_ms: i64,
+}
+
+/// Mints disclosure correlation ids that no protocol request can collide with.
+///
+/// A process-local counter, so an id is never repeated within a process even for two
+/// disclosures of the same file in the same millisecond. `pid` and `at_ms` keep it distinct
+/// across a restart, where the audit chain resumes from durable storage and a counter alone
+/// would start over.
+fn mint_disclosure_request(at_ms: i64) -> RequestId {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RequestId::new(format!(
+        "disclosure:{pid}:{at_ms}:{n}",
+        pid = std::process::id()
+    ))
+}
+
+impl DisclosureRecord {
+    /// Builds a disclosure record, minting its own correlation.
+    ///
+    /// The caller supplies the read's correlation and everything being disclosed *about*.
+    /// The disclosure's correlation is minted here, so it cannot be made to match the
+    /// parent's.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified_read(
+        parent_read_request: RequestId,
+        parent_proposal_id: impl Into<String>,
+        task_id: TaskId,
+        step_no: u32,
+        path: impl Into<String>,
+        provider: crate::observation::ProviderIdentity,
+        byte_count: usize,
+        at_ms: i64,
+    ) -> Self {
+        Self {
+            disclosure_request: mint_disclosure_request(at_ms),
+            parent_read_request,
+            parent_proposal_id: parent_proposal_id.into(),
+            task_id,
+            step_no,
+            path: path.into(),
+            provider,
+            byte_count,
+            at_ms,
+        }
+    }
+
+    /// The read whose approved result produced these bytes.
+    #[must_use]
+    pub fn parent_read_request(&self) -> &RequestId {
+        &self.parent_read_request
+    }
+
+    /// This disclosure's own correlation. Never equal to the parent's.
+    #[must_use]
+    pub fn disclosure_request(&self) -> &RequestId {
+        &self.disclosure_request
+    }
+
+    /// The task the disclosure belongs to.
+    #[must_use]
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// The step the disclosure happened at.
+    #[must_use]
+    pub fn step_no(&self) -> u32 {
+        self.step_no
+    }
+
+    /// The workspace-relative path that was read.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The canonical identity the bytes went to.
+    ///
+    /// The same value that authorised the release, so the record and the check cannot
+    /// disagree about where the content went.
+    #[must_use]
+    pub fn provider(&self) -> &crate::observation::ProviderIdentity {
+        &self.provider
+    }
+
+    /// How many bytes were disclosed. A count, never the content.
+    #[must_use]
+    pub fn byte_count(&self) -> usize {
+        self.byte_count
+    }
+
+    /// Renders this disclosure as an audit record on its own correlation.
+    ///
+    /// The `capability` is `orxnud.policy/disclose` — it names the disclosure rather than
+    /// the read, so a reviewer scanning capabilities sees that a disclosure happened rather
+    /// than inferring one from a `Finished` on some other action.
+    ///
+    /// The actor is the **human who approved the read**: that is the authority the
+    /// disclosure rests on, since one approval covers both the local read and the sending of
+    /// its result to this provider identity, and nothing else (ADR-0045).
+    #[must_use]
+    pub fn to_audit_record(&self, approver: Actor) -> AuditRecord {
+        AuditRecord {
+            seq: 0, // assigned by the chain
+            authority_root: approver.authority_root().map(ToString::to_string),
+            actor: approver,
+            capability: "orxnud.policy/disclose".to_owned(),
+            target: Some(self.path.clone()),
+            data_class: DataClass::Public,
+            risk: RiskClass::High,
+            policy_version: "v1".to_owned(),
+            // No approval digest: this is not an approval, it is the *consequence* of one.
+            approval: None,
+            secret_ref: None,
+            task: Some(self.task_id.clone()),
+            // The dedicated correlation. This is what keeps the disclosure from closing, or
+            // being closed by, the read's own authorisation record.
+            request: Some(self.disclosure_request.clone()),
+            outcome: AuditOutcome::Finished {
+                kind: OutcomeKind::Completed,
+                at_ms: self.at_ms,
+                // Bounded and content-free: identifiers, a count, and the canonical
+                // destination identity.
+                detail: Some(self.detail()),
+            },
+        }
+    }
+
+    /// The bounded, content-free detail line.
+    ///
+    /// Fixed key order. An auditor can answer "which approved read sent what, where, and how
+    /// much" from this alone, without reconstructing anything from timestamps — which is
+    /// what `parent_read` and `disclosure` correlations are both cited for.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        format!(
+            "disclosure parent_read={} disclosure={} parent_proposal={} task={} step_no={} \
+             path={} endpoint={} model={} byte_count={}",
+            self.parent_read_request,
+            self.disclosure_request,
+            self.parent_proposal_id,
+            self.task_id,
+            self.step_no,
+            self.path,
+            self.provider.endpoint(),
+            self.provider.model(),
+            self.byte_count,
+        )
+    }
+}
+
+/// Stage 4c: the retention and release rules.
+///
+/// Each test pins one clause of the contract. The ones that matter most are the negative
+/// ones — cross-task, cross-provider and repeat-release — because those are the ways approved
+/// content could reach somewhere it was not approved for.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_767_225_600_000;
+    /// Unmistakable in a prompt or a log if it ever appears where it should not.
+    const SENTINEL: &str = "SENTINEL-OBSERVATION-b7e2d1";
+
+    fn provider() -> ProviderIdentity {
+        ProviderIdentity::new("https://api.groq.com/openai/v1", "openai/gpt-oss-120b")
+    }
+
+    fn obs(path: &str, provider: ProviderIdentity, at: i64) -> Observation {
+        Observation {
+            task_id: TaskId::new("t-1"),
+            path: path.to_owned(),
+            provider,
+            bytes: SENTINEL.as_bytes().to_vec(),
+            recorded_at_ms: at,
+        }
+    }
+
+    // ------------------------------------------------- provider identity
+
+    #[test]
+    fn the_same_endpoint_and_model_is_eligible() {
+        assert!(provider().matches(&provider()));
+    }
+
+    /// The case the model-string-only rule would have got wrong.
+    #[test]
+    fn a_different_model_on_the_same_endpoint_is_refused() {
+        let other = ProviderIdentity::new("https://api.groq.com/openai/v1", "some/other-model");
+        assert!(!provider().matches(&other));
+    }
+
+    #[test]
+    fn a_different_endpoint_with_the_same_model_is_refused() {
+        let other = ProviderIdentity::new("https://evil.example/openai/v1", "openai/gpt-oss-120b");
+        assert!(
+            !provider().matches(&other),
+            "the same model name on another operator's endpoint must not inherit the approval"
+        );
+    }
+
+    #[test]
+    fn a_different_endpoint_and_model_is_refused() {
+        let other = ProviderIdentity::new("https://elsewhere.test/v1", "other/model");
+        assert!(!provider().matches(&other));
+    }
+
+    /// Cosmetic spellings of one endpoint must not refuse legitimate reuse, or the rule
+    /// becomes something operators work around.
+    #[test]
+    fn cosmetic_spellings_of_one_endpoint_canonicalise_together() {
+        let a = ProviderIdentity::new("https://API.Groq.com/openai/v1/", "m");
+        let b = ProviderIdentity::new("https://api.groq.com:443/openai/v1", "m");
+        let c = ProviderIdentity::new("  https://api.groq.com/openai/v1  ", "m");
+        assert!(
+            a.matches(&b) && b.matches(&c) && a.matches(&c),
+            "{a:?} {b:?} {c:?}"
+        );
+        // And an http endpoint on the same host is a different destination.
+        assert!(!ProviderIdentity::new("http://api.groq.com/v1", "m").matches(&a));
+    }
+
+    #[test]
+    fn the_identity_reports_what_an_audit_record_would_cite() {
+        let p = ProviderIdentity::new("https://api.groq.com/openai/v1/", "openai/gpt-oss-120b");
+        assert_eq!(p.endpoint(), "https://api.groq.com/openai/v1");
+        assert_eq!(p.model(), "openai/gpt-oss-120b");
+    }
+
+    // ---------------------------------------------------- task isolation
+
+    #[test]
+    fn observations_are_never_visible_across_tasks() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+
+        let other_task = TaskId::new("t-2");
+        let released = store.take_for(&other_task, &provider(), NOW, 64 * 1024);
+        assert!(
+            released.is_empty(),
+            "one task's approved read reached another task's prompt: {released:?}"
+        );
+        // And it was not consumed by the attempt.
+        assert_eq!(
+            store.len(),
+            1,
+            "the observation must still be there for its own task"
+        );
+    }
+
+    #[test]
+    fn the_owning_task_releases_it() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].bytes, SENTINEL.as_bytes());
+        assert_eq!(released[0].byte_count, SENTINEL.len());
+    }
+
+    // ------------------------------------------------- provider binding
+
+    #[test]
+    fn a_repointed_endpoint_does_not_receive_retained_bytes() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        let elsewhere = ProviderIdentity::new("https://elsewhere.test/v1", "openai/gpt-oss-120b");
+        let released = store.take_for(&TaskId::new("t-1"), &elsewhere, NOW, 64 * 1024);
+        assert!(released.is_empty(), "{released:?}");
+        assert_eq!(
+            store.len(),
+            1,
+            "and the observation is retained, not consumed"
+        );
+    }
+
+    #[test]
+    fn a_changed_model_does_not_receive_retained_bytes() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        let other_model = ProviderIdentity::new("https://api.groq.com/openai/v1", "other/model");
+        assert!(
+            store
+                .take_for(&TaskId::new("t-1"), &other_model, NOW, 64 * 1024)
+                .is_empty()
+        );
+    }
+
+    // --------------------------------------------------- consume exactly once
+
+    #[test]
+    fn an_observation_is_consumed_by_one_proposal() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        let first = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        assert_eq!(first.len(), 1);
+        let second = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        assert!(
+            second.is_empty(),
+            "the same approved bytes informed a second proposal: {second:?}"
+        );
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn an_observation_that_is_not_released_is_not_consumed() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("big.txt", provider(), NOW));
+        // A budget too small for it.
+        let none = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 4);
+        assert!(none.is_empty());
+        assert_eq!(
+            store.len(),
+            1,
+            "an unreleased observation must survive for a later budget"
+        );
+        // And it is still whole when it does fit.
+        let some = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        assert_eq!(some[0].bytes, SENTINEL.as_bytes());
+    }
+
+    // ------------------------------------------------------------- expiry
+
+    #[test]
+    fn an_observation_expires_on_the_ttl() {
+        let mut store = ObservationStore::with_limits(1_000, 8, 64 * 1024);
+        store.retain(obs("a.txt", provider(), NOW));
+        assert_eq!(
+            store
+                .take_for(&TaskId::new("t-1"), &provider(), NOW + 999, 64 * 1024)
+                .len(),
+            1
+        );
+        store.retain(obs("a.txt", provider(), NOW + 5_000));
+        // Still inside the TTL at +5_100, which is the boundary the check has to respect.
+        assert_eq!(
+            store
+                .take_for(&TaskId::new("t-1"), &provider(), NOW + 5_100, 64 * 1024)
+                .len(),
+            1,
+            "100ms into a 1000ms TTL must not expire"
+        );
+        store.retain(obs("b.txt", provider(), NOW + 20_000));
+        assert!(
+            store
+                .take_for(
+                    &TaskId::new("t-1"),
+                    &provider(),
+                    NOW + 20_000 + 1_001,
+                    64 * 1024
+                )
+                .is_empty(),
+            "past the TTL it must be withheld"
+        );
+        assert!(
+            store.is_empty(),
+            "an expired observation must be deleted, not just withheld"
+        );
+    }
+
+    // -------------------------------------------------------- accumulation
+
+    #[test]
+    fn a_newer_read_replaces_the_older_one_for_the_same_path() {
+        let mut store = ObservationStore::new();
+        store.retain(Observation {
+            bytes: b"old".to_vec(),
+            ..obs("a.txt", provider(), NOW)
+        });
+        store.retain(Observation {
+            bytes: b"new".to_vec(),
+            ..obs("a.txt", provider(), NOW + 1)
+        });
+        assert_eq!(
+            store.len(),
+            1,
+            "a stale version of the same path must not accumulate"
+        );
+        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW + 1, 64 * 1024);
+        assert_eq!(released[0].bytes, b"new".to_vec());
+    }
+
+    #[test]
+    fn distinct_paths_accumulate_up_to_the_limit() {
+        let mut store = ObservationStore::with_limits(60_000, 3, 64 * 1024);
+        for i in 1..=5 {
+            store.retain(obs(&format!("f{i}.txt"), provider(), NOW + i64::from(i)));
+        }
+        assert_eq!(store.len(), 3, "the store is bounded");
+        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW + 5, 64 * 1024);
+        assert_eq!(
+            released.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["f5.txt", "f4.txt", "f3.txt"],
+            "newest first, and the oldest were evicted"
+        );
+    }
+
+    // ---------------------------------------------------- content budget
+
+    #[test]
+    fn whole_observations_only_and_newest_first() {
+        let mut store = ObservationStore::new();
+        for (i, size) in [(1, 10usize), (2, 10), (3, 10)] {
+            store.retain(Observation {
+                bytes: vec![b'a' + i as u8; size],
+                ..obs(&format!("f{i}.txt"), provider(), NOW + i64::from(i))
+            });
+        }
+        // Room for two of the three.
+        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW + 3, 20);
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0].path, "f3.txt", "newest first");
+        assert_eq!(released[1].path, "f2.txt");
+        assert!(
+            released.iter().all(|r| r.byte_count == 10),
+            "nothing was truncated"
+        );
+        assert_eq!(store.len(), 1, "the skipped observation is retained");
+    }
+
+    #[test]
+    fn a_never_truncated_blob_is_whole_or_absent() {
+        let mut store = ObservationStore::new();
+        store.retain(Observation {
+            bytes: vec![b'x'; 100],
+            ..obs("big.txt", provider(), NOW)
+        });
+        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 99);
+        assert!(
+            released.is_empty(),
+            "a 100-byte blob must not be released into a 99-byte budget"
+        );
+    }
+
+    #[test]
+    fn release_order_is_deterministic_for_equal_timestamps() {
+        let render = || {
+            let mut store = ObservationStore::new();
+            for i in 1..=4 {
+                store.retain(obs(&format!("f{i}.txt"), provider(), NOW));
+            }
+            store
+                .take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024)
+                .iter()
+                .map(|r| r.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let first = render();
+        for _ in 0..8 {
+            assert_eq!(render(), first);
+        }
+        assert_eq!(first, vec!["f4.txt", "f3.txt", "f2.txt", "f1.txt"]);
+    }
+
+    #[test]
+    fn a_mismatched_task_or_provider_releases_nothing_and_consumes_nothing() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        let _ = store.take_for(&TaskId::new("other"), &provider(), NOW, 64 * 1024);
+        let _ = store.take_for(
+            &TaskId::new("t-1"),
+            &ProviderIdentity::new("https://x.test/v1", "m"),
+            NOW,
+            64 * 1024,
+        );
+        assert_eq!(
+            store.len(),
+            1,
+            "an ineligible lookup must not consume anything"
+        );
+        assert_eq!(
+            store
+                .take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024)
+                .len(),
+            1
+        );
+    }
+}
+
+/// The store's own ceiling cannot be widened by a caller.
+///
+/// A caller passing a large budget must not be able to exceed what the store was configured
+/// with, because the configured limit is the one an operator reasoned about. The effective
+/// ceiling is the smaller of the two.
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    const NOW: i64 = 1_767_225_600_000;
+
+    #[test]
+    fn a_caller_cannot_exceed_the_stores_own_ceiling() {
+        let mut store = ObservationStore::with_limits(60_000, 8, 100);
+        let provider = ProviderIdentity::new("https://p.test/v1", "m");
+        for i in 1..=3 {
+            store.retain(Observation {
+                task_id: TaskId::new("t"),
+                path: format!("f{i}.txt"),
+                provider: provider.clone(),
+                bytes: vec![b'x'; 80],
+                recorded_at_ms: NOW + i64::from(i),
+            });
+        }
+        let released = store.take_for(&TaskId::new("t"), &provider, NOW + 3, 100_000);
+        assert_eq!(
+            released.len(),
+            1,
+            "the caller's huge budget must not override the configured 100-byte ceiling"
+        );
+        assert_eq!(released[0].byte_count, 80);
+        assert_eq!(store.len(), 2, "the rest stay retained, untruncated");
+    }
+
+    #[test]
+    fn a_smaller_caller_budget_still_wins() {
+        let mut store = ObservationStore::with_limits(60_000, 8, 10_000);
+        let provider = ProviderIdentity::new("https://p.test/v1", "m");
+        store.retain(Observation {
+            task_id: TaskId::new("t"),
+            path: "a.txt".to_owned(),
+            provider: provider.clone(),
+            bytes: vec![b'x'; 500],
+            recorded_at_ms: NOW,
+        });
+        assert!(
+            store
+                .take_for(&TaskId::new("t"), &provider, NOW, 100)
+                .is_empty(),
+            "a per-request budget below the blob size must release nothing"
+        );
+        assert_eq!(store.len(), 1);
+    }
+}
+
+/// The disclosure record's interaction with the audit chain.
+///
+/// These are the assertions that answer the question 4c was gated on: can a disclosure ride
+/// its own correlation without disturbing the read's, without inventing an "outcome unknown",
+/// and without weakening the meaning of `Finished`?
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+    use orxnud_audit::AuditChain;
+    use orxnud_domain::actor::AuthChannel;
+    use orxnud_domain::ids::UserId;
+
+    const NOW: i64 = 1_767_225_600_000;
+    const SENTINEL: &str = "SENTINEL-DISCLOSURE-CONTENT-4a91c7";
+
+    fn approver() -> Actor {
+        Actor::Human {
+            user: UserId::new("local"),
+            via: AuthChannel::LocalInteractive,
+        }
+    }
+
+    fn provider() -> ProviderIdentity {
+        ProviderIdentity::new("https://api.groq.com/openai/v1/", "openai/gpt-oss-120b")
+    }
+
+    fn disclosure(path: &str, bytes: usize) -> DisclosureRecord {
+        DisclosureRecord::from_verified_read(
+            RequestId::new("req-read-1"),
+            "p-1",
+            TaskId::new("t-1"),
+            2,
+            path,
+            provider(),
+            bytes,
+            NOW,
+        )
+    }
+
+    fn read_auth(request: RequestId) -> AuditRecord {
+        AuditRecord::authorised(
+            approver(),
+            "filesystem/read-text",
+            Some("a.txt".to_owned()),
+            DataClass::Public,
+            RiskClass::High,
+            "v1",
+            None,
+            None,
+            Some(TaskId::new("t-1")),
+            Some(request),
+            NOW,
+        )
+    }
+
+    /// The structural invariant: the disclosure correlation is minted, so it cannot be the
+    /// read's. Asserted directly rather than inferred from behaviour.
+    #[test]
+    fn a_disclosure_correlation_cannot_be_made_to_equal_its_parent() {
+        let d = disclosure("a.txt", 42);
+        assert_ne!(
+            d.disclosure_request(),
+            d.parent_read_request(),
+            "a disclosure sharing its read's correlation would close the read's authorisation"
+        );
+        // And repeatedly minting against the same parent still yields distinct ids.
+        let ids: Vec<String> = (0..8)
+            .map(|_| disclosure("a.txt", 42).disclosure_request().to_string())
+            .collect();
+        let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 8, "disclosure correlations repeated: {ids:?}");
+    }
+
+    #[test]
+    fn the_disclosure_record_carries_no_content() {
+        let detail = disclosure("a.txt", SENTINEL.len()).detail();
+        assert!(!detail.contains(SENTINEL), "{detail}");
+        assert!(detail.contains("byte_count="), "{detail}");
+        assert!(detail.len() < 400, "unbounded detail: {detail}");
+    }
+
+    /// The identity in the record is the canonical one, byte for byte.
+    #[test]
+    fn the_record_cites_the_canonical_identity() {
+        let d = disclosure("a.txt", 10);
+        let identity = provider();
+        assert!(
+            d.detail()
+                .contains(&format!("endpoint={}", identity.endpoint())),
+            "not the canonical endpoint: {}",
+            d.detail()
+        );
+        assert!(d.detail().contains(&format!("model={}", identity.model())));
+        assert_eq!(
+            d.to_audit_record(approver()).capability,
+            "orxnud.policy/disclose"
+        );
+    }
+
+    /// An auditor can answer the linkage question from the record alone.
+    #[test]
+    fn the_linkage_to_the_approved_read_is_explicit() {
+        let detail = disclosure("sub/a.txt", 42).detail();
+        for expected in [
+            "parent_read=req-read-1",
+            "parent_proposal=p-1",
+            "task=t-1",
+            "step_no=2",
+            "path=sub/a.txt",
+            "byte_count=42",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "missing {expected:?} in {detail}"
+            );
+        }
+        assert!(detail.contains("disclosure=disclosure:"), "{detail}");
+    }
+
+    /// The decisive one: a disclosure neither closes the read's authorisation nor
+    /// manufactures an unresolved one.
+    #[test]
+    fn a_disclosure_does_not_disturb_the_read_correlation() {
+        let mut chain = AuditChain::new();
+        let read = read_auth(RequestId::new("req-read-1"));
+        chain.append(read.clone()).expect("append");
+        chain
+            .append(disclosure("a.txt", 42).to_audit_record(approver()))
+            .expect("append");
+        // Still open: the read has not been closed by the disclosure.
+        assert_eq!(
+            chain.unresolved_authorisations().len(),
+            1,
+            "the disclosure closed the read's authorisation"
+        );
+        chain
+            .append(read.finished(OutcomeKind::Completed, NOW, None))
+            .expect("append");
+        assert!(chain.unresolved_authorisations().is_empty());
+        chain.verify().expect("the chain still verifies");
+    }
+
+    /// And a disclosure never manufactures one either.
+    #[test]
+    fn a_disclosure_alone_creates_no_unresolved_authorisation() {
+        let mut chain = AuditChain::new();
+        chain
+            .append(disclosure("a.txt", 42).to_audit_record(approver()))
+            .expect("append");
+        assert!(chain.unresolved_authorisations().is_empty());
+        chain.verify().expect("verify");
+    }
+
+    #[test]
+    fn two_disclosures_of_the_same_file_get_distinct_correlations() {
+        let mut chain = AuditChain::new();
+        chain
+            .append(disclosure("a.txt", 10).to_audit_record(approver()))
+            .expect("append");
+        chain
+            .append(disclosure("a.txt", 20).to_audit_record(approver()))
+            .expect("append");
+        assert!(chain.unresolved_authorisations().is_empty());
+        chain.verify().expect("verify");
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn disclosures_for_different_tasks_do_not_interfere() {
+        let a = DisclosureRecord::from_verified_read(
+            RequestId::new("req-a"),
+            "p-a",
+            TaskId::new("t-a"),
+            1,
+            "a.txt",
+            provider(),
+            5,
+            NOW,
+        );
+        let b = DisclosureRecord::from_verified_read(
+            RequestId::new("req-b"),
+            "p-b",
+            TaskId::new("t-b"),
+            1,
+            "b.txt",
+            provider(),
+            5,
+            NOW,
+        );
+        assert_ne!(a.disclosure_request(), b.disclosure_request());
+        assert_eq!(a.task_id(), &TaskId::new("t-a"));
+        assert_eq!(b.task_id(), &TaskId::new("t-b"));
+    }
+}
