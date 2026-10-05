@@ -108,6 +108,19 @@ pub enum Method {
     /// It cannot approve, cannot execute, and cannot reach a capability directly: there
     /// is no path from this method to an `ApprovalRecord` or to a `Dispatcher`.
     TaskAiPropose,
+
+    /// Advance a task that has finished one step across its next step boundary.
+    ///
+    /// Claims the next logical step, asks the configured provider what it should do, and
+    /// persists the answer as an ordinary durable proposal — which parks the task in
+    /// `WaitingForUser` exactly as `task/ai-propose` does. It does not execute, cannot
+    /// approve, and has no path to a `Dispatcher`: a continued task is governed from the
+    /// moment its proposal exists, not before.
+    ///
+    /// One call crosses one boundary. There is no loop here to bound, which is the point:
+    /// a caller decides whether to continue again, and `max_steps` remains the only thing
+    /// that bounds a task's length (ADR-0043, ADR-0047).
+    TaskContinue,
 }
 
 impl Method {
@@ -115,7 +128,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -130,6 +143,7 @@ impl Method {
         Self::TaskPropose,
         Self::TaskExecute,
         Self::TaskAiPropose,
+        Self::TaskContinue,
     ];
 
     /// The wire name.
@@ -150,6 +164,7 @@ impl Method {
             Self::TaskPropose => "task/propose",
             Self::TaskExecute => "task/execute",
             Self::TaskAiPropose => "task/ai-propose",
+            Self::TaskContinue => "task/continue",
         }
     }
 
@@ -177,6 +192,7 @@ impl Method {
             "task/propose" => Some(Self::TaskPropose),
             "task/execute" => Some(Self::TaskExecute),
             "task/ai-propose" => Some(Self::TaskAiPropose),
+            "task/continue" => Some(Self::TaskContinue),
             _ => None,
         }
     }

@@ -539,6 +539,69 @@ DROP TABLE task_attempts;
 ALTER TABLE task_attempts_scoped RENAME TO task_attempts;
 "#;
 
+/// The correction `MIGRATION_ATTEMPT_STEP_SCOPE` owed `task_approvals`.
+///
+/// # What stage 2 and the composition correction missed
+///
+/// Both fixed `attempt_no` used as a step identity, but only `task_attempts` and
+/// `task_proposals` were given a `(task_id, step_no, attempt_no)` key. `task_approvals`
+/// kept `PRIMARY KEY (task_id, attempt_no)` from stage 2.
+///
+/// That is wrong under the settled semantics, because **`attempt_no` restarts at 1 for
+/// every logical step**: `complete_verified_step` resets `attempts` to 0 when a task
+/// parks at a boundary, so the first attempt of step 2 is attempt 1 just as the first
+/// attempt of step 1 was. Two logical steps of one task therefore collide on
+/// `(task_id, 1)`.
+///
+/// The collision is silent rather than loud, which is what makes it worth a migration
+/// rather than a code guard: `record_approval` is an `INSERT OR IGNORE`, so step 2's
+/// approval is discarded and `approval_for` hands back step 1's row. A multi-step task
+/// could then never have its second step approved, and the only symptom was an
+/// `approval-step-mismatch` refusal naming a mismatch the caller had not caused.
+///
+/// Discovered by making continuation reachable rather than by inspection: before
+/// `task/continue` existed no task ever reached a second logical step, so the key was
+/// unreachable and untested.
+///
+/// # What this does
+///
+/// The same table rebuild [`MIGRATION_ATTEMPT_STEP_SCOPE`] applies to `task_attempts`:
+/// create the corrected table, copy every row across unchanged, drop the old one, rename.
+/// Copying verbatim rather than renumbering is the point — every historical approval was
+/// recorded on a single logical step, so its `step_no` is already right, and inventing
+/// numbers here would fabricate a multi-step history that did not happen.
+///
+/// A forward migration rather than an edit to stage 2, for the reason the composition
+/// correction gives: a database that already applied stage 2 holds the old primary key,
+/// and editing the old version would leave it in place while claiming it never existed.
+pub const MIGRATION_APPROVAL_STEP_SCOPE: &str = r#"
+CREATE TABLE task_approvals_scoped (
+    task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    step_no        INTEGER NOT NULL DEFAULT 1,
+    attempt_no     INTEGER NOT NULL,
+    digest         BLOB    NOT NULL,
+    capability     TEXT    NOT NULL,
+    target         TEXT,
+    params         TEXT    NOT NULL,
+    issued_at_ms   INTEGER NOT NULL,
+    expires_at_ms  INTEGER NOT NULL,
+    consumed_at_ms INTEGER,
+    PRIMARY KEY (task_id, step_no, attempt_no),
+    CHECK (step_no >= 1)
+);
+
+INSERT INTO task_approvals_scoped
+    (task_id, step_no, attempt_no, digest, capability, target, params,
+     issued_at_ms, expires_at_ms, consumed_at_ms)
+SELECT task_id, step_no, attempt_no, digest, capability, target, params,
+       issued_at_ms, expires_at_ms, consumed_at_ms
+  FROM task_approvals;
+
+DROP TABLE task_approvals;
+
+ALTER TABLE task_approvals_scoped RENAME TO task_approvals;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

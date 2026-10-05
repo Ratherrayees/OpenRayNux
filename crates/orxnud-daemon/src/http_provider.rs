@@ -648,7 +648,31 @@ fn render_user_message(ctx: &ProposalContext, steps: &PriorStepContext) -> Strin
         "\nAttempt {}. Reply with one JSON object.",
         ctx.attempt_no
     ));
+    out.push_str(render_reply_contract());
     out
+}
+
+/// The reply contract, including the one way to say "there is nothing left to do".
+///
+/// Stated in the prompt because it is part of the interface: without it a model asked
+/// what to do next has no way to answer "nothing", and the only thing it can do is
+/// propose work that does not need doing. That is why this is a declared JSON shape
+/// rather than a sentinel capability — there is a real reason for a model to say `done`,
+/// so the way to say it has to be part of what it is told.
+///
+/// `done` is a second shape, not an extra field: the two answers are mutually exclusive,
+/// and a response carrying both is refused as unreadable rather than resolved.
+///
+/// The instruction is to stop when the task is *actually* finished. `max_steps` is the
+/// outer bound regardless — it is enforced by the engine, not by this prompt — but a
+/// model that finishes early and says so is the difference between a task that ends
+/// when it is done and one that runs its whole step budget every time.
+fn render_reply_contract() -> &'static str {
+    "\n\nReply with exactly one of these two JSON objects, and nothing else:\n\
+     - to do the next step: {\"capability\": \"<id>\", \"target\": \"<target>\", \"params\": {...}}\n\
+     - if no further work is needed: {\"done\": true, \"summary\": \"<one sentence>\"}\n\
+     Use the second form only when the task is genuinely finished. Asking for more work \
+     than the task needs is refused as unreadable rather than guessed at.\n"
 }
 
 /// Pulls `choices[0].message.content` out of a response body.

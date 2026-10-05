@@ -22,7 +22,8 @@ use orxnud_daemon::http_provider::{
     MAX_RESPONSE_BYTES, OpenAiCompatibleProvider, ProviderConfig, provider_from_settings,
 };
 use orxnud_daemon::proposer::{
-    AllowedCapability, ProposalContext, ProposalProvider, ProviderError, StatusKind, validate,
+    AllowedCapability, ProposalContext, ProposalOutcome, ProposalProvider, ProviderError,
+    StatusKind, validate,
 };
 use orxnud_domain::ParamField;
 use orxnud_domain::ParamKind;
@@ -804,6 +805,9 @@ fn adversarial_model_output_never_becomes_authority() {
         );
         let proposal = validate(&text, &ctx(), &registered)
             .unwrap_or_else(|e| panic!("{what} should satisfy the shape: {e:?}"));
+        let ProposalOutcome::Step(proposal) = proposal else {
+            panic!("{what}: a proposal asking for work must not read as a task finished")
+        };
         assert_eq!(proposal.capability, "filesystem/write-text");
         assert!(
             orxnud_capability::write_text::parse(&proposal.params).is_err(),
@@ -859,6 +863,9 @@ fn a_conforming_proposal_from_a_socket_is_accepted() {
     let text = p.complete(&ctx()).expect("a response");
     let _ = rt.block_on(server);
     let accepted = validate(&text, &ctx(), &registered).expect("accepted");
+    let ProposalOutcome::Step(accepted) = accepted else {
+        panic!("a proposal asking for work must not read as a task finished")
+    };
     assert_eq!(accepted.capability, "filesystem/write-text");
     assert_eq!(accepted.target.as_deref(), Some("final.txt"));
 }

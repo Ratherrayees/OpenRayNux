@@ -292,6 +292,17 @@ pub struct NewTask {
     pub catch_up: bool,
     /// An opaque payload, validated on the way in and on the way out.
     pub payload: Option<String>,
+    /// How many logical steps this task may have.
+    ///
+    /// Written through [`validate_max_steps`]; never clamped. One is the default and the
+    /// only value most tasks need: a single-step task completes on its first verified
+    /// effect instead of parking at a boundary nobody asked for.
+    ///
+    /// This exists as a field on the way in because without it there is no way to create a
+    /// multi-step task at all — `max_steps` defaults to 1 in the schema, and a task whose
+    /// every step is its last one never reaches a step boundary, so the continuation path
+    /// would be unreachable in production however correct it is.
+    pub max_steps: u32,
 }
 
 impl NewTask {
@@ -310,6 +321,10 @@ impl NewTask {
             fire_time_ms: None,
             catch_up: false,
             payload: None,
+            // A task is single-step until something asks for more. Keeping the default at
+            // one is what makes `complete_verified_step` finish a task rather than park it
+            // at a boundary nobody asked for.
+            max_steps: 1,
         }
     }
 }
@@ -944,15 +959,20 @@ impl<'a> TaskRepository<'a> {
     /// made progress, which is TP-1's "silently disappears" in the other
     /// direction.
     pub fn insert(&mut self, task: &NewTask, now_ms: i64) -> Result<(), TaskRepoError> {
+        // Checked before the write rather than trusted: `max_steps` is the bound on how
+        // long a task can be, so a zero here would be a task that can never finish and
+        // must not be storable just because it arrived from a caller.
+        validate_max_steps(task.max_steps)
+            .map_err(|e| TaskRepoError::InvalidComposition(Box::new(e)))?;
         let tx = self.tx()?;
         let n = insert_outcome(tx.execute(
             "INSERT INTO tasks (
                 id, kind, state, priority, payload, idempotent, effect_observed,
                 attempts, max_attempts, lease_holder, lease_expires_at_ms,
                 run_after_ms, catch_up, cancel_requested_at_ms, schedule_id, fire_time_ms,
-                created_at_ms, updated_at_ms, completed_at_ms, dead_lettered_at_ms)
+                created_at_ms, updated_at_ms, completed_at_ms, dead_lettered_at_ms, max_steps)
              VALUES (?1, ?2, 'pending', ?3, ?4, ?5, 0, 0, ?6, NULL, NULL,
-                     ?7, ?8, NULL, ?9, ?10, ?11, ?11, NULL, NULL);",
+                     ?7, ?8, NULL, ?9, ?10, ?11, ?11, NULL, NULL, ?12);",
             rusqlite::params![
                 task.id.as_str(),
                 task.kind.as_wire_str(),
@@ -965,6 +985,7 @@ impl<'a> TaskRepository<'a> {
                 task.schedule_id.as_ref().map(ToString::to_string),
                 task.fire_time_ms,
                 now_ms,
+                task.max_steps,
             ],
         ))?;
         if is_unique_violation(&n) {
@@ -2830,9 +2851,15 @@ impl<'a> TaskRepository<'a> {
     /// # Errors
     ///
     /// Any SQLite error.
+    ///
+    /// The step is part of the lookup, not merely checked afterwards, because
+    /// `attempt_no` alone does not name an approval: the counter restarts at 1 for every
+    /// logical step, so step 1's first attempt and step 2's first attempt are both
+    /// `(task_id, 1)`. See [`crate::schema::MIGRATION_APPROVAL_STEP_SCOPE`].
     pub fn approval_for_attempt(
         &self,
         task_id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
     ) -> Result<Option<ApprovalRow>, TaskRepoError> {
         Ok(self
@@ -2840,8 +2867,9 @@ impl<'a> TaskRepository<'a> {
             .query_row(
                 "SELECT task_id, attempt_no, hex(digest), step_no, capability, target, params,
                         issued_at_ms, expires_at_ms, consumed_at_ms
-                   FROM task_approvals WHERE task_id = ?1 AND attempt_no = ?2;",
-                rusqlite::params![task_id.as_str(), attempt_no],
+                   FROM task_approvals
+                  WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3;",
+                rusqlite::params![task_id.as_str(), step_no, attempt_no],
                 decode_approval,
             )
             .optional()?)
@@ -2852,22 +2880,28 @@ impl<'a> TaskRepository<'a> {
     /// # Errors
     ///
     /// [`TaskRepoError::NotFound`] if the attempt has no approval.
+    ///
+    /// Takes the step for the same reason [`Self::approval_for_attempt`] does: consuming
+    /// an approval is claiming *that* approval, and an attempt number on its own names
+    /// one attempt per step rather than one attempt overall.
     pub fn consume_approval(
         &mut self,
         task_id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         now_ms: i64,
     ) -> Result<bool, TaskRepoError> {
         let changed = write(self.conn.execute(
-            "UPDATE task_approvals SET consumed_at_ms = ?3
-              WHERE task_id = ?1 AND attempt_no = ?2 AND consumed_at_ms IS NULL;",
-            rusqlite::params![task_id.as_str(), attempt_no, now_ms],
+            "UPDATE task_approvals SET consumed_at_ms = ?4
+              WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3
+                AND consumed_at_ms IS NULL;",
+            rusqlite::params![task_id.as_str(), step_no, attempt_no, now_ms],
         ))?;
         if changed == 0 {
             // Either there was never an approval, or it was already consumed.
             // Both mean "this attempt may not use an approval".
             return Err(TaskRepoError::NotFound(format!(
-                "{task_id} attempt {attempt_no} has no unconsumed approval"
+                "{task_id} step {step_no} attempt {attempt_no} has no unconsumed approval"
             )));
         }
         Ok(true)
@@ -4392,12 +4426,12 @@ mod tests {
         // The query takes an attempt number, so asking for attempt 1 still works
         // and asking for attempt 2 finds nothing. There is no "current approval".
         assert!(
-            repo.approval_for_attempt(&tid("t"), 1)
+            repo.approval_for_attempt(&tid("t"), 1, 1)
                 .expect("a1")
                 .is_some()
         );
         assert!(
-            repo.approval_for_attempt(&tid("t"), 2)
+            repo.approval_for_attempt(&tid("t"), 1, 2)
                 .expect("a2")
                 .is_none(),
             "the retry must not inherit the approval"
@@ -4424,11 +4458,14 @@ mod tests {
         insert(&mut repo, "t", TaskKind::Workflow);
         repo.record_approval(&approval("t", 1, NOW + 60_000))
             .expect("record");
-        assert!(repo.consume_approval(&tid("t"), 1, NOW).expect("consume"));
+        assert!(
+            repo.consume_approval(&tid("t"), 1, 1, NOW)
+                .expect("consume")
+        );
         // A second consumption is refused.
-        assert!(repo.consume_approval(&tid("t"), 1, NOW + 1).is_err());
+        assert!(repo.consume_approval(&tid("t"), 1, 1, NOW + 1).is_err());
         let row = repo
-            .approval_for_attempt(&tid("t"), 1)
+            .approval_for_attempt(&tid("t"), 1, 1)
             .expect("read")
             .expect("present");
         assert!(
@@ -4443,7 +4480,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         assert!(matches!(
-            repo.consume_approval(&tid("t"), 1, NOW),
+            repo.consume_approval(&tid("t"), 1, 1, NOW),
             Err(TaskRepoError::NotFound(_))
         ));
     }
@@ -4456,7 +4493,7 @@ mod tests {
         repo.record_approval(&approval("t", 1, NOW + 1_000))
             .expect("record");
         let row = repo
-            .approval_for_attempt(&tid("t"), 1)
+            .approval_for_attempt(&tid("t"), 1, 1)
             .expect("read")
             .expect("present");
         assert!(row.is_valid_at(NOW + 999));
@@ -4938,7 +4975,7 @@ mod composition_tests {
         .expect("record");
 
         let read = repo
-            .approval_for_attempt(&tid("t"), 1)
+            .approval_for_attempt(&tid("t"), 1, 1)
             .expect("read")
             .expect("present");
         assert_eq!(read.step_no, 1);
@@ -5220,7 +5257,7 @@ mod composition_tests {
                 "attempt {attempt} is a retry of step 1, not a later step"
             );
             let a = repo
-                .approval_for_attempt(&tid("retried"), attempt)
+                .approval_for_attempt(&tid("retried"), 1, attempt)
                 .expect("read")
                 .expect("present");
             assert_eq!((a.step_no, a.attempt_no), (1, attempt));
@@ -6871,7 +6908,7 @@ mod next_step_claim_tests {
                 .expect("resume step 2");
         }
         let approval = TaskRepository::new(&mut c)
-            .approval_for_attempt(&tid("t"), proposal.attempt_no)
+            .approval_for_attempt(&tid("t"), proposal.step_no, proposal.attempt_no)
             .expect("read approval")
             .expect("present");
         assert_eq!(
@@ -6894,6 +6931,170 @@ mod next_step_claim_tests {
             .expect("finish step 2");
         let (state, completed, _, _, holder, _) = row_of(&c);
         assert_eq!((state.as_str(), completed, holder), ("completed", 2, None));
+    }
+
+    /// Two steps, two approvals, both of them real.
+    ///
+    /// The regression this exists for. `attempt_no` restarts at 1 for every logical step —
+    /// `complete_verified_step` resets `attempts` to 0 at the boundary — so step 1's first
+    /// attempt and step 2's first attempt are *both* `(task_id, 1)`. With
+    /// `task_approvals` keyed `(task_id, attempt_no)`, step 2's approval was silently
+    /// dropped by an `INSERT OR IGNORE` and the lookup handed back step 1's row, so a
+    /// multi-step task could never have its second step approved.
+    ///
+    /// Asserting the second approval is *present* rather than merely that the step
+    /// completes is the point: the failure mode was a wrong-but-valid row, not a missing
+    /// one, so a test that only checked the happy path downstream would have passed.
+    #[test]
+    fn both_steps_of_a_task_can_hold_their_own_approval() {
+        let mut c = mem_task(2);
+        // Step 1: proposed, approved, approved.
+        {
+            let mut repo = TaskRepository::new(&mut c);
+            repo.claim("worker-a", NOW, LEASE).expect("claim step 1");
+            let row = repo
+                .propose_action(
+                    "p1",
+                    &tid("t"),
+                    "worker-a",
+                    "filesystem/write-text",
+                    Some("a.txt"),
+                    "{}",
+                    "{}",
+                    None,
+                    1,
+                    NOW,
+                )
+                .expect("propose step 1");
+            assert_eq!((row.step_no, row.attempt_no), (1, 1));
+            repo.decide_proposal("p1", "approved", NOW)
+                .expect("approve step 1");
+            repo.record_approval(&ApprovalRow {
+                task_id: tid("t"),
+                attempt_no: row.attempt_no,
+                step_no: row.step_no,
+                digest_hex: "11".repeat(32),
+                capability: "filesystem/write-text".into(),
+                target: Some("a.txt".into()),
+                params: "{}".into(),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + LEASE,
+                consumed_at_ms: None,
+            })
+            .expect("record approval 1");
+            repo.begin_approved_execution("p1", "worker-a", NOW, LEASE)
+                .expect("resume step 1");
+            repo.complete_verified_step(&VerifiedStep {
+                task_id: tid("t"),
+                worker: "worker-a",
+                step_no: 1,
+                proposal_id: "p1",
+                status: StepStatus::Verified,
+                verification: None,
+                structured_output: None,
+                artifacts: None,
+                recorded_at_ms: NOW,
+            })
+            .expect("verify step 1");
+        }
+
+        // The boundary resets the attempt counter, which is exactly what made the two
+        // approvals collide.
+        // The key itself, asserted rather than inferred from the behaviour above: a
+        // regression that reintroduced `(task_id, attempt_no)` would fail the two reads.
+        let pk: String = c
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_approvals';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the table exists");
+        assert!(
+            pk.contains("PRIMARY KEY (task_id, step_no, attempt_no)"),
+            "the approvals key must name the step: {pk}"
+        );
+
+        let (_, _, _, attempts, holder, _) = row_of_id(&c, "t");
+        assert_eq!(
+            (attempts, holder),
+            (0, None),
+            "the boundary resets attempts"
+        );
+
+        // Step 2: the same attempt number, so the same key.
+        let row = {
+            let mut repo = TaskRepository::new(&mut c);
+            let claimed = repo
+                .claim_next_step(&tid("t"), "worker-b", NOW, LEASE)
+                .expect("claim");
+            assert!(matches!(claimed, TargetedClaimOutcome::Claimed(_)));
+            let row = repo
+                .propose_action(
+                    "p2",
+                    &tid("t"),
+                    "worker-b",
+                    "filesystem/write-text",
+                    Some("b.txt"),
+                    "{}",
+                    "{}",
+                    None,
+                    2,
+                    NOW,
+                )
+                .expect("propose step 2");
+            repo.record_approval(&ApprovalRow {
+                task_id: tid("t"),
+                attempt_no: row.attempt_no,
+                step_no: row.step_no,
+                digest_hex: "22".repeat(32),
+                capability: "filesystem/write-text".into(),
+                target: Some("b.txt".into()),
+                params: "{}".into(),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + LEASE,
+                consumed_at_ms: None,
+            })
+            .expect("record approval 2");
+            row
+        };
+        assert_eq!(
+            (row.step_no, row.attempt_no),
+            (2, 1),
+            "step 2's first attempt is attempt 1 again"
+        );
+
+        // Both approvals exist, and each reads back as its own step's.
+        for (step, digest) in [(1u32, "11"), (2, "22")] {
+            let a = TaskRepository::new(&mut c)
+                .approval_for_attempt(&tid("t"), step, 1)
+                .unwrap_or_else(|e| panic!("step {step}: {e}"))
+                .unwrap_or_else(|| panic!("step {step} must have its own approval"));
+            assert_eq!(a.step_no, step);
+            assert_eq!(
+                a.digest_hex,
+                digest.repeat(32),
+                "step {step} read back the wrong approval's digest"
+            );
+        }
+
+        // And consuming one leaves the other usable: single-use is per approval, not per
+        // attempt number, which is what "per attempt" would wrongly have made it.
+        TaskRepository::new(&mut c)
+            .consume_approval(&tid("t"), 1, 1, NOW)
+            .expect("consume step 1's approval");
+        assert!(
+            TaskRepository::new(&mut c)
+                .approval_for_attempt(&tid("t"), 1, 1)
+                .expect("read")
+                .is_some(),
+            "a consumed approval is still the row for that step"
+        );
+        assert!(
+            TaskRepository::new(&mut c)
+                .consume_approval(&tid("t"), 2, 1, NOW)
+                .expect("consume step 2's"),
+            "step 2's approval must not have been consumed by step 1's"
+        );
     }
 
     fn row_of_id(c: &Connection, id: &str) -> (String, i64, i64, i64, Option<String>, Option<i64>) {

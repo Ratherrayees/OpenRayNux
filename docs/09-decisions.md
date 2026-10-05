@@ -1,7 +1,7 @@
 # 09 — Architecture Decision Records
 
 Status: **Draft v0.3** · Adopted 2026-09-30 · index and metadata reconciled
-**2026-10-05** against `HEAD` (`1721761`).
+**2026-10-06** against `HEAD` (`e9fadbf`).
 
 Each ADR follows: Context · Problem · Options · Evidence · Decision · Why ·
 Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**44 ADRs, numbered ADR-0001 … ADR-0046.** Two numbers in that range are
+**45 ADRs, numbered ADR-0001 … ADR-0047.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -24,11 +24,17 @@ current, because a decision log edited to agree with the present stops being
 evidence of what was decided. Where a later change made an early ADR's prose
 obsolete, an amendment is appended to that ADR rather than its reasoning edited.
 
-Three ADRs gained dated amendments in this pass because their Status line had
+Three ADRs gained dated amendments in the 2026-10-05 pass because their Status line had
 become actively misleading: **ADR-0035** (its "gap Phase 4b must close" is closed
-by V-51), **ADR-0043** ("implemented" overstated it — the primitive exists, no
-production caller does), and **ADR-0044** ("implementation begins in Stage 4"
+by V-51), **ADR-0043** ("implemented" overstated it — the primitive existed with no
+production caller), and **ADR-0044** ("implementation begins in Stage 4"
 understated what shipped, and omitted that the wiring is deliberately absent).
+
+**ADR-0043 gained a further amendment on 2026-10-06**, when ADR-0047 closed the
+orchestration gap it had recorded as unmet, and **ADR-0044 gained a note** recording
+that continuation is now the first routine path showing a model anything about earlier
+steps — without that decision changing, since `PriorStepContext` still carries no
+content.
 
 **Index**
 
@@ -78,6 +84,7 @@ understated what shipped, and omitted that the wiring is deliberately absent).
 | [0044](#adr-0044) | **Observation is governed: approved reads, and a context that carries no content** | **Accepted + governance core implemented** |
 | [0045](#adr-0045) | **One approval, two acts: a read and its disclosure to a provider identity** | **Accepted + governance core implemented** |
 | [0046](#adr-0046) | **A missing host guarantee is a refusal to assert, not a test to skip** | **Accepted + implemented** |
+| [0047](#adr-0047) | **A continuation is one boundary and one proposal, and the caller decides whether to take another** | **Accepted + implemented** |
 
 ---
 
@@ -3412,10 +3419,19 @@ point `prompt_hash` becomes a real hash rather than the placeholder it is today.
 
 ## ADR-0043 — Continuation is an explicit operation, not a widened claim
 
-**Status.** **Decided. The primitive is implemented; the orchestration is deliberately
-absent.** `AwaitingNextStep` is advanced only by `TaskRepository::claim_next_step()`. The
-generic claim path (`claim()` / `take_lease()` / `claim_specific()`) remains `Pending`-only,
-and `idx_tasks_claimable` was not widened.
+**Status.** **Decided and now implemented.** `AwaitingNextStep` is advanced only by
+`TaskRepository::claim_next_step()`. The generic claim path (`claim()` / `take_lease()` /
+`claim_specific()`) remains `Pending`-only, and `idx_tasks_claimable` was not widened.
+
+**Amendment, 2026-10-06 — the orchestration exists.** ADR-0047 closes the "recorded" this
+decision left open, and the "explicit operation, not a widened claim" half of the title is
+what it delivered: `task/continue` is the sole production caller of `claim_next_step()`, one
+boundary per call, and it does not execute. Three facts surfaced while doing it, none of them
+design choices: no task could reach a boundary at all because `max_steps` defaulted to 1 and
+nothing could set it; `task_approvals` was keyed `(task_id, attempt_no)` while `attempt_no`
+restarts per step, so a second step's approval was silently discarded (schema 10); and no
+capability other than a sandboxed Tier-1 one verifies, which is why reaching a boundary is
+sandbox evidence.
 
 **Amendment, 2026-10-05 — "implemented" overstated this.** As of `HEAD`, the *governance
 primitive* is complete and tested: the state exists, `claim_next_step()` exists,
@@ -3461,6 +3477,13 @@ than by accident. See V-84.
 
 **Status.** **Decided. The governance core is implemented; the runtime wiring is
 deliberately absent.**
+
+**Note, 2026-10-06.** ADR-0047 delivered the *continuation* wiring, which is the first
+routine path that shows a model anything about earlier steps. It did not change this
+decision: `PriorStepContext` still carries step number, status and workspace-relative
+artifact names and nothing else, and `prior_step_context_carries_status_and_names_but_
+never_content` now asserts that shape directly so a later content field cannot be added
+without failing a test. The observation wiring below remains absent.
 
 **Amendment, 2026-10-05.** "Implementation begins in Stage 4" understated what shipped.
 At `HEAD` both mechanisms exist and are tested: `filesystem/read-text` is a registered
@@ -3688,3 +3711,157 @@ allowed to be incapable, and its Tier-1 result is a correct refusal.
 * Windows remains **NOT_PROVEN** for isolation, and none of this changes that. The container
   is Linux evidence about the Linux configuration.
 
+
+---
+
+## ADR-0047 — A continuation is one boundary and one proposal, and the caller decides whether to take another
+
+**Status.** **Decided and implemented.** `task/continue` and `orxnuctl task continue` ship;
+`tests/continuation.rs` and the `cli_e2e` loop are the evidence.
+
+**Context.** ADR-0043 recorded that a multi-step task continues by *executing a recorded
+step and proposing a governed next step*, and left "recorded" as the open question. That
+question closed with three findings from the code rather than from preference.
+
+First, **the primitives already existed and nothing reached them.**
+`complete_verified_step` moves a task to `AwaitingNextStep` and resets `attempts`; the
+targeted claim `claim_next_step` is the only way across that boundary; `propose_action`
+binds a proposal to `steps_completed + 1`. `claim_next_step` had **no caller at all**.
+
+Second, **no task could ever reach a boundary.** `max_steps` defaults to 1 in the schema
+and `NewTask` had no field for it, so every task created through `task/create` completed
+on its first verified effect. A correct continuation implementation would have been
+unreachable code.
+
+Third, **the approvals table could not represent two steps of one task.**
+`complete_verified_step` resets the attempt counter at a boundary, so `attempt_no` restarts
+at 1 for each logical step and step 2's first attempt is `(task_id, 1)` exactly as step 1's
+was. `task_approvals` was keyed `PRIMARY KEY (task_id, attempt_no)` — the key stage 2 got
+wrong for `task_proposals` and which the composition correction (ADR-0043's predecessor)
+fixed there but not here. `record_approval` is an `INSERT OR IGNORE`, so step 2's approval
+was silently discarded and the lookup returned step 1's row. The only symptom was an
+`approval-step-mismatch` refusal blaming a mismatch the caller had not caused. Migration
+10 rebuilds the table keyed `(task_id, step_no, attempt_no)`, the same treatment
+`MIGRATION_ATTEMPT_STEP_SCOPE` gave `task_attempts`.
+
+**Problem.** How does a task reach its second step, without giving the model a way to do
+anything it could not already do?
+
+**Options considered.**
+
+1. *A background driver that runs a task to completion.* Rejected. It needs somewhere to
+   record "this is the Nth retry", a rule for when to stop asking a model that keeps
+   failing, and a resume point after a crash — three decisions that each want their own
+   record and their own review, in the one component with no user present to object.
+2. *Fold advancement into the existing generic claim.* Rejected. ADR-0043 and V-84 both
+   record that advancing a boundary is a distinct operation from picking up fresh work;
+   widening the generic claim would assert that any polling worker which *observes* a
+   boundary is entitled to advance it. `claim_next_step` stays separate and stays the only
+   route.
+3. *Extend the proposal to an orchestrated capability.* Rejected on the same grounds as
+   ADR-0037: it would put execution planning inside the capability registry.
+4. *One explicit call that claims, asks and proposes.* **Chosen.**
+
+**Decision 1 — one call, one boundary, no execution.**
+
+`task/continue` does exactly three things: claim the next logical step, ask the provider
+what it should do, persist the result as an ordinary durable proposal. It then stops, in
+`WaitingForUser`, exactly where `task/ai-propose` leaves a task.
+
+It deliberately does **not** execute. That is what makes "the governed path is the only
+path" a property of the code rather than a claim about it: a continued step re-enters
+`task/ai-propose` → durable proposal → approval → dispatcher → sandbox → verification →
+audit with no continuation-specific shortcut, and `tests/continuation.rs` asserts that an
+unapproved continuation does not run.
+
+**Decision 2 — the caller decides whether there is another boundary.**
+
+The orchestrator is a step, not a driver. There is no loop here to bound, which is the
+point: each call is one boundary and at most one provider call, and `max_steps` remains the
+only thing that bounds a task's length. The alternative would have required a durable retry
+counter and a new policy for when to stop asking, and neither is a decision this change
+should make on its own.
+
+**Decision 3 — the terminal answer is a declared shape, not a magic capability.**
+
+`{"done": true, "summary": "..."}` is a **second declared shape**, selected by the presence
+of a `done` key, so `{"done": true, "capability": ...}` is refused as unreadable rather than
+resolved in favour of one half. `ProposalOutcome` names both cases. Nothing about `done` is a
+capability: it carries no target, no parameters and no authority, so there is nothing in it
+that could have been used to smuggle an action past the allowlist — which is asserted
+directly in `a_done_answer_cannot_carry_an_action_and_contradictions_are_refused`.
+
+**Decision 4 — the model proposes completion; the engine disposes.**
+
+`done` is not a state transition the model performs. The runtime completes the task
+through the same fenced `complete_task_with` every other terminal report uses, holding a
+live lease, with the reason recorded on the task and the model named in the reply. The
+model answered a question the runtime asked; it did not move the task, approve anything, or
+assert that an effect succeeded. That distinction is the whole reason the answer is a
+separate shape rather than a capability — a capability could be *executed*.
+
+`steps_completed` does not move, because no effect was verified. The task finished without
+doing another thing, which is different from having done another thing.
+
+**Decision 5 — a failed ask returns the boundary.**
+
+The claim commits, then the model is asked, then the proposal commits: a network call
+cannot be held inside the single SQLite write transaction. If the ask or the write fails,
+`release_to_boundary` puts the task back on `AwaitingNextStep` and releases the lease.
+Without it, one provider outage would strand a task holding a lease for a step that will
+never be proposed, and since `task/continue` only ever acts at a boundary, continuation
+could never be retried. A crash between the two is recoverable the ordinary way: the lease
+expires and the task returns to a claimable boundary.
+
+**Decision 6 — `max_steps` is a caller-set field, bounded, never clamped.**
+
+`task/create` takes an optional `max_steps`, defaulting to one so no existing task changes
+behaviour. It is validated through the store's own `validate_max_steps` and refused above
+64 (`MAX_MAX_STEPS`). Refused rather than clamped at both ends: a silent clamp would let a
+caller ask for three steps, get one, and never learn, and `max_steps = 0` is a task that can
+never finish. The wire stays strict — the CLI parses what a person types and sends a JSON
+number, so there is one spelling of a number and the daemon owns the bound.
+
+**Trade-offs.**
+
+* Running a task to completion is a sequence of `approve` / `execute` / `continue` calls,
+  not one call. That is more work for a user than a driver would be, and it is the cost of
+  not having a component nobody supervises.
+* A caller in a loop will keep asking a model that keeps failing, and nothing stops it. Each
+  iteration is bounded and visible; nothing is bounded *across* iterations, because a retry
+  policy is a decision this change declines to make.
+* `max_steps` reaching 64 is refused even though `validate_max_steps` would accept it. The
+  store's invariant is a lower bound; the daemon adds an upper one.
+
+**Consequences.**
+
+* Schema **10**. Fresh and migrated databases converge because migrations run in order.
+* `Method::ALL` is 15. `orxnuctl task continue` and `task create --max-steps` are new.
+* `PriorStepContext` is unchanged and still carries status and workspace-relative artifact
+  names only. Continuation is the first routine path that shows a model anything about
+  earlier steps, so `prior_step_context_carries_status_and_names_but_never_content` asserts
+  the shape directly: no content, no verification text, no absolute path (ADR-0044).
+* Reaching a boundary needs a *verified* effect, and `text/word-count` deliberately returns
+  `Undetermined` rather than `Verified`. So there is **no host-independent way** to reach a
+  boundary, and the five continuation tests that execute are sandbox evidence: named in the
+  G9 exclusion list, run in the ADR-0046 container. The four that do not execute run
+  everywhere.
+
+**Rejected alternatives.**
+
+* *Let `max_steps` keep defaulting to 1 and add a way to change it later.* The feature would
+  ship with no way to reach the code it adds.
+* *Model-signalled completion as a reserved capability id.* A magic string that would have to
+  be registered, allow-listed and dispatched in order to mean *nothing happens* — and would
+  then be approvable and executable like any other.
+* *Complete the task when the model's `done` arrives without an intervening claim.* Would
+  complete from a state the model has not been given a lease on.
+
+**Revisit conditions.**
+
+* Revisit if a supervisor appears that could own a retry budget and a stop rule.
+* Revisit if `max_steps` proves too coarse a bound and per-step bounds are needed.
+* Revisit if `attempt_no` is ever made global rather than per-step, which would remove the
+  reason migration 10 exists.
+* Revisit if a terminal signal ever needs to carry more than a bounded, non-authoritative
+  summary.
