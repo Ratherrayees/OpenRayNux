@@ -532,10 +532,17 @@ than the work.
   choice about the tests.** Reaching `AwaitingNextStep` requires a *verified* effect, and
   `text/word-count` deliberately returns `Undetermined` rather than `Verified` — counting
   words has no effect to observe — so `filesystem/write-text` is the only capability that can
-  put a task at a boundary. Five of the nine tests in `tests/continuation.rs` are therefore
-  named in the G9 exclusion list and run in the ADR-0046 container; the four that do not
-  execute a capability — the boundary race, the `max_steps` bounds, the `done`-shape
-  refusals, and the prior-step disclosure shape — run on every host.
+  put a task at a boundary. Six of the nine tests in `tests/continuation.rs` therefore have
+  to execute one first, are named in the G9 exclusion list, and run in the ADR-0046
+  container. The three that do not execute a capability — the `max_steps` bounds, the
+  `done`-shape refusals, and the prior-step disclosure shape — run on every host.
+
+  This was got wrong once: the first version of that exclusion list named five, on the
+  reasoning that a test which only *asserts a race* does not need a sandbox. It does —
+  it has to put the task at a boundary to have a boundary to race over — and hosted CI
+  caught it (`a_boundary_is_claimed_by_exactly_one_worker`). The lesson is that the
+  exclusion list has to be derived from what a test must *set up*, not from what it
+  asserts.
 
 ### What a green CI run does and does not prove
 
