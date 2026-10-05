@@ -1387,11 +1387,19 @@ mod tests {
     /// `EPERM`, without naming libc: the crate forbids `unsafe` and takes no dependency
     /// for one errno. The value is the ABI constant, which is 1 on every Linux target
     /// this crate builds for.
+    ///
+    /// `#[cfg(unix)]` with its only caller,
+    /// `a_permission_failure_and_a_value_failure_are_different_kinds` -- the convention
+    /// this file already records above
+    /// `a_failed_control_write_leaves_no_cgroup_behind`. Ungated, they are dead code off
+    /// Linux and an MSVC `--all-targets` build fails on `-D warnings`.
+    #[cfg(unix)]
     fn libc_eperm() -> i32 {
         1
     }
 
     /// `EINVAL`. See [`libc_eperm`].
+    #[cfg(unix)]
     fn libc_einval() -> i32 {
         22
     }
