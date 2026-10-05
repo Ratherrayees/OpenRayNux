@@ -1,21 +1,18 @@
-//! The runtime, end to end, against a real socket and a real database.
+//! Unix-socket evidence, recorded as such per test rather than per file.
 //!
-//! # What is actually exercised
+//! Every test here reaches the daemon through a real Unix domain socket, and
+//! `std::os::unix::net::UnixStream` has no Windows equivalent -- the local IPC
+//! transport *refuses* there rather than binding a named pipe
+//! (`crates/orxnud-platform-ipc`, ADR-0035). So each test carries
+//! `#[cfg_attr(not(target_os = "linux"), ignore = ...)]` naming that reason, and
+//! this file still *compiles* for MSVC, which is what the `windows-check` lane's
+//! `--all-targets` proves.
 //!
-//! A real `Runtime` is started against a real directory. Nothing is mocked: the
-//! SQLite file is created by the runtime's own migration path, the socket is a real
-//! Unix domain socket, and the client is a separate connection. That matters
-//! because the properties under test are all *arrangement* properties — durable
-//! state attached before the endpoint exists, a request reaching the nine stages,
-//! state surviving a restart — and none of them is observable from a unit test that
-//! constructs the pieces separately.
+//! Per test rather than a whole-file `#![cfg(unix)]`, and the reason is gate G3:
+//! `cfg` may appear only inside a `orxnud-platform-*` crate, so a file-level gate
+//! here would fail the boundary check that keeps the portable core portable. What
+//! it proved stays Linux evidence either way -- V-29.
 //!
-//! # The refusals are the evidence
-//!
-//! With an empty registry a dispatch cannot succeed, and that is the useful result:
-//! a `send-message` request comes back refused *by policy*, which proves it entered
-//! the governed path. A fake capability registered to make the test green would
-//! prove nothing about the boundary and is deliberately absent.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -106,7 +103,7 @@ fn call_raw(endpoint: &Path, line: &[u8]) -> Option<Value> {
 }
 
 fn call_once(endpoint: &Path, line: &[u8]) -> Option<Value> {
-    let mut s = std::os::unix::net::UnixStream::connect(endpoint).ok()?;
+    let mut s = orxnud_platform_ipc::connect_blocking(endpoint)?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let _ = s.write_all(line);
     let _ = s.write_all(b"\n");
@@ -176,6 +173,12 @@ where
     outcome
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn startup_attaches_durable_security_state_before_the_endpoint_exists() {
     rt().block_on(async {
@@ -198,6 +201,12 @@ fn startup_attaches_durable_security_state_before_the_endpoint_exists() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn startup_refuses_when_durable_state_cannot_be_opened_and_binds_nothing() {
     rt().block_on(async {
@@ -220,6 +229,12 @@ fn startup_refuses_when_durable_state_cannot_be_opened_and_binds_nothing() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_health_request_succeeds_over_a_real_socket() {
     rt().block_on(async {
@@ -259,6 +274,12 @@ fn a_health_request_succeeds_over_a_real_socket() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_protocol_methods_the_runtime_claims_to_serve_all_answer() {
     rt().block_on(async {
@@ -290,6 +311,12 @@ fn the_protocol_methods_the_runtime_claims_to_serve_all_answer() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_governed_dispatch_reaches_policy_and_is_refused_there() {
     rt().block_on(async {
@@ -320,6 +347,12 @@ fn a_governed_dispatch_reaches_policy_and_is_refused_there() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn malformed_unknown_and_invalid_requests_all_get_structured_errors() {
     rt().block_on(async {
@@ -357,6 +390,12 @@ fn malformed_unknown_and_invalid_requests_all_get_structured_errors() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_oversized_request_is_refused_with_a_structured_error() {
     rt().block_on(async {
@@ -369,7 +408,7 @@ fn an_oversized_request_is_refused_with_a_structured_error() {
             line.push(b'\n');
             let sock = endpoint.clone();
             let handle = std::thread::spawn(move || {
-                let mut s = std::os::unix::net::UnixStream::connect(&sock).expect("connect");
+                let mut s = orxnud_platform_ipc::connect_blocking(&sock).expect("connect");
                 s.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let mut reader = BufReader::new(s.try_clone().expect("clone"));
                 let _ = s.write_all(&line);
@@ -394,13 +433,19 @@ fn an_oversized_request_is_refused_with_a_structured_error() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn an_abrupt_disconnect_does_not_stop_the_runtime() {
     rt().block_on(async {
         with_runtime("disconnect", |endpoint| async move {
             // Connect and close without sending anything.
             for _ in 0..5 {
-                let s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+                let s = orxnud_platform_ipc::connect_blocking(&endpoint).expect("connect");
                 drop(s);
             }
             let r = call_raw(
@@ -416,6 +461,12 @@ fn an_abrupt_disconnect_does_not_stop_the_runtime() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn durable_state_survives_a_restart_and_the_chain_continues() {
     rt().block_on(async {
@@ -495,6 +546,12 @@ fn durable_state_survives_a_restart_and_the_chain_continues() {
 /// verified. It also reached the verifier and both audit records. A journal whose
 /// timestamps are all `0` orders its records by sequence alone and cannot answer
 /// "when did this happen", which is most of what an audit log is for.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_dispatch_is_audited_with_a_real_wall_clock_instant() {
     rt().block_on(async {
@@ -610,6 +667,12 @@ fn max_seq(d: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_runtime_never_binds_a_network_socket() {
     // Structural rather than behavioural: a TCP listener would have to be written,
@@ -624,6 +687,12 @@ fn the_runtime_never_binds_a_network_socket() {
     }
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_runtime_never_reaches_an_adapter_directly() {
     // The structural half of the security boundary: nothing in the runtime may name
@@ -657,11 +726,17 @@ fn the_runtime_never_reaches_an_adapter_directly() {
 // disconnect and always worked -- so the suite reported this area as green.
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_peer_that_closes_before_reading_its_response_does_not_stop_the_daemon() {
     rt().block_on(async {
         let ended = with_observed_runtime("write-side-disconnect", |endpoint| async move {
-            let mut s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+            let mut s = orxnud_platform_ipc::connect_blocking(&endpoint).expect("connect");
             let _ = s.write_all(br#"{"jsonrpc":"2.0","id":"w","method":"daemon/status"}"#);
             let _ = s.write_all(b"\n");
             let _ = s.flush();
@@ -692,6 +767,12 @@ fn a_peer_that_closes_before_reading_its_response_does_not_stop_the_daemon() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_reset_style_disconnect_does_not_stop_the_daemon() {
     rt().block_on(async {
@@ -699,7 +780,7 @@ fn a_reset_style_disconnect_does_not_stop_the_daemon() {
             // Repeated, because one close can land before the runtime is reading and
             // would then prove nothing about the write path.
             for attempt in 0..5 {
-                let mut s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+                let mut s = orxnud_platform_ipc::connect_blocking(&endpoint).expect("connect");
                 let _ = s.write_all(br#"{"jsonrpc":"2.0","id":"r","method":"daemon/status"}"#);
                 let _ = s.write_all(b"\n");
                 let _ = s.flush();
@@ -707,7 +788,7 @@ fn a_reset_style_disconnect_does_not_stop_the_daemon() {
                 // then refuses the inbound answer with a reset instead of accepting
                 // it, which is the ECONNRESET half of the classification -- and it is
                 // reachable with portable std, so no cfg and no unsafe.
-                let _ = s.shutdown(std::net::Shutdown::Read);
+                s.shutdown_read();
                 drop(s);
                 let _ = attempt;
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -725,6 +806,12 @@ fn a_reset_style_disconnect_does_not_stop_the_daemon() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn a_peer_disconnect_ends_the_connection_rather_than_the_serve_loop() {
     // Test D, stated as the classification it is: the disconnect must be absorbed by
@@ -735,13 +822,13 @@ fn a_peer_disconnect_ends_the_connection_rather_than_the_serve_loop() {
     rt().block_on(async {
         let ended = with_observed_runtime("disconnect-is-not-fatal", |endpoint| async move {
             for _ in 0..3 {
-                let s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+                let s = orxnud_platform_ipc::connect_blocking(&endpoint).expect("connect");
                 drop(s);
             }
-            let mut s = std::os::unix::net::UnixStream::connect(&endpoint).expect("connect");
+            let mut s = orxnud_platform_ipc::connect_blocking(&endpoint).expect("connect");
             let _ = s.write_all(br#"{"jsonrpc":"2.0","id":"d","method":"daemon/status"}"#);
             let _ = s.write_all(b"\n");
-            let _ = s.shutdown(std::net::Shutdown::Both);
+            s.shutdown_read();
             drop(s);
             tokio::time::sleep(Duration::from_millis(400)).await;
         })
@@ -753,6 +840,12 @@ fn a_peer_disconnect_ends_the_connection_rather_than_the_serve_loop() {
     });
 }
 
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
 #[test]
 fn the_endpoint_is_removed_when_the_runtime_finishes_serving() {
     // The cleanup guarantee on the ordinary path, asserted through the public API:

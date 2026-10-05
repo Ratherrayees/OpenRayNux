@@ -139,7 +139,15 @@ docker run --rm \
     export PATH="/usr/local/cargo/bin:$PATH"
 
     apt-get update -qq
-    apt-get install -y -qq bubblewrap util-linux
+    apt-get install -y -qq bubblewrap util-linux curl ca-certificates
+
+    # `cargo-nextest` is not in the image, and the suites are selected with its filters.
+    # The prebuilt binary is a download rather than a `cargo install`, which would add
+    # minutes of compilation to every uncached run.
+    if ! cargo nextest --version >/dev/null 2>&1; then
+      curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
+    fi
+    cargo nextest --version
 
     # A real unprivileged user, and a build cache it owns, so `setpriv` can drop every
     # capability and still write to /target.

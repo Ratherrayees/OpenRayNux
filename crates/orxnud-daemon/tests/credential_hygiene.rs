@@ -256,6 +256,15 @@ fn the_scripted_provider_needs_no_credential() {
 ///
 /// Walks the whole state root after a store cycle, so the check is on bytes rather than on
 /// which API was called.
+// Ignored off Linux for one reason: this is the only test in the file that reaches the
+// daemon through a real socket, to prove the sentinel reached no file under a *live*
+// runtime rather than a simulated one. Off Linux the transport refuses rather than
+// binding a named pipe, so `connect_blocking` returns `None` and there is nothing to
+// wait for. Every other test here is host-independent and keeps running.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs a live daemon socket, and the local IPC transport refuses off Linux"
+)]
 #[test]
 fn the_credential_reaches_no_file_the_daemon_owns() {
     use orxnud_daemon::Paths;
@@ -292,7 +301,7 @@ fn the_credential_reaches_no_file_the_daemon_owns() {
                 .await;
         });
         for _ in 0..200 {
-            if std::os::unix::net::UnixStream::connect(&endpoint).is_ok() {
+            if orxnud_platform_ipc::connect_blocking(&endpoint).is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
