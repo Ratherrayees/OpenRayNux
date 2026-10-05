@@ -618,11 +618,25 @@ async fn route<S: SecretsContract>(
         Method::DaemonStatus => {
             // No lock: the fields are composition state, immutable while serving.
             let g = governed.lock().await;
+            // The host's *runtime* sandbox capability, not just the compile-time backend
+            // name. `transport` above answers "which backend did this build select";
+            // this answers "can a Tier-1 capability actually run here", which is the
+            // question a caller — including the end-to-end tests — actually needs, and
+            // the one that explains a refusal instead of hiding behind the name.
+            let sandbox = orxnud_platform_sandbox::host_capability();
             Ok(json!({
                 "status": "running",
                 "protocol": orxnud_protocol::version::PROTOCOL_VERSION.as_u16(),
                 "durable_audit": g.0.has_durable_audit(),
                 "transport": orxnud_platform_ipc::backend_name(),
+                "sandbox": {
+                    "backend": sandbox.backend,
+                    "mechanism": sandbox.mechanism,
+                    "visibility": sandbox.guarantees.visibility,
+                    "tree_lifetime": sandbox.guarantees.tree_lifetime,
+                    "resources": sandbox.guarantees.resources,
+                    "tier1_executable": sandbox.tier1_executable,
+                },
                 "capabilities_enabled": g.0.components().enabled_capabilities(),
             }))
         }

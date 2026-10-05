@@ -75,6 +75,24 @@ jobs:
           cargo install cargo-semver-checks --locked
           cargo install cargo-nextest --locked
 
+      # What this runner can actually do, before anything is inferred from a red test.
+      #
+      # `bwrap` is preinstalled on `ubuntu-latest` but cannot create a user namespace
+      # there, so a host-level `bwrap --version` check would report success on a runner
+      # that can isolate nothing — which is exactly how two governed CLI tests came to
+      # fail with no visible reason. The suites are environment-aware and assert whichever
+      # property is true here (a refusal, on a host that cannot isolate), so this step
+      # exists to make the *reason* legible rather than to gate anything.
+      #
+      # Deliberately not `--require`: this host is allowed to be incapable, and the lane
+      # that must execute Tier-1 work is the container job below.
+      #
+      # Placed *before* the gates on purpose. A diagnostic that runs after a failing step
+      # is a diagnostic nobody reads, and the whole point is to explain exactly the runs
+      # that need explaining.
+      - name: Report this runner's sandbox capability
+        run: ./scripts/preflight.sh
+
       # The gates script is the single source of truth; CI invokes it rather than
       # re-implementing the checks. A duplicated gate drifts from the local one.
       - name: Run the gates
@@ -170,6 +188,53 @@ jobs:
       # Windows host must also satisfy.
       - name: Sandbox platform-dispatch tests
         run: cargo test -p orxnud-platform-sandbox --lib
+
+  # The Tier-1 sandbox suites, in a second, explicitly-labelled environment.
+  #
+  # # Why this job exists
+  #
+  # The `linux-gates` job above runs on the runner host, which cannot create a user
+  # namespace, so every Tier-1 dispatch there is *refused* — correctly, but it means that
+  # job cannot show that a Tier-1 capability actually executes under isolation. Something
+  # has to, or the governed path has no positive evidence anywhere in CI.
+  #
+  # # Why a container, and why not `--privileged`
+  #
+  # Measured, not assumed: with `--privileged` or `--cap-add=SYS_ADMIN` the probe passes,
+  # but `bwrap` then runs *without* creating a user namespace — the identity inside the
+  # sandbox is the full map `0 0 4294967295` instead of the production `1000 0 1`. That is
+  # a materially weaker claim about the security boundary and would not be evidence that
+  # the path users run works. So the container grants nothing: two runtime-only
+  # relaxations (Docker's seccomp blocks `unshare(CLONE_NEWUSER)`, and Docker's masked
+  # `/proc` paths make a nested procfs mount illegal), and the tests then run as an
+  # unprivileged uid with every capability dropped, which forces `bwrap` to nest a user
+  # namespace exactly as on a desktop. The full measurement table is in
+  # `scripts/run-sandbox-tests.sh`; the reasons are not repeated here.
+  #
+  # # Why it cannot pass quietly
+  #
+  # The lane runs `preflight --require` first, which exits non-zero unless a Tier-1
+  # capability can be sandboxed here *and* the observed identity is the nested shape. If
+  # this environment ever stops reproducing production, the job fails saying so instead of
+  # running a reduced suite and going green.
+  sandbox-integration:
+    name: Tier-1 sandbox (production configuration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox-integration
+
+      # A cold build of the workspace, including bundled SQLite. Cached after the first
+      # run, which is why the timeout is generous rather than tight.
+      - name: Run the Tier-1 suites in a production-configuration container
+        run: ./scripts/run-sandbox-tests.sh
 
   # A dedicated lane for the portable-core claim, because it is the one gate whose
   # failure would invalidate an architectural claim rather than just a build.

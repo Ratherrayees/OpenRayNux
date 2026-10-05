@@ -310,10 +310,17 @@ where
                 })
             }
             "doctor" => {
-                reject_extra("doctor", rest)?;
+                // `--endpoint` is lifted here for the same reason as for `task` and
+                // `capability`: `doctor` asks a *running* daemon what this host can do,
+                // so a user with a non-default state root has to be able to name the
+                // daemon they meant. `main` has always read `invocation.endpoint` on this
+                // path, so refusing the flag here made that read dead and `doctor` could
+                // only ever observe the default endpoint.
+                let (endpoint, rest) = lift_endpoint(args_after(&args, 1))?;
+                reject_extra("doctor", &rest)?;
                 Ok(Invocation {
                     command: Command::Doctor,
-                    endpoint: None,
+                    endpoint: endpoint.map(Into::into),
                 })
             }
             "task" => {
@@ -547,6 +554,11 @@ fn parse_capability(args: &[String]) -> Result<(CapabilityCommand, Option<String
     }
 }
 
+/// `args` from index `from` onwards.
+fn args_after(args: &[String], from: usize) -> &[String] {
+    args.get(from..).unwrap_or(&[])
+}
+
 /// Removes every `--endpoint` from `args`, returning it and what is left.
 ///
 /// A value-taking flag read out of band, because it may appear before the verb and the
@@ -762,8 +774,69 @@ pub struct DoctorReport {
     pub audit_wired: bool,
     /// Whether the store is wired.
     pub store_wired: bool,
+    /// What the daemon reports this host can guarantee for a Tier-1 capability.
+    ///
+    /// `None` when no daemon was reachable, which is not the same as `false`. A
+    /// `doctor` that cannot ask must say it does not know rather than imply the host
+    /// cannot sandbox: "unknown" and "no" send an operator to different places.
+    pub sandbox: Option<SandboxCapability>,
     /// A note that no other commands exist, so a user is not left guessing.
     pub commands: Vec<&'static str>,
+}
+
+/// The daemon's report of this host's sandbox capability.
+///
+/// Mirrors `daemon/status`'s `sandbox` object. Kept as named fields rather than a raw
+/// `serde_json::Value` so `doctor` cannot render a half-understood shape, and so a
+/// daemon that answers with something unexpected is visibly *absent* rather than
+/// silently rendered as `false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCapability {
+    /// Which backend the daemon's build selected. Compile-time.
+    pub backend: String,
+    /// Whether PID/mount namespaces are available here.
+    pub visibility: bool,
+    /// Whether a detached descendant can be contained here.
+    pub tree_lifetime: bool,
+    /// Whether OS-enforced resource ceilings are available here.
+    pub resources: bool,
+    /// Whether a Tier-1 capability can run here at all.
+    pub tier1_executable: bool,
+}
+
+impl SandboxCapability {
+    /// Reads the `sandbox` object out of a `daemon/status` response.
+    ///
+    /// Returns `None` when the field is absent or any field has the wrong type, so a
+    /// protocol change degrades to "unknown" instead of to a wrong `false` — and a
+    /// wrong `false` here would claim this host cannot isolate anything.
+    #[must_use]
+    pub fn from_status(value: &serde_json::Value) -> Option<Self> {
+        let s = value.get("sandbox")?;
+        Some(Self {
+            backend: s.get("backend")?.as_str()?.to_owned(),
+            visibility: s.get("visibility")?.as_bool()?,
+            tree_lifetime: s.get("tree_lifetime")?.as_bool()?,
+            resources: s.get("resources")?.as_bool()?,
+            tier1_executable: s.get("tier1_executable")?.as_bool()?,
+        })
+    }
+
+    /// The lines `render` prints for this capability.
+    #[must_use]
+    fn render(&self) -> String {
+        let verdict = if self.tier1_executable {
+            "yes"
+        } else {
+            "no — Tier-1 capabilities are refused here, which is correct"
+        };
+        format!(
+            "sandbox backend: {}\n\
+             sandbox guarantees: visibility={} tree_lifetime={} resources={}\n\
+             tier1 executable: {verdict}\n",
+            self.backend, self.visibility, self.tree_lifetime, self.resources,
+        )
+    }
 }
 
 impl DoctorReport {
@@ -779,6 +852,16 @@ impl DoctorReport {
         }
         s.push_str(&format!("store wired: {}\n", self.store_wired));
         s.push_str(&format!("audit wired: {}\n", self.audit_wired));
+        // The sandbox capability, when a daemon could be asked. It is absent here rather
+        // than guessed at: this process cannot know what the *host* can isolate, only
+        // the daemon that will actually dispatch on it can.
+        match &self.sandbox {
+            Some(cap) => s.push_str(&cap.render()),
+            None => s.push_str(
+                "sandbox capability: unknown (no daemon reachable, so it cannot be \
+                 observed)\n",
+            ),
+        }
         s.push_str(&format!("commands: {}\n", self.commands.join(", ")));
         s.push_str(
             "\nCapability state is the daemon's to report; this build asks it when one \
@@ -798,15 +881,25 @@ pub fn doctor() -> DoctorReport {
     doctor_with(None)
 }
 
-/// [`doctor`], with the enabled-capability count a running daemon reported.
+/// [`doctor`], with what a running daemon reported.
+///
+/// Both observations come from the same round trip conceptually and are passed together
+/// so `doctor` has one place to learn what it could not observe.
 #[must_use]
-pub fn doctor_with(enabled_capabilities: Option<usize>) -> DoctorReport {
+pub fn doctor_with(observed: Option<&serde_json::Value>) -> DoctorReport {
     DoctorReport {
         cli_version: CLI_VERSION,
         protocol_version: PROTOCOL_VERSION.as_u16(),
-        enabled_capabilities,
+        enabled_capabilities: observed
+            // `daemon/status` names it `capabilities_enabled`; `capability/list` names it
+            // `enabled`. Both are read so a `doctor` still works against either shape,
+            // and a response carrying neither degrades to "unknown" rather than to 0.
+            .and_then(|r| r.get("capabilities_enabled").or_else(|| r.get("enabled")))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok()),
         audit_wired: true,
         store_wired: true,
+        sandbox: observed.and_then(SandboxCapability::from_status),
         commands: vec![
             "version",
             "doctor",
@@ -930,12 +1023,117 @@ mod tests {
 
     #[test]
     fn doctor_reports_the_count_a_daemon_gave_it() {
-        let r = doctor_with(Some(3));
+        let status = serde_json::json!({
+            "status": "running",
+            "capabilities_enabled": 3,
+            "sandbox": {
+                "backend": "bwrap",
+                "visibility": true,
+                "tree_lifetime": true,
+                "resources": true,
+                "tier1_executable": true,
+            },
+        });
+        let r = doctor_with(Some(&status));
         assert!(
             r.render().contains("capabilities enabled: 3"),
             "{}",
             r.render()
         );
+    }
+
+    /// The capability count came from `capability/list` before and comes from
+    /// `daemon/status` now, so both spellings must still be understood.
+    #[test]
+    fn the_capability_count_is_read_from_either_daemon_spelling() {
+        let legacy = serde_json::json!({ "enabled": 2 });
+        let current = serde_json::json!({ "capabilities_enabled": 2 });
+        assert_eq!(
+            doctor_with(Some(&legacy)).enabled_capabilities,
+            Some(2),
+            "`enabled` must keep working so an older daemon is still readable"
+        );
+        assert_eq!(doctor_with(Some(&current)).enabled_capabilities, Some(2));
+    }
+
+    /// `doctor` reports the host's real Tier-1 capability, in both states.
+    ///
+    /// The pair matters more than either half. A `doctor` that only ever printed
+    /// `tier1_executable: yes` would pass the positive test and be useless, and one that
+    /// only printed the refusal would make a capable host look broken.
+    #[test]
+    fn doctor_reports_that_a_tier1_capability_can_run_when_the_host_allows_it() {
+        let status = serde_json::json!({
+            "sandbox": {
+                "backend": "bwrap",
+                "visibility": true,
+                "tree_lifetime": true,
+                "resources": true,
+                "tier1_executable": true,
+            },
+        });
+        let out = doctor_with(Some(&status)).render();
+        assert!(out.contains("sandbox backend: bwrap"), "{out}");
+        assert!(out.contains("tier1 executable: yes"), "{out}");
+    }
+
+    #[test]
+    fn doctor_reports_the_refusal_when_the_host_cannot_isolate() {
+        // The state a GitHub-hosted Linux runner is in: the backend is still named, and
+        // every Tier-1 capability is refused anyway. The wording has to say the refusal
+        // is correct, or an operator reads it as a fault and starts "fixing" the host.
+        let status = serde_json::json!({
+            "sandbox": {
+                "backend": "bwrap",
+                "visibility": false,
+                "tree_lifetime": false,
+                "resources": false,
+                "tier1_executable": false,
+            },
+        });
+        let out = doctor_with(Some(&status)).render();
+        assert!(out.contains("tier1 executable: no"), "{out}");
+        assert!(out.contains("which is correct"), "{out}");
+    }
+
+    #[test]
+    fn doctor_says_unknown_rather_than_claiming_a_host_cannot_sandbox() {
+        // No daemon, and a daemon that answers with an unexpected shape, must both
+        // degrade to "unknown". Collapsing either into `false` would assert that this
+        // host cannot isolate anything, which is a security claim nobody observed.
+        let silent = doctor().render();
+        assert!(silent.contains("sandbox capability: unknown"), "{silent}");
+        assert!(!silent.contains("tier1 executable: no"), "{silent}");
+
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({ "sandbox": null }),
+            serde_json::json!({ "sandbox": { "backend": "bwrap" } }),
+            serde_json::json!({ "sandbox": {
+                "backend": "bwrap",
+                "visibility": "yes",
+                "tree_lifetime": true,
+                "resources": true,
+                "tier1_executable": true,
+            } }),
+            serde_json::json!({ "sandbox": {
+                "backend": 7,
+                "visibility": true,
+                "tree_lifetime": true,
+                "resources": true,
+                "tier1_executable": true,
+            } }),
+        ] {
+            let out = doctor_with(Some(&malformed)).render();
+            assert!(
+                out.contains("sandbox capability: unknown"),
+                "a malformed status must not be rendered as a capability verdict: {out}"
+            );
+            assert!(
+                !out.contains("tier1 executable: no"),
+                "unknown must never render as a refusal: {out}"
+            );
+        }
     }
 
     #[test]

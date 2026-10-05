@@ -102,6 +102,10 @@ banner() { printf '\n\033[1m== %s: %s\033[0m\n' "$1" "${NAMES[$1]}"; }
 ok()      { printf '   \033[32mok\033[0m    %s\n' "$1"; }
 bad()     { printf '   \033[31mFAIL\033[0m  %s\n' "$1"; }
 note_skip() { printf '   \033[33mskip\033[0m  %s\n' "$1"; SKIPPED+=("$gate"); }
+# Informational only. Deliberately NOT `note_skip`: a narrower test scope on a host that
+# cannot isolate is not a skipped gate -- the gate still runs, still runs the tests that
+# apply, and still fails if any of them fail. Calling it a skip would overstate it.
+note()     { printf '   \033[2m%s\033[0m\n' "$1"; }
 fail_gate() { bad "$1"; FAILED+=("$gate"); }
 
 # The `[dependencies]` section of a manifest, one bare dependency name per line.
@@ -520,6 +524,84 @@ gate_G9() {
     # test in its own process. TP-7 spawns and SIGKILLs a child, and a test that
     # kills processes or exits from a destructor would take the rest of a
     # single-process test binary down with it.
+    #
+    # # Scope is measured, not assumed
+    #
+    # Some suites assert that a Tier-1 capability *executes under isolation*, and
+    # that is only observable on a host that can isolate. A GitHub-hosted Linux
+    # runner ships `bwrap` and cannot create a user namespace, so those suites
+    # cannot pass there and their failure says nothing about OpenRayNux.
+    #
+    # So the host's capability is asked first, via the same probe the dispatcher
+    # uses, and the scope follows the answer:
+    #
+    #   * can isolate  -> everything runs, unchanged;
+    #   * cannot       -> the sandbox-evidence binaries are excluded, each with a
+    #                     stated reason, and the reason is printed.
+    #
+    # This is not a silent skip. The exclusion is narrower than "the sandbox
+    # tests": the refusal-path tests inside those same binaries DO run, because
+    # they assert the property that is true on an incapable host. And the positive
+    # evidence is not dropped -- `scripts/run-sandbox-tests.sh` runs exactly these
+    # suites in a container verified to reproduce the production configuration, and
+    # CI runs it on every push. See ADR-0046, V-85, V-86.
+    # `ORXNUD_TIER1_ASSUMED` is an escape hatch for a caller that has already measured the
+    # host and knows the suites apply -- `scripts/run-sandbox-tests.sh` uses it inside the
+    # container, where the point is to run them unconditionally.
+    local filter=()
+    if [ -z "${ORXNUD_TIER1_ASSUMED:-}" ] && ! scripts/preflight.sh --check >/dev/null 2>&1; then
+      # The sentinel a Tier-1 suite fails with when it cannot run here. Checked below, so
+      # a suite added to this repository later and forgotten in this list fails the gate
+      # with a pointed message instead of being silently skipped. A hand-maintained
+      # exclusion rots; this makes it complain when it does.
+      local refusal="cannot establish the required sandbox guarantees"
+
+      # Binaries whose whole subject is Tier-1 sandboxed execution.
+      #
+      # `test(...)` matches a substring of the test's own name, which for a `#[cfg(test)]`
+      # module inside a crate does not include the module path -- hence plain names here.
+      #
+      # The `linux::tests::` module is excluded whole rather than name by name: it is the
+      # Linux backend's own suite, it is unobservable on a host with no sandbox, and
+      # naming five of its tests would be a list with five more places to rot. The one
+      # sandbox-dependent test in `platform::tests` is named individually, because the rest
+      # of that module is the refusing-backend evidence and must keep running.
+      #
+      # The `orxnud-daemon` tests are named individually because their module also holds
+      # the proposal, approval and restart evidence that holds on any host.
+      filter=(
+        -E 'not (binary(governed_path) or binary(read_text_real) or binary(write_text) or binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper)
+              or test(linux::tests::)
+              or test(the_host_backend_is_selected_at_compile_time_and_reports_honestly)
+              or test(a_proposed_action_is_approved_executed_verified_and_completes_its_task)
+              or test(a_proposal_and_its_waiting_task_survive_a_restart_unchanged)
+              or test(an_approval_cannot_be_executed_twice)
+              or test(an_approval_for_one_proposal_does_not_execute_another)
+              or test(an_ai_proposal_becomes_a_governed_action))'
+      )
+      note "host cannot isolate: excluding the Tier-1 sandbox-evidence tests."
+      note "  governed_path, read_text_real, write_text, isolation, enforcement,"
+      note "  resources, hostile_helper  -- binaries whose subject is a real sandbox."
+      note "  linux::tests::              -- the Linux backend's own suite."
+      note "  6 named tests               -- sandbox-evidence tests inside larger modules."
+      note "  Everything else runs, including every refusal-path assertion."
+      note "  Positive evidence: scripts/run-sandbox-tests.sh (CI job sandbox-integration)."
+
+      local out rc=0
+      # shellcheck disable=SC2086 # the filter is intentionally several words
+      out="$(cargo nextest run --workspace --no-fail-fast "${filter[@]}" 2>&1)" || rc=$?
+      echo "$out"
+      if printf '%s' "$out" | grep -q "$refusal"; then
+        fail_gate "a suite outside the exclusion list needs a real sandbox: it failed with \"$refusal\" on a host that cannot isolate, so it was never excluded. Add its binary to the G9 filter above, or run it in scripts/run-sandbox-tests.sh"
+        return
+      fi
+      if [ "$rc" -ne 0 ]; then
+        fail_gate "tests failed"
+        return
+      fi
+      ok "cargo nextest run (all host-applicable tests)"
+      return
+    fi
     if cargo nextest run --workspace; then
       ok "cargo nextest run (all tests)"
     else

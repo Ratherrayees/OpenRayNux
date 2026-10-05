@@ -232,6 +232,137 @@ impl Daemon {
             .output()
             .expect("run orxnuctl")
     }
+
+    /// Whether this host can actually run a Tier-1 capability, as the daemon reports.
+    ///
+    /// Read from `doctor` rather than from a crate the CLI is forbidden to depend on
+    /// (gate G2(b)), and through the same diagnostic a user would consult. The daemon
+    /// answers for the host *it* dispatches on, which is the only host that matters.
+    fn tier1_executable(&self) -> bool {
+        let out = self.cli(&["doctor"]);
+        let text = stdout_of(&out);
+        assert!(
+            out.status.success(),
+            "doctor must succeed: {text}{}",
+            stderr_of(&out)
+        );
+        let verdict = text
+            .lines()
+            .find_map(|l| l.strip_prefix("tier1 executable: "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "doctor did not report a Tier-1 verdict, so this test cannot know \
+                        which property to assert:\n{text}"
+                )
+            });
+        match verdict.trim() {
+            "yes" => true,
+            other if other.starts_with("no") => false,
+            other => panic!("doctor reported an unreadable Tier-1 verdict {other:?}:\n{text}"),
+        }
+    }
+}
+
+/// Describes the host to the test log, so a failure says which environment produced it.
+///
+/// Printed rather than asserted: the point is that "this failed on a host that cannot
+/// sandbox" is legible from the log alone, without re-running anything.
+fn print_host_environment(daemon: &Daemon) -> bool {
+    let ok = daemon.tier1_executable();
+    let kind = if ok {
+        "CAN sandbox: asserting successful Tier-1 execution"
+    } else {
+        "CANNOT sandbox: asserting the fail-closed refusal, which is correct here"
+    };
+    println!("   [host] tier1_executable={ok} -- {kind}");
+    ok
+}
+
+/// Runs a Tier-1 dispatch that the caller needs to have **succeed**, or asserts the
+/// fail-closed refusal when this host cannot isolate.
+///
+/// # Why this exists rather than a platform `ignore`
+///
+/// The question "can this host isolate a subprocess?" is not a platform question. A
+/// Linux host can answer no — `bwrap` installed, kernel or LSM refusing the user
+/// namespace — which is the state a GitHub-hosted runner is in. The gate these tests used
+/// to carry was `#[cfg_attr(not(target_os = "linux"), ignore)]`, which answers a
+/// different question, is an `ignore` (and a skip teaches nothing), and so left the
+/// genuinely interesting host state untested: a Linux machine that cannot sandbox.
+///
+/// # What it does on a host that cannot
+///
+/// It performs the dispatch and asserts the refusal *positively*: non-zero exit, the
+/// missing guarantee named, and nothing written. Then it returns `None` so the caller
+/// returns without asserting anything it cannot observe here. The test is not skipped
+/// and does not pass vacuously — it asserts the property that is actually true, which is
+/// that a Tier-1 capability does not run unsandboxed.
+///
+/// Returns `None` only on such a host. `Some` means the dispatch was attempted and the
+/// caller owns the rest.
+fn tier1_dispatch(
+    daemon: &Daemon,
+    root: &std::path::Path,
+    approval: &str,
+    target: &str,
+    params: &str,
+) -> Option<Output> {
+    if print_host_environment(daemon) {
+        return Some(daemon.cli(&[
+            "capability",
+            "run",
+            "--capability",
+            "filesystem/write-text",
+            "--target",
+            target,
+            "--params",
+            params,
+            "--approval",
+            approval,
+        ]));
+    }
+
+    let out = daemon.cli(&[
+        "capability",
+        "run",
+        "--capability",
+        "filesystem/write-text",
+        "--target",
+        target,
+        "--params",
+        params,
+        "--approval",
+        approval,
+    ]);
+    assert_tier1_refused(&out, root, target);
+    let _ = std::fs::remove_dir_all(root);
+    None
+}
+
+/// Asserts that `out` is the fail-closed refusal this host should produce, and that it
+/// created nothing.
+///
+/// Shared with the tests that reach Tier-1 execution through `task/execute` rather than
+/// `capability/run`, so the three assertions a refusal must satisfy are written once. The
+/// reason is checked as well as the failure, because "it failed somehow" is not the
+/// property — "it refused because it could not isolate" is.
+fn assert_tier1_refused(out: &Output, root: &std::path::Path, target: &str) {
+    let stderr = stderr_of(out);
+    assert!(
+        !out.status.success(),
+        "a host that cannot isolate must refuse, not run the work: {}",
+        stdout_of(out)
+    );
+    assert!(
+        stderr.contains("sandbox guarantees"),
+        "the refusal must name the missing guarantee, got: {stderr}"
+    );
+    // Both spellings: `capability/run` writes under the workspace, `task/execute` does
+    // too, but the assertion should not depend on which route produced the refusal.
+    assert!(
+        !workspace(root).join(target).exists() && !root.join(target).exists(),
+        "a refused Tier-1 dispatch must leave nothing behind"
+    );
 }
 
 impl Drop for Daemon {
@@ -967,31 +1098,37 @@ fn approve(daemon: &Daemon, target: &str, contents: &str, ttl_ms: &str) -> Strin
 }
 
 /// The full governed loop, as a person would perform it.
+///
+/// # Why this asserts different things on different hosts
+///
+/// Tier-1 execution needs a host that can actually isolate a subprocess, and not every
+/// host can: `bwrap` may be installed while the kernel or an LSM forbids it from creating
+/// a user namespace, which is the case on a GitHub-hosted Linux runner. On such a host
+/// the dispatch is **refused**, and that refusal is the security property working — so
+/// asserting a successful write there would assert something false about the host, and
+/// asserting the failure unconditionally would assert nothing anywhere.
+///
+/// [`tier1_dispatch`] asks the daemon what the host can do and then asserts the property
+/// that is true: successful, verified execution where isolation is available, and a
+/// refusal that creates nothing where it is not. Neither branch is a skip, neither is
+/// mocked, and neither weakens the contract — a host that cannot isolate cannot run the
+/// capability, by design (ADR-0035, V-49).
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "a Tier-1 capability needs a sandbox, and the host backend on this \
-             platform is a refusal rather than a sandbox"
-)]
 fn a_user_approves_a_write_and_the_file_appears_with_exactly_those_bytes() {
     let root = dir("write-happy");
     let daemon = Daemon::start(&root);
 
     let approval = approve(&daemon, "hello.txt", "hello world", "60000");
 
-    let params = r#"{"path":"hello.txt","contents":"hello world"}"#;
-    let out = daemon.cli(&[
-        "capability",
-        "run",
-        "--capability",
-        "filesystem/write-text",
-        "--target",
-        "hello.txt",
-        "--params",
-        params,
-        "--approval",
+    let Some(out) = tier1_dispatch(
+        &daemon,
+        &root,
         &approval,
-    ]);
+        "hello.txt",
+        r#"{"path":"hello.txt","contents":"hello world"}"#,
+    ) else {
+        return;
+    };
 
     assert!(
         out.status.success(),
@@ -1058,19 +1195,17 @@ fn an_approval_for_one_write_cannot_be_reused_for_different_contents() {
 
     let approval = approve(&daemon, "sub.txt", "alpha", "60000");
 
-    // Alpha: approved, and it runs.
-    let ok = daemon.cli(&[
-        "capability",
-        "run",
-        "--capability",
-        "filesystem/write-text",
-        "--target",
-        "sub.txt",
-        "--params",
-        r#"{"path":"sub.txt","contents":"alpha"}"#,
-        "--approval",
+    // Alpha: approved, and it runs. Needs a host that can isolate; see
+    // `tier1_dispatch` for why the gate is a capability question and not a platform one.
+    let Some(ok) = tier1_dispatch(
+        &daemon,
+        &root,
         &approval,
-    ]);
+        "sub.txt",
+        r#"{"path":"sub.txt","contents":"alpha"}"#,
+    ) else {
+        return;
+    };
     assert!(ok.status.success(), "{}", stderr_of(&ok));
 
     // Beta: same capability, same target, same approval, different contents.
@@ -1105,16 +1240,29 @@ fn an_approval_for_one_write_cannot_be_reused_for_different_contents() {
 }
 
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "a Tier-1 capability needs a sandbox, and the host backend on this \
-             platform is a refusal rather than a sandbox"
-)]
 fn an_approval_works_once_and_is_refused_the_second_time() {
     let root = dir("write-single-use");
     let daemon = Daemon::start(&root);
 
     let approval = approve(&daemon, "once.txt", "x", "60000");
+    // The first use has to *succeed* for "and is refused the second time" to mean
+    // anything, so this test needs a host that can isolate. `tier1_dispatch` performs
+    // that first use and hands it back -- reusing it rather than dispatching again,
+    // because a second dispatch would itself be the reuse this test is about.
+    let Some(first) = tier1_dispatch(
+        &daemon,
+        &root,
+        &approval,
+        "once.txt",
+        r#"{"path":"once.txt","contents":"x"}"#,
+    ) else {
+        return;
+    };
+    assert!(
+        first.status.success(),
+        "the first use must succeed: {}",
+        stderr_of(&first)
+    );
     let args = [
         "capability",
         "run",
@@ -1127,11 +1275,6 @@ fn an_approval_works_once_and_is_refused_the_second_time() {
         "--approval",
         approval.as_str(),
     ];
-
-    assert!(
-        daemon.cli(&args).status.success(),
-        "the first use must succeed"
-    );
     let second = daemon.cli(&args);
     assert!(!second.status.success(), "the second use must be refused");
     assert!(
@@ -1221,18 +1364,17 @@ fn the_write_is_audited_with_real_timestamps_and_survives_a_restart() {
     let before = {
         let daemon = Daemon::start(&root);
         let approval = approve(&daemon, "audited.txt", "recorded", "60000");
-        let out = daemon.cli(&[
-            "capability",
-            "run",
-            "--capability",
-            "filesystem/write-text",
-            "--target",
-            "audited.txt",
-            "--params",
-            r#"{"path":"audited.txt","contents":"recorded"}"#,
-            "--approval",
+        // A *completed* execution is what there is to audit, so this needs a host that
+        // can isolate. On one that cannot, `tier1_dispatch` asserts the refusal instead.
+        let Some(out) = tier1_dispatch(
+            &daemon,
+            &root,
             &approval,
-        ]);
+            "audited.txt",
+            r#"{"path":"audited.txt","contents":"recorded"}"#,
+        ) else {
+            return;
+        };
         assert!(out.status.success(), "{}", stderr_of(&out));
         let bytes = state_bytes(&root);
         assert!(
@@ -1365,8 +1507,14 @@ fn a_user_proposes_a_governed_action_approves_it_and_executes_it() {
     assert!(approval.contains("\"approver\": \"human\""), "{approval}");
     assert!(approval.contains("\"actor_label\": \"ai\""), "{approval}");
 
-    // Execution.
+    // Execution. Tier-1, so it needs a host that can isolate: everything above is
+    // host-independent and stays asserted either way.
     let executed = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+    if !print_host_environment(&daemon) {
+        assert_tier1_refused(&executed, &root, "cli.txt");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
     assert!(executed.status.success(), "{}", stderr_of(&executed));
     assert!(
         stdout_of(&executed).contains("verified: true"),
@@ -1435,12 +1583,16 @@ fn the_governed_refusals_reach_the_cli_as_failures() {
         "60000",
     ]);
     assert!(approved.status.success());
-    assert!(
-        daemon
-            .cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"])
-            .status
-            .success()
-    );
+    // The first execution after approval is a Tier-1 dispatch, so it is the one step
+    // here that needs a host that can isolate. Everything above and below it is a
+    // refusal or a governance assertion that holds either way.
+    let first = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+    if !print_host_environment(&daemon) {
+        assert_tier1_refused(&first, &root, "r.txt");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    assert!(first.status.success(), "{}", stderr_of(&first));
     let again = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
     assert!(!again.status.success(), "an approval must be single-use");
 
@@ -1499,6 +1651,11 @@ fn the_governed_execution_is_audited_and_survives_a_restart() {
             "60000",
         ]);
         let out = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "w1"]);
+        if !print_host_environment(&daemon) {
+            assert_tier1_refused(&out, &root, "audited.txt");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
         assert!(out.status.success(), "{}", stderr_of(&out));
     }
     let bytes = state_bytes(&root);
@@ -1617,10 +1774,18 @@ fn a_daemon_with_no_provider_flags_refuses_to_propose() {
 /// The product claim is "ask the model what it would do, then let the deterministic
 /// runtime decide" — so both halves are driven here: the proposal arrives, the file does
 /// not exist yet, a human approves, and only then does anything happen.
+/// The AI proposer, a human approval, and the governed path finishing the job.
+///
+/// Environment-aware for the same reason as
+/// `a_user_approves_a_write_and_the_file_appears_with_exactly_those_bytes`: the tail of
+/// this loop executes a Tier-1 capability, and a host that cannot isolate refuses it.
+/// The proposal and approval stages are host-independent, so they are asserted
+/// unconditionally; only the execution stage branches.
 #[test]
 fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
     let root = dir("ai-happy");
     let daemon = Daemon::start(&root);
+    let can_sandbox = print_host_environment(&daemon);
 
     daemon.cli(&["task", "create", "--id", "e1", "Create", "final.txt"]);
     assert!(
@@ -1637,7 +1802,8 @@ fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
     assert!(out.contains("waiting_for: human-approval"), "{out}");
     let pid = propose_id(&proposed);
 
-    // Proposing is not doing.
+    // Proposing is not doing. True on every host, and it is the assertion that matters
+    // most here: nothing ran before a human said yes.
     assert!(!root.join("workspace").join("final.txt").exists());
     assert!(stdout_of(&daemon.cli(&["task", "list"])).contains("waiting-for-user"));
 
@@ -1656,6 +1822,26 @@ fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
             .success()
     );
     let done = daemon.cli(&["task", "execute", "--proposal", &pid, "--worker", "ai"]);
+
+    if !can_sandbox {
+        let stderr = stderr_of(&done);
+        assert!(
+            !done.status.success(),
+            "a host that cannot isolate must refuse the execution, not perform it: {}",
+            stdout_of(&done)
+        );
+        assert!(
+            stderr.contains("sandbox guarantees"),
+            "the refusal must name the missing guarantee, got: {stderr}"
+        );
+        assert!(
+            !root.join("workspace").join("final.txt").exists(),
+            "a refused execution must leave the workspace untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+
     assert!(done.status.success(), "{}", stderr_of(&done));
     assert!(stdout_of(&done).contains("verified: true"));
     assert_eq!(

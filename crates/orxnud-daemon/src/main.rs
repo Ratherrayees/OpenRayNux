@@ -338,10 +338,11 @@ fn doctor(paths: &Paths) {
         "ipc endpoint: {}",
         orxnud_platform_ipc::endpoint_for(&paths.root).display()
     );
-    println!(
-        "sandbox backend: {}",
-        orxnud_platform_sandbox::host_backend_name()
-    );
+    // The backend *name* is a compile-time fact and says nothing about whether this host
+    // can actually isolate anything: it reads `bwrap` on a machine where `bwrap` cannot
+    // create a user namespace and every Tier-1 capability is refused. So the guarantees
+    // are printed too, and the verdict says whether a Tier-1 capability can run here.
+    print!("{}", orxnud_platform_sandbox::host_capability().report());
     println!("durable security state: attach_durable_security_state on start");
     println!("(no paths were created; --doctor only reports)");
 }
