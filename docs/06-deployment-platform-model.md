@@ -1,6 +1,14 @@
 # 06 — Deployment & Platform Model
 
-Status: **Draft v0.1**
+Status: **Draft v0.3** · Reconciled **2026-10-05** against `HEAD` (`1721761`) and CI run
+`37343986458`, where both Windows lanes and the Linux gates are green.
+
+**The one thing to read first.** Windows is **not** "untested" and it is **not**
+"sandbox-supported". Both of those were wrong here. It is *portable and compiled, and its
+isolation is unproven*: all 16 crates compile for MSVC, both Windows CI lanes pass, and
+there is still no Job Object or AppContainer backend, so a Tier-1 execution on Windows is
+**refused** rather than degraded. Refusing is correct — an unsandboxed Tier-1 subprocess is
+worse than no capability at all (ADR-0035).
 
 ---
 
@@ -12,8 +20,8 @@ transports are opened.
 
 | Profile | Transport | Persistence | Autostart | Use case |
 |---|---|---|---|---|
-| **P1 Desktop** | UDS / named pipe | SQLite in the user data dir | user session | The default. Linux + Windows GUI. |
-| **P2 Headless** | UDS / named pipe (+ optional TCP) | SQLite | service manager | Server, container, always-on box, CLI/TUI only. |
+| **P1 Desktop** | UDS (**FUTURE** — no GUI crate) | SQLite in the user data dir | user session | The intended default. Not buildable today: there is no desktop application. |
+| **P2 Headless** | UDS | SQLite | service manager | **This is what exists.** `orxnud` + `orxnuctl` over a 0600 Unix socket. Optional TCP is FUTURE and is not implemented. |
 | **P3 Cloud** | HTTPS (mTLS or OAuth) | SQLite *(v1)* → Postgres *(later)* | managed | Single-tenant hosted instance. |
 | **P4 Multi-tenant cloud** | HTTPS + per-tenant identity | Postgres, tenant-partitioned | managed | The "platform" mode. **Not v1.** |
 
@@ -36,15 +44,63 @@ out of scope for v1.
 
 ### 2.2 The honest current assessment
 
+### 2.3 The honest current assessment, per platform
+
+**Linux.** Tier-1 execution works **where the host provides the guarantees**, and refuses
+where it does not. That is not a caveat; it is the design. `bwrap` with PID and mount
+namespaces provides visibility and tree lifetime; `cgroup v2` provides resource ceilings
+**where the host delegates the controllers**, which is a per-host property and is measured
+rather than assumed — `scripts/run-resource-tests.sh` prints the own-cgroup path rather
+than a remembered verdict, and the governed path writes ceilings *before* spawning and
+verifies membership from `cgroup.procs` afterwards. A host that delegates nothing still
+runs the shipped capabilities, because they *require* no control, and records the gap in
+`ExecutionResult::unproven` rather than refusing for no security gain.
+
+**Windows.** Two CI lanes, both green: `windows-check` runs `cargo check --workspace
+--all-targets` nightly, and `windows-portability` runs the platform-neutral suites as
+*tests* rather than only compiling them. Five Rust-level MSVC defects were found and fixed
+during 2026-10-05 — including one that gate **G3** structurally could not see, because G3
+greps for `cfg` and not for a platform *API*, so an unguarded `std::os::unix` passed the
+gate and broke the build. All 16 crates now compile for MSVC.
+
+**Isolation remains NOT_PROVEN.** No Job Object, no AppContainer, no Windows resource
+limits. `host_backend()` binds the refusing `UnsupportedRunner` off Linux, so a Tier-1
+execution on Windows is refused with a reason rather than degraded. A Windows sandbox
+backend needs `windows-sys` and `unsafe`, in a platform crate that has not opted in under
+G4 — that is the honest blocker, and it is a design decision rather than an oversight.
+
+**GitHub-hosted Linux CI — a measured limitation, not a defect.** The hosted runner ships
+`bwrap` and **cannot create an unprivileged user namespace**, because Ubuntu 24.04+ sets
+`kernel.apparmor_restrict_unprivileged_userns`. Measured, and printed on every run by the
+preflight step in `linux-gates`:
+
+```text
+sandbox backend: bwrap
+guarantees: visibility=false tree_lifetime=false resources=false
+tier1_executable: no (Tier-1 capabilities are refused here; this is correct, not a fault)
+```
+
+So the hosted Linux lane asserts the **refusal**, which is the property that is true there,
+and the `sandbox-integration` job measures whether a container can do better. It cannot:
+AppArmor's restriction applies inside the container too, measured. That job therefore
+reports the limitation in capitals and produces **no positive Tier-1 evidence**, rather than
+disabling AppArmor or granting a capability to manufacture a green run.
+
+**Positive Tier-1 sandbox evidence comes from a host that can create an unprivileged user
+namespace** — a developer machine via `scripts/run-sandbox-tests.sh --host`, or a container
+on such a host. That is where `governed_path`, `read_text_real`, `write_text`, `isolation`
+and the `cli_e2e` loop are exercised against a real sandbox.
+
+
 | Platform | Current tier | Target | Evidence and gaps |
 |---|---|---|---|
 | **Linux x86_64** | **T-A** | T-A | Native deps verified working on Fedora 44 (webkit2gtk 2.54.0, appindicator 12.10.1, librsvg 2.62.3, libxdo, SQLite 3.51.2 + headers). Dev machine. |
-| **Windows x86_64** | none | **T-A** | Requires WebView2 (bootstrapped by the Tauri installer); MSVC toolchain; named-pipe transport; DPAPI keyring; a real signing story. **Untested.** Highest-risk target. |
+| **Windows x86_64** | none | **T-A** | Requires WebView2 (**FUTURE** — no GUI crate exists); MSVC toolchain ✅; DPAPI keyring ✅ (`orxnud-platform-secrets` compiles for MSVC, untested at runtime); a real signing story ❌ (no packaging pipeline). **Portability PROVEN, isolation NOT PROVEN** — no named-pipe transport and no sandbox backend, so Tier-1 refuses. |
 | **Linux aarch64** | none | T-B | Raspberry Pi and ARM SBCs are a genuinely attractive personal-assistant target. `sherpa-onnx` already publishes x86/ARM/RISC-V builds. Needs aarch64 CI. |
 | **macOS** | none | T-B | WKWebView, Keychain, `launchd` autostart, notarisation. The Tauri stack supports it. **Deliberately not first-class:** the stated platforms are Linux and Windows. |
 | **Windows on ARM** | none | T-C | DirectML is the only acceleration path for some GPUs (whisper.cpp has no DirectML); ARM64 ONNX is patchy. |
 
-### 2.3 Are macOS and ARM64 first-class? — the decision
+### 2.4 Are macOS and ARM64 first-class? — the decision
 
 **macOS: no, not first-class. ARM64: yes, but as Tier B, not Tier A.**
 
@@ -69,13 +125,31 @@ platform-specific behaviour confined to adapters.* See §4.
 ## 3. Per-OS concern matrix
 
 Each row is a `platform-*` crate behind a trait. This table is the definition of
-"adapter", and the CI grep gate enforces that nothing else touches the OS.
+"adapter", and gate **G3** enforces that no `cfg(target_os)` appears outside one.
+
+> **Corrected 2026-10-05 — this table mixes shipped code with design, and did not say
+> which is which.** Gate G7 now asserts the workspace member list, and it contains **five**
+> platform crates: `fs`, `sandbox`, `secrets`, `notify`, `ipc`. Every other row below is
+> **future design** — a place the architecture intends to put a boundary, not a crate that
+> exists. Two rows that were actively wrong:
+>
+> * **IPC on Windows** said "named pipe". It refuses; there is no pipe backend.
+> * **Browser, WebView, Tray, Audio capture, Autostart, WebKit/WebView2** all name Tauri
+>   plugins and `cpal`. No Tauri application exists, so none of these are linked.
+>
+> The matrix is kept because it is a reasonable statement of where each concern belongs.
+> It is not a dependency list, and `Cargo.toml` is.
+
+**The five that exist:** `orxnud-platform-fs` (bounded reads, atomic writes, rooted jail),
+`orxnud-platform-sandbox` (Tier-1 boundary + ceilings; refuses off Linux),
+`orxnud-platform-secrets` (`keyring` → Secret Service / DPAPI / Keychain),
+`orxnud-platform-notify`, `orxnud-platform-ipc` (UDS on Unix; refuses elsewhere).
 
 | Concern | Linux | Windows | macOS | Notes |
 |---|---|---|---|---|
 | **Config dir** | XDG (`~/.config/openraynux`) | `%APPDATA%` | `~/Library/Application Support` | via `directories` 6.0.0 |
 | **Data dir** | XDG_STATE_HOME | `%LOCALAPPDATA%` | `~/Library/Application Support` | |
-| **IPC** | Unix domain socket | **named pipe** | Unix domain socket | Both give OS-enforced ACLs |
+| **IPC** | Unix domain socket | **refuses** | Unix domain socket | **Correction 2026-10-05:** there is no named-pipe backend. `orxnud-platform-ipc` is a UDS on Unix and a refusal everywhere else, because a pipe needs `windows-sys` and `unsafe` and gate **G4** forbids `unsafe` outside a platform crate that has opted in. |
 | **Single instance** | `flock` on a lockfile | named-pipe mutex / lockfile | `flock` | Must be crash-safe |
 | **Secrets** | Secret Service (`libsecret`) | **DPAPI** | Keychain | via `keyring` 4.2.0 |
 | **Notifications** | `notify-send` / D-Bus (portal) | **Windows Toast / Action Center** | `UNUserNotificationCenter` | via `tauri-plugin-notification` 2.5.0 |

@@ -1,7 +1,17 @@
 # 03 — System Architecture
 
-Status: **Draft v0.1** · Decisions referenced as ADR-NNNN live in
-`09-decisions.md`.
+Status: **Draft v0.4** · Decisions referenced as ADR-NNNN live in
+`09-decisions.md`. Reconciled **2026-10-05** against `HEAD`
+(`1721761`) and CI run `37343986458`.
+
+**How to read this document now.** Sections 1–6 and 9 describe the architecture as
+*implemented*. Section 7 is the component inventory and has been corrected against the
+workspace manifest. Where a row describes something that does **not** exist, it is marked
+**FUTURE** and says so — this document used to present the whole planned system in the
+present tense, which made it impossible to tell a reader what was real. That distinction
+is now load-bearing rather than cosmetic, because the milestone boundary in
+[`12-verification-register.md`](12-verification-register.md) depends on it: the 4c
+*governance core* is delivered and the 4c *runtime wiring* is deliberately absent.
 
 ---
 
@@ -226,8 +236,31 @@ makes "GUI cost" literally opt-in.
 
 ## 4. The local protocol
 
-**JSON-RPC 2.0 over a Unix domain socket (Linux/macOS) or named pipe
-(Windows).** In cloud profile only, the same frames travel over HTTP.
+**JSON-RPC 2.0 over a Unix domain socket.** In cloud profile only (FUTURE — no cloud
+profile exists), the same frames would travel over HTTP.
+
+**Correction, 2026-10-05.** This previously read "or named pipe (Windows)". There is no
+named-pipe backend. `orxnud-platform-ipc` is a Unix socket on Unix and a **refusal** on
+every other platform: `bind`, `connect` and `Listener::accept` all return
+`IpcError::Unsupported`. A named pipe needs `CreateNamedPipeW` and `CreateFileW`, which
+means `windows-sys` and `unsafe`, and gate **G4** forbids `unsafe` outside a platform
+crate that has opted in. ADR-0003 chose UDS/named-pipe as the *shape*; only the Unix half
+is built. A Windows pipe is an addition behind `Listener`, not a redesign.
+
+Protocol version is **1** (`orxnud-protocol::PROTOCOL_VERSION`), and it is exact: the
+daemon's supported range is `1..=1`, so a version mismatch is refused rather than
+best-effort parsed.
+
+**The 14 shipped methods** (`crates/orxnud-protocol/src/method.rs`):
+`daemon/status` · `daemon/version` · `capability/list` · `echo` · `capability/dispatch` ·
+`capability/approve` · `task/create` · `task/list` · `task/claim` · `task/complete` ·
+`task/cancel` · `task/propose` · `task/execute` · `task/ai-propose`.
+
+`daemon/status` returns the runtime sandbox capability — the three guarantees and
+`tier1_executable` — alongside the transport name. That is deliberate: the transport name
+is a compile-time fact and says nothing about whether the host can isolate anything, and a
+status line reading `sandbox backend: bwrap` on a host where every Tier-1 dispatch is
+refused is exactly the kind of diagnostic that misleads.
 
 Rationale, and the alternatives genuinely considered:
 
@@ -377,52 +410,98 @@ the recovery path understands. See ADR-0007 for the state machine.
 | `orxnud-store` | SQLite repositories, migrations, backup/restore. Owns the DB. |
 | `orxnud-policy` | Permissions, risk classification, approval binding, egress control, budget. **Fails closed.** |
 | `orxnud-task` | Task table, state machine, scheduler, leases, idempotency, dead-letter. **Must never be able to reach `orxnud-capability`.** |
-| `orxnud-capability` | Registry, contracts, dispatcher, sandbox policy. Sits above `orxnud-task` in the graph; the direction *between* these two is open, the reverse edge is forbidden. |
+| `orxnud-capability` | Registry, contracts, dispatcher, sandbox policy, the governed provider/proposal path. **Distinct from `orxnud-task`, and neither depends on the other** (ADR-0033); gate G2 enforces the direction. |
 | `orxnud-audit` | Append-only, tamper-evident journal. |
 | `orxnud-config` | Layered configuration + schema versioning + migration. |
 | `orxnud-obs` | `tracing` wiring, redaction, optional OTLP exporter. |
 | `orxnud-daemon` | Composition root, supervision, lifecycle, single-instance lock. |
 
-### 7.2 Optional (feature-gated; zero cost when disabled — CR-2)
+### 7.2 Optional components — **FUTURE DESIGN, none of it exists**
 
-| Component | Cargo feature | Cost when off |
+The design below is ADR-0009, ADR-0011, ADR-0014, ADR-0015, ADR-0016 and ADR-0025. It is
+retained because it is the shape those decisions imply, and it is marked because a reader
+must not infer any of it from the workspace.
+
+| Component | Cargo feature | Cost when off | Exists? |
+|---|---|---|---|
+| `orxnud-llm` | `llm` | No provider crates linked, no endpoints, no keys | **No** |
+| `orxnud-voice-in` | `asr` | No ONNX/native libs, no models, no audio device opened | **No** |
+| `orxnud-voice-out` | `tts` | as above | **No** |
+| `orxnud-web` | `browser` | No browser binary, no profile dir, no CDP socket | **No** |
+| `orxnud-mcp` | `mcp` | No MCP client, no server config parsing | **No** |
+| `orxnud-msg` | `messaging` | No provider clients linked | **No** |
+| `orxnud-domains-*` | per domain | No schedulers, no tables, no jobs | **No** |
+| `orxnud-otel` | `otlp` | No OTLP exporter linked | **No** |
+
+**Two corrections to what this section previously claimed.**
+
+*The provider is not feature-gated, because there is no provider crate.* What exists is
+`orxnud-daemon`'s `ProposalProvider` trait and one adapter inside the daemon,
+`http_provider.rs`, which speaks OpenAI-compatible `chat/completions` over hand-written
+HTTP/1.1 on `tokio` with `tokio-rustls`. It is always linked. A second provider, or a
+provider moved into its own crate, is future work.
+
+*"Enforcement of CR-2" is not enforced.* The paragraph claiming a CI check asserts that
+resident set and binary size do not change when optional features are added described a
+gate that does not exist — there is no feature matrix in `ci-gates.sh` or in
+`.github/workflows/ci.yml`, and no committed baseline file. The underlying budget is
+**unmeasured** (V-25), which V-25's own row already says. The claim is removed here rather
+than softened, because a documented enforcement that does not exist is worse than an
+admitted gap: it is the failure V-79 records, where a control was asserted as test-backed
+with nothing behind it.
+
+### 7.3 Platform adapters — five exist
+
+| Crate | Concern | Absent platform behaviour |
 |---|---|---|
-| `orxnud-llm` | `llm` | No provider crates linked, no endpoints, no keys |
-| `orxnud-voice-in` | `asr` | No ONNX/native libs, no models, no audio device opened |
-| `orxnud-voice-out` | `tts` | as above |
-| `orxnud-web` | `browser` | No browser binary, no profile dir, no CDP socket |
-| `orxnud-mcp` | `mcp` | No MCP client, no server config parsing |
-| `orxnud-msg` | `messaging` | No provider clients linked |
-| `orxnud-domains-*` | per domain | No schedulers, no tables, no jobs |
-| `orxnud-otel` | `otlp` | No OTLP exporter linked |
+| `orxnud-platform-fs` | Bounded reads, atomic writes, rooted jail, owner-only directories | — |
+| `orxnud-platform-sandbox` | Tier-1 execution boundary and OS resource ceilings | Windows: binds the **refusing** `UnsupportedRunner`; no Job Object or AppContainer backend (ADR-0035, V-29) |
+| `orxnud-platform-secrets` | Credential storage via the platform keyring | — |
+| `orxnud-platform-notify` | Desktop notification | — |
+| `orxnud-platform-ipc` | Local transport | Windows: **refuses**. No named-pipe backend, because that needs `windows-sys` and `unsafe`, and gate G4 forbids `unsafe` outside a platform crate that has opted in |
 
-**Enforcement of CR-2:** a CI check asserts that a `default`-features build's
-resident set and binary size do not change when optional features are added.
-Drift beyond a stated threshold fails the build. This turns "optional" from a
-claim into a measured property.
+**FUTURE:** `process`, `audio`, `net`, `single-instance`, `autostart`, `power`,
+`path-conventions`. Single-instance enforcement currently lives in `orxnud-daemon` as an
+instance lock rather than behind a platform trait.
 
-### 7.3 Platform adapters (one crate per OS concern, all behind traits)
+Gate **G3** permits `cfg(target_os)` **only** inside these five crates, and gate **G7**
+asserts the workspace member list matches this table. Both are enforced. G3's known blind
+spot is recorded in V-29: it greps for `cfg`, not for a platform *API*, so unguarded
+`std::os::unix` passed G3 and broke the MSVC build. That happened, was found on a hosted
+runner, and is fixed (V-29).
 
-`fs` · `process` · `secrets` · `notify` · `audio` · `net` · `single-instance` ·
-`autostart` · `power` · `path-conventions`
+### 7.4 Interfaces — one exists
 
-### 7.4 Interfaces (thin clients)
+| Interface | State |
+|---|---|
+| `orxnuctl` | **Ships.** Hand-written argument parser — `clap` is a workspace dependency and is deliberately **unused**, recorded in `crates/orxnuctl/Cargo.toml` as the smaller dependency for a closed verb set. Verbs: `version`, `doctor`, `task {create,list,claim,complete,cancel,propose,execute,ai-propose}`, `capability {run,approve}`, `provider credential {set,delete,status}` |
+| `orxnu-gui` (Tauri 2 + Svelte 5) | **FUTURE** (ADR-0002, ADR-0005). No crate, no `package.json` |
+| `orxnu-tui` (Ratatui) | **FUTURE** |
+| `orxnu-mcp-host` | **FUTURE** (ADR-0010) |
+| Programmatic API crate | **FUTURE** |
 
-`orxnu-gui` (Tauri+Svelte) · `orxnu-tui` (Ratatui) · `orxnuctl` (Clap) ·
-`orxnu-mcp-host` (optional stdio bridge) · programmatic API crate
+`orxnuctl` also runs against a **real** `orxnud` binary in `crates/orxnuctl/tests/cli_e2e.rs`
+— 34 tests that spawn the shipped daemon and drive the whole product loop over the local
+socket. Gate G2(b) restricts which internal crates the CLI may name, so a CLI verb cannot
+reimplement a domain rule.
 
 ---
 
 ## 8. What is core, optional, platform-specific, provider-specific
 
-| Class | Members |
-|---|---|
-| **Core** | protocol, domain, store, policy, task, capability, audit, config, obs, daemon. No provider, no OS, no model. |
-| **Optional** | llm, asr, tts, browser, mcp, messaging, every domain, otlp. All feature-gated. |
-| **Platform-specific** | Everything that touches the OS: paths, processes, keyrings, notifications, audio devices, autostart, single-instance. Behind traits, one crate per concern. |
-| **Provider-specific** | Each LLM provider, each messaging platform, each ASR/TTS engine. One adapter crate each, behind a shared contract. |
-| **Deployment-specific** | HTTP listener (cloud only), TLS, remote auth. Behind the same protocol. |
-| **Third-party, untrusted** | MCP servers, third-party capabilities, user-installed plugins. Always Tier 1/2. Never in-process. |
+| Class | Members | Exists? |
+|---|---|---|
+| **Core** | protocol, domain, store, policy, task, capability, audit, config, obs, daemon. No OS, no model. | **All ten** |
+| **Provider adapter** | `orxnud-daemon/src/http_provider.rs` — one OpenAI-compatible HTTPS client. It lives in the daemon rather than its own crate, so the core-class row above is accurate only for the *other* nine. | **Yes, one** |
+| **Optional** | llm, asr, tts, browser, mcp, messaging, every domain, otlp. All feature-gated. | **None** |
+| **Platform-specific** | paths and bounded I/O, process isolation and ceilings, keyrings, notifications, local IPC. Behind traits, one crate per concern. | **Five crates** |
+| **Provider-specific** | Each LLM provider, each messaging platform, each ASR/TTS engine. One adapter each, behind a shared contract. | **One adapter** |
+| **Deployment-specific** | HTTP listener (cloud only), remote auth. | **None** — no cloud profile exists |
+| **Third-party, untrusted** | MCP servers, third-party capabilities, user-installed plugins. Always Tier 1/2. Never in-process. | **None** |
+
+TLS is the one piece of this table that arrived early and unremarked: the provider's
+transport is `tokio-rustls` with `rustls-native-certs`, inside the daemon, not a
+deployment-specific concern (ADR-0040, V-77).
 
 ---
 
@@ -487,6 +566,83 @@ against every host change. A subprocess gives crash containment, a language
 boundary, a versioned contract, and — with the right sandbox — real isolation.
 
 ---
+
+## 9a. Where the implementation actually stands
+
+Added 2026-10-05, because the rest of this document describes a system and a reader needs
+to know which parts of it are built.
+
+### Delivered and exercised
+
+The governed path is real and tested end to end: `Dispatcher::dispatch` runs the nine
+stages above, `PolicyEngine::authorise_for_dispatch` performs stages 1–4 inside the policy
+crate so no second authorisation system can exist, and `CapabilityInvocation` cannot be
+constructed outside `orxnud-policy` because its constructor demands a private seal
+(ADR-0034). `CapabilityInvocation` does not derive `Deserialize`, so a forged invocation
+cannot enter from JSON — demonstrated by a compile-fail test with a recorded `.stderr`.
+
+Tier-1 execution runs through that path and nowhere else. A `Subprocess` adapter's
+`invoke` **panics by design**, so a bypass surfaces as a loud failure rather than a silent
+unsandboxed run, and gate G2 rejects `Command::new` anywhere in `orxnud-capability`. There
+is deliberately no setter that takes a program and arguments, because that would be the
+`dispatcher -> direct subprocess` bypass the whole design exists to prevent.
+
+Three capabilities are registered (`crates/orxnud-daemon/src/lib.rs::shipped_declarations`,
+one list so the registry, the bundles and the policy table cannot drift):
+
+| id | Risk | Tier | Target | Idempotent | Approval |
+|---|---|---|---|---|---|
+| `text/word-count` | `Low` | `InProcess` | `None` | yes | none — a standing grant suffices |
+| `filesystem/write-text` | `High` | `Subprocess` | `Required` | **no** | single-use, digest-bound, time-boxed |
+| `filesystem/read-text` | `High` | `Subprocess` | `Required` | **no** | single-use, digest-bound, time-boxed |
+
+Both `Subprocess` capabilities declare `Public -> Public` data classes, state a resource
+budget (64 MiB, 16 processes, 1.0 core) and **require no control** — `ResourcePolicy.required`
+is empty, so they run on a host that delegates nothing and record the gap rather than
+refusing for no security gain. `read-text` additionally caps a read at 64 KiB, enforced
+*by the read* and measured with a byte-counting reader, not inferred from an oversized file
+being refused.
+
+The provider path is real: `ProposalProvider` is provider-neutral, one adapter implements
+it over HTTPS with `tokio-rustls` and `rustls-native-certs`, credentials are stored through
+the platform secret store and resolved per request, and the capability menu handed to the
+model is **walked from the registry** rather than hand-listed (ADR-0039). Proposals are
+durable before approval (ADR-0038), approvals name their approver and bind the logical step
+into a **v3** digest (ADR-0037, V-83), and the durable proposal records the model that
+actually answered rather than a configured name (V-81).
+
+### Delivered as governance primitives, with the runtime wiring deliberately absent
+
+Stage 4c's *core* exists and is well tested. What does not exist is the loop that drives
+it. Both gaps are deliberate and both are recorded:
+
+* **Multi-step composition.** `AwaitingNextStep` is a task state, attempts and approvals
+  are scoped to a logical step, and `TaskRepository::claim_next_step()` is the only thing
+  that advances a boundary. **No production code calls it** — the daemon exposes no IPC
+  method that reaches it — so a multi-step task stops at the boundary by design (ADR-0043,
+  V-84). The generic claim path is deliberately still `Pending`-only, and a test pins that.
+* **Observation.** `filesystem/read-text` exists as a governed capability, and
+  `PriorStepContext` carries step number, status and workspace-relative artifact paths into
+  the provider request — never file contents, never prior `structured_output`, never prior
+  verification text. Alongside it, `crates/orxnud-daemon/src/observation.rs` implements the
+  provider-identity binding, the ephemeral observation store and the disclosure record
+  (29 tests). **The daemon's runtime neither reads nor writes an `ObservationStore`**, so a
+  model can propose a read and has nowhere to receive the bytes. `3c8a413` names itself the
+  rollback point immediately before moving approved workspace content to a third party.
+
+So: **stages 1–4b are delivered, the 4c governance core is delivered, and the 4c runtime
+continuation and observation wiring is intentionally not enabled.**
+
+### Not implemented, and not planned into the near milestone
+
+No GUI or Tauri application. No TUI. No MCP surface (ADR-0010 keeps MCP an external
+integration boundary). No messaging integration. No local ASR or TTS runtime. No general
+shell capability. No unrestricted filesystem capability — both filesystem capabilities
+address exactly one file inside a sandbox-controlled workspace, with no directory creation,
+no deletion, no copy and no permission change. No Windows Tier-1 sandbox backend. No actor
+runtime beyond the authority model implemented here: `Actor` is still a *principal
+assertion* over the local socket, not an authenticated identity (V-70), and no delegated
+actor can reach the dispatcher.
 
 ## 10. Deliberate non-architectures
 

@@ -1,6 +1,19 @@
 # Sources
 
-Status: **Draft v0.1** · All URLs accessed **2026-09-30** unless otherwise noted.
+Status: **Draft v0.2** · All URLs accessed **2026-09-30** unless otherwise noted.
+
+**One correction, 2026-10-05.** §1 is titled "Rust — core dependencies" and reads as the
+dependency manifest. It is not: it lists **evaluated candidates**, several of which are not
+dependencies and will not be (`opentelemetry`, `reqwest`, `tokio-util`/`futures`,
+`moka`/`dashmap`/`parking_lot`, `cpal`, `notify`/`notify-rust`, `sqlite-vec`). The
+authoritative dependency list is the workspace `Cargo.toml`.
+
+**Added since the research date, with no source rows here:** the TLS stack ADR-0040 approved
+— `tokio-rustls`, `rustls-native-certs`, `ring`, `rustls-webpki` (ISC and BSD-3-Clause
+added to `deny.toml`; `webpki-roots` rejected as MPL-2.0) — and `rcgen`, used only to
+generate per-test certificates in `tests/https_provider.rs`. The Groq endpoint and model in
+V-75 are recorded in the register rather than here, and **Groq's pricing page remains
+unverified**.
 
 ## Verification method and its limits
 

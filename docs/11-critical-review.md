@@ -1,6 +1,18 @@
 # 11 — Critical Review
 
-Status: **Draft v0.1** · The uncomfortable section. Written to be argued with.
+Status: **Draft v0.2** · The uncomfortable section. Written to be argued with · two
+criticisms reconciled **2026-10-05**.
+
+One **withdrawn**: §1.8's "the S1 verification test is automated, so a regression fails the
+build". No such test exists — `grep -rn 'cannot resolve a secret' crates` returns nothing.
+That is precisely the V-79 failure mode, and it sat in the one document whose stated purpose
+is to be argued with.
+
+One **corrected**: §1.9's `synchronous=FULL` "Unmeasured" — it was measured (~2.3 ms/commit,
+V-30/V-35). The residual risk about a slower disk stands; the "unmeasured" part did not.
+And §1.5's "Windows untested until Phase 1" is now half-stale: all 16 crates compile for
+MSVC and both Windows lanes are green, while Windows *isolation* remains unproven. The
+residual risk is now that a reader reads "compiles and CI-green" as "supported".
 
 This document answers §32 of the brief. It is deliberately adversarial toward our
 own design: a plan that only lists its virtues has not been reviewed.
@@ -183,9 +195,13 @@ filesystem access is a potential S1 regression. And there will be a bug: the
 capability that "genuinely needs" to read a file to decide, added under deadline,
 will get filesystem access. That is the moment the model regains a lever.
 
-**Mitigation.** The S1 verification test (§4 of `04-…`) is automated, so a
-regression *fails the build* rather than shipping. **This is the most important
-test in the repository.**
+**Mitigation — WITHDRAWN 2026-10-05.** This asserted that an S1 verification test exists
+in §4 of `04-…` and is automated, so a regression fails the build. **No such test
+exists**: `grep -rn 'cannot resolve a secret' crates` returns nothing, and no S1 test
+appears in `ci-gates.sh` or any test binary. The nearest artefact is `orxnud-domain`'s
+state-class table, which concerns writability rather than secrets. That is precisely the
+failure V-79 records -- a control asserted as test-backed with nothing behind it -- and it
+was sitting in the one document whose stated purpose is to be argued with.
 
 ### 1.9 Assumptions we have not examined because they feel safe
 
@@ -193,7 +209,7 @@ test in the repository.**
 |---|---|
 | Rust 1.98.1 is enough MSRV headroom | `sqlx` needs 1.94, `egui` 1.95. Two more dependency bumps and our floor moves. |
 | Feature flags deliver CR-2 | Verified only in CI for *our* build. A dependency that ignores features can silently link anyway. |
-| `synchronous=FULL` is affordable | Unmeasured (Q-OPEN-17). Rotational storage would break the 5 ms target. |
+| `synchronous=FULL` is affordable | **Measured — this criticism is out of date.** ~2.3 ms/commit, 7–14× `NORMAL`, resolving Q-OPEN-17 in favour of `FULL` (V-30, V-35). Headroom against the 5 ms budget is 30–55 %, so a slower disk makes the budget the binding constraint — the residual risk stands, the "unmeasured" part does not. |
 | FTS5 is enough retrieval | If it is not, we discover it late and the fix is `sqlite-vec`, which is 6 months stale. |
 | Append-only hash-chained audit is tamper-evident | It is tamper-*evident*, not tamper-proof. A determined local attacker with write access can rewrite the whole chain. |
 | One user, one machine, is the actual use case | The brief says open-source, general-purpose, cloud-deployable. Those pull toward multi-user, and we are betting single-user for v1. |
@@ -282,7 +298,7 @@ is adding infrastructure "just in case", which is exactly what
 | **A hash-chained audit log that is tamper-evident, not tamper-proof** | Proportionate to a local single-user threat model | High if multi-tenant (P4) |
 | **Schema sanitiser losing JSON Schema fidelity** | Portability beats richness when providers 400 on rich schemas | Low |
 | **Approval UX is unvalidated** | No research exists; it must be discovered empirically | High — this is the product's feel |
-| **Windows untested until Phase 1** | It is scheduled early for a reason, but it *is* untested | High if it slips — hence the Phase 1 commitment |
+| **Windows untested until Phase 1** | **Out of date in one direction, still right in another.** All 16 crates compile for MSVC, both Windows CI lanes are green, and the platform-neutral suites run there. Still true: Windows *isolation* is NOT proven — no Job Object or AppContainer backend, so a Tier-1 execution refuses rather than degrades (V-29) | Was High; now the risk is a *silent* one — a reader seeing "compiles and CI-green" as "supported" |
 
 ---
 

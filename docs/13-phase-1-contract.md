@@ -26,7 +26,7 @@ conformance machinery — with **zero features** working.
 |---|---|---|
 | 1 | Rust 1.98.1 stable, edition 2024, rustfmt/clippy/rust-analyzer/nextest/deny | ✅ verified |
 | 2 | Tauri Linux native deps (webkit2gtk 2.54.0 etc.) | ✅ verified, link-tested |
-| 3 | Architecture documented; 32 ADRs with revisit conditions | ✅ |
+| 3 | Architecture documented; ADRs with revisit conditions | ✅ — **32 at Phase 1.** The register now holds 44 (ADR-0001…ADR-0046, with 0041 and 0042 deliberately unused). Count corrected 2026-10-05; the Phase 1 figure is left in place as the phase record. |
 | 4 | Verification register with sources and triggers | ✅ `12-…` |
 | 5 | Node 24.21.0 LTS project-local, checksum-verified | ✅ ADR-0031 |
 | 6 | `apalis-sqlite` contingency closed | ✅ ADR-0032 |
@@ -86,7 +86,16 @@ now): `platform-process`, `platform-net`, `platform-audio`, `platform-single-ins
 |---|---|
 | Deps point **inward** toward the core; never sideways | workspace member dependency lists; a violation is a compile error |
 | `orxnud-domain` has no I/O, no async, no platform dep | its own dependency list is the check |
-| Interfaces may name the wire vocabulary and the local transport, and nothing else that could carry a domain rule | **CI gate G2(b)**, over `orxnuctl`'s manifest. *Amended:* was "`orxnud-protocol` **only**", which predated a real local IPC client. Now `orxnud-protocol` + `orxnud-platform-ipc` are permitted and `orxnud-domain`, `-store`, `-task`, `-policy`, `-capability`, `-daemon` are not. The purpose is unchanged — a CLI cannot reimplement a rule it cannot see — and opening the approved socket is not such a rule |
+| Interfaces may name the wire vocabulary and the local transport, and nothing else that could carry a domain rule | **CI gate G2(b)**, over `orxnuctl`'s manifest. *Amended:* was "`orxnud-protocol` **only**", which predated a real local IPC client. Now `orxnud-protocol` + `orxnud-platform-ipc` are permitted and `orxnud-domain`, `-store`, `-task`, `-policy`, `-capability`, `-daemon` are not.
+
+**Superseded 2026-10-05 — corrected here rather than left to drift.** Gate G2(b) now permits
+`orxnud-platform-ipc`, `orxnud-protocol`, `orxnud-domain` **and** `orxnud-platform-secrets`.
+`orxnud-domain` was added when `orxnuctl provider credential set` had to name the
+authoritative `SecretRef` rather than invent one, and `orxnud-platform-secrets` because that
+command must reach the platform store directly rather than have a credential cross the IPC
+socket. The live rule is `CLI_ALLOWED_INTERNAL` in `scripts/ci-gates.sh`. The amendment
+note above is preserved because the Phase 1 record should show what was agreed then;
+ADR-0040 records the change and its reasoning. The purpose is unchanged — a CLI cannot reimplement a rule it cannot see — and opening the approved socket is not such a rule |
 | `cfg(target_os)` / `cfg(windows)` / `env::consts::OS` appear **only** in `orxnud-platform-*` | **CI grep gate** (see §5) |
 | The portable core builds with no platform crate available | **CI check:** `cargo check -p orxnud-domain -p orxnud-protocol --target wasm32-unknown-unknown` (or equivalent), proving the boundary is real rather than asserted |
 
@@ -228,7 +237,7 @@ Stated so scope cannot drift:
 | The **task queue implementation** | Phase 2. Phase 1 builds the conformance harness |
 | Any **interface** — GUI, TUI | Phase 6. Only protocol types are created |
 | **GUI / TUI** interfaces | Phase 6 |
-| **CLI commands beyond `--version`/`doctor`** | Phase 6. *Since delivered:* `orxnuctl task {create,list,claim,complete}` exists, over the local IPC contract and the same protocol types. It stays within the interface rule — gate G2(b) permits `orxnud-protocol` and `orxnud-platform-ipc` and forbids every crate that could carry a domain rule |
+| **CLI commands beyond `--version`/`doctor`** | Phase 6. *Since delivered, and this list keeps growing — corrected 2026-10-05 to the current set:* `orxnuctl task {create,list,claim,complete,cancel,propose,execute,ai-propose}`, `capability {run,approve}`, `provider credential {set,delete,status}`. Recorded here so a Phase 1 reader sees the shape of what arrived:* `orxnuctl task {create,list,claim,complete}` exists, over the local IPC contract and the same protocol types. It stays within the interface rule — gate G2(b) permits `orxnud-protocol` and `orxnud-platform-ipc` and forbids every crate that could carry a domain rule |
 | **Tauri / Svelte / Vite / pnpm** | Phase 6. Node is provisioned (ADR-0031) but unused until then |
 | **Windows MSI, installers, signing** | Procured in parallel (lead time), built in Phase 5 |
 | Any **schema beyond `schema_meta`** | The brief prohibits creating application schemas in this phase |

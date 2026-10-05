@@ -1,6 +1,14 @@
 # 08 — Testing & Engineering Standards
 
-Status: **Draft v0.1**
+Status: **Draft v0.3** · Reconciled **2026-10-05** against `HEAD` (`1721761`) and CI run
+`37343986458`.
+
+**This document previously described a CI that does not exist.** Four items in its gate
+list had no gate behind them, and its platform-lane list named runners that are not
+configured. Both are corrected below. The rule applied throughout: *do not call something
+"enforced in CI" unless a gate or a workflow step actually runs it.* A documented
+enforcement that does not exist is worse than an admitted gap, because it is the failure
+V-79 records — a control asserted as test-backed with nothing behind it.
 
 ---
 
@@ -30,8 +38,8 @@ direct benefit of the determinism boundary in `00-…` §6.
 |---|---|---|---|
 | **Unit** | ~60 % | Pure domain logic, validators, state machine, schema, policy evaluation, redaction | 100 % |
 | **Property** | ~15 % | `proptest` over parsers, state machines, policy, migrations, idempotency | 100 % |
-| **Contract** | ~10 % | Every capability against the shared contract suite; every LLM provider against the abstraction | 100 % (mocked) |
-| **Integration** | ~10 % | Real SQLite (temp files), real IPC, real subprocesses, real scheduler | 100 % |
+| **Contract** | ~10 % | Every capability against the shared contract suite; every LLM provider against the abstraction | 100 % (mocked) — **note:** 3 capabilities ship, and points 4 and 6 of the contract remain `declared_only` **by decision**, because the contract harness is in-process and cannot observe a namespace (V-40). The real isolation evidence is in `tests/isolation.rs`. |
+| **Integration** | ~10 % | Real SQLite (temp files), real IPC, real subprocesses, real scheduler | 100 % — **note:** the real-subprocess suites need a host that can sandbox; see §19. |
 | **Failure injection** | ~3 % | Kill, timeouts, malformed output, partial writes, provider outages | 100 % |
 | **E2E** | ~2 % | Scripted user journeys across the daemon and one interface | Mostly |
 | **AI evaluation** | separate track | Offline dataset + distribution metrics, run on demand, **not** in the blocking CI gate | N/A |
@@ -293,25 +301,51 @@ recorded as redundant rather than artificially isolated.
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo nextest run` (parallel; faster than `cargo test`)
-- `cargo deny check` (advisories, licences, bans, duplicates)
-- `cargo audit`
-- `cargo vet`
-- Property tests
-- Contract tests, all capabilities
-- Security tests
-- Migrations up **and down** on a copy of a real previous DB
-- Cross-compile check for the portable core (proves the platform boundary)
-- `cfg(target_os)` grep gate
-- Licence scan of model manifests
-- Feature-matrix resource regression check (CR-2)
+### Actually enforced — every item below is a real gate or a real workflow step
 
-**Non-blocking / scheduled:**
+Gates are `scripts/ci-gates.sh` G1–G12, run on every push and every PR, and re-runnable
+locally. Verified against run `37343986458`, all green.
 
-- Full soak (72 h)
-- AI evaluation track
-- Performance benchmarks with comparison reports
-- Fuzz targets
-- Windows / macOS / ARM builds (Tier B/C)
+| Gate | What it runs |
+|---|---|
+| G1 | `cargo fmt --check` |
+| G2 | dependency-graph direction, incl. the CLI's permitted-crate rule (G2(b)) |
+| G3 | `cfg(target_os)` / `cfg(windows)` / `env::consts::OS` grep outside `orxnud-platform-*` |
+| G4 | zero `unsafe` outside `orxnud-platform-*` |
+| G5 | `cargo check -p orxnud-domain -p orxnud-protocol --target wasm32-unknown-unknown` |
+| G6 | `cargo clippy -D warnings` |
+| G7 | workspace member list matches the declared crate graph |
+| G8 | `cargo deny` — licences and supply chain |
+| G9 | `cargo nextest run --workspace` |
+| G10 | secret hygiene greps — no PEM key, no token pattern, no committed `.env` |
+| G11 | `cargo audit` |
+| G12 | `cargo semver-checks` — **skips with a loud message when no release tag exists** |
+
+Plus, in `.github/workflows/ci.yml`: `cargo doc --workspace --no-deps` with
+`RUSTDOCFLAGS: -D warnings`; a `windows-check` lane (`cargo check --workspace
+--all-targets` on `windows-latest`, nightly); a `windows-portability` lane running the
+platform-neutral suites as tests; a `portable-core` wasm32 lane; a `sandbox-integration`
+lane; and a preflight step that prints the runner's measured sandbox capability.
+
+Property tests **do** run (`proptest` in `orxnud-policy` and `orxnuctl`).
+
+### Claimed here previously, and NOT enforced — corrections
+
+| Was claimed | Reality |
+|---|---|
+| `cargo vet` | **Not a gate.** G1–G12 do not include it. |
+| Feature-matrix resource regression check (CR-2) | **Does not exist.** No feature matrix in `ci-gates.sh` or the workflow, and no committed baseline file. The underlying budget is **unmeasured** (V-25). |
+| Golden files for provider request/response pairs | **None exist.** The provider tests assert on the request body inline. |
+| A hand-kept `CHANGELOG.md` | **No `CHANGELOG.md` exists.** |
+| `cargo geiger` in CI, `unsafe` count tracked | **Not present.** The actual control is gate **G4**, a grep. |
+| Licence scan of model manifests | **No models ship**, so there is nothing to scan. |
+| Migrations up and down on a copy of a real previous DB | Partially true: `orxnud-store` tests migration and rollback, and the conformance suite runs `synchronous = FULL` durability cases. Not a gate in the form stated. |
+| Cross-compile check for the portable core | **True** — gate G5 plus the `portable-core` job. |
+| `cfg(target_os)` grep gate | **True** — gate G3. Known blind spot recorded in V-29: it greps for `cfg`, not for a platform *API*, so unguarded `std::os::unix` passed it and broke MSVC. That happened and is fixed. |
+
+**Non-blocking / scheduled — what is actually configured:** the AI evaluation track and
+the nightly `windows-check`. **Not configured:** full soak, performance comparison reports,
+fuzz targets, macOS, Linux aarch64, and any release pipeline with signature.
 
 ---
 
@@ -452,15 +486,68 @@ Transitive additions are reviewed via `cargo deny`.
 - Minimal `.github/dependabot.yml` breadth — no auto-merge on anything touching
   auth, crypto, network, or serialisation.
 
-## 19. CI
+## 19. CI — what is configured
 
-- Linux x86_64 on every PR (fast lane, < 10 min target).
-- Windows x86_64 and Linux aarch64 nightly (Tier A/T-B).
-- macOS weekly (Tier B).
-- Matrix over feature combinations for the CR-2 check.
-- Caching keyed on `Cargo.lock` + toolchain, never on a mutable ref.
-- Release pipeline separated from the PR pipeline, with manual approval and
-  signature.
+Five jobs, all green on run `37343986458` (2026-10-05):
+
+| Job | Trigger | What it proves |
+|---|---|---|
+| `linux-gates` (G1–G11) | every push and PR | the twelve gates, 1244 tests under the measured scope |
+| `windows-check` | nightly | all 16 crates compile for MSVC, all targets |
+| `windows-portability` | every push and PR | the platform-neutral suites **run** on Windows, not merely compile |
+| `portable-core` | every push and PR | the portable core builds for `wasm32-unknown-unknown` |
+| `sandbox-integration` | every push and PR | measures whether a Tier-1 sandbox is possible here, and says so |
+
+**Not configured**, contrary to what this section previously claimed: Linux aarch64,
+macOS, any feature-combination matrix, and a signed release pipeline.
+
+Caching is keyed on `Cargo.lock` and the toolchain. The scheduled lane is deliberately
+off the hour (03:17 UTC), because scheduled runs cluster at `:00` and the queue is longer
+than the work.
+
+### The current baseline, precisely
+
+* **1360 tests, 1360 passed, 0 failed, 5 skipped** locally on a host that can create an
+  unprivileged user namespace.
+* The **5 skips** are `#[ignore]`d child-process entry points — re-exec targets for
+  power-loss and failure injection, and the hostile sandbox helper. They are entry points,
+  not tests.
+* **Leaky tests: 1 or 2, and the count is not stable.** nextest's leak detector samples
+  child processes at test end, so which of the two cgroup tests trip it depends on
+  scheduling:
+  * `orxnud-platform-sandbox::resources::cgroup_kill_terminates_a_member_that_forked_a_descendant`
+    — trips consistently;
+  * `orxnud-platform-sandbox::enforcement::a_repeated_kill_stays_deterministic` — trips
+    intermittently, and reports 2 leaky on every subset run of that crate.
+
+  Both are pre-existing, both are `cgroup.kill` subtree tests, and **neither is a failure** —
+  they pass. Recorded as a range rather than a number because a fixed figure here would be
+  wrong within a week, which is the failure this whole document was corrected for.
+* On the hosted runner, G9 runs **1244** tests, not 1360, and all 1244 pass. The
+  difference is the Tier-1 sandbox-evidence suites, which the runner cannot execute; the
+  gate prints which ones it excluded and why.
+
+### What a green CI run does and does not prove
+
+**It proves:** all twelve gates pass on Linux; every crate compiles for MSVC; the
+platform-neutral suites behave on a real Windows host; the portable core is genuinely
+portable; and on the hosted Linux runner a Tier-1 capability is **refused** with the
+missing guarantee named — which is the fail-closed property, and is asserted positively
+rather than skipped.
+
+**It does not prove:** that a Tier-1 capability executes under isolation. The hosted
+runner ships `bwrap` and cannot create an unprivileged user namespace (Ubuntu 24.04+
+`kernel.apparmor_restrict_unprivileged_userns`), and a container does not escape it either
+— measured, with AppArmor applying inside the container too. **`governed_path`,
+`read_text_real`, `write_text`, `isolation` and the sandbox suites are positive Tier-1
+evidence only on a host that can create one**, which is a developer machine
+(`scripts/run-sandbox-tests.sh --host`) or a container on such a host. The
+`sandbox-integration` job reports this rather than weakening anything to hide it (V-85,
+V-86, V-87, ADR-0046).
+
+So: **1360 passing tests and a green run are not the same claim, and neither is positive
+hosted Tier-1 isolation evidence.** That evidence does not exist in GitHub-hosted CI and
+this document now says so where a reader would otherwise assume it.
 
 ## 20. Code review
 
