@@ -1,6 +1,16 @@
 # 04 — Security & Threat Model
 
-Status: **Draft v0.1** · Normative. Every control here is a requirement for
+Status: **Draft v0.3** · Normative · reconciled **2026-10-05** against `HEAD`.
+
+**Corrections in this pass, all in service of the word "Normative".** Four claims here
+contradicted the implementation and were fixed rather than softened: the approval record's
+fields (the digest is v3 and carries the approver *and* the logical step), the T2 boundary
+(the model **does** hold the provider credential and **does** have network egress — what it
+must not hold is a *capability* credential), the S11 row (OS hardening is no longer optional
+for anything shipped), and the approval-level table (L0/L1 said no prompt; both shipped
+filesystem capabilities are `High` risk and always require approval). One claim was
+**withdrawn** because no such test exists: §1.9's "the S1 verification test is automated".
+**§5a is new** and records the threats Stage 4c and the CI work introduced. Every control here is a requirement for
 Phase 3 onward.
 
 This product reads a person's mail, messages, calendar, health data, files and
@@ -41,8 +51,10 @@ that the design must be such that this does not matter.
         │ authorised, narrow, logged
 ┌─ T2  EXECUTION ───────────────────────────────────────────────────┐
 │  task engine · capability dispatcher · in-process adapters          │
-│  ⚠ the LLM lives here and must have NO credential handle and NO   │
-│    arbitrary filesystem or network reach                          │
+│  ⚠ CORRECTED 2026-10-05: the model DOES hold a credential  │
+│    handle (the provider key) and DOES have network egress.  │
+│    What it must not hold is a *capability* credential — see │
+│    the note below the diagram.                               │
 └────────────────────────────────────────────────────────────────────┘
         │ process boundary
 ┌─ T3  ADAPTER PROCESSES ───────────────────────────────────────────┐
@@ -157,6 +169,26 @@ Because human approval is the last boundary, it must actually bind.
 
 - An approval record contains `(capability, target, **normalised** parameters,
   actor, timestamp, expiry)`.
+
+  **Corrected 2026-10-05 — the tuple is larger than stated.** The canonical digest is
+  now **`orxnud-approval-v3`** and carries, in order: approver label, approver authority
+  root, proposer label, proposer authority root, capability, target, canonical params,
+  issued-at, expiry, and **`step_no`** as the final field (ADR-0037, ADR-0037's v2→v3
+  amendment, V-83). Two of those fields did not exist when this was written and both
+  were found by asking what the record was missing:
+
+  * **the approver.** `ApprovalRecord` had no approver field at all, `actor_label` was
+    written and never read, and `Decision::Gate.approver` was *derived* from the
+    proposer's authority root — an inference where evidence belonged. An approval was
+    therefore a bearer token proving *parameters*, not *consent* (V-69).
+  * **the step.** Without a step in the tuple, one approval authorised the same action
+    at every step of a multi-step task, because the single-use ledger is keyed by that
+    digest (V-83).
+
+  Verification: `crates/orxnud-policy/src/digest.rs`, and mutation-checked — dropping
+  `step_no`, reverting the prefix to `v2`, or hardcoding the recomputed step to `1` each
+  fail at least one test. Historical `v2` approvals fail closed and remain structurally
+  verifiable in the audit chain; no compatibility shim was added..
 - A digest of that tuple is what the user is shown **and** what is verified.
 - The digest is **re-verified immediately before execution**; mismatch ⇒ abort.
 - Approvals expire in seconds-to-minutes, are **single-use**, and are **never
@@ -225,6 +257,16 @@ Tier 1/2 capabilities run as separate processes with:
 - an explicit network allowlist,
 - a resource limit (memory, CPU time, output size) and a hard timeout,
 - automatic restart with backoff, and quarantine after N failures.
+
+**OS hardening is no longer optional.** Corrected 2026-10-05: this row previously read
+"optional ... not required for v1", which is no longer true of anything shipped. Every
+`Subprocess` capability executes under `bubblewrap` with PID and mount namespaces, and a
+host that cannot establish the required guarantees **refuses the dispatch** — before a
+credential resolves and before a process exists. There is no unsandboxed fallback and no
+`BestEffort` path in the governed route (ADR-0035, V-49, V-51). What remains optional is
+narrower: cgroup resource ceilings are stated as budgets rather than requirements for the
+shipped capabilities, so a host that delegates nothing runs them and records the gap in
+`ExecutionResult::unproven` rather than refusing for no security gain (V-53, V-56).
 
 **Optional OS hardening** where available: Linux `seccomp`/`bubblewrap`/
 namespaces; Windows Job Objects + restricted token. Not required for v1, but the
@@ -311,7 +353,16 @@ reviewable argv.
 - Every inbound payload is schema-validated **before** it reaches a type.
 - Deserialisation is depth- and size-bounded; a 10 MB "web page" is rejected at
   a size limit, not parsed.
-- `deny_unknown_fields` on protocol types so a peer cannot smuggle fields.
+- ~~`deny_unknown_fields` on protocol types so a peer cannot smuggle fields.~~
+  **Not implemented as stated, corrected 2026-10-05.** There is exactly one
+  `deny_unknown_fields` in the workspace and it is on *model output*, in
+  `crates/orxnud-daemon/src/proposer.rs`, because an unrecognised field from a model is a
+  capability bug rather than a protocol-version question. Protocol types do not carry it.
+  What *does* enforce the same property where it matters is V-76: a capability refuses an
+  unrecognised parameter at parse time, and `ParamSchema::validate` states the same rule
+  once in the domain layer and is asserted to agree with every parser. So the intent is
+  enforced for capability parameters and not for protocol frames — stated here rather than
+  left implying coverage that does not exist.
 - SQL is parameterised; no string-built SQL anywhere (enforced in review, and
   by the repository layer exposing no raw-SQL escape hatch by default).
 - Structured model output is validated against the schema, and the refusal path
@@ -434,10 +485,21 @@ rejected for actor B; an `Ai` actor's authority never exceeds its delegating
 
 ## 5. Approval levels
 
-| Level | Examples | Requirement |
-|---|---|---|
-| **L0 — Informational** | Read a file the user named; summarise a document they opened | No prompt; logged |
-| **L1 — Reversible local** | Write to a scratch dir; create a local note; re-run a read | No prompt; logged |
+> **Corrected 2026-10-05 — this table contradicted the code.** L0 and L1 said a filesystem
+> read and a filesystem write need no prompt. **Both shipped filesystem capabilities are
+> `RiskClass::High` and always require a single-use, digest-bound, time-boxed approval.**
+> `filesystem/read-text` is High *by decision*, not by accident: ADR-0044 Decision 1 states
+> that reading is disclosure, and that `read-text` is the mechanism by which a model
+> observes prior-step output, so a lower class would create the project's first capability
+> whose entire purpose is to release information to a party that has not been individually
+> asked. The cost is a human round trip per observation, paid on purpose. The levels below
+> are kept as the *intended* policy; the mapping from risk class to prompt is what ships, and
+> it is stricter than L0/L1 as written.
+
+| Level | Examples | Requirement | Exists? |
+|---|---|---|---|
+| **L0 — Informational** | Read a file the user named; summarise a document they opened | No prompt; logged | **Not used by any shipped capability** |
+| **L1 — Reversible local** | Write to a scratch dir; create a local note; re-run a read | No prompt; logged | **Not used** |
 | **L2 — External but reversible** | Send a message the user explicitly asked for; fetch a URL | No prompt *if* the exact target was user-specified; logged |
 | **L3 — Consequential** | Submit a job application; post publicly; send email on the user's behalf; spend money | **Approval, digest-bound, single-use** |
 | **L4 — Irreversible or privileged** | Delete data; change permissions; install software; grant a new capability; run a third-party MCP tool for the first time | **Approval, digest-bound, single-use, plus explicit per-argument scope** |
@@ -446,6 +508,95 @@ rejected for actor B; an `Ai` actor's authority never exceeds its delegating
 **Unknown ⇒ L4.** Risk classification is a property of the *action*, never of the
 tool, never of the model, never of "the user asked for something similar last
 time".
+
+---
+
+## 5a. Threats introduced by Stage 4c, and by the CI work
+
+Added 2026-10-05. A threat model that stops at the phase that last revised it is a model
+of a system that no longer exists, and three genuinely new exposures appeared.
+
+### T-n4 — one approval now covers two acts
+
+**The threat.** ADR-0045: a human approving `filesystem/read-text` authorises the local
+read **and** the disclosure of the resulting bytes to a provider identity. This is the
+first time one consent covers both an action on this machine and an egress to a third
+party. A user who does not know that is not consenting to what was asked, and the failure
+is silent — every stage reports success.
+
+**The controls, as implemented.** The disclosure is bound to `(endpoint, model)`, not to
+the model string, so re-pointing the endpoint while keeping the same model name cannot
+inherit an approval given to the old destination. The disclosure gets its own audit
+correlation, minted inside the record so it cannot collide with the read it descends from,
+carrying `orxnud.policy/disclose`, the approving human as actor, and a bounded
+content-free detail line. Nothing is durable: observations live in process memory, are
+consumed by exactly one proposal, and expire on a TTL (15 min, 8 entries per task, 32 KiB
+whole-blob ceiling; a truncated blob is dropped rather than released).
+
+**Status: the mechanism is implemented and tested (29 tests in `observation.rs`); the
+runtime wiring is absent.** `orxnud-daemon`'s runtime neither reads nor writes an
+`ObservationStore`, so today no workspace content can reach a provider at all. The exposure
+is real but currently unreachable, which is exactly why `3c8a413` is named the rollback
+point. **It becomes live the moment the wiring lands**, and the prompt and the register
+entry for `filesystem/read-text` must say so before it does.
+
+### T-n5 — a host that cannot isolate, and a test suite that wants it to
+
+**The threat.** ADR-0046. The obvious way to make a sandbox test green on a host that
+cannot sandbox is to weaken the contract. The subtler way is to weaken the *assertion* —
+report a run as passing because the thing that would have failed did not run.
+
+**The controls, as implemented.** `BwrapRunner::probe()` measures what the host provides
+by *running* the namespace, because `bwrap --version` succeeding says nothing: a
+GitHub-hosted runner ships `bwrap` and cannot create a user namespace, and reports the
+tier-1 capability as refused. `host_capability()` surfaces that through `daemon/status`,
+`orxnud --doctor` and `orxnuctl doctor`, reading the runner's own answer and the same
+`AvailableGuarantees::check` the dispatcher runs — so a diagnostic cannot disagree with the
+dispatch that refused. On a host that cannot isolate, the end-to-end tests assert a
+**refusal** — non-zero exit, missing guarantee named, nothing written — rather than a
+successful execution or a skip. Gate G9 measures the host before choosing its scope and
+prints what it excluded, then greps its own output for the refusal sentinel so a suite
+added later and forgotten fails the gate instead of being silently dropped.
+
+**The invariant, stated so it can be checked:** *OpenRayNux never executes Tier-1 work
+merely because CI wants the test to pass.* It holds structurally rather than by
+convention — on a host that cannot isolate the assertable outcome **is** the refusal, so
+the executing path is unreachable.
+
+**What is deliberately not done.** Making the hosted `sandbox-integration` lane produce
+positive Tier-1 evidence would require disabling AppArmor's unprivileged-userns
+restriction, or loading a per-binary AppArmor profile for `bwrap`, on the runner. Both are
+host security-policy changes made so a test can pass. Neither was done. The lane reports
+the limitation and produces no positive evidence, and a green run there means "the
+environment was measured", not "the sandbox was proven" (V-85, V-86, V-87).
+
+### T-n6 — a sandbox measured in a configuration no user runs
+
+**The threat.** A `--privileged` or `CAP_SYS_ADMIN` container makes the Tier-1 probe pass
+while exercising nothing real: `bwrap` then creates **no** user namespace, and the identity
+inside the sandbox is the full map `0 0 4294967295` with the container's capabilities,
+against production's `1000 0 1` with none. A green suite there would be evidence about a
+configuration OpenRayNux will never ship — worse than no evidence, because it looks like
+evidence.
+
+**The control.** `BwrapRunner::probe_identity()` reads `uid_map` and `CapEff` from *inside*
+the probe sandbox, so the configuration is read rather than inferred from how the sandbox
+was launched. The Tier-1 lane runs `preflight --require` first and exits non-zero unless
+the nested shape is observed. The generalisable rule, and the one worth keeping: **a
+sandbox test is evidence only if it ran in the same privilege configuration as
+production.**
+
+### T-n7 — Windows: portable is not isolated
+
+**The threat.** Reading "all 16 crates compile for MSVC" as "Windows is supported".
+
+**The facts.** It is now true that all 16 compile and that both Windows CI lanes are green,
+and it remains true that **Windows isolation is NOT PROVEN**. No Job Object or AppContainer
+backend exists; `host_backend()` binds the refusing `UnsupportedRunner` off Linux, so a
+Tier-1 execution on Windows is refused rather than degraded. Refusing is the correct
+behaviour and is preferable to an unsandboxed Tier-1 subprocess. Gate G4's `unsafe`
+prohibition is a large part of why no Windows backend exists yet: a real one needs
+`windows-sys` and `unsafe`, in a platform crate that has not opted in (ADR-0035, V-29).
 
 ---
 

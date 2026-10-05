@@ -1,6 +1,14 @@
 # 00 — System Requirements
 
-Status: **Draft v0.1** · Research date: **2026-09-30** · No code exists yet.
+Status: **Draft v0.1** · Research date: **2026-09-30** · **No code existed when this was
+written** (corrected 2026-10-05: the workspace now holds 16 crates; this file is a
+requirements record, not a status report — see `docs/README.md`).
+
+Two claims are worth correcting because a reader will otherwise treat them as current
+rather than as requirements: IR-3 names six interfaces (GUI, TUI, CLI, voice, messaging,
+programmatic API) and **only `orxnuctl` exists**; and the task-state vocabulary in §2.4
+omits `NeedsVerification`, `DeadLettered` and `AwaitingNextStep`, all of which are in
+`orxnud-domain`'s `TaskState::ALL` today.
 
 This document states what OpenRayNux must *be*, in a form that later phases can
 test against. Nothing here is a technology decision. Technology choices live in

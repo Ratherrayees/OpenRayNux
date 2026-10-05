@@ -1,12 +1,34 @@
 # 09 — Architecture Decision Records
 
-Status: **Draft v0.1** · 2026-09-30 · All evidence verified on that date.
+Status: **Draft v0.3** · Adopted 2026-09-30 · index and metadata reconciled
+**2026-10-05** against `HEAD` (`1721761`).
 
 Each ADR follows: Context · Problem · Options · Evidence · Decision · Why ·
 Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
+
+**44 ADRs, numbered ADR-0001 … ADR-0046.** Two numbers in that range are
+deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
+renumbered because renumbering would break every existing citation, and because a
+silent gap is indistinguishable from an omission. `V-44` is unused in the
+verification register for the same reason.
+
+**Reading the dates.** ADR-0001 … ADR-0030 were written on 2026-09-30 against
+`Draft v0.1` of the architecture, and their *reasoning* is a point-in-time record
+that is preserved as written. The Status column below is navigational metadata and
+has been corrected where it was stale — notably ADR-0007's contingency, which
+ADR-0032 closed. The bodies of the early ADRs have **not** been rewritten to sound
+current, because a decision log edited to agree with the present stops being
+evidence of what was decided. Where a later change made an early ADR's prose
+obsolete, an amendment is appended to that ADR rather than its reasoning edited.
+
+Three ADRs gained dated amendments in this pass because their Status line had
+become actively misleading: **ADR-0035** (its "gap Phase 4b must close" is closed
+by V-51), **ADR-0043** ("implemented" overstated it — the primitive exists, no
+production caller does), and **ADR-0044** ("implementation begins in Stage 4"
+understated what shipped, and omitted that the wiring is deliberately absent).
 
 **Index**
 
@@ -18,7 +40,7 @@ will never be revisited, which is a smell.
 | [0004](#adr-0004) | Runtime: Tokio + an explicit supervisor | Accepted |
 | [0005](#adr-0005) | Frontend: Svelte 5 + Vite 8; **TS 7.0.2 baseline + TS 6.0.3 co-installed** | **Amended (rev 2)** |
 | [0006](#adr-0006) | Storage: SQLite via rusqlite, bundled ≥ 3.51.3 | Accepted |
-| [0007](#adr-0007) | Task engine: hand-rolled durable task table | Accepted with contingency |
+| [0007](#adr-0007) | Task engine: hand-rolled durable task table | Accepted — contingency **closed** by ADR-0032 |
 | [0008](#adr-0008) | No vector database | Accepted |
 | [0009](#adr-0009) | Capability model: three isolation tiers, no dynamic plugins | Accepted |
 | [0010](#adr-0010) | MCP as an external integration protocol only | Accepted |
@@ -44,6 +66,18 @@ will never be revisited, which is a smell.
 | [0030](#adr-0030) | **"Disabled" means zero operational cost and zero reachable capability** | **Accepted (new)** |
 | [0031](#adr-0031) | **Node toolchain: OpenRayNux-local Node 24.21.0 LTS; global environment untouched** | **Accepted (new)** |
 | [0032](#adr-0032) | **`apalis-sqlite` rejected: `synchronous = OFF` fails TP-7; ADR-0007's contingency is closed** | **Accepted (new)** |
+| [0033](#adr-0033) | **`orxnud-task` and `orxnud-capability` are distinct layers** | **Accepted + implemented** |
+| [0034](#adr-0034) | **`CapabilityInvocation` is not deserialisable; ingress uses `CapabilityRequest`** | **Accepted + implemented** (closes V-36) |
+| [0035](#adr-0035) | **Tier-1 execution: PID namespace + `PDEATHSIG`, and what it does not do** | **Accepted + implemented** (its "gap Phase 4b must close" is closed by V-51) |
+| [0036](#adr-0036) | **Tree lifetime on Linux: the PID namespace is load-bearing, `cgroup.kill` a redundant backstop** | **Accepted** |
+| [0037](#adr-0037) | **An approval names its approver, and the digest binds them** (v2 → v3) | **Accepted + implemented** |
+| [0038](#adr-0038) | **A governed action is proposed durably before it is approved** | **Accepted + implemented** |
+| [0039](#adr-0039) | **A capability declares its parameters; the proposer reads the declaration** | **Accepted + implemented** |
+| [0040](#adr-0040) | **One real provider, over HTTP, with the credential in the secret store** | **Accepted + implemented** (closes V-77, V-78) |
+| [0043](#adr-0043) | **Continuation is an explicit operation, not a widened claim** | **Accepted + primitive implemented; no production caller** |
+| [0044](#adr-0044) | **Observation is governed: approved reads, and a context that carries no content** | **Accepted + governance core implemented** |
+| [0045](#adr-0045) | **One approval, two acts: a read and its disclosure to a provider identity** | **Accepted + governance core implemented** |
+| [0046](#adr-0046) | **A missing host guarantee is a refusal to assert, not a test to skip** | **Accepted + implemented** |
 
 ---
 
@@ -2264,7 +2298,6 @@ Re-split if a capability is found where a linked transitive dependency grants
 *reachability* rather than merely bytes — that would be a Tier 1 failure and must
 be treated as a security bug.
 
-
 ---
 
 <a id="adr-0031"></a>
@@ -2523,7 +2556,6 @@ Verified by injecting the forbidden edge and observing gate G2 fail with
 **Revisit conditions.** Revisit when the dispatcher's task-integration direction is
 decided (Phase 3), at which point the reverse edge may be asserted if it exists.
 
-
 ---
 
 <a id="adr-0034"></a>
@@ -2646,7 +2678,6 @@ authorised* invocation across a process boundary — and then the correct answer
 send the `CapabilityRequest` plus a reference to the authorisation record, and
 re-authorise on arrival. Forwarding authority across a trust boundary should never be
 the design.
-
 
 ---
 
@@ -2786,7 +2817,20 @@ Three properties are structural rather than conventional:
    sandbox, because `Err` is how a refusal is expressed. A boolean would permit `Ok`
    with `sandboxed: false` -- the unsandboxed fallback in all but name.
 
-### The gap Phase 4b must close
+### The gap Phase 4b must close — **CLOSED, see the amendment below**
+
+> **Amendment, 2026-10-05.** This section is preserved as written because it is the record
+> of what was true when Phase 4a was accepted. **The gap is closed.** The governed path
+> exists and is exercised end to end: `orxnud-capability/src/subprocess.rs` holds the
+> `SandboxRunner`, `tests/governed_path.rs` runs 24 tests through `Dispatcher::dispatch`
+> against real sandboxed subprocesses, `tests/read_text_real.rs` adds 12 more for a governed
+> read, and `cli_e2e` drives the shipped binaries through the whole loop. **V-50 recorded
+> this gap and V-51 closed it**; the entry that stated it was simply never re-read, which
+> is the register's own failure mode. Contract points 4 and 6 of ADR-0009's suite remain
+> `declared_only` **by decision**, not by omission — the contract harness is in-process and
+> cannot observe a namespace; the evidence lives in `tests/isolation.rs`. See V-40.
+
+The original text follows.
 
 `orxnud-platform-sandbox` currently has **no consumer**. The governed path
 
@@ -2808,6 +2852,10 @@ only, and prove no bypass exists.
 (Phase 4b), at which point `cgroup.kill` replaces the namespace approach for tree
 lifetime. Revisit the contract if a capability legitimately needs weaker containment —
 by relaxing that one spec, not by changing the default.
+
+---
+
+<a id="adr-0036"></a>
 
 ## ADR-0036 — Tree lifetime on Linux: the PID namespace is load-bearing, `cgroup.kill` is a redundant backstop
 
@@ -2876,11 +2924,555 @@ It does not claim `cgroup.kill` is useless, nor that the two mechanisms are
 interchangeable. It claims only that on the current Linux path the namespace already
 provides the property, so the governed test cannot distinguish them, and that the honest
 record is redundancy.
+
 ---
+
+<a id="adr-0037"></a>
+
+## ADR-0037 — An approval names its approver, and the digest binds them
+
+**Status.** **Implemented.** `ApprovalRecord` carries an explicit `approver: Actor`;
+`canonical_bytes` binds both parties and its prefix moved `v1` -> `v2` so a pre-change
+digest cannot verify; `authorise` refuses a non-granting approver
+(`approval_approver_cannot_grant`) and an approver who is not the proposer's authority
+root (`approval_approver_not_authorised`); and `issue_approval` asserts
+`approver.can_grant()` at minting. The minting path re-derives the approver from the
+trusted local-human boundary and never reads it from the request. Cites V-69 and V-70.
+
+**Amendment — the digest binds the logical step (`v2` -> `v3`).** `canonical_bytes` now
+appends `step_no` as its final field and its prefix moved `v2` -> `v3`. `ApprovalRecord`
+carries `step_no: u32`, and `authorise` recomputes with **the step recorded on the
+approval**, never one supplied by the caller: a record that does not say which step it
+speaks for cannot be told apart from one that speaks for another, so under `v2` a single
+human approval would authorise the same action at *every* step of a multi-step task.
+
+The field is **required, not defaulted**. Every production call site supplies an explicit
+step: the task path reads it from the durable proposal (`task_proposals.step_no`) and
+`runtime` refuses an approval whose step disagrees with the proposal it is recorded
+against (`approval-step-mismatch`); the standalone `capability approve` path, which
+governs no task and therefore has exactly one step, uses the named constant
+`STANDALONE_APPROVAL_STEP`.
+
+Appending rather than inserting keeps every previously-bound field in its
+previously-hashed position, so the entire difference from `v2` is one prefix and one
+field.
+
+**There is no version to read out of a stored digest.** `ApprovalDigest` is a bare
+32-byte blake3 hash; the `v2` marker lives *inside* the hashed bytes and is not
+recoverable. A superseded `v2` digest and a malformed `v3` one are therefore genuinely
+indistinguishable, and both are refused through the same `approval_digest_mismatch`
+denial — inventing a distinction would mean parsing hash bytes, which would be a guess
+dressed as a check. The authorization result is identical either way.
+
+Historical `v2` approvals fail closed. They remain readable and structurally verifiable
+in the audit chain, because the digest is stored as an opaque hash: **no migration shim
+was added, and none should be**, since one would only obscure the transition. See V-83.
+
+**Context.** ADR-0012 committed this project to "the model proposes; the deterministic
+engine disposes", and ADR-0034 later proved one of its structural claims false in the
+way that matters: `CapabilityInvocation` derived `Deserialize`, and a derived
+`Deserialize` writes private fields without a constructor, so the type-level seal was
+bypassable. The lesson carried forward is that a claim about who *may* authorise has to
+be checked where authorisation happens, not asserted at the type that carries it.
+
+**Problem.** The approval as it exists today is a **bearer token**. `ApprovalRecord`
+carries `actor_label`, capability, target, params, issued/expires, risk and a digest —
+and **no approver**, anywhere:
+
+- `canonical_bytes` binds `actor.label()`, `actor.authority_root()`, capability, target,
+  params, issued-at and expires-at. The *proposer's* identity is bound. The approver's
+  is not.
+- `actor_label` is written to the record and to `task_approvals.actor_label`, and **no
+  dispatch-time code reads it.**
+- `Decision::Gate.approver` is *derived* at `engine.rs:396` from the proposer's
+  `authority_root()` — an inference sitting where evidence should be. The system
+  asserts "the approver is the human whose authority is being used" rather than
+  recording that a human was asked.
+- `Actor::can_grant()` is enforced in exactly one non-test place (`engine.rs:266`), and
+  only to refuse an actor with neither grant capability nor an authority root. It cannot
+  check *who approved*, because there is nothing to check.
+
+So an approval currently establishes: *these parameters, for this proposer, before this
+time*. It does not establish: *a specific human examined this and consented*. Combined
+with a minting endpoint that answers any caller, a delegated pipeline built on this
+would be a **false demonstration** — the AI side could obtain its own approval through
+the same mechanism, and every stage would report success.
+
+**Decision.** An approval is a statement about a *pair* of parties, and the digest
+covers both.
+
+1. **D1 — approval is non-bearer.** The bound tuple becomes
+   `approver + proposer/actor + authority_root + capability + target +
+   normalized params + issued_at + expires_at`. An approval cannot be detached and
+   reused for a different actor or action, because both parties are inside the digest.
+2. **D2 — the approver is explicit and grant-capable.** `ApprovalRecord` gains an
+   approver identity. Dispatch verifies, in order: the approval exists, is unexpired,
+   is unconsumed, its digest matches the action about to run, the approver
+   `can_grant()`, and `approver == proposer.authority_root()` for delegated execution.
+   The authority-root relation becomes a **checked** equality rather than an assumption
+   the engine makes on the actor's behalf.
+3. **D6 — a wire actor is an asserted principal, not an authenticated identity.**
+   `Actor` crossing local IPC means the structure deserialises; it does not mean the
+   caller possesses that identity. The three are kept distinct in naming, docs and
+   tests: *principal assertion* ≠ *principal authentication* ≠ *principal
+   authorization*. Today's boundary is the 0700 Unix socket plus the single-user local
+   model, and that is stated as the boundary rather than implied by the type.
+
+### Consequences
+
+- For `Actor::Ai { delegated_by: H, .. }`, the approval must come from `H`. The
+  delegation becomes enforceable rather than descriptive: **delegation is not authority
+  creation**, and an AI actor's authority is bounded by its delegating human's.
+- Human approval becomes the only place new authority enters the chain, which is what
+  makes ADR-0012's sentence true of the *runtime* and not only of the type.
+- The register gains V-69 (the gap above) and V-70 (asserted principal vs authenticated
+  identity), because both are claims that will silently become false.
+- Multi-user authentication stays out of scope, and is now *named* as out of scope. The
+  hazard is specific: an `Actor { user: "H" }` arriving over a socket is easy to later
+  mistake for proof that the caller is `H`.
+
+### What this ADR does not claim
+
+It does not claim the current approval flow is exploitable today. With one local user
+behind a 0700 socket, minting on request is equivalent to that user consenting, so V-69
+is a **latent** defect that becomes live the moment a non-human proposer exists. It does
+not claim adding an approver field alone is sufficient: the minting path must also be
+reachable only by a grant-capable principal, or the field is decoration.
+
+### Amendment trigger
+
+Re-read if any of: an actor other than `Human` reaches the dispatcher; a capability is
+reachable over anything other than the local socket; `can_grant` gains a second true
+variant; or multi-user support is proposed.
+
+---
+
+<a id="adr-0038"></a>
+
+## ADR-0038 — A governed action is proposed durably before it is approved
+
+**Status.** **Implemented.** A `task_proposals` table carries the durable proposal;
+`TaskRepository::propose_action` commits the proposal, the transition to
+`waiting_for_user` and the task event in one transaction, and releases the lease;
+`decide_proposal` records the human's decision without touching task state; and
+`begin_approved_execution` takes a **fresh** lease and resumes the task in one
+transaction, leaving `attempts` untouched. The proposal carries an `Actor::Ai` proposer
+derived from the task identity, never from the lease holder. Cites V-71. Builds on
+ADR-0037.
+
+**Context.** ADR-0037 settles *what an approval is*. It says nothing about the thing
+that precedes one, and the store already contains a half-built answer that is worth
+reading before adding anything.
+
+**Problem.** Three concrete gaps, all verified against source rather than inferred:
+
+1. **There is no durable proposal.** `task_approvals` is keyed `(task_id, attempt_no)`
+   and its `digest` column is `NOT NULL`, so a row can only exist *once approved*. A
+   proposed-but-unapproved action has no representation at all — which means there is
+   no durable answer to "why did this task enter `WaitingForUser`?", and an approval row
+   appears with no antecedent.
+2. **Two approval ledgers exist with materially different strength.** The policy layer's
+   `spent_approvals` is digest-keyed and verifies the digest against the action, checks
+   expiry, and enforces single-use. The task layer's `may_use_approval` checks
+   `is_valid_at(now_ms)` **only** — it never verifies the digest, and its own doc
+   defers that to policy. Reading `may_use_approval() == true` as "this action is
+   authorised" would be wrong.
+3. **`WaitingForUser` already exists and is already correct.** The transitions are
+   `Pending → WaitingForUser`, `Running → WaitingForUser`, and
+   `WaitingForUser → Running | Cancelled`. A task can rest awaiting a human and resume.
+
+**Decision.**
+
+1. **D3 — the proposal precedes the approval, durably.** `ActionProposal` is a new
+   durable object holding capability, target, normalized params, proposer `Actor`,
+   authority root, `created_at`, status, and a nullable approval reference. It exists
+   *before* the task rests in `WaitingForUser`, so the wait is explained by a record
+   rather than by an absence.
+2. **A new table, not a nullable digest.** `task_approvals` stays the **approved-action
+   ledger**. Overloading it with a nullable-digest proposal row was considered and
+   rejected: it would make "the task asked for permission" and "permission was granted"
+   the same row, which is precisely the distinction the audit trail exists to preserve.
+3. **D4 — approval remains per-attempt.** A retry creates a new attempt, which derives
+   its own proposal and requires its own approval. This is what TP-6 already implies by
+   keying approvals on `(task_id, attempt_no)`; the proposal inherits the same keying
+   rather than inventing a second scheme.
+4. **D5 — a lease never grants authority, and this becomes a test.** The current state is
+   structurally sound: a lease grants exactly one thing, completion fencing, and **no
+   `Actor` is constructed from a task or lease anywhere** — the only non-test `Actor::`
+   in the codebase is the hardcoded local human in the runtime. That is true by absence
+   of code paths, which is exactly the kind of truth that erodes silently. It becomes a
+   regression test: a task claimed by a worker must not influence the actor, the
+   authority, or the approval at dispatch.
+
+### Consequences
+
+- The lifecycle becomes: `Running → (ordinary work | governed action proposed) →
+  WaitingForUser → approved → Running → capability → verification → task completion`,
+  with rejection reaching a terminal task outcome. **No new task state is introduced**;
+  the reason for waiting lives in the proposal's status, not in the state machine.
+- An **expired approval implies neither approval nor execution.** It is a terminal
+  status on the proposal, and a retry is a new attempt with a new proposal.
+- The two ledgers stay separate and their boundary is documented: the task ledger scopes
+  and consumes per attempt, the policy ledger is the only place a digest is verified
+  against an action. Any future caller of `may_use_approval` must still go through
+  policy.
+- V-71 exists because D5's invariant is currently guaranteed by nothing but the absence
+  of the code path that would break it.
+
+### What this ADR does not claim
+
+It does not claim the proposal needs to be a first-class table forever; a proposal that
+never leaves `pending` may later prove to be derivable from the task's own attempt
+record, and this decision can be amended if that is shown. It does not claim rejection
+needs a task state — it does not. It does not claim `WaitingForUser` is well-named for
+every future use; it is reused here because adding `WaitingForApproval` would duplicate
+a state that already means "a human is required to continue".
+
+### Amendment trigger
+
+Re-read if a second waiting-for-human reason appears that `WaitingForUser` cannot
+express; if `task_approvals` is ever asked to represent an unapproved proposal; or if
+`may_use_approval` is called from a dispatch path without a subsequent policy check.
+
+---
+
+<a id="adr-0039"></a>
+
+## ADR-0039 — A capability declares its parameters; the proposer reads the declaration
+
+**Status.** **Implemented.** `CapabilityDeclaration` carries `params: ParamSpec` (prose
+plus a machine-checkable `ParamSchema`) and `target: TargetSemantics`; `ai_propose` walks
+`Registry::enabled()` to build the menu it offers a model instead of a literal list;
+`proposer::validate` refuses a proposal whose parameters do not match the declared shape
+(`proposal-schema-mismatch`) or that omits a required target
+(`proposal-target-missing`); and the provider is owned per `Runtime` rather than by a
+process-global slot. Cites V-76.
+
+**Context.** V-75's slice left one hardcoded list standing. `ai_propose` named
+`filesystem/write-text` literally, alongside its display name and its two parameter
+names, in a file that had nothing to do with the capability. The capability itself carried
+no statement of what it accepted: `write_text::parse` knew the rule, and the proposer
+knew a second, partial copy of it. Two lists, one of them in the wrong place, and the
+drift was structural rather than accidental — the next capability added would be
+registrable and therefore invisible to the model until somebody remembered to edit the
+proposer.
+
+The deeper problem is that a proposal could be *persisted* with parameters no capability
+would accept. The shape check lived inside the capability, reached only when the execution
+plan was built, which is after the proposal was durable and after a human had been asked
+to approve it. So the cost of a malformed parameter set was paid at the most expensive
+moment in the pipeline, and attributed to the sandbox rather than to the request.
+
+**Decision.** A capability describes its own parameters, in the domain layer so that the
+capability and its callers share one type without either depending on the other. The
+schema is *shape only* — field names, types, which are required, what a nested object
+contains — and value rules stay with the capability that understands the world. A schema
+that expressed "a path must stay inside the workspace" would either become a second
+implementation of the capability's own checks or a constraint language nobody could read.
+`orxnud-capability` asserts the two agree, so the shape can never be the stricter of them
+in a way that refuses valid work.
+
+`ai_propose` walks the registry. A capability that is registered and enabled is
+proposable, with its own declared shape and target semantics, and adding one requires no
+edit to the proposer.
+
+The provider moved from a process-global `OnceLock` to a field on `Runtime`. The
+`OnceLock` panicked on its second write, which meant the suite could test exactly one
+provider scenario and no more. Replacing it with a scoped, restorable `RwLock` fixed that
+and introduced a worse bug: a process-global mutable value cannot be scoped against
+concurrency, so one test installing a malformed provider changed the answer another test
+was receiving at the same moment — which the suite demonstrated by failing a test that
+had nothing to do with it. Per-runtime ownership makes the interference structurally
+impossible rather than merely unlikely, and it is also simply true that two daemons in one
+process may be configured differently.
+
+**Alternatives rejected.**
+
+* *A capability-owned validator trait, invoked by the proposer.* Rejected: it puts the
+  capability crate's parse path behind the proposal path, so a shape error and a semantic
+  error become indistinguishable at both ends, and a model cannot be told which it made.
+* *Keeping the hardcoded list and adding a test that it matches the registry.* Rejected:
+  this is a synchronisation test for a duplication that should not exist. It would have
+  caught the first drift and then required a second edit per capability forever.
+* *Expressing the schema in JSON Schema and validating with a library.* Rejected for now:
+  it adds a dependency to the domain layer, which is held to serde alone, and buys
+  expressiveness that no shipped capability uses. A constraint language is also
+  unreadable in an approval prompt, which is one of the consumers this slice names.
+* *Passing the schema to the model so it can conform exactly.* Rejected: it invites a
+  model to contrive a shape-satisfying request rather than an honest one. The model is
+  told field *names*; the deterministic side holds the shape and enforces it.
+
+**Consequences.** The model is told what each capability is for, what its parameters are
+called, and what risk it carries — risk included, because a proposer that cannot see that
+a capability is High will confidently propose work that is always going to wait for a
+human. A malformed parameter set is refused at propose time, costs nothing, and is
+attributed to the request. Approval presentation has a single source to render from,
+which is the consumer this slice was building toward. `ParamKind::Array` has no element
+type: no shipped capability takes an array, and an unconstrained array is honest about
+that where a guessed element type would not be.
+
+The refusal reasons are diagnostic on purpose. `proposal-capability-not-allowed` and
+`proposal-unknown-capability` stay distinct because they say different things about a
+model's mistake — it asked for something real but off-limits, or it invented an id.
+
+### Amendment trigger
+
+Re-read if a capability needs a parameter constraint the shape cannot express (at which
+point the split between shape and semantics is being tested rather than respected); if a
+second consumer needs the schema to be something other than prose plus structure; or if
+the model is ever handed the schema itself.
+
+---
+
+<a id="adr-0040"></a>
+
+## ADR-0040 — One real provider, over HTTP, with the credential in the secret store
+
+**Status.** **Implemented.** V-77 and V-78 are closed: TLS via `rustls` with certificate
+chain and hostname verification, and `orxnuctl provider credential set` as the user-facing
+path into the platform secret store. Provider selection is **manual and authoritative** —
+there is no automatic fallback of any kind, and a future one is a separate decision.
+
+**Amendment: manual selection, and no fallback.** The originally selected provider and model
+are exactly what the runtime uses. If that provider fails, the failure is reported; no other
+provider, model, endpoint or script is tried. This is deliberate rather than merely
+unimplemented. A provider outage is an outage, and a task's text may be personal or
+sensitive, so "the configured provider is unavailable" is not permission to transmit the same
+context to a different company. Automatic fallback is deferred until several real providers
+exist and there is evidence about their behaviour; if it is ever built, it will be an explicit
+opt-in policy with its own data-boundary rules (public context may fall back freely,
+regulated context may not), not a default.
+
+**Amendment: the credential has one supported path.** `orxnuctl provider credential set`
+reads the value from **stdin** and writes it through `SecretsContract::set`. No spelling of
+the command takes a credential as an argument — an argument is visible in `ps` output and in
+shell history — and the argument parser is tested against every plausible attempt to pass
+one. Nothing echoes the value back, not even a prefix, because a prefix is four characters of
+a credential in every scrollback and CI log.
+
+**Amendment: TLS, and no downgrade.** `https://` is TLS or it is nothing. There is no
+configuration that turns it into plaintext, no retry from TLS to plain when a handshake
+fails, and no redirect following — an `https://` endpoint answering `302 http://…` would
+otherwise be a downgrade delivered by the far side rather than by us, which is the same
+failure with the blame moved. `http://` remains reachable only when explicitly permitted,
+which only a loopback test server does, and the transport refuses to attach an
+`Authorization` header over plaintext at all. That last rule is what makes the permission
+safe to have in the codebase: it cannot be used to prove a credential path works over
+`http://` and then carry that expectation to a real host differing by one character.
+
+`orxnud-config` and gate G2(b) were both amended deliberately. The CLI's permitted internal
+crates gained `orxnud-domain` and `orxnud-platform-secrets`, because the credential command
+must use the authoritative `SecretRef` and `SecretsContract` rather than hand-roll a
+reference format that would write a credential the provider cannot read. That is the gate's
+own reasoning applied: naming the real types is safer than inventing copies. The licence
+allowlist gained `ISC` and `BSD-3-Clause`, required by `rustls-webpki`, `untrusted`, `ring`
+and `subtle`; all four are permissive, and `ring` is `Apache-2.0 AND ISC` so ISC had to be
+acceptable for `rustls` to be usable at all. `webpki-roots` was rejected: it is MPL-2.0, and
+bundled roots also go stale. `rustls-native-certs` reads the host trust store instead.
+
+One HTTP bug was fixed on the way. The response reader waited for the peer to close, which
+was wrong twice: a provider answering `Connection: close` with a kept-alive connection would
+hang until the deadline, and a TLS peer closing without `close_notify` looked like a
+truncation error. The reader now delimits the body by HTTP framing — `Content-Length` where
+declared — so the end of a response is a fact about the response rather than about the peer's
+manners.
+
+`OpenAiCompatibleProvider<S>` speaks
+OpenAI-compatible `chat/completions` over HTTP/1.1, is injected per `Runtime`, resolves its
+credential through `SecretsContract`, and returns text only. `ProviderError` grew from one
+variant to eight, each with a fixed reason and no retry. `Runtime::start` now leaves the
+provider **unconfigured** and `task/ai-propose` answers `provider-not-configured`. Cites
+V-77 and V-78.
+
+**Context.** V-75 shipped the pipeline and the boundary with a scripted provider, and said
+plainly that the interesting half — a real model producing a sensible proposal — was
+unproven. This slice is that half, minus the part no credential can reach.
+
+**Decision.** One provider, no framework. `ProposalProvider` was not redesigned: it stays
+synchronous and takes a context by reference. A synchronous network call inside the
+daemon's async task would occupy a runtime worker for the length of a model call, and making
+the trait `async` would push a runtime into every implementor and every test — so the call
+site hands the provider to `tokio::task::spawn_blocking` instead. The provider drives a
+private current-thread runtime. One call is in flight per daemon, so this costs a thread.
+
+The transport is HTTP/1.1 written on `tokio`'s socket types rather than a new dependency.
+`http://` is complete; **`https://` is refused**, not downgraded (V-77). Silently dropping
+TLS would turn a configured `https://` endpoint into a plaintext attempt at the same host
+with the credential in the clear, and nothing in a log would show it. The refusal is a
+refusal precisely because it is inconvenient.
+
+The credential is a `SecretRef`, never a `String` in a struct, resolved per request into a
+`Zeroizing`. `orxnud-config` states that an environment variable must never be treated as a
+secret store — it is visible to every process of the same user and ends up in `ps` output
+and crash dumps — so the key comes from `SecretsContract` and the two provider settings come
+from arguments. The key is dereferenced to `&str` for the `Authorization` header and
+nowhere else, which means there is no expression that can put it in a log line: `Zeroizing`
+has no `Display`. Third-party error strings are passed through a deliberately crude
+redactor, because a credential store that fails while quoting the secret must not launder it
+into a daemon log through us.
+
+`Runtime::start` no longer installs the scripted provider. A daemon with no provider answers
+`provider-not-configured`, and `--provider-scripted` is an explicit opt-in that announces
+itself on stderr and records `scripted/none` in the audit record. The previous arrangement
+would have let a production daemon quietly answer with a fixed string and report a working
+intelligence loop that did not exist.
+
+**Alternatives rejected.**
+
+* *`https` via a TLS dependency (`ureq` + `rustls`).* Deferred, not rejected: it is the
+  right answer and it is roughly fifteen crates into a repository that holds its domain
+  layer to serde and thiserror alone. It deserves its own decision and its own licence
+  review under G8, not a side effect of adding a provider.
+* *An environment variable for the API key.* Rejected by the repository's own stated
+  position on secrets, before any other consideration.
+* *A transport trait so tests could mock HTTP.* Rejected in favour of a real loopback
+  server. A mocked transport cannot catch a malformed request line, a wrong
+  `Content-Length`, or a body limit that never engages — which are precisely the parts that
+  have never been executed.
+* *Retrying, or falling back to the scripted provider on failure.* Rejected. A retry is a
+  second proposal attempt with different text, and a fallback is a daemon reporting a model
+  that is not there.
+* *Handing the model the `ParamSchema`.* Rejected for the reason ADR-0039 gives: it invites
+  a model to contrive a shape-satisfying request rather than an honest one.
+
+**Consequences.** The model is told the menu, the parameter names, and the risk class, and
+nothing else; the request body is asserted to contain no dispatcher, task service, policy
+engine, store handle or credential. The system prompt states the output contract and asks
+for no safety behaviour, because a model that follows instructions is not a security
+control. Every refusal is enforced after the text returns, and fifteen adversarial outputs
+are refused by the parser while three semantic ones — a traversing path, an absolute path, a
+nested path — are asserted to satisfy the *shape* and be refused by the capability, because
+`ParamSchema` is shape-only and a test claiming otherwise would be claiming a job the
+schema does not do.
+
+`orxnuctl` now shows the `reason` word rather than the most specific string available,
+because a reason exists to be branched on and hiding it behind prose defeats that. Provider
+failures are a distinct wire error from a declined proposal: "the model was unreachable"
+must not read as "the model's proposal was refused", or an outage starts looking like a
+policy decision.
+
+### Amendment: detection has to be asked for by name
+
+`KeyringSecrets` no longer implements `Default`. It had one, derived over a single
+`available: bool`, so `default()` built a store that reported "no secret store" without
+consulting the platform -- and all three production call sites used it. The credential path
+was therefore inoperable on every host, while every test passed, because every test builds
+its store with `assume_available()` and so never exercised detection at all (V-79).
+
+The lesson is recorded because it is not specific to this bug: **a test suite that skips
+the code under repair cannot report it broken.** Detection now returns a three-way
+`Probe`, availability comes from the write alone, a leftover probe entry is its own outcome
+rather than a false "unavailable", and `clippy::new_without_default` is refused on purpose
+with the reasoning in the source. `new()` probes; `assume_available()` does not; the caller
+has to mean one.
+
+### Amendment: the answering provider is the authority on who answered
+
+`delegated_actor` takes the model identity as a parameter rather than naming one. It used to
+pass the literal `openraynux/task-agent`, and so every AI actor in the signed audit journal
+claimed that model whatever replied. The first live run made the cost concrete: the API
+response said `openai/gpt-oss-120b` while `task_proposals.proposer` and both `audit_log`
+records said something else entirely.
+
+The rule this establishes: **the model recorded in an audit record is supplied by the
+component that actually executed the request**, read from the answering object rather than
+from configuration, so it cannot name a model that did not answer. Where no model
+participates — the direct `task/propose` path — the record says `none/direct-proposal`
+rather than borrowing a name. This is the same posture as `scripted/none` in V-75: the
+audit's job is to say what happened, and a confident wrong value is the failure mode.
+
+`prompt_hash` is still the literal `phase-2`. It is a placeholder for a prompt-framing
+version this code does not version, and left alone deliberately: inventing a hash of nothing
+would look like provenance while being exactly the kind of confident fiction this amendment
+exists to remove (V-81).
+
+### Amendment: the menu must state everything the validator enforces
+
+The capability menu now announces each capability's target requirement, derived from
+`TargetSemantics`. It did not, and a real model was asked for a `target` field it had never
+been told about, then refused three times for omitting it (V-80).
+
+The general rule: **a component that enforces a requirement is responsible for announcing
+it.** A validator that refuses output for omitting a field the model was never told about
+has found its own information gap, not the model's disobedience. The parser was not made
+more permissive to accommodate the model; the description was made complete.
+
+### Amendment trigger
+
+Re-read when TLS lands (V-77); when a user can store a provider credential (V-78); if a
+second provider is added, at which point the question is whether `ProviderConfig` was the
+right place for the shared parts; if a provider ever needs to be reachable without a
+credential; if anything else in the tree grows a `Default` that quietly decides whether a
+platform capability is present; or if the prompt framing is actually versioned, at which
+point `prompt_hash` becomes a real hash rather than the placeholder it is today.
+
+---
+
+<a id="adr-0043"></a>
+
+## ADR-0043 — Continuation is an explicit operation, not a widened claim
+
+**Status.** **Decided. The primitive is implemented; the orchestration is deliberately
+absent.** `AwaitingNextStep` is advanced only by `TaskRepository::claim_next_step()`. The
+generic claim path (`claim()` / `take_lease()` / `claim_specific()`) remains `Pending`-only,
+and `idx_tasks_claimable` was not widened.
+
+**Amendment, 2026-10-05 — "implemented" overstated this.** As of `HEAD`, the *governance
+primitive* is complete and tested: the state exists, `claim_next_step()` exists,
+step-scoped attempts and approvals exist, and the digest binds `step_no` (ADR-0037, V-83).
+**No production code calls it.** `orxnud-daemon` exposes no IPC method that reaches
+`claim_next_step`, and `grep -rn claim_next_step crates --include=*.rs` outside
+`task_repo.rs` returns nothing. So a multi-step task stops at the boundary by design. The
+requirement recorded below stands, and V-84 is where a reader should confirm it is still
+unmet.
+
+**Context.** Stage 3d made `AwaitingNextStep -> Running` claimable. The obvious alternative
+was to extend the existing claim query so a polling worker would pick boundaries up
+alongside fresh work. That is one line of SQL and a much larger decision.
+
+**Decision.** Continuation stays a separate, explicit operation.
+
+**Why.** Widening the generic claim would assert that *any* worker which sees a boundary is
+entitled to advance it. That is a new scheduling contract, not a composition detail, and it
+would drag in three questions the composition work never had to answer: what
+`Pending`/`AwaitingNextStep` coexistence means for priority and ordering, whether every
+existing worker implementation understands a state it was not written for, and whether
+automatic discovery is desirable at all. It also fails the rule this project keeps applying
+to authority — new behaviour should not appear merely because an existing generic path was
+widened.
+
+The two paths are now deliberately asymmetric, and the asymmetry is the point:
+
+```text
+Pending            -> generic worker claim()
+AwaitingNextStep   -> explicit claim_next_step()
+```
+
+**Consequence, recorded as an orchestration requirement.** A production execution loop must
+explicitly resume `AwaitingNextStep` and must never rely on `claim()` polling to find a
+boundary. Until such a loop exists, a multi-step task stops at the boundary by design rather
+than by accident. See V-84.
+
+---
+
+<a id="adr-0044"></a>
 
 ## ADR-0044 — Observation is governed: approved reads, and a context that carries no content
 
-**Status.** **Decided. Implementation begins in Stage 4.**
+**Status.** **Decided. The governance core is implemented; the runtime wiring is
+deliberately absent.**
+
+**Amendment, 2026-10-05.** "Implementation begins in Stage 4" understated what shipped.
+At `HEAD` both mechanisms exist and are tested: `filesystem/read-text` is a registered
+Tier-1 capability (`read_text.rs`, 1045 lines, 34 tests including 12 against a real
+sandbox), and `PriorStepContext` is derived from durable rows and carried into the provider
+request (29 `prior_step` tests). What does **not** exist is the wiring: `orxnud-daemon`'s
+runtime neither reads nor writes an `ObservationStore`, so a model can *propose* a read and
+has nowhere to receive the bytes. That absence is deliberate — `3c8a413` names itself the
+rollback point immediately before moving approved workspace content to a remote provider —
+and it means ADR-0044 Decision 2's content boundary is intact **in practice** today. See
+V-84 for the parallel gap on continuation and ADR-0045 for the disclosure decision this
+one forced.
 
 **Context.** Stage 3 gave a task multiple logical steps, each with a durable result. Until
 now the model was blind after its first proposal: it could not see what an earlier step
@@ -3096,505 +3688,3 @@ allowed to be incapable, and its Tier-1 result is a correct refusal.
 * Windows remains **NOT_PROVEN** for isolation, and none of this changes that. The container
   is Linux evidence about the Linux configuration.
 
----
-
-## ADR-0043 — Continuation is an explicit operation, not a widened claim
-
-**Status.** **Decided and implemented.** `AwaitingNextStep` is advanced only by
-`TaskRepository::claim_next_step()`. The generic claim path (`claim()` / `take_lease()` /
-`claim_specific()`) remains `Pending`-only, and `idx_tasks_claimable` was not widened.
-
-**Context.** Stage 3d made `AwaitingNextStep -> Running` claimable. The obvious alternative
-was to extend the existing claim query so a polling worker would pick boundaries up
-alongside fresh work. That is one line of SQL and a much larger decision.
-
-**Decision.** Continuation stays a separate, explicit operation.
-
-**Why.** Widening the generic claim would assert that *any* worker which sees a boundary is
-entitled to advance it. That is a new scheduling contract, not a composition detail, and it
-would drag in three questions the composition work never had to answer: what
-`Pending`/`AwaitingNextStep` coexistence means for priority and ordering, whether every
-existing worker implementation understands a state it was not written for, and whether
-automatic discovery is desirable at all. It also fails the rule this project keeps applying
-to authority — new behaviour should not appear merely because an existing generic path was
-widened.
-
-The two paths are now deliberately asymmetric, and the asymmetry is the point:
-
-```text
-Pending            -> generic worker claim()
-AwaitingNextStep   -> explicit claim_next_step()
-```
-
-**Consequence, recorded as an orchestration requirement.** A production execution loop must
-explicitly resume `AwaitingNextStep` and must never rely on `claim()` polling to find a
-boundary. Until such a loop exists, a multi-step task stops at the boundary by design rather
-than by accident. See V-84.
-
----
-
-## ADR-0037 — An approval names its approver, and the digest binds them
-
-**Status.** **Implemented.** `ApprovalRecord` carries an explicit `approver: Actor`;
-`canonical_bytes` binds both parties and its prefix moved `v1` -> `v2` so a pre-change
-digest cannot verify; `authorise` refuses a non-granting approver
-(`approval_approver_cannot_grant`) and an approver who is not the proposer's authority
-root (`approval_approver_not_authorised`); and `issue_approval` asserts
-`approver.can_grant()` at minting. The minting path re-derives the approver from the
-trusted local-human boundary and never reads it from the request. Cites V-69 and V-70.
-
-**Amendment — the digest binds the logical step (`v2` -> `v3`).** `canonical_bytes` now
-appends `step_no` as its final field and its prefix moved `v2` -> `v3`. `ApprovalRecord`
-carries `step_no: u32`, and `authorise` recomputes with **the step recorded on the
-approval**, never one supplied by the caller: a record that does not say which step it
-speaks for cannot be told apart from one that speaks for another, so under `v2` a single
-human approval would authorise the same action at *every* step of a multi-step task.
-
-The field is **required, not defaulted**. Every production call site supplies an explicit
-step: the task path reads it from the durable proposal (`task_proposals.step_no`) and
-`runtime` refuses an approval whose step disagrees with the proposal it is recorded
-against (`approval-step-mismatch`); the standalone `capability approve` path, which
-governs no task and therefore has exactly one step, uses the named constant
-`STANDALONE_APPROVAL_STEP`.
-
-Appending rather than inserting keeps every previously-bound field in its
-previously-hashed position, so the entire difference from `v2` is one prefix and one
-field.
-
-**There is no version to read out of a stored digest.** `ApprovalDigest` is a bare
-32-byte blake3 hash; the `v2` marker lives *inside* the hashed bytes and is not
-recoverable. A superseded `v2` digest and a malformed `v3` one are therefore genuinely
-indistinguishable, and both are refused through the same `approval_digest_mismatch`
-denial — inventing a distinction would mean parsing hash bytes, which would be a guess
-dressed as a check. The authorization result is identical either way.
-
-Historical `v2` approvals fail closed. They remain readable and structurally verifiable
-in the audit chain, because the digest is stored as an opaque hash: **no migration shim
-was added, and none should be**, since one would only obscure the transition. See V-83.
-
-**Context.** ADR-0012 committed this project to "the model proposes; the deterministic
-engine disposes", and ADR-0034 later proved one of its structural claims false in the
-way that matters: `CapabilityInvocation` derived `Deserialize`, and a derived
-`Deserialize` writes private fields without a constructor, so the type-level seal was
-bypassable. The lesson carried forward is that a claim about who *may* authorise has to
-be checked where authorisation happens, not asserted at the type that carries it.
-
-**Problem.** The approval as it exists today is a **bearer token**. `ApprovalRecord`
-carries `actor_label`, capability, target, params, issued/expires, risk and a digest —
-and **no approver**, anywhere:
-
-- `canonical_bytes` binds `actor.label()`, `actor.authority_root()`, capability, target,
-  params, issued-at and expires-at. The *proposer's* identity is bound. The approver's
-  is not.
-- `actor_label` is written to the record and to `task_approvals.actor_label`, and **no
-  dispatch-time code reads it.**
-- `Decision::Gate.approver` is *derived* at `engine.rs:396` from the proposer's
-  `authority_root()` — an inference sitting where evidence should be. The system
-  asserts "the approver is the human whose authority is being used" rather than
-  recording that a human was asked.
-- `Actor::can_grant()` is enforced in exactly one non-test place (`engine.rs:266`), and
-  only to refuse an actor with neither grant capability nor an authority root. It cannot
-  check *who approved*, because there is nothing to check.
-
-So an approval currently establishes: *these parameters, for this proposer, before this
-time*. It does not establish: *a specific human examined this and consented*. Combined
-with a minting endpoint that answers any caller, a delegated pipeline built on this
-would be a **false demonstration** — the AI side could obtain its own approval through
-the same mechanism, and every stage would report success.
-
-**Decision.** An approval is a statement about a *pair* of parties, and the digest
-covers both.
-
-1. **D1 — approval is non-bearer.** The bound tuple becomes
-   `approver + proposer/actor + authority_root + capability + target +
-   normalized params + issued_at + expires_at`. An approval cannot be detached and
-   reused for a different actor or action, because both parties are inside the digest.
-2. **D2 — the approver is explicit and grant-capable.** `ApprovalRecord` gains an
-   approver identity. Dispatch verifies, in order: the approval exists, is unexpired,
-   is unconsumed, its digest matches the action about to run, the approver
-   `can_grant()`, and `approver == proposer.authority_root()` for delegated execution.
-   The authority-root relation becomes a **checked** equality rather than an assumption
-   the engine makes on the actor's behalf.
-3. **D6 — a wire actor is an asserted principal, not an authenticated identity.**
-   `Actor` crossing local IPC means the structure deserialises; it does not mean the
-   caller possesses that identity. The three are kept distinct in naming, docs and
-   tests: *principal assertion* ≠ *principal authentication* ≠ *principal
-   authorization*. Today's boundary is the 0700 Unix socket plus the single-user local
-   model, and that is stated as the boundary rather than implied by the type.
-
-### Consequences
-
-- For `Actor::Ai { delegated_by: H, .. }`, the approval must come from `H`. The
-  delegation becomes enforceable rather than descriptive: **delegation is not authority
-  creation**, and an AI actor's authority is bounded by its delegating human's.
-- Human approval becomes the only place new authority enters the chain, which is what
-  makes ADR-0012's sentence true of the *runtime* and not only of the type.
-- The register gains V-69 (the gap above) and V-70 (asserted principal vs authenticated
-  identity), because both are claims that will silently become false.
-- Multi-user authentication stays out of scope, and is now *named* as out of scope. The
-  hazard is specific: an `Actor { user: "H" }` arriving over a socket is easy to later
-  mistake for proof that the caller is `H`.
-
-### What this ADR does not claim
-
-It does not claim the current approval flow is exploitable today. With one local user
-behind a 0700 socket, minting on request is equivalent to that user consenting, so V-69
-is a **latent** defect that becomes live the moment a non-human proposer exists. It does
-not claim adding an approver field alone is sufficient: the minting path must also be
-reachable only by a grant-capable principal, or the field is decoration.
-
-### Amendment trigger
-
-Re-read if any of: an actor other than `Human` reaches the dispatcher; a capability is
-reachable over anything other than the local socket; `can_grant` gains a second true
-variant; or multi-user support is proposed.
----
-
-## ADR-0038 — A governed action is proposed durably before it is approved
-
-**Status.** **Implemented.** A `task_proposals` table carries the durable proposal;
-`TaskRepository::propose_action` commits the proposal, the transition to
-`waiting_for_user` and the task event in one transaction, and releases the lease;
-`decide_proposal` records the human's decision without touching task state; and
-`begin_approved_execution` takes a **fresh** lease and resumes the task in one
-transaction, leaving `attempts` untouched. The proposal carries an `Actor::Ai` proposer
-derived from the task identity, never from the lease holder. Cites V-71. Builds on
-ADR-0037.
-
-**Context.** ADR-0037 settles *what an approval is*. It says nothing about the thing
-that precedes one, and the store already contains a half-built answer that is worth
-reading before adding anything.
-
-**Problem.** Three concrete gaps, all verified against source rather than inferred:
-
-1. **There is no durable proposal.** `task_approvals` is keyed `(task_id, attempt_no)`
-   and its `digest` column is `NOT NULL`, so a row can only exist *once approved*. A
-   proposed-but-unapproved action has no representation at all — which means there is
-   no durable answer to "why did this task enter `WaitingForUser`?", and an approval row
-   appears with no antecedent.
-2. **Two approval ledgers exist with materially different strength.** The policy layer's
-   `spent_approvals` is digest-keyed and verifies the digest against the action, checks
-   expiry, and enforces single-use. The task layer's `may_use_approval` checks
-   `is_valid_at(now_ms)` **only** — it never verifies the digest, and its own doc
-   defers that to policy. Reading `may_use_approval() == true` as "this action is
-   authorised" would be wrong.
-3. **`WaitingForUser` already exists and is already correct.** The transitions are
-   `Pending → WaitingForUser`, `Running → WaitingForUser`, and
-   `WaitingForUser → Running | Cancelled`. A task can rest awaiting a human and resume.
-
-**Decision.**
-
-1. **D3 — the proposal precedes the approval, durably.** `ActionProposal` is a new
-   durable object holding capability, target, normalized params, proposer `Actor`,
-   authority root, `created_at`, status, and a nullable approval reference. It exists
-   *before* the task rests in `WaitingForUser`, so the wait is explained by a record
-   rather than by an absence.
-2. **A new table, not a nullable digest.** `task_approvals` stays the **approved-action
-   ledger**. Overloading it with a nullable-digest proposal row was considered and
-   rejected: it would make "the task asked for permission" and "permission was granted"
-   the same row, which is precisely the distinction the audit trail exists to preserve.
-3. **D4 — approval remains per-attempt.** A retry creates a new attempt, which derives
-   its own proposal and requires its own approval. This is what TP-6 already implies by
-   keying approvals on `(task_id, attempt_no)`; the proposal inherits the same keying
-   rather than inventing a second scheme.
-4. **D5 — a lease never grants authority, and this becomes a test.** The current state is
-   structurally sound: a lease grants exactly one thing, completion fencing, and **no
-   `Actor` is constructed from a task or lease anywhere** — the only non-test `Actor::`
-   in the codebase is the hardcoded local human in the runtime. That is true by absence
-   of code paths, which is exactly the kind of truth that erodes silently. It becomes a
-   regression test: a task claimed by a worker must not influence the actor, the
-   authority, or the approval at dispatch.
-
-### Consequences
-
-- The lifecycle becomes: `Running → (ordinary work | governed action proposed) →
-  WaitingForUser → approved → Running → capability → verification → task completion`,
-  with rejection reaching a terminal task outcome. **No new task state is introduced**;
-  the reason for waiting lives in the proposal's status, not in the state machine.
-- An **expired approval implies neither approval nor execution.** It is a terminal
-  status on the proposal, and a retry is a new attempt with a new proposal.
-- The two ledgers stay separate and their boundary is documented: the task ledger scopes
-  and consumes per attempt, the policy ledger is the only place a digest is verified
-  against an action. Any future caller of `may_use_approval` must still go through
-  policy.
-- V-71 exists because D5's invariant is currently guaranteed by nothing but the absence
-  of the code path that would break it.
-
-### What this ADR does not claim
-
-It does not claim the proposal needs to be a first-class table forever; a proposal that
-never leaves `pending` may later prove to be derivable from the task's own attempt
-record, and this decision can be amended if that is shown. It does not claim rejection
-needs a task state — it does not. It does not claim `WaitingForUser` is well-named for
-every future use; it is reused here because adding `WaitingForApproval` would duplicate
-a state that already means "a human is required to continue".
-
-### Amendment trigger
-
-Re-read if a second waiting-for-human reason appears that `WaitingForUser` cannot
-express; if `task_approvals` is ever asked to represent an unapproved proposal; or if
-`may_use_approval` is called from a dispatch path without a subsequent policy check.
-
-## ADR-0039 — A capability declares its parameters; the proposer reads the declaration
-
-**Status.** **Implemented.** `CapabilityDeclaration` carries `params: ParamSpec` (prose
-plus a machine-checkable `ParamSchema`) and `target: TargetSemantics`; `ai_propose` walks
-`Registry::enabled()` to build the menu it offers a model instead of a literal list;
-`proposer::validate` refuses a proposal whose parameters do not match the declared shape
-(`proposal-schema-mismatch`) or that omits a required target
-(`proposal-target-missing`); and the provider is owned per `Runtime` rather than by a
-process-global slot. Cites V-76.
-
-**Context.** V-75's slice left one hardcoded list standing. `ai_propose` named
-`filesystem/write-text` literally, alongside its display name and its two parameter
-names, in a file that had nothing to do with the capability. The capability itself carried
-no statement of what it accepted: `write_text::parse` knew the rule, and the proposer
-knew a second, partial copy of it. Two lists, one of them in the wrong place, and the
-drift was structural rather than accidental — the next capability added would be
-registrable and therefore invisible to the model until somebody remembered to edit the
-proposer.
-
-The deeper problem is that a proposal could be *persisted* with parameters no capability
-would accept. The shape check lived inside the capability, reached only when the execution
-plan was built, which is after the proposal was durable and after a human had been asked
-to approve it. So the cost of a malformed parameter set was paid at the most expensive
-moment in the pipeline, and attributed to the sandbox rather than to the request.
-
-**Decision.** A capability describes its own parameters, in the domain layer so that the
-capability and its callers share one type without either depending on the other. The
-schema is *shape only* — field names, types, which are required, what a nested object
-contains — and value rules stay with the capability that understands the world. A schema
-that expressed "a path must stay inside the workspace" would either become a second
-implementation of the capability's own checks or a constraint language nobody could read.
-`orxnud-capability` asserts the two agree, so the shape can never be the stricter of them
-in a way that refuses valid work.
-
-`ai_propose` walks the registry. A capability that is registered and enabled is
-proposable, with its own declared shape and target semantics, and adding one requires no
-edit to the proposer.
-
-The provider moved from a process-global `OnceLock` to a field on `Runtime`. The
-`OnceLock` panicked on its second write, which meant the suite could test exactly one
-provider scenario and no more. Replacing it with a scoped, restorable `RwLock` fixed that
-and introduced a worse bug: a process-global mutable value cannot be scoped against
-concurrency, so one test installing a malformed provider changed the answer another test
-was receiving at the same moment — which the suite demonstrated by failing a test that
-had nothing to do with it. Per-runtime ownership makes the interference structurally
-impossible rather than merely unlikely, and it is also simply true that two daemons in one
-process may be configured differently.
-
-**Alternatives rejected.**
-
-* *A capability-owned validator trait, invoked by the proposer.* Rejected: it puts the
-  capability crate's parse path behind the proposal path, so a shape error and a semantic
-  error become indistinguishable at both ends, and a model cannot be told which it made.
-* *Keeping the hardcoded list and adding a test that it matches the registry.* Rejected:
-  this is a synchronisation test for a duplication that should not exist. It would have
-  caught the first drift and then required a second edit per capability forever.
-* *Expressing the schema in JSON Schema and validating with a library.* Rejected for now:
-  it adds a dependency to the domain layer, which is held to serde alone, and buys
-  expressiveness that no shipped capability uses. A constraint language is also
-  unreadable in an approval prompt, which is one of the consumers this slice names.
-* *Passing the schema to the model so it can conform exactly.* Rejected: it invites a
-  model to contrive a shape-satisfying request rather than an honest one. The model is
-  told field *names*; the deterministic side holds the shape and enforces it.
-
-**Consequences.** The model is told what each capability is for, what its parameters are
-called, and what risk it carries — risk included, because a proposer that cannot see that
-a capability is High will confidently propose work that is always going to wait for a
-human. A malformed parameter set is refused at propose time, costs nothing, and is
-attributed to the request. Approval presentation has a single source to render from,
-which is the consumer this slice was building toward. `ParamKind::Array` has no element
-type: no shipped capability takes an array, and an unconstrained array is honest about
-that where a guessed element type would not be.
-
-The refusal reasons are diagnostic on purpose. `proposal-capability-not-allowed` and
-`proposal-unknown-capability` stay distinct because they say different things about a
-model's mistake — it asked for something real but off-limits, or it invented an id.
-
-### Amendment trigger
-
-Re-read if a capability needs a parameter constraint the shape cannot express (at which
-point the split between shape and semantics is being tested rather than respected); if a
-second consumer needs the schema to be something other than prose plus structure; or if
-the model is ever handed the schema itself.
-
-## ADR-0040 — One real provider, over HTTP, with the credential in the secret store
-
-**Status.** **Implemented.** V-77 and V-78 are closed: TLS via `rustls` with certificate
-chain and hostname verification, and `orxnuctl provider credential set` as the user-facing
-path into the platform secret store. Provider selection is **manual and authoritative** —
-there is no automatic fallback of any kind, and a future one is a separate decision.
-
-**Amendment: manual selection, and no fallback.** The originally selected provider and model
-are exactly what the runtime uses. If that provider fails, the failure is reported; no other
-provider, model, endpoint or script is tried. This is deliberate rather than merely
-unimplemented. A provider outage is an outage, and a task's text may be personal or
-sensitive, so "the configured provider is unavailable" is not permission to transmit the same
-context to a different company. Automatic fallback is deferred until several real providers
-exist and there is evidence about their behaviour; if it is ever built, it will be an explicit
-opt-in policy with its own data-boundary rules (public context may fall back freely,
-regulated context may not), not a default.
-
-**Amendment: the credential has one supported path.** `orxnuctl provider credential set`
-reads the value from **stdin** and writes it through `SecretsContract::set`. No spelling of
-the command takes a credential as an argument — an argument is visible in `ps` output and in
-shell history — and the argument parser is tested against every plausible attempt to pass
-one. Nothing echoes the value back, not even a prefix, because a prefix is four characters of
-a credential in every scrollback and CI log.
-
-**Amendment: TLS, and no downgrade.** `https://` is TLS or it is nothing. There is no
-configuration that turns it into plaintext, no retry from TLS to plain when a handshake
-fails, and no redirect following — an `https://` endpoint answering `302 http://…` would
-otherwise be a downgrade delivered by the far side rather than by us, which is the same
-failure with the blame moved. `http://` remains reachable only when explicitly permitted,
-which only a loopback test server does, and the transport refuses to attach an
-`Authorization` header over plaintext at all. That last rule is what makes the permission
-safe to have in the codebase: it cannot be used to prove a credential path works over
-`http://` and then carry that expectation to a real host differing by one character.
-
-`orxnud-config` and gate G2(b) were both amended deliberately. The CLI's permitted internal
-crates gained `orxnud-domain` and `orxnud-platform-secrets`, because the credential command
-must use the authoritative `SecretRef` and `SecretsContract` rather than hand-roll a
-reference format that would write a credential the provider cannot read. That is the gate's
-own reasoning applied: naming the real types is safer than inventing copies. The licence
-allowlist gained `ISC` and `BSD-3-Clause`, required by `rustls-webpki`, `untrusted`, `ring`
-and `subtle`; all four are permissive, and `ring` is `Apache-2.0 AND ISC` so ISC had to be
-acceptable for `rustls` to be usable at all. `webpki-roots` was rejected: it is MPL-2.0, and
-bundled roots also go stale. `rustls-native-certs` reads the host trust store instead.
-
-One HTTP bug was fixed on the way. The response reader waited for the peer to close, which
-was wrong twice: a provider answering `Connection: close` with a kept-alive connection would
-hang until the deadline, and a TLS peer closing without `close_notify` looked like a
-truncation error. The reader now delimits the body by HTTP framing — `Content-Length` where
-declared — so the end of a response is a fact about the response rather than about the peer's
-manners.
-
-`OpenAiCompatibleProvider<S>` speaks
-OpenAI-compatible `chat/completions` over HTTP/1.1, is injected per `Runtime`, resolves its
-credential through `SecretsContract`, and returns text only. `ProviderError` grew from one
-variant to eight, each with a fixed reason and no retry. `Runtime::start` now leaves the
-provider **unconfigured** and `task/ai-propose` answers `provider-not-configured`. Cites
-V-77 and V-78.
-
-**Context.** V-75 shipped the pipeline and the boundary with a scripted provider, and said
-plainly that the interesting half — a real model producing a sensible proposal — was
-unproven. This slice is that half, minus the part no credential can reach.
-
-**Decision.** One provider, no framework. `ProposalProvider` was not redesigned: it stays
-synchronous and takes a context by reference. A synchronous network call inside the
-daemon's async task would occupy a runtime worker for the length of a model call, and making
-the trait `async` would push a runtime into every implementor and every test — so the call
-site hands the provider to `tokio::task::spawn_blocking` instead. The provider drives a
-private current-thread runtime. One call is in flight per daemon, so this costs a thread.
-
-The transport is HTTP/1.1 written on `tokio`'s socket types rather than a new dependency.
-`http://` is complete; **`https://` is refused**, not downgraded (V-77). Silently dropping
-TLS would turn a configured `https://` endpoint into a plaintext attempt at the same host
-with the credential in the clear, and nothing in a log would show it. The refusal is a
-refusal precisely because it is inconvenient.
-
-The credential is a `SecretRef`, never a `String` in a struct, resolved per request into a
-`Zeroizing`. `orxnud-config` states that an environment variable must never be treated as a
-secret store — it is visible to every process of the same user and ends up in `ps` output
-and crash dumps — so the key comes from `SecretsContract` and the two provider settings come
-from arguments. The key is dereferenced to `&str` for the `Authorization` header and
-nowhere else, which means there is no expression that can put it in a log line: `Zeroizing`
-has no `Display`. Third-party error strings are passed through a deliberately crude
-redactor, because a credential store that fails while quoting the secret must not launder it
-into a daemon log through us.
-
-`Runtime::start` no longer installs the scripted provider. A daemon with no provider answers
-`provider-not-configured`, and `--provider-scripted` is an explicit opt-in that announces
-itself on stderr and records `scripted/none` in the audit record. The previous arrangement
-would have let a production daemon quietly answer with a fixed string and report a working
-intelligence loop that did not exist.
-
-**Alternatives rejected.**
-
-* *`https` via a TLS dependency (`ureq` + `rustls`).* Deferred, not rejected: it is the
-  right answer and it is roughly fifteen crates into a repository that holds its domain
-  layer to serde and thiserror alone. It deserves its own decision and its own licence
-  review under G8, not a side effect of adding a provider.
-* *An environment variable for the API key.* Rejected by the repository's own stated
-  position on secrets, before any other consideration.
-* *A transport trait so tests could mock HTTP.* Rejected in favour of a real loopback
-  server. A mocked transport cannot catch a malformed request line, a wrong
-  `Content-Length`, or a body limit that never engages — which are precisely the parts that
-  have never been executed.
-* *Retrying, or falling back to the scripted provider on failure.* Rejected. A retry is a
-  second proposal attempt with different text, and a fallback is a daemon reporting a model
-  that is not there.
-* *Handing the model the `ParamSchema`.* Rejected for the reason ADR-0039 gives: it invites
-  a model to contrive a shape-satisfying request rather than an honest one.
-
-**Consequences.** The model is told the menu, the parameter names, and the risk class, and
-nothing else; the request body is asserted to contain no dispatcher, task service, policy
-engine, store handle or credential. The system prompt states the output contract and asks
-for no safety behaviour, because a model that follows instructions is not a security
-control. Every refusal is enforced after the text returns, and fifteen adversarial outputs
-are refused by the parser while three semantic ones — a traversing path, an absolute path, a
-nested path — are asserted to satisfy the *shape* and be refused by the capability, because
-`ParamSchema` is shape-only and a test claiming otherwise would be claiming a job the
-schema does not do.
-
-`orxnuctl` now shows the `reason` word rather than the most specific string available,
-because a reason exists to be branched on and hiding it behind prose defeats that. Provider
-failures are a distinct wire error from a declined proposal: "the model was unreachable"
-must not read as "the model's proposal was refused", or an outage starts looking like a
-policy decision.
-
-### Amendment: detection has to be asked for by name
-
-`KeyringSecrets` no longer implements `Default`. It had one, derived over a single
-`available: bool`, so `default()` built a store that reported "no secret store" without
-consulting the platform -- and all three production call sites used it. The credential path
-was therefore inoperable on every host, while every test passed, because every test builds
-its store with `assume_available()` and so never exercised detection at all (V-79).
-
-The lesson is recorded because it is not specific to this bug: **a test suite that skips
-the code under repair cannot report it broken.** Detection now returns a three-way
-`Probe`, availability comes from the write alone, a leftover probe entry is its own outcome
-rather than a false "unavailable", and `clippy::new_without_default` is refused on purpose
-with the reasoning in the source. `new()` probes; `assume_available()` does not; the caller
-has to mean one.
-
-### Amendment: the answering provider is the authority on who answered
-
-`delegated_actor` takes the model identity as a parameter rather than naming one. It used to
-pass the literal `openraynux/task-agent`, and so every AI actor in the signed audit journal
-claimed that model whatever replied. The first live run made the cost concrete: the API
-response said `openai/gpt-oss-120b` while `task_proposals.proposer` and both `audit_log`
-records said something else entirely.
-
-The rule this establishes: **the model recorded in an audit record is supplied by the
-component that actually executed the request**, read from the answering object rather than
-from configuration, so it cannot name a model that did not answer. Where no model
-participates — the direct `task/propose` path — the record says `none/direct-proposal`
-rather than borrowing a name. This is the same posture as `scripted/none` in V-75: the
-audit's job is to say what happened, and a confident wrong value is the failure mode.
-
-`prompt_hash` is still the literal `phase-2`. It is a placeholder for a prompt-framing
-version this code does not version, and left alone deliberately: inventing a hash of nothing
-would look like provenance while being exactly the kind of confident fiction this amendment
-exists to remove (V-81).
-
-### Amendment: the menu must state everything the validator enforces
-
-The capability menu now announces each capability's target requirement, derived from
-`TargetSemantics`. It did not, and a real model was asked for a `target` field it had never
-been told about, then refused three times for omitting it (V-80).
-
-The general rule: **a component that enforces a requirement is responsible for announcing
-it.** A validator that refuses output for omitting a field the model was never told about
-has found its own information gap, not the model's disobedience. The parser was not made
-more permissive to accommodate the model; the description was made complete.
-
-### Amendment trigger
-
-Re-read when TLS lands (V-77); when a user can store a provider credential (V-78); if a
-second provider is added, at which point the question is whether `ProviderConfig` was the
-right place for the shared parts; if a provider ever needs to be reachable without a
-credential; if anything else in the tree grows a `Default` that quietly decides whether a
-platform capability is present; or if the prompt framing is actually versioned, at which
-point `prompt_hash` becomes a real hash rather than the placeholder it is today.

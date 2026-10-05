@@ -1,6 +1,16 @@
 # 10 — Open Questions
 
-Status: **Draft v0.1**
+Status: **Draft v0.3** · Reconciled **2026-10-05** against `HEAD`.
+
+**This file says it contains "only unresolved items", and it did not — it also held three
+resolved answers as full records.** That is a defensible format and it is kept, but the
+header now says so, because a reader needs to know that a `✅ RESOLVED` entry here is a
+preserved answer rather than a live question.
+
+**Six entries changed status on 2026-10-05** because the code answered them, not because
+the questions got easier: Q-OPEN-14 (partly), Q-OPEN-15 (owner), Q-OPEN-16 (closed by
+delivery), Q-OPEN-18 (owner), Q-OPEN-20 (interim position falsified by delivery), and
+Q-OPEN-01 (interim position overtaken by a different mechanism). Each says which.
 
 This document contains **only unresolved items**. Anything decided is in
 `09-decisions.md`; anything required is in `00-system-requirements.md`.
@@ -13,6 +23,18 @@ last.
 ---
 
 ## Q-OPEN-01 — Telegram's ToS §1.5 and AI inference on message content 🔴 **BLOCKING for Telegram**
+
+> **Reconciled 2026-10-05 — still open, but the interim position was overtaken.** The
+> question is a legal one and it remains unanswered; ADR-0016 and V-16 still make Telegram
+> notification-output-only. What changed is the *enforcement*. The interim position said
+> "Phase 1 must build the adapter boundary capable of the notification-only implementation",
+> and **that was not built** — there is no messaging code at all
+> (`grep -rn telegram crates --include=*.rs` returns nothing). What shipped instead is
+> stronger for the case that does exist: reads are governed structurally rather than by
+> convention, with `filesystem/read-text` at `RiskClass::High` requiring approval per read,
+> and ADR-0045/ADR-0046 governing what may then be disclosed and to whom. So: no Telegram
+> adapter, no interim position, and the boundary it was meant to protect is enforced at a
+> different layer.
 
 **Question.** Telegram's API Terms §1.5 state:
 
@@ -287,6 +309,8 @@ Never silently show less and let the user approve blind.
 
 ## Q-OPEN-14 — What happens to a task whose *approval expires* mid-workflow? 🟡
 
+> **Reconciled 2026-10-05.** **Partly answered by the code, and the remaining half is V-82.** The per-step re-approval half of the interim position **shipped**: the approval digest is v3 and binds `step_no`, so one consent cannot cover a sibling step (ADR-0037, V-83). The scoped session-grant half is still prose — `grep -rn 'session_grant' crates` returns nothing. What the code actually does with an expired approval is recorded as **V-82**, still open: a proposal approved with an already-elapsed TTL becomes unrecoverable and can only be cancelled.
+
 **Question.** Approvals are short-lived and single-use (S6) and are never
 inherited by a retry. For a long workflow, does the user re-approve each
 consequential step (correct but tedious), or is there a scoped grant?
@@ -303,6 +327,8 @@ implementer, Phase 3.
 
 ## Q-OPEN-15 — Do we need a formal policy language for permissions? 🟢
 
+> **Reconciled 2026-10-05.** **Owner corrected; the question is still open.** The interim position — a hand-written, typed, testable evaluator — is what ships, and the limitation is now documented rather than theoretical: `BudgetLedger::permits_all` is **conjunctive**, so four per-risk ceilings are one constraint on a single number and "fund the cheap scope, zero the rest" silently refuses everything (V-61). The shipped budget is therefore a single `with_global` ceiling. Owner is no longer "implementer, Phase 3"; Phase 3 is shipped.
+
 **Question.** The policy engine evaluates permissions. At what complexity does a
 hand-written evaluator stop sufficating, and does that justify a rule language
 (a Datalog/POL/Rego-like system)?
@@ -318,6 +344,8 @@ the thing they wrap both apply.
 ---
 
 ## Q-OPEN-16 — Should the daemon be one process or a small supervisor + workers? 🟢
+
+> **Reconciled 2026-10-05.** **Closed by decision and delivery.** The interim position — one daemon, with Tier-1/2 adapters in separate processes — is what is built. `orxnud-daemon/src/lib.rs` is the composition root and owns the single-instance lock; a `Subprocess` capability runs as a real child under `bwrap`. The owner line still said "implementer, Phase 4", which was stale by two phases.
 
 **Question.** ADR-0004 puts everything in one daemon process with in-process
 adapters. Is that right, or should Tier 1/2 adapters each get a supervised
@@ -379,6 +407,8 @@ better on an unencrypted SSD and materially worse on rotational storage.
 
 ## Q-OPEN-18 — What is the recovery UX for a task that may have had a side effect? 🟡
 
+> **Reconciled 2026-10-05.** **Owner corrected; still open.** The `NeedsVerification` task state exists (`orxnud-domain/src/task_state.rs`) and is reachable, but nothing offers the three choices this question is about — assume succeeded, retry, verify externally — so the UX is unbuilt. Owner is no longer "implementer, Phase 3".
+
 **Question.** A crash during a non-idempotent step (a job application submitted,
 a message sent) leaves us unable to know whether the effect occurred. S7 says
 mark it `needs_verification` and require human confirmation. But how does the
@@ -410,6 +440,8 @@ default. Not ideal; honest.
 ---
 
 ## Q-OPEN-20 — What is the minimum viable "intelligence" for a first release? 🟡
+
+> **Reconciled 2026-10-05.** **The interim position was falsified by delivery, and should be read as superseded rather than as guidance.** It said start with *structured extraction and classification*, then tool selection, then planning. What shipped first was **tool selection**: `task/ai-propose` builds a menu walked from the capability registry (ADR-0039) and a real model chose `filesystem/write-text` (V-75). Extraction and classification are not started. Whether that was the right rung is now an open question rather than a settled one.
 
 **Question.** Phase 5 is "first AI provider". Is the first useful thing
 *intent classification*, *tool selection*, *planning*, or *summarisation*? The

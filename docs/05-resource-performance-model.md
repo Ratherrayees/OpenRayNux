@@ -1,6 +1,15 @@
 # 05 — Resource & Performance Model
 
-Status: **Draft v0.1** · **All targets are budgets to be measured, not claims.**
+Status: **Draft v0.2** · **All targets are budgets to be measured, not claims.**
+Reconciled **2026-10-05**.
+
+**Correction to three claims of enforcement in this document.** All three said "measured in
+CI" or "CI enforcement". None is true. There is no feature-combination matrix in
+`ci-gates.sh` or in `.github/workflows/ci.yml`, no committed RSS or binary-size baseline,
+and no gate that measures either. The underlying budgets are **unmeasured**, which V-25's
+own row already states. The claims are corrected here rather than softened, because a
+documented enforcement that does not exist is worse than an admitted gap — it is the
+failure V-79 records.
 Nothing in this document asserts a performance figure we have not observed.
 
 ---
@@ -143,7 +152,7 @@ expression is an unbounded financial instrument.
 This is the mechanism that makes the product honest about being lightweight, so
 it is enforced mechanically, not by intention.
 
-### 4.1 Tier 1 — the guarantee (measured in CI, contract-level)
+### 4.1 Tier 1 — the guarantee (**NOT currently measured in CI**, contract-level)
 
 A disabled capability:
 
@@ -188,7 +197,10 @@ A disabled capability must have:
 7. **No configuration surface** — a disabled capability's config keys are
    rejected, not ignored, so typos surface immediately.
 
-**CI enforcement:** a build matrix over feature combinations asserts (1)–(3)
+**CI enforcement: none exists.** This should be a build matrix over feature
+combinations asserting (1)–(3) against committed baselines. It is not implemented, and
+`scripts/run-resource-tests.sh` is not invoked by any workflow. The claim is recorded here
+as the *intended* enforcement so the gap is visible rather than assumed closed.
 against committed baselines. Drift beyond a stated threshold fails the build.
 The `all-features` binary size is recorded per release so regressions are
 visible in review.
@@ -227,7 +239,8 @@ What *is* true, and is the actual product promise:
 
 - **Core + CLI is genuinely tiny** (< 60 MB, < 40 MB disk).
 - **Every capability's cost is opt-in and attributable.**
-- **Disabled capabilities cost exactly nothing**, measured in CI.
+- **Disabled capabilities cost exactly nothing.** *Intended* to be measured in CI; no
+  baseline is committed and no gate measures it, so this is currently an assertion.
 - **A cloud-LLM + TUI + eSpeak-NG configuration stays in the low hundreds of MB**
   and is a genuinely good everyday assistant.
 

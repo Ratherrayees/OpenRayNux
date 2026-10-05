@@ -4,8 +4,17 @@ Status:
 
 ```text
 Phase 2 implementation: COMPLETE
-Windows verification:   OPEN (V-29)
+Windows verification:   PORTABILITY PROVEN, ISOLATION NOT PROVEN (V-29)
+                        [corrected 2026-10-05 — see below]
 ```
+
+**Correction, 2026-10-05.** This block read "Windows verification: OPEN (V-29)" and
+attributed the gap to this host lacking an MSVC C toolchain. That was true of the *Phase 2
+verification run* and is preserved below as the Phase 2 record, but it is no longer the
+whole truth: five Rust-level MSVC defects were found on a hosted Windows runner and fixed,
+all 16 crates now compile for MSVC, and both Windows CI lanes are green. **Windows
+*isolation* remains NOT_PROVEN** — there is still no Job Object or AppContainer backend, so
+a Tier-1 execution refuses rather than degrades (V-29, ADR-0035).
 
 These are separate. The Linux implementation is complete and verified; the Windows
 cross-check is unrun because this host has no MSVC C toolchain. V-29 is an open
@@ -38,7 +47,7 @@ happened are recorded as amendments A-001 … A-004 in
 
 | # | Deliverable | Where |
 |---|---|---|
-| 1 | Persistent storage: 7 task-layer tables, versioned migrations | `orxnud-store/src/schema.rs` |
+| 1 | Persistent storage: 7 task-layer tables, versioned migrations | *(Phase 2 record: 7 tables, schema v7. Since then `task_proposals` and `task_step_results` were added and the schema is at **v9** — see `CURRENT_VERSION` in `crates/orxnud-store/src/migration.rs`.)* | `orxnud-store/src/schema.rs` |
 | 2 | Snapshot-protected migration with restore-on-failure (ADR-0017) | `orxnud-store/src/backup.rs`, `migration.rs` |
 | 3 | The production task repository, all SQL in one crate (ADR-0006 §2) | `orxnud-store/src/task_repo.rs` |
 | 4 | The durable engine, implementing the unchanged `TaskEngine` | `orxnud-task/src/engine.rs` |
@@ -286,7 +295,7 @@ needing to be requeued so TP-11 is not satisfied vacuously.
 
 ## 10. Intentionally absent
 
-No LLM provider · no agent framework · no intent interpretation · no domain model
+No LLM provider · no agent framework · no intent interpretation *(superseded: `task/ai-propose` and a real HTTPS provider now exist — V-75, ADR-0040)* · no domain model
 (health, jobs, learning) · no GUI · no TUI behaviour · no voice · no messaging ·
 no browser automation · no MCP · no cloud deployment · no multi-tenancy · no
 device sync · no PostgreSQL / Redis / Kafka / Temporal / Restate / DBOS · no vector

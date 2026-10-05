@@ -4,17 +4,31 @@ Status:
 
 ```text
 Phase 4a implementation: COMPLETE
-Phase 4b (cgroup ceilings, Windows Job Objects): NOT STARTED
-Windows verification:     OPEN (V-29)
+Phase 4b (cgroup ceilings): **DONE** (Linux; V-46 PROVEN and mutation-verified, ADR-0036 closes `cgroup.kill`). Phase 4b-Windows: **NOT STARTED** — no Job Object backend. *Status block corrected 2026-10-05; see `docs/12` V-29.*
+Windows verification:     PORTABILITY PROVEN, ISOLATION NOT PROVEN (V-29). *Corrected
+                           2026-10-05: all 16 crates compile for MSVC and both Windows CI
+                           lanes are green. Isolation remains unproven -- no Job Object
+                           backend, so a Tier-1 execution refuses rather than degrades.*
 ```
 
 Phase 4a turned ADR-0009's two `declared_only` isolation properties into
 **process-level evidence**, and corrected a Phase 3 blocker that turned out to be a
 measurement error rather than a missing mechanism.
 
-**Known gap, deliberately recorded (V-50):** the sandbox is not yet reachable from the
-Phase 3 dispatcher. Nothing is registered and nothing runs unsandboxed, so there is no
-active exposure — but Phase 4a proves a boundary that no execution path yet enforces.
+**Known gap, recorded as V-50 — CLOSED, superseded 2026-10-05.** The text below is the
+Phase 4a record and is preserved as written: at the time, the sandbox had no consumer and
+Phase 4a proved a boundary nothing enforced. **V-51 closed it.** The governed path now
+runs end to end — `crates/orxnud-capability/src/subprocess.rs` holds the `SandboxRunner`,
+`tests/governed_path.rs` runs 24 tests through `Dispatcher::dispatch` against real
+sandboxed subprocesses, `tests/read_text_real.rs` adds 12 for a governed read, and
+`cli_e2e` drives the shipped binaries through the whole loop. Contract points 4 and 6
+remain `declared_only` **in the contract harness by decision**, because an in-process
+fixture cannot observe a namespace; the evidence lives in `tests/isolation.rs` (V-40).
+
+The original gap statement follows.
+
+The sandbox has no consumer. Nothing is registered and nothing runs unsandboxed, so there
+is no active exposure — but Phase 4a proves a boundary that no execution path yet enforces.
 Closing that is Phase 4b's first objective.
 
 ---
@@ -69,7 +83,7 @@ phase look blocked rather than merely unfinished.
 |---|---|---|---|
 | **Visibility** | PID + mount + net namespaces | Job Object / AppContainer | PROVEN |
 | **Tree lifetime** | `--unshare-pid` + `--die-with-parent` | Job Object kill-on-close | PROVEN |
-| **Resource ceilings** | cgroup v2 controllers | Job Object limits | **NOT PROVEN** |
+| **Resource ceilings** | cgroup v2 controllers | Job Object limits | **PROVEN on Linux since Phase 4b** (V-46; this row is the Phase 4a record and is preserved as written) | |
 
 A PID namespace gives visibility, not lifetime. A parent-death signal gives the direct
 child, not the subtree. `cgroup.kill` gives both, and is writable here — but the
@@ -204,3 +218,10 @@ capability is registered. No Phase 5+ feature. `CapabilityRegistry` still has no
 production registrations; the sandbox crate has no consumer yet, which is correct — the
 dispatcher integration is Phase 4b work once a governed execution path exists to hang
 it on.
+
+> **Every clause above is superseded, 2026-10-05.** Preserved as the Phase 4a record; the
+> current state is `docs/03` §9a. What is true now: a **real HTTPS provider exists**
+> (ADR-0030/0040, V-77), an **AI proposer** exists and a real model has answered through it
+> (V-75, live-run evidence), and **three capabilities are registered**
+> (`text/word-count`, `filesystem/write-text`, `filesystem/read-text`). The sandbox crate
+> **does** have a consumer. Still true: no GUI, TUI, voice, messaging, browser or MCP.

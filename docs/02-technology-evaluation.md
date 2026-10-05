@@ -1,6 +1,7 @@
 # 02 — Technology Evaluation
 
-Status: **Draft v0.1** · All versions verified 2026-09-30 against crates.io,
+Status: **Draft v0.2** · **Two verdict rows corrected 2026-10-05** — see below; the rest is
+a dated evaluation record and is preserved. · All versions verified 2026-09-30 against crates.io,
 npm registry, `nodejs.org`, `go.dev`. Sources in `docs/sources.md`.
 
 **Scoring note:** no numerical scores are used. Where a measurable quantity
@@ -40,9 +41,9 @@ Where judgement is involved, the reasoning is given and the trade-off is named.
 | | React 19 + Vite | — | — | Largest ecosystem, most hiring pool, most third-party components | Largest runtime, most boilerplate, reconciler overhead | Highest | Any webview | Same XSS model | ⚠️ **Viable alternative**, deliberately rejected on bundle/verbosity; cheap to switch since both run on Vite |
 | | TypeScript 7.0.2 | 7.0.2 (2026-07-08) | MS blog + `svelte-check` peers | 8–12× faster builds, 15 % less build memory | **Microsoft explicitly excludes Svelte**; no stable programmatic API until 7.1 | Lower build cost | — | — | ⛔ **Not for this stack** — revisit after 7.1 + Volar |
 | **TUI** | Ratatui | 0.30.2 (2026-06-19) | 19.6 M dl/30 d | De-facto Rust TUI; immediate-mode; excellent widgets | Not accessible (no AT-SPI), terminal-only | Negligible | Terminals only | N/A | **✅ ADOPT for the TUI** (NR-07 exemption documented) |
-| **CLI** | Clap | 4.6.7 (2026-09-14) | 240 M dl/30 d | Derive macros, completions, excellent UX | Verbose for a single command | Negligible | Universal | Arg parsing is an injection surface — must be explicit | **✅ ADOPT** |
+| **CLI** | Clap | 4.6.7 (2026-09-14) | 240 M dl/30 d | Derive macros, completions, excellent UX | Verbose for a single command | Negligible | Universal | Arg parsing is an injection surface — must be explicit | **❌ NOT USED** — *corrected 2026-10-05.* `clap` remains a workspace dependency and `orxnuctl` deliberately does **not** use it; the parser is hand-written, recorded in `crates/orxnuctl/Cargo.toml` as the smaller dependency for a closed verb set. |
 | **Task engine** | Hand-rolled on SQLite | — | design in §7 of ADR-0007 | Zero deps, exact durability semantics, inspectable rows, no extra process | We own the bugs | ~0 extra RSS | Universal | Single trust boundary | **✅ ADOPT** |
-| | `apalis` + `apalis-sqlite` | 0.7.4 / 1.0.0-rc.9 | 331 k dl/30 d | Ready-made queue, heartbeats, orphan recovery, priorities | SQLite backend is **RC only**, single maintainer, `synchronous` default **unverified** | In-process | Any | In-process | ⚠️ **Adopt if and only if** the durability pragma is verified correct; else hand-roll |
+| | `apalis` + `apalis-sqlite` | 0.7.4 / 1.0.0-rc.9 | 331 k dl/30 d | Ready-made queue, heartbeats, orphan recovery, priorities | SQLite backend is **RC only**, single maintainer, `synchronous` default **unverified** | In-process | Any | In-process | ⚠️ **Adopt if and only if** the durability pragma is verified correct; else hand-roll — **❌ REJECTED, the condition was evaluated and failed.** `SqliteStorage::setup()` sets `PRAGMA synchronous = OFF`, which fails TP-7. ADR-0032; Q-OPEN-02 resolved. |
 | | Temporal (Rust 1.0.0) | 1.0.0 (2026-09-04) | first-party, MIT | Industry-standard durable execution; first-party Rust | Requires **server + DB**; workflow code must be deterministic, fighting LLM nondeterminism | Process + DB | Cloud | Separate trust boundary | ⛔ local · ✅ **cloud profile** |
 | | Restate | 0.12.1 | first-party | Single binary; exactly-once; `ctx.sleep()`; **"durable agents"** is a first-class concept | SDK 0.x, self-declared breaking; still a second process; RocksDB not SQLite | Process | Cloud | Separate boundary | ⛔ local · ✅ **cloud profile, preferred** |
 | | LangGraph / LangChain | 1.2.12 | Python | Mature checkpointer model | Python; primary sources (incl. LangChain's own) advise against the abstraction | Interpreter + deps | — | Extra runtime | ❌ **Reject** |

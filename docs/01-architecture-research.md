@@ -1,6 +1,8 @@
 # 01 — Architecture Research
 
-Status: **Draft v0.1** · All version claims verified against primary registries on **2026-09-30**.
+Status: **Draft v0.2** · All version claims verified against primary registries on
+**2026-09-30**. One open question in §10 has since been closed; it is annotated in place
+rather than removed.
 Source URLs and access dates: `docs/sources.md`.
 
 This document records *what the ecosystem actually looks like today*, before any
@@ -453,7 +455,7 @@ argument for hand-rolling rests on the primary sources above, not on a number.
 
 | Item | Status |
 |---|---|
-| `apalis-sqlite`'s `PRAGMA synchronous` default | ⚠ unverified — blocks adoption for a power-loss guarantee |
+| `apalis-sqlite`'s `PRAGMA synchronous` default | ✅ **CLOSED 2026-10-05** — verified and it fails. `SqliteStorage::setup()` sets `PRAGMA synchronous = OFF`, which fails TP-7, so `apalis-sqlite` was rejected and ADR-0007's contingency closed (ADR-0032, Q-OPEN-02). Left in this table because a research record that hides its own open questions is worth less than one that shows them closing. |
 | `apalis-sqlite` WAL default | ⚠ unverified |
 | SQLite write-throughput ceiling on our hardware | **No authoritative number exists.** Must be measured, not cited. |
 | Independent 2026 benchmark of agent-framework overhead | does not exist |

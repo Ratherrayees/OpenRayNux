@@ -1,6 +1,15 @@
 # 07 — Extension & Capability Model
 
-Status: **Draft v0.1**
+Status: **Draft v0.3** · reconciled **2026-10-05** against `HEAD`.
+
+**Three claims here were fictional or wrong and are corrected in place.** The dispatcher
+diagram showed a ten-step order numbered 0–9 with approval verification at step 9 and a
+separate EGRESS stage; the implemented order is **nine** stages with approval at **stage 3**
+and no EGRESS stage, and the difference is a security property rather than bookkeeping. The
+manifest schema implied a signed YAML file; there is no manifest and nothing is signed —
+what exists is a compiled-in `CapabilityDeclaration` struct. The inventory listed 18
+planned capabilities including `filesystem` as Tier 0; **three** are registered, and
+`filesystem` is Tier 1 at `High` risk.
 
 ---
 
@@ -134,9 +143,24 @@ health_check:     { type: load-model, model: moonshine-tiny }
 `side_effects` and `reversibility` are the fields policy actually uses. Getting
 them right is a design task per capability, not a mechanical one.
 
-**Manifests are signed.** A capability from an untrusted source is identified as
-such regardless of what its manifest claims — the manifest is *data to be
-validated*, never an authority.
+**Manifests are signed.** **This claim is false of the implementation, corrected
+2026-10-05.** There is no manifest file, no manifest format, and no signing anywhere in the
+workspace. What exists is `CapabilityDeclaration` — a Rust struct in
+`crates/orxnud-capability/src/lib.rs` — with fields `id`, `display_name`, `risk`, `reads`,
+`writes`, `isolation`, `idempotent`, `params: ParamSpec`, `target: TargetSemantics` and
+`enabled`. Declarations are compiled into the binary, not loaded from disk, so there is
+nothing to sign and nothing to trust-but-verify at load time.
+
+The intent behind the original sentence is still right and is enforced differently: a
+declaration is *not* an authority. It says what calling a capability **means**, never what
+it does; `CapabilityInvocation` carries a private seal that only `orxnud-policy` can mint
+(ADR-0034). Two of the schema's fields have no counterpart in the old YAML sketch and both
+are load-bearing: `params` is the declared shape the proposer validates against (ADR-0039,
+V-76) and `target` is `TargetSemantics::{None, Optional, Required}`, which the proposer
+announces so a model is never asked for a field it was not told about (V-80).
+
+Dynamic loading remains future design under ADR-0009, and gate **G7** asserts the crate
+list so a new capability cannot arrive without appearing in the workspace manifest.
 
 ---
 
@@ -157,27 +181,52 @@ CapabilityInvocation {
 }
         │
         ▼
-   ┌─────────────────────────────────────┐
-   │  DISPATCHER  (the choke point)      │
-   │  0. AUTHORITY: may THIS actor do    │
-   │     this? (delegation chain valid,  │  ──▶ gate or deny  (S33, ADR-0027)
-   │     not expired, not revoked)       │
-   │  1. capability exists? version ok?  │  ──▶ deny
-   │  2. params validate vs contract?    │  ──▶ deny
-   │  3. data classes ⊆ task's classes?  │  ──▶ deny
-   │  4. POLICY: grant present?          │  ──▶ gate or deny  (S4, S5, S6)
-   │  5. BUDGET: within ceiling?         │  ──▶ deny          (S17)
-   │  6. EGRESS: consent for classes?     │  ──▶ deny          (S18)
-   │  7. AUDIT: record authorisation     │  ──▶ **must succeed** or deny
-   │  8. ISOLATION: tier, sandbox, limits │  ──▶ configure
-   │  9. VERIFY approval digest          │  ──▶ abort on mismatch (S6)
-   └──────────────┬──────────────────────┘
-                  ▼
-        adapter  ──▶  audit result
+   ┌──────────────────────────────────────────────┐
+   │  DISPATCHER  (the choke point)               │
+   │  1. AUTHORITY              who is asking,    │
+   │                            and on whose      │  ──▶ gate or deny  (S33, ADR-0027)
+   │  2. POLICY                 deterministic:    │
+   │                            allow, gate, deny │  ──▶ gate or deny  (S4, S5)
+   │  3. APPROVAL               digest-bound,     │
+   │                            single-use,      │  ──▶ abort on mismatch (S6)
+   │                            re-verified      │
+   │  4. BUDGET                 charged BEFORE    │
+   │                            execution        │  ──▶ deny          (S17)
+   │  5. CAPABILITY RESOLUTION  find an           │
+   │                            implementation   │  ──▶ deny
+   │  6. CREDENTIAL RESOLUTION  resolve a secret, │
+   │                            iff permitted     │  ──▶ deny
+   │  7. EXECUTION              call the adapter  │  ──▶ execute
+   │  8. VERIFICATION           did the effect    │  ──▶ verified / refuted /
+   │                            actually happen?  │      undetermined
+   │  9. AUDIT / FINAL STATE    hash-chained      │  ──▶ **must succeed**
+   └──────────────────┬───────────────────────────┘
+                      ▼
+            adapter  ──▶  audit result
 ```
 
-**Steps 0–7 are deterministic and synchronous. They cannot be skipped, because
-no other code path constructs a `CapabilityInvocation`.** That is the structural
+> **Corrected 2026-10-05 — this diagram was wrong, and it disagreed with `docs/03` §9.**
+> It showed a **ten**-step order numbered 0–9, with approval-digest verification at **step
+> 9** and a separate **EGRESS** stage. The implemented order is the **nine** stages above,
+> and the difference is not cosmetic:
+>
+> * **Approval is stage 3, not step 9.** `can_fulfil` / `authorise_for_dispatch` re-verify
+>   the digest *before* capability resolution and long before credential resolution, so a
+>   digest mismatch never reaches the secret store at all. The old diagram implied a peer
+>   could present a mismatched approval and still have stage 6 run.
+> * **There is no EGRESS stage.** Data-class consent is folded into the policy decision
+>   (stage 2). A separate stage would have been a second place the same rule is written.
+> * **Stage 7 is not synchronous.** For a `Subprocess` capability it is asynchronous
+>   subprocess work behind the sandbox supervisor.
+>
+> The authoritative list is the module documentation of
+> `crates/orxnud-capability/src/dispatch.rs`, which states the same nine stages and why
+> the order is not negotiable.
+
+**Stages 1–4 are deterministic and are performed inside `orxnud-policy`, not here.**
+That is deliberate: policy is the sole authority for its own decisions, and a dispatcher
+that reimplemented any of them would be a second authorisation system. **They cannot be
+skipped, because no other code path constructs a `CapabilityInvocation`.** That is the structural
 guarantee; a review checklist would not be.
 
 **Step 0 is authority, and it precedes everything else.** An `External` actor can
@@ -331,33 +380,56 @@ can establish. See ADR-0035.
 
 ---
 
-## 9. Capability inventory (initial, non-exhaustive)
+## 9. Capability inventory — what is registered at `HEAD`
 
-| Capability | Contract | Tier | Notes |
-|---|---|---|---|
-| `clock`, `calendar` | builtin | 0 | ICS + provider adapters |
-| `task-engine` | builtin | 0 | The core's own scheduler |
-| `filesystem` | builtin | 0 | Scoped, audited, deny-by-default |
-| `notify` | builtin | 0 | Per-platform |
-| `llm` | builtin | 0 | Provider-neutral; see ADR-0012 |
-| `memory` | builtin | 0 | Derived vs authoritative separation |
-| `search` (lexical) | builtin | 0 | SQLite FTS5 |
-| `http` | builtin | 0 | The HTTP-first browser tier |
-| `speech-to-text` | builtin | 1 | sherpa-onnx / parakeet / whisper-cpp / cloud |
-| `text-to-speech` | builtin | 1 | kokoro / espeak-ng / cloud |
-| `browser` | builtin | 1 | **opt-in**; dedicated profile; HTTP-first default |
-| `messaging` | builtin | 0/1 | Per provider; see §10 |
-| `mcp-host` | builtin | 0 | Client for Tier 2 |
-| `github` | builtin | 0 | API, not browser automation |
-| `email` | builtin | 0/1 | IMAP/SMTP; needs IDLE or polling |
-| `matrix` | builtin | 0 | The one user-account-sanctioned platform |
-| `web-search` | builtin | 0 | |
-| `domain-*` | builtin | 0 | Per FR-01 |
+**Three capabilities, and this is the whole list.** It comes from one function,
+`shipped_declarations()` in `crates/orxnud-daemon/src/lib.rs`, deliberately a single list
+so the registry, the adapter bundles and the policy table cannot drift apart — three
+hand-written lists eventually disagree, and the disagreement is a capability that is
+declared but unresolvable, or resolvable but undeclared.
 
-**Deliberately absent from v1:** WhatsApp, Discord user accounts, Signal, any
-vector-database capability, any dynamic-library plugin system.
+| id | Risk | Tier | Data classes | Target | Idempotent | Approval |
+|---|---|---|---|---|---|---|
+| `text/word-count` | `Low` | `InProcess` | `Public → Public` | `None` | **yes** | none; a standing grant suffices |
+| `filesystem/write-text` | `High` | `Subprocess` | `Public → Public` | `Required` | **no** | single-use, digest-bound **v3**, time-boxed |
+| `filesystem/read-text` | `High` | `Subprocess` | `Public → Public` | `Required` | **no** | single-use, digest-bound **v3**, time-boxed |
 
----
+Both `Subprocess` capabilities declare `ResourcePolicy.required` **empty** and state a
+budget (64 MiB, 16 processes, 1.0 core). That is a decision, not an omission: requiring a
+control would refuse the capability on any host that cannot delegate, for no security gain,
+so the host offers what it can and the gap is recorded in `ExecutionResult::unproven`
+(V-53, V-56). Both are deliberately **not idempotent**, so an uncertain outcome becomes
+`NeedsVerification` rather than a retry that would duplicate an effect (TP-2, TP-12).
+
+Neither grants more than one file inside a sandbox-controlled workspace. There is no
+directory creation, no deletion, no copy, no permission change, no shell and no network —
+and that narrowness is the point, because it is what the sandbox contract can actually
+enforce.
+
+### What this section previously claimed, and why it was wrong
+
+The old inventory listed 18 planned capabilities including `filesystem | builtin | Tier 0`
+and `llm | builtin | Tier 0`. Two of those rows were wrong in the direction that matters:
+
+* `filesystem` is not Tier 0. It is two **Tier-1 subprocess** capabilities, both `High`
+  risk, both requiring human approval. A reader told "Tier 0" would assume an in-process
+  call with no sandbox and no prompt.
+* `llm` is not an unbuilt Tier-0 placeholder. A real provider ships: one adapter speaking
+  OpenAI-compatible `chat/completions` over HTTPS, with the credential in the platform
+  secret store (ADR-0039, ADR-0040).
+
+The other 16 rows remain **future design** under ADR-0009 and are not marked "exists"
+because they do not.
+
+### MCP
+
+**Future design, and it stays outside the capability set.** ADR-0010 makes MCP an
+*external integration boundary*: something OpenRayNux calls or is called by, never a way to
+add capability to this process. No `orxnud-mcp` crate exists, no MCP client is linked, and
+no MCP server configuration is parsed. An MCP tool, if it ever arrives, would be reached
+through a governed `Subprocess` capability under the same nine stages as everything else —
+which is the whole reason the boundary is drawn there rather than in the core.
+
 
 ## 10. Messaging: a narrow common denominator, honestly
 
