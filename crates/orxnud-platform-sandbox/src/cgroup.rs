@@ -1369,6 +1369,9 @@ mod tests {
         assert_eq!(miss.controls, vec!["memory"]);
     }
 
+    // cgroup v2 does not exist off Linux, and the distinction under test is between two
+    // errno values the kernel returns for a cgroup write.
+    #[cfg(unix)]
     #[test]
     fn a_permission_failure_and_a_value_failure_are_different_kinds() {
         // `EPERM` and `EINVAL` on a control file mean opposite things, and the brief
