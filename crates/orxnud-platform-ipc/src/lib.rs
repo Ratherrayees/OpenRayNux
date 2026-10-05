@@ -128,15 +128,110 @@ fn peer_io(e: std::io::Error) -> IpcError {
 ///
 /// Byte-oriented on purpose: framing is the caller's business, because only the
 /// caller knows what a valid message is. [`LocalStream::read_line_bounded`] is
-/// "read one line, but never more than N bytes" is the single most important thing a
-/// provided because a "read one line, but never more than N bytes" contract is the
-/// one thing a line protocol must not get wrong, and getting it wrong is a\n/// memory-exhaustion bug rather than a parse error.
+/// "read one line, but never more than N bytes", and that bound is the one thing a
+/// line protocol must not get wrong, because getting it wrong is a
+/// memory-exhaustion bug rather than a parse error.
 pub struct LocalStream {
     inner: Inner,
 }
 
 #[cfg(unix)]
 type Inner = tokio::net::UnixStream;
+
+/// The stream a platform with no backend cannot have.
+///
+/// # Why this is a refusal and not a fake socket
+///
+/// The portable core names `LocalStream` in signatures it may not `cfg` — gate **G3**
+/// forbids `cfg` above this crate — so the type has to exist everywhere even where no
+/// connection can ever be made. The obvious ways to satisfy that are all wrong:
+///
+/// * `Option<tokio::net::UnixStream>` would need a Unix type in a non-Unix build.
+/// * A second `read_line_bounded` under `#[cfg]` would give Windows its own framing
+///   loop, which is precisely the second-implementation drift
+///   [`LocalStream`]'s shared-framing design exists to prevent.
+/// * A silent no-op stream would be the worst of the three: a Windows caller would
+///   read an empty buffer forever and conclude the peer was quiet.
+///
+/// So the field is a type with no transport behind it, and every operation on it
+/// refuses. This is the same posture [`Listener::Unsupported`] takes, one level down:
+/// the refusal lives in the platform crate, and the caller above meets
+/// [`IpcError::Unsupported`] at the three entry points that can actually reach a
+/// stream — [`bind`], [`Listener::accept`] and [`connect`] — rather than here.
+///
+/// It is deliberately unreachable rather than merely discouraged: no public path
+/// constructs a `LocalStream` without one of those three succeeding first, so this
+/// exists to make "the mechanism does not exist here" total instead of leaving it to
+/// an `unreachable!()` that would panic in a daemon.
+#[cfg(not(unix))]
+type Inner = RefusedStream;
+
+/// A peer stream for a platform where no local transport is implemented.
+///
+/// Zero-sized and never constructed; it exists so [`LocalStream`] compiles and so
+/// that any operation on one refuses rather than pretending to have read or written
+/// bytes. This is the `orxnud-platform-sandbox` `UnsupportedRunner` shape applied to
+/// the transport: refuse every operation, and say which facility is missing.
+#[cfg(not(unix))]
+struct RefusedStream;
+
+#[cfg(not(unix))]
+impl RefusedStream {
+    /// The single refusal every operation reports.
+    ///
+    /// [`std::io::ErrorKind::Unsupported`] rather than a connection error, because
+    /// nothing was ever connected: the message has to distinguish "this platform has
+    /// no transport" from "the peer misbehaved", or a reader will debug the wrong
+    /// layer.
+    fn refuse() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "no local IPC backend is implemented for {}: this host has no {}, so a \
+                 connected peer cannot exist here. Refusing rather than reporting an \
+                 empty read",
+                std::env::consts::OS,
+                "unix domain socket or Windows named pipe",
+            ),
+        )
+    }
+}
+
+#[cfg(not(unix))]
+impl tokio::io::AsyncRead for RefusedStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(RefusedStream::refuse()))
+    }
+}
+
+#[cfg(not(unix))]
+impl tokio::io::AsyncWrite for RefusedStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(RefusedStream::refuse()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(RefusedStream::refuse()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(RefusedStream::refuse()))
+    }
+}
 
 impl std::fmt::Debug for LocalStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -147,6 +242,11 @@ impl std::fmt::Debug for LocalStream {
 
 impl LocalStream {
     /// Wraps an accepted stream.
+    ///
+    /// `#[cfg(unix)]` because the real backend is the only thing that produces one.
+    /// On a platform with no backend this constructor must **not** exist: its absence
+    /// is what makes [`LocalStream`] uninhabited there, rather than merely unlikely.
+    #[cfg(unix)]
     fn wrap(inner: Inner) -> Self {
         Self { inner }
     }

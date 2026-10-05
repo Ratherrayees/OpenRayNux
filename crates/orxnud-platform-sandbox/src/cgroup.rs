@@ -1543,6 +1543,12 @@ mod tests {
 
     /// A handle that claims every controller is writable, for driving paths the host
     /// itself may not permit.
+    ///
+    /// `#[cfg(unix)]` with the test that calls it, for the reason the file records
+    /// above `a_failed_control_write_leaves_no_cgroup_behind`: the only caller is
+    /// Unix-gated, so an ungated helper is dead code there and an MSVC `--all-targets`
+    /// build fails on `-D warnings`.
+    #[cfg(unix)]
     fn claiming_everything() -> CgroupV2 {
         CgroupV2 {
             path: PathBuf::new(),
