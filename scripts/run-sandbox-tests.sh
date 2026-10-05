@@ -85,10 +85,23 @@ IMAGE="${ORXNUD_SANDBOX_IMAGE:-rust:1-bookworm}"
 # The suites whose subject is Tier-1 sandboxed execution. Listed here rather than left to
 # `cargo nextest run --workspace` so the lane's scope is visible in one place, and so
 # adding a sandbox-dependent suite is a deliberate edit to this file.
+# Namespace/visibility evidence only -- the part that depends on an unprivileged user
+# namespace, which is what this container reproduces.
+#
+# `orxnud-platform-sandbox`'s `enforcement` and `resources` binaries are deliberately NOT
+# here. They assert cgroup v2 ceilings bite, which needs *delegation*: writing a controller
+# file requires CAP_SYS_ADMIN over the hierarchy, so it requires a privileged container --
+# and that is a different question from "can this process isolate a subprocess". Granting
+# it here would mean granting CAP_SYS_ADMIN, which is precisely the configuration ADR-0046
+# rejects as evidence about the sandbox. Those suites have their own home and it is the
+# right one: `scripts/run-resource-tests.sh`, which runs them in a `--privileged
+# --cgroupns=host` container and says why that is not a sandbox-privilege question.
 SUITES=(
   "-p orxnud-capability --test governed_path"
   "-p orxnud-capability --test read_text_real"
-  "-p orxnud-platform-sandbox"
+  "-p orxnud-capability --test write_text"
+  "-p orxnud-platform-sandbox --test isolation"
+  "-p orxnud-platform-sandbox --lib"
   "-p orxnuctl --test cli_e2e"
 )
 
@@ -131,15 +144,19 @@ docker run --rm \
     # A real unprivileged user, and a build cache it owns, so `setpriv` can drop every
     # capability and still write to /target.
     useradd --create-home --uid 1000 orxnud
-    chown -R orxnud /target /usr/local/cargo/registry
+    chown -R orxnud /usr/local/cargo/registry
     chmod -R a+rX /usr/local/cargo
 
-    # Build as root (so the caches stay writable and warm across runs) and *run* the
-    # tests as the unprivileged user. The split is deliberate: the security-relevant
-    # process is the one that spawns bwrap, and that must be unprivileged.
-    for suite in '"${SUITES[*]}"'; do :; done
-    cargo nextest build $(for s in '"${SUITES[*]}"'; do echo $s; done) >/dev/null 2>&1 || \
-      cargo test --workspace --no-run >/dev/null
+    # Build as root, so the caches stay writable and warm across runs, and *run* as the
+    # unprivileged user. The split is deliberate: the security-relevant process is the
+    # one that spawns bwrap, and that must be unprivileged.
+    #
+    # The chown AFTER the build is load-bearing, and it exists because CI found it: a root
+    # build creates root-owned files under /target, and the unprivileged `cargo run` then
+    # cannot open `/target/debug/.cargo-build-lock`. Chowning before the build is not
+    # enough, because the build is what makes the files root-owned again.
+    cargo nextest build $(for s in '"${SUITES[*]}"'; do echo $s; done) >/dev/null
+    chown -R orxnud /target
 
     exec setpriv --reuid=1000 --regid=1000 --clear-groups \
                  --inh-caps=-all --bounding-set=-all -- \

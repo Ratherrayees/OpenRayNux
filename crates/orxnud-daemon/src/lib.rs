@@ -140,7 +140,6 @@ impl Paths {
     ///
     /// If the directory cannot be created.
     pub fn ensure_workspace(&self) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         let ws = self.workspace();
         if ws.is_dir() {
             return Ok(());
@@ -148,7 +147,12 @@ impl Paths {
         std::fs::create_dir_all(&ws)?;
         // Owner-only, like the database and the socket: this tree holds the output of a
         // High-risk capability, so it must not be group- or world-readable.
-        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700))
+        //
+        // Asked of the platform crate rather than done here. It used to be an
+        // unconditional `std::os::unix::fs::PermissionsExt` in this file, which gate G3
+        // could not see -- it greps for `cfg`, not for a platform API -- and which broke
+        // the MSVC build outright.
+        orxnud_platform_fs::restrict_to_owner(&ws)
     }
 
     /// Every path this configuration would use, for `doctor` output.

@@ -134,8 +134,8 @@ pub fn host_backend_mechanism() -> &'static str {
 /// build select", so on Linux it says `bwrap` on a host where `bwrap` cannot create a
 /// user namespace and every Tier-1 dispatch is refused. That gap is how a red CI run and
 /// a `doctor` line reading `sandbox backend: bwrap` coexisted with zero sandboxed
-/// execution. [`tier1_executable`] is the runtime answer, and it is the one that
-/// decides whether work runs.
+/// execution. [`HostCapability::tier1_executable`] is the runtime answer, and it is the
+/// one that decides whether work runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostCapability {
     /// Which backend the build selected. Compile-time.
@@ -147,7 +147,7 @@ pub struct HostCapability {
     /// Whether a Tier-1 dispatch can be fulfilled on this host.
     ///
     /// [`AvailableGuarantees::check`] against the *default*
-    /// [`IsolationRequirements`] — `Visibility::Namespaced` plus
+    /// [`crate::contract::IsolationRequirements`] — `Visibility::Namespaced` plus
     /// `TreeLifetime::Required`, which is what every Tier-1 contract asks for before a
     /// capability adds anything. So `false` means a Tier-1 capability is refused here,
     /// and that refusal is correct rather than a defect.

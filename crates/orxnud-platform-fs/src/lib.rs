@@ -276,6 +276,43 @@ fn is_runnable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Restricts `dir` to its owner, as far as this platform can express that.
+///
+/// # Why it lives here
+///
+/// It was in `orxnud-daemon` as an unconditional `std::os::unix::fs::PermissionsExt`,
+/// which is a mistake with two faces. Gate **G3** greps for `cfg`, and this code had
+/// none, so the gate passed -- while the MSVC build failed outright, because
+/// `PermissionsExt` does not exist on Windows. V-29's "consequence of drift" predicted
+/// exactly this: *G3 only greps for `cfg`, not for a Linux type name.* A platform API
+/// used without a `cfg` is the same defect wearing a different hat.
+///
+/// So the branch lives here, where `cfg` is permitted, and the portable core asks for the
+/// behaviour rather than reaching for the mechanism.
+///
+/// # What it does off Unix
+///
+/// Windows has no POSIX mode bits, and a portable owner-only spelling needs
+/// `windows-sys` plus `unsafe` -- which gate **G4** forbids outside a platform crate that
+/// has opted in, and this one has not. Rather than invent a weaker-looking call that reads
+/// as though the restriction happened, this returns `Ok(())` and records the limit: a
+/// directory created under a per-user state root already inherits a per-user ACL, so the
+/// protection the caller wanted is present by a different mechanism. Windows sandbox
+/// isolation as a whole remains **NOT_PROVEN** (ADR-0035, V-29); this says nothing about
+/// it.
+pub fn restrict_to_owner(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
