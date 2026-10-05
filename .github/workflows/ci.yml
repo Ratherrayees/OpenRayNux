@@ -233,7 +233,14 @@ jobs:
 
       # A cold build of the workspace, including bundled SQLite. Cached after the first
       # run, which is why the timeout is generous rather than tight.
-      - name: Run the Tier-1 suites in a production-configuration container
+      #
+      # On `ubuntu-latest` this job currently *reports* that the environment cannot create
+      # an unprivileged user namespace and produces no positive Tier-1 evidence -- measured,
+      # not assumed, and printed on every run. It still runs because the measurement is the
+      # point: it is the only place the gap is recorded against the exact image it happens
+      # on. It is not made green by disabling AppArmor or granting a capability, both of
+      # which `scripts/run-sandbox-tests.sh` declines in more words.
+      - name: Measure the environment and run the Tier-1 suites if it can isolate
         run: ./scripts/run-sandbox-tests.sh
 
   # A dedicated lane for the portable-core claim, because it is the one gate whose

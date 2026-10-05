@@ -1276,11 +1276,6 @@ fn a_high_risk_capability_refuses_without_an_approval_and_writes_nothing() {
     ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
 )]
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "a Tier-1 capability needs a sandbox, and the host backend on this \
-             platform is a refusal rather than a sandbox"
-)]
 fn an_approval_for_one_write_cannot_be_reused_for_different_contents() {
     let root = dir("write-substitute");
     let daemon = Daemon::start(&root);
