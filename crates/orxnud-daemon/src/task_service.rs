@@ -35,7 +35,9 @@ use orxnud_domain::task_state::TaskState;
 use orxnud_store::StoreError;
 use orxnud_store::migration::MigrationRunner;
 use orxnud_store::sqlite::Store;
-use orxnud_store::task_repo::{ClaimRefusal, ClaimedTask, NewTask, ProposalRow, TaskRow};
+use orxnud_store::task_repo::{
+    ClaimRefusal, ClaimedTask, NewTask, ProposalRow, TargetedClaimOutcome, TaskRow,
+};
 use orxnud_task::engine::{ClaimAttempt, TaskCreation};
 use orxnud_task::scheduler::{PassReport, Scheduler};
 use orxnud_task::{DurableEngine, EngineError, EngineLimits};
@@ -635,6 +637,38 @@ impl TaskService {
         {
             ClaimAttempt::Claimed(c) => Ok(*c),
             ClaimAttempt::Refused(r) => Err(TaskFault::NotClaimable(r)),
+        }
+    }
+
+    /// Claims the next logical step of a task sitting at a step boundary.
+    ///
+    /// The service's route to the one targeted continuation claim (ADR-0043). Separate
+    /// from [`Self::claim_task`] on purpose: that one picks up work that has never
+    /// started, and this one advances a task which has already completed a step. A
+    /// polling worker must not be able to advance a boundary merely by observing it.
+    ///
+    /// Reports the refusal rather than collapsing it, so the caller can tell "this task
+    /// was not at a boundary" from "another worker got there first" from "its budget is
+    /// spent" instead of a single opaque error.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::NotClaimable`] with the stated [`ClaimRefusal`], or
+    /// [`TaskFault::Stopped`] after [`Self::shutdown`].
+    pub fn claim_next_step(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<ClaimedTask, TaskFault> {
+        self.guard_running()?;
+        match self
+            .engine
+            .claim_next_step(id, worker, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))?
+        {
+            TargetedClaimOutcome::Claimed(c) => Ok(*c),
+            TargetedClaimOutcome::Refused(r) => Err(TaskFault::NotClaimable(r)),
         }
     }
 

@@ -492,7 +492,7 @@ Five jobs, all green on run `37343986458` (2026-10-05):
 
 | Job | Trigger | What it proves |
 |---|---|---|
-| `linux-gates` (G1–G11) | every push and PR | the twelve gates, 1244 tests under the measured scope |
+| `linux-gates` (G1–G11) | every push and PR | the twelve gates, over the host-applicable test scope |
 | `windows-check` | nightly | all 16 crates compile for MSVC, all targets |
 | `windows-portability` | every push and PR | the platform-neutral suites **run** on Windows, not merely compile |
 | `portable-core` | every push and PR | the portable core builds for `wasm32-unknown-unknown` |
@@ -507,7 +507,7 @@ than the work.
 
 ### The current baseline, precisely
 
-* **1360 tests, 1360 passed, 0 failed, 5 skipped** locally on a host that can create an
+* **1372 tests, 1372 passed, 0 failed, 5 skipped** locally on a host that can create an
   unprivileged user namespace.
 * The **5 skips** are `#[ignore]`d child-process entry points — re-exec targets for
   power-loss and failure injection, and the hostile sandbox helper. They are entry points,
@@ -523,9 +523,19 @@ than the work.
   Both are pre-existing, both are `cgroup.kill` subtree tests, and **neither is a failure** —
   they pass. Recorded as a range rather than a number because a fixed figure here would be
   wrong within a week, which is the failure this whole document was corrected for.
-* On the hosted runner, G9 runs **1244** tests, not 1360, and all 1244 pass. The
+* On the hosted runner, G9 runs fewer tests, not all of them, and all of those pass. The
   difference is the Tier-1 sandbox-evidence suites, which the runner cannot execute; the
-  gate prints which ones it excluded and why.
+  gate prints which ones it excluded and why. The exact figure is not recorded here because
+  it moves with the suite list and a stale number is worse than none — read it from the run.
+
+  **Continuation is sandbox evidence, and that is a property of the code rather than a
+  choice about the tests.** Reaching `AwaitingNextStep` requires a *verified* effect, and
+  `text/word-count` deliberately returns `Undetermined` rather than `Verified` — counting
+  words has no effect to observe — so `filesystem/write-text` is the only capability that can
+  put a task at a boundary. Five of the nine tests in `tests/continuation.rs` are therefore
+  named in the G9 exclusion list and run in the ADR-0046 container; the four that do not
+  execute a capability — the boundary race, the `max_steps` bounds, the `done`-shape
+  refusals, and the prior-step disclosure shape — run on every host.
 
 ### What a green CI run does and does not prove
 
@@ -545,7 +555,7 @@ evidence only on a host that can create one**, which is a developer machine
 `sandbox-integration` job reports this rather than weakening anything to hide it (V-85,
 V-86, V-87, ADR-0046).
 
-So: **1360 passing tests and a green run are not the same claim, and neither is positive
+So: **a green run and a full local suite are not the same claim, and neither is positive
 hosted Tier-1 isolation evidence.** That evidence does not exist in GitHub-hosted CI and
 this document now says so where a reader would otherwise assume it.
 

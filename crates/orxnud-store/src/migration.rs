@@ -154,10 +154,19 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "task_attempt_step_scope",
         sql: crate::schema::MIGRATION_ATTEMPT_STEP_SCOPE,
     },
+    Migration {
+        // The same widening `task_approvals` was owed and did not get in version 9. Every
+        // logical step starts its attempt counter again, so a second step's approval
+        // collided with the first step's on `(task_id, attempt_no)` and was silently
+        // dropped by an `INSERT OR IGNORE`. Forward, for the same reason as version 9.
+        version: 10,
+        name: "task_approval_step_scope",
+        sql: crate::schema::MIGRATION_APPROVAL_STEP_SCOPE,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 9;
+pub const CURRENT_VERSION: u32 = 10;
 
 /// Applies pending migrations.
 #[derive(Debug)]

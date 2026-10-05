@@ -24,13 +24,13 @@ capability set. One surface ships today.
 | | |
 |---|---|
 | Workspace | 16 Rust crates, 1.98.1, gate-enforced dependency direction |
-| Storage | SQLite (bundled, ≥ 3.51.3), schema at **v9**, snapshot-protected migrations |
+| Storage | SQLite (bundled, ≥ 3.51.3), schema at **v10**, snapshot-protected migrations |
 | Task engine | Durable, hand-rolled; passes all 12 ADR-0029 properties from a second test binary |
 | Governance | 9-stage dispatcher; `CapabilityInvocation` cannot be constructed outside `orxnud-policy` |
 | Audit | Append-only, hash-chained, durable, survives restart |
 | Approvals | Single-use, digest-bound **v3**, time-boxed, bound to an approver *and* a logical step |
 | Sandbox | Tier-1 execution under `bubblewrap`; cgroup v2 ceilings where the host delegates |
-| Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 14 methods |
+| Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 15 methods |
 | CLI | `orxnuctl` — hand-written parser, 5 verb groups |
 | Daemon | `orxnud` — composition root, single-instance lock, serves the socket |
 | Provider | **One real HTTPS provider**, TLS with chain and hostname verification |
@@ -117,7 +117,9 @@ The 4c *governance core* is delivered. The loop that would drive it is not.
 
 * **`AwaitingNextStep`, step-scoped attempts and approvals, and `claim_next_step()` exist
   and are tested — and nothing in production calls it.** No IPC method reaches it. A
-  multi-step task stops at the boundary *by design*, not by accident (ADR-0043, V-84).
+  multi-step task stops at the boundary *by design*, not by accident (ADR-0043, V-84). The
+  boundary is now crossed by `task/continue`, which claims one step and proposes the next
+  through the ordinary approval gate (ADR-0047).
 * **`PriorStepContext` exists and is tested; the observation store exists and is tested; the
   daemon's runtime does not read or write it.** A model can propose a read and has nowhere
   to receive the bytes. `3c8a413` names itself the rollback point immediately before moving
@@ -128,11 +130,12 @@ The 4c *governance core* is delivered. The loop that would drive it is not.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**1360 tests, 1360 passed, 5 skipped** locally, with 1–2 *leaky* results depending on
+**1372 tests, 1372 passed, 5 skipped** locally, with 1–2 *leaky* results depending on
 scheduling — both are pre-existing `cgroup.kill` tests that pass and are named in
-[`08`](08-testing-engineering-standards.md) §19. On the hosted runner, gate G9 runs
-**1244** and all 1244 pass — the difference is the Tier-1 sandbox-evidence suites, which the
-runner cannot execute, and the gate prints which it excluded and why.
+[`08`](08-testing-engineering-standards.md) §19. On the hosted runner, gate G9 runs fewer
+and all of those pass — the difference is the Tier-1 sandbox-evidence suites, which the
+runner cannot execute, and the gate prints which it excluded and why. The hosted figure is
+read from the run rather than recorded here, because it moves with the suite list.
 
 **A green CI run proves:** twelve gates on Linux; every crate compiles for MSVC; the
 platform-neutral suites behave on real Windows; the portable core is portable; and on the
@@ -169,7 +172,7 @@ Tier-1 evidence should live, since GitHub-hosted runners cannot supply it.
 |---|----------|----------------|
 | **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, and **§9a: where the implementation actually stands.** |
 | **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 86 entries: every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
-| **09** | [Architecture Decision Records](09-decisions.md) | 44 ADRs, ADR-0001…ADR-0046 (0041 and 0042 deliberately unused). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
+| **09** | [Architecture Decision Records](09-decisions.md) | 45 ADRs, ADR-0001…ADR-0047 (0041 and 0042 deliberately unused). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
 | **06** | [Deployment & Platform Model](06-deployment-platform-model.md) | Profiles, the platform boundary, and **§2.3: the honest per-platform assessment.** |

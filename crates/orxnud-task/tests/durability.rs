@@ -285,9 +285,9 @@ fn an_approval_recorded_before_a_restart_is_still_scoped_to_its_attempt() {
         e.record_approval(&approval).expect("record");
     }
     let e = engine(&path);
-    assert!(e.approval_for(&tid("t"), 1).expect("read").is_some());
+    assert!(e.approval_for(&tid("t"), 1, 1).expect("read").is_some());
     assert!(
-        e.approval_for(&tid("t"), 2).expect("read").is_none(),
+        e.approval_for(&tid("t"), 1, 2).expect("read").is_none(),
         "attempt 2 must not inherit, even across a restart"
     );
     let _ = std::fs::remove_dir_all(&d);

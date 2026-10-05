@@ -179,7 +179,7 @@ pub enum CliError {
 
     /// A `task` verb that does not exist.
     #[error(
-        "unknown task command {0:?}; expected create, list, claim, complete, cancel, propose, execute or ai-propose"
+        "unknown task command {0:?}; expected create, list, claim, complete, cancel, propose, execute, ai-propose or continue"
     )]
     UnknownTaskCommand(String),
 
@@ -407,8 +407,28 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
         "create" => {
             let id = flags.take("create", "--id")?;
             let kind = flags.take_optional("--kind");
+            let max_steps = flags
+                .take_optional("--max-steps")
+                .map(|raw| {
+                    raw.parse::<u32>().map_err(|_| {
+                        CliError::BadArgument(format!(
+                            "--max-steps must be a whole number, not {raw:?}"
+                        ))
+                    })
+                })
+                .transpose()?;
             let content = flags.into_content();
-            TaskCommand::Create { id, kind, content }
+            // Sent as a JSON number, not as the string the user typed. The wire stays
+            // strict -- one spelling of a number, decided by the daemon -- while this is
+            // only about accepting what a person types. The *bounds* are not duplicated
+            // here: `0` and `1000` are sent on and refused by the daemon, which owns the
+            // invariant, so the CLI and the daemon cannot disagree about what is legal.
+            TaskCommand::Create {
+                id,
+                kind,
+                content,
+                max_steps,
+            }
         }
         "list" => {
             flags.reject_all("list")?;
@@ -446,6 +466,12 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
             let worker = flags.take("ai-propose", "--worker")?;
             flags.reject_all("ai-propose")?;
             TaskCommand::AiPropose { task, worker }
+        }
+        "continue" => {
+            let task = flags.take("continue", "--task")?;
+            let worker = flags.take("continue", "--worker")?;
+            flags.reject_all("continue")?;
+            TaskCommand::Continue { task, worker }
         }
         "execute" => {
             let proposal = flags.take("execute", "--proposal")?;
@@ -614,9 +640,13 @@ impl Flags {
         // question, answered by what that verb `take`s and by `reject_all` refusing
         // whatever is left -- so `task create --target x` parses here and is then
         // refused by the verb, rather than being invisible to the task parser.
-        const KNOWN: [&str; 10] = [
+        const KNOWN: [&str; 11] = [
             "--id",
             "--kind",
+            // How many logical steps a task may have. Optional, and defaulted by the
+            // daemon to one, so a task that does not need continuation stays a short
+            // command.
+            "--max-steps",
             "--worker",
             "--capability",
             "--params",
@@ -1209,6 +1239,7 @@ mod tests {
                 id: "t1".to_owned(),
                 kind: None,
                 content: Some("buy milk".to_owned()),
+                max_steps: None,
             }),
             "bare words join into the content"
         );
@@ -1220,6 +1251,7 @@ mod tests {
                 id: "t1".to_owned(),
                 kind: Some("workflow".to_owned()),
                 content: Some("ship".to_owned()),
+                max_steps: None,
             })
         );
         assert_eq!(

@@ -2021,3 +2021,207 @@ fn the_ai_proposer_cannot_approve_or_execute() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The whole loop as a person performs it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_person_can_run_a_two_step_task_through_continue_and_the_capability_approve_gate() {
+    let root = dir("multi-step");
+    let daemon = Daemon::start(&root);
+
+    // A task is single-step unless it asks for more, so asking is the first thing that
+    // makes a boundary reachable at all.
+    let created = daemon.cli(&[
+        "task",
+        "create",
+        "--id",
+        "ms1",
+        "--max-steps",
+        "2",
+        "write",
+        "cli.txt",
+    ]);
+    assert!(created.status.success(), "{}", stderr_of(&created));
+    assert!(
+        stdout_of(&created).contains("max_steps: 2"),
+        "{}",
+        stdout_of(&created)
+    );
+
+    let claimed = daemon.cli(&["task", "claim", "--id", "ms1", "--worker", "w1"]);
+    assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+
+    // Step 1, proposed by the model.
+    let first = daemon.cli(&["task", "ai-propose", "--task", "ms1", "--worker", "w1"]);
+    assert!(first.status.success(), "{}", stderr_of(&first));
+    let p1 = propose_id(&first);
+
+    let a1 = daemon.cli(&[
+        "capability",
+        "approve",
+        "--proposal",
+        &p1,
+        "--ttl-ms",
+        "60000",
+    ]);
+    assert!(a1.status.success(), "{}", stderr_of(&a1));
+
+    let x1 = daemon.cli(&["task", "execute", "--proposal", &p1, "--worker", "w1"]);
+    if !print_host_environment(&daemon) {
+        // Everything above is host-independent. A host that cannot isolate is asserted as
+        // the fail-closed refusal rather than skipped, per the same rule as the other
+        // Tier-1 tests.
+        assert_tier1_refused(&x1, &root, "cli.txt");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    assert!(x1.status.success(), "{}", stderr_of(&x1));
+    assert!(
+        stdout_of(&x1).contains("verified: true"),
+        "{}",
+        stdout_of(&x1)
+    );
+
+    // The verified step parked the task at a boundary rather than finishing it.
+    let listed = daemon.cli(&["task", "list"]);
+    assert!(
+        stdout_of(&listed).contains("awaiting-next-step"),
+        "{}",
+        stdout_of(&listed)
+    );
+    assert!(
+        !stdout_of(&listed).contains("completed"),
+        "a two-step task must not finish on its first step: {}",
+        stdout_of(&listed)
+    );
+
+    // One `continue`: crosses the boundary and proposes step 2, ending in approval.
+    let next = daemon.cli(&["task", "continue", "--task", "ms1", "--worker", "w1"]);
+    assert!(next.status.success(), "{}", stderr_of(&next));
+    let out = stdout_of(&next);
+    assert!(out.contains("step: 2"), "{out}");
+    assert!(out.contains("waiting_for: human-approval"), "{out}");
+    assert!(out.contains("proposed_by: ai"), "{out}");
+    let p2 = propose_id(&next);
+    assert_ne!(p2, p1, "the second step needs its own proposal");
+
+    // Continuing is not a way around the approval gate.
+    let early = daemon.cli(&["task", "execute", "--proposal", &p2, "--worker", "w1"]);
+    assert!(
+        !early.status.success(),
+        "an unapproved continuation must fail"
+    );
+
+    let a2 = daemon.cli(&[
+        "capability",
+        "approve",
+        "--proposal",
+        &p2,
+        "--ttl-ms",
+        "60000",
+    ]);
+    assert!(a2.status.success(), "{}", stderr_of(&a2));
+    let x2 = daemon.cli(&["task", "execute", "--proposal", &p2, "--worker", "w1"]);
+    assert!(x2.status.success(), "{}", stderr_of(&x2));
+    assert!(
+        stdout_of(&x2).contains("verified: true"),
+        "{}",
+        stdout_of(&x2)
+    );
+
+    // Both steps done, and `max_steps` finished the task without a `done` answer.
+    // `task list` renders a table, so the state is read as a word in the row.
+    let listed = daemon.cli(&["task", "list"]);
+    let text = stdout_of(&listed);
+    assert!(text.contains("ms1"), "{text}");
+    assert!(
+        text.contains("completed"),
+        "the task must be completed: {text}"
+    );
+    assert!(
+        !text.contains("awaiting-next-step"),
+        "the task must not still be at a boundary: {text}"
+    );
+
+    // And there is no third step, because `max_steps` is the bound.
+    let over = daemon.cli(&["task", "continue", "--task", "ms1", "--worker", "w1"]);
+    assert!(!over.status.success(), "a finished task cannot continue");
+    assert!(
+        stderr_of(&over).contains("not-at-boundary"),
+        "{}",
+        stderr_of(&over)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An impossible `--max-steps` is refused by the daemon, not clamped by the CLI.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn an_impossible_max_steps_is_refused_rather_than_clamped() {
+    let root = dir("max-steps-bounds");
+    let daemon = Daemon::start(&root);
+
+    // Nonsense syntax is the CLI's to refuse, naming the flag the user typed.
+    let nonsense = daemon.cli(&[
+        "task",
+        "create",
+        "--id",
+        "bad",
+        "--max-steps",
+        "abc",
+        "do",
+        "it",
+    ]);
+    assert!(!nonsense.status.success(), "abc is not a step count");
+    assert!(
+        stderr_of(&nonsense).contains("--max-steps"),
+        "{}",
+        stderr_of(&nonsense)
+    );
+
+    // Impossible values are the daemon's to refuse: it owns the invariant, so the CLI
+    // cannot become the place where a bound is quietly enforced twice.
+    for bad in ["0", "1000"] {
+        let out = daemon.cli(&[
+            "task",
+            "create",
+            "--id",
+            "bad",
+            "--max-steps",
+            bad,
+            "do",
+            "it",
+        ]);
+        assert!(
+            !out.status.success(),
+            "--max-steps {bad} must be refused, not stored: {}",
+            stdout_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("max_steps"),
+            "the daemon's refusal must name the field: {}",
+            stderr_of(&out)
+        );
+    }
+
+    // Nothing was created, so the task list has no such row.
+    let listed = daemon.cli(&["task", "list"]);
+    assert!(
+        !stdout_of(&listed).contains("bad"),
+        "{}",
+        stdout_of(&listed)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

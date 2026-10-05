@@ -11,7 +11,8 @@ workspace manifest. Where a row describes something that does **not** exist, it 
 present tense, which made it impossible to tell a reader what was real. That distinction
 is now load-bearing rather than cosmetic, because the milestone boundary in
 [`12-verification-register.md`](12-verification-register.md) depends on it: the 4c
-*governance core* is delivered and the 4c *runtime wiring* is deliberately absent.
+*governance core* and its continuation wiring are delivered, and the 4c *observation
+wiring* is deliberately absent.
 
 ---
 
@@ -611,16 +612,44 @@ durable before approval (ADR-0038), approvals name their approver and bind the l
 into a **v3** digest (ADR-0037, V-83), and the durable proposal records the model that
 actually answered rather than a configured name (V-81).
 
-### Delivered as governance primitives, with the runtime wiring deliberately absent
+### Multi-step composition: the boundary is now crossed (ADR-0047)
 
-Stage 4c's *core* exists and is well tested. What does not exist is the loop that drives
-it. Both gaps are deliberate and both are recorded:
+`AwaitingNextStep` is a task state, attempts and approvals are scoped to a logical step, and
+`TaskRepository::claim_next_step()` is the only thing that advances a boundary.
 
-* **Multi-step composition.** `AwaitingNextStep` is a task state, attempts and approvals
-  are scoped to a logical step, and `TaskRepository::claim_next_step()` is the only thing
-  that advances a boundary. **No production code calls it** — the daemon exposes no IPC
-  method that reaches it — so a multi-step task stops at the boundary by design (ADR-0043,
-  V-84). The generic claim path is deliberately still `Pending`-only, and a test pins that.
+`task/continue` is now the production caller, and `orxnuctl task continue` is how a user
+reaches it. **One call crosses one boundary** — claim the next step, ask the provider what it
+should do, persist the result as an ordinary durable proposal — and then stops, in
+`WaitingForUser`, exactly where `task/ai-propose` leaves a task. It does **not** execute, so
+a continued step re-enters `task/ai-propose` → approval → dispatcher → sandbox →
+verification → audit with no continuation-specific shortcut. There is no loop here to bound:
+each call is one boundary and at most one provider call, and `max_steps` remains the only
+thing bounding a task's length (ADR-0043).
+
+Three things had to be true before the call could exist, and each was a finding rather than
+a design choice:
+
+* **`max_steps` had to be settable.** It defaulted to 1 in the schema and `NewTask` had no
+  field for it, so every task completed on its first verified effect and no task could reach
+  a boundary at all. `task/create` takes an optional `max_steps`, defaulting to one,
+  validated and never clamped, bounded at 64.
+* **The approvals table had to be able to hold two steps.** The attempt counter resets at a
+  boundary, so `attempt_no` restarts at 1 per step and `(task_id, attempt_no)` names two
+  different approvals. `INSERT OR IGNORE` discarded step 2's silently. Schema **10** rebuilds
+  `task_approvals` on `(task_id, step_no, attempt_no)`, the treatment `task_attempts` already
+  had.
+* **A terminal answer needed a name.** `{"done": true, "summary": ...}` is a second declared
+  shape, not a capability, so it carries no target, no parameters and nothing that could be
+  executed or smuggled past the allowlist. The runtime completes the task through the same
+  fenced completion every other terminal report uses; `steps_completed` does not move.
+
+If the provider cannot be asked after the boundary is crossed, the boundary is released and
+the task is retryable — otherwise one outage would strand it holding a lease for a step that
+will never be proposed. The generic claim path is deliberately still `Pending`-only, and a
+test pins that.
+
+### Observation: the runtime wiring remains deliberately absent
+
 * **Observation.** `filesystem/read-text` exists as a governed capability, and
   `PriorStepContext` carries step number, status and workspace-relative artifact paths into
   the provider request — never file contents, never prior `structured_output`, never prior
@@ -630,8 +659,8 @@ it. Both gaps are deliberate and both are recorded:
   model can propose a read and has nowhere to receive the bytes. `3c8a413` names itself the
   rollback point immediately before moving approved workspace content to a third party.
 
-So: **stages 1–4b are delivered, the 4c governance core is delivered, and the 4c runtime
-continuation and observation wiring is intentionally not enabled.**
+So: **stages 1–4b are delivered, the 4c governance core is delivered, the 4c continuation
+wiring is delivered (ADR-0047), and the 4c observation wiring is intentionally not enabled.**
 
 ### Not implemented, and not planned into the near milestone
 

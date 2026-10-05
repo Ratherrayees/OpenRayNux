@@ -367,6 +367,33 @@ impl DurableEngine {
         self.repo().next_step_no(id).map_err(EngineError::from)
     }
 
+    /// Claims the next logical step of a task sitting at a step boundary.
+    ///
+    /// The engine's route to the one targeted claim `orxnud-store` defines, and the only
+    /// way a caller can reach it. Deliberately *not* folded into [`Self::claim`]: ADR-0043
+    /// and V-84 both record that advancing a boundary is a distinct operation from picking
+    /// up fresh work, and widening the generic claim would assert that any polling worker
+    /// which sees a boundary is entitled to advance it.
+    ///
+    /// The lease duration comes from this engine's own limits rather than from the caller,
+    /// so a caller cannot extend a boundary lease by asking for a longer one -- the same
+    /// reason [`Self::heartbeat`] derives it rather than taking it.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] as [`orxnud_store::task_repo::TaskRepository::claim_next_step`].
+    pub fn claim_next_step(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+    ) -> Result<TargetedClaimOutcome, EngineError> {
+        let lease_ms = self.limits.lease_duration_ms;
+        self.repo()
+            .claim_next_step(id, worker, now_ms, lease_ms)
+            .map_err(EngineError::from)
+    }
+
     /// Extends a lease the caller still holds.
     ///
     /// # Errors
@@ -541,8 +568,12 @@ impl DurableEngine {
 
     /// The approval for one **specific** attempt.
     ///
-    /// Takes an attempt number rather than "the current approval" so that asking
-    /// for the wrong attempt is impossible to express. TP-6's mechanism.
+    /// Takes a step and an attempt rather than "the current approval" so that asking
+    /// for the wrong one is impossible to express. TP-6's mechanism.
+    ///
+    /// The step is not redundant with the attempt: the counter restarts at every logical
+    /// step, so `(task_id, attempt_no)` names one attempt *per step* and cannot identify
+    /// an approval on its own.
     ///
     /// # Errors
     ///
@@ -550,10 +581,11 @@ impl DurableEngine {
     pub fn approval_for(
         &self,
         id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
     ) -> Result<Option<ApprovalRow>, EngineError> {
         self.repo_ref()
-            .approval_for_attempt(id, attempt_no)
+            .approval_for_attempt(id, step_no, attempt_no)
             .map_err(EngineError::from)
     }
 
@@ -566,11 +598,12 @@ impl DurableEngine {
     pub fn consume_approval(
         &mut self,
         id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         now_ms: i64,
     ) -> Result<(), EngineError> {
         self.repo()
-            .consume_approval(id, attempt_no, now_ms)
+            .consume_approval(id, step_no, attempt_no, now_ms)
             .map(|_| ())
             .map_err(EngineError::from)
     }
@@ -578,8 +611,8 @@ impl DurableEngine {
     /// Whether an attempt may proceed on an approval it already holds.
     ///
     /// This is the whole of TP-6 as the engine can express it: the approval is
-    /// looked up **by attempt**, so a retry finds nothing and must re-derive. The
-    /// caller then runs policy again — which is where the actor is re-derived and
+    /// looked up **by step and attempt**, so a retry finds nothing and must re-derive.
+    /// The caller then runs policy again — which is where the actor is re-derived and
     /// the delegation re-checked, in `orxnud-policy`.
     ///
     /// # Errors
@@ -588,11 +621,12 @@ impl DurableEngine {
     pub fn may_use_approval(
         &self,
         id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         now_ms: i64,
     ) -> Result<bool, EngineError> {
         Ok(self
-            .approval_for(id, attempt_no)?
+            .approval_for(id, step_no, attempt_no)?
             .is_some_and(|a| a.is_valid_at(now_ms)))
     }
 
@@ -1173,7 +1207,7 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         e.record_approval(&approval("t", 1, NOW + 60_000))
             .expect("record");
-        assert!(e.may_use_approval(&tid("t"), 1, NOW).expect("check"));
+        assert!(e.may_use_approval(&tid("t"), 1, 1, NOW).expect("check"));
 
         let _ = e
             .complete_task_with(
@@ -1190,7 +1224,7 @@ mod tests {
         assert_eq!(retry.attempts, 2);
 
         assert!(
-            !e.may_use_approval(&tid("t"), 2, NOW + 1).expect("check"),
+            !e.may_use_approval(&tid("t"), 1, 2, NOW + 1).expect("check"),
             "TP-6: a retry inherits nothing"
         );
     }
@@ -1203,8 +1237,8 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         e.record_approval(&approval("t", 1, NOW + 60_000))
             .expect("record");
-        e.consume_approval(&tid("t"), 1, NOW).expect("consume");
-        assert!(!e.may_use_approval(&tid("t"), 1, NOW + 1).expect("check"));
+        e.consume_approval(&tid("t"), 1, 1, NOW).expect("consume");
+        assert!(!e.may_use_approval(&tid("t"), 1, 1, NOW + 1).expect("check"));
     }
 
     #[test]
@@ -1219,7 +1253,7 @@ mod tests {
         a.digest_hex = ApprovalDigest::from_bytes([9u8; 32]).to_hex();
         e.record_approval(&a).expect("record");
         let stored = e
-            .approval_for(&tid("t"), 1)
+            .approval_for(&tid("t"), 1, 1)
             .expect("read")
             .expect("present");
         assert_eq!(stored.digest_hex, a.digest_hex);

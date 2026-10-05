@@ -670,6 +670,8 @@ async fn route<S: SecretsContract>(
         // and the sandbox backend, which `tasks` deliberately has no access to.
         Method::TaskExecute => execute_proposal(request, governed).await,
         Method::TaskAiPropose => ai_propose(request, governed, provider.as_ref()).await,
+        // One boundary per call, and no execution: see `continue_task`.
+        Method::TaskContinue => continue_task(request, governed, provider.as_ref()).await,
     }
 }
 
@@ -737,10 +739,88 @@ async fn ai_propose<S: SecretsContract>(
     let mut g = governed.lock().await;
     let now = g.2.clock_now_ms();
 
+    let outcome = ask_next_step(&mut g, provider, &task_id).await?;
+    let validated = match outcome {
+        crate::proposer::ProposalOutcome::Step(v) => v,
+        // The model says there is nothing to do. Completing from here is the same fenced
+        // engine completion any other terminal report goes through; the model did not move
+        // the task, it answered a question the runtime asked. See ADR-0047.
+        crate::proposer::ProposalOutcome::Done { summary } => {
+            let finished =
+                g.2.complete_task_with(
+                    &TaskId::new(task_id.as_str()),
+                    &worker,
+                    now,
+                    TaskState::Completed,
+                    false,
+                    Some(&format!("no work required: {summary}")),
+                    None,
+                )
+                .map_err(task_fault)?;
+            return Ok(json!({
+                "completed": true,
+                "summary": summary,
+                "state": finished.state.as_wire_str(),
+                "proposed_by": delegated_actor(&task_id, provider.model_id()).label(),
+                "model": provider.model_id(),
+            }));
+        }
+    };
+
+    let canonical = orxnud_policy::canonical_params(&validated.params);
+    let proposal_id = format!("p-{task_id}-{now}");
+    // The provider instance that just answered is the only authority on which model
+    // produced this text. Read from it rather than from configuration, so the audit cannot
+    // name a model that did not answer.
+    let proposer = delegated_actor(&task_id, provider.model_id());
+    let proposed = persist_proposal(
+        &mut g,
+        ProposalWrite {
+            proposal_id: &proposal_id,
+            task_id: &task_id,
+            worker: &worker,
+            validated: &validated,
+            canonical_params: canonical.as_str(),
+            proposer: &proposer,
+            now,
+        },
+    )?;
+
+    Ok(json!({
+        "proposal": proposal_json(&proposed),
+        "waiting_for": "human-approval",
+        // Restated for the caller, and not because it is a secret: the whole claim of
+        // this path is that a model asked and a person decides, so both facts belong in
+        // the reply rather than only in the database.
+        "proposed_by": proposer.label(),
+        "model": provider.model_id(),
+    }))
+}
+
+/// Asks the configured provider what a task should do next, and interprets the answer.
+///
+/// Shared by `task/ai-propose` and `task/continue` so the two cannot drift: the context
+/// the model is shown, the strict parse, the allowlist check and the refusal taxonomy are
+/// all one implementation, and a change to what the model is offered cannot land in one
+/// route and not the other.
+///
+/// The task is re-read here rather than passed in, because both callers need the row they
+/// read for a different reason (one to check a lease, one to check a boundary) and the
+/// `attempt_no` in the context must be the attempt the claim just created.
+///
+/// # Errors
+///
+/// [`RequestError::Invalid`] if the task is gone, or a structured refusal when the
+/// provider could not answer or its answer is not one this build understands.
+async fn ask_next_step<S: SecretsContract>(
+    g: &mut (Daemon, S, TaskService),
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+    task_id: &str,
+) -> Result<crate::proposer::ProposalOutcome, RequestError> {
     // The task's own words. Read here, from durable state, so the model is shown what
     // was actually asked rather than what a caller says was asked.
     let row =
-        g.2.task(&TaskId::new(task_id.as_str()))
+        g.2.task(&TaskId::new(task_id))
             .map_err(task_fault)?
             .ok_or_else(|| RequestError::Invalid(format!("no task {task_id:?}")))?;
 
@@ -794,7 +874,7 @@ async fn ai_propose<S: SecretsContract>(
     //
     // A read failure here is not fatal to the proposal. Losing the *context* degrades what the
     // model is told; refusing the proposal would mean a reporting fault stops the work.
-    let prior_steps = match g.2.step_results_for(&TaskId::new(task_id.as_str())) {
+    let prior_steps = match g.2.step_results_for(&TaskId::new(task_id)) {
         Ok(rows) => crate::proposer::prior_step_context_from(&rows),
         Err(e) => {
             tracing::warn!(
@@ -806,7 +886,7 @@ async fn ai_propose<S: SecretsContract>(
     };
 
     let ctx = crate::proposer::ProposalContext {
-        task_id: task_id.clone(),
+        task_id: task_id.to_owned(),
         content: row.payload.clone().unwrap_or_default(),
         attempt_no: row.attempts,
         allowed,
@@ -838,7 +918,7 @@ async fn ai_propose<S: SecretsContract>(
         }
     })?;
 
-    let validated =
+    let outcome =
         crate::proposer::validate(&text, &ctx, &|id| registered_ids.iter().any(|r| r == id))
             .map_err(|e| RequestError::Declined {
                 reason: e.reason().to_owned(),
@@ -848,37 +928,273 @@ async fn ai_propose<S: SecretsContract>(
                 detail: Some(e.to_string()),
             })?;
 
-    // From here the model is out of the picture. What follows is the same path a human
-    // worker would take, and the proposer is a `Actor::Ai` derived from the task — never
-    // from the worker holding the lease.
-    let canonical = orxnud_policy::canonical_params(&validated.params);
-    let proposal_id = format!("p-{task_id}-{now}");
-    // The provider instance that just answered is the only authority on which model
-    // produced this text. Read from it rather than from configuration, so the audit cannot
-    // name a model that did not answer.
-    let proposer = delegated_actor(&task_id, provider.model_id());
-    let proposed =
-        g.2.propose_action(
-            &proposal_id,
-            &TaskId::new(task_id.as_str()),
-            &worker,
-            &orxnud_domain::CapabilityId::new(validated.capability.as_str()),
-            validated.target.as_deref(),
-            canonical.as_str(),
-            &proposer,
-            now,
-        )
-        .map_err(task_fault)?;
+    Ok(outcome)
+}
 
-    Ok(json!({
-        "proposal": proposal_json(&proposed),
-        "waiting_for": "human-approval",
-        // Restated for the caller, and not because it is a secret: the whole claim of
-        // this path is that a model asked and a person decides, so both facts belong in
-        // the reply rather than only in the database.
-        "proposed_by": proposer.label(),
-        "model": provider.model_id(),
-    }))
+/// Writes a validated step through the ordinary proposal path.
+///
+/// Every durable proposal in the runtime goes through here, so the model-sourced route and
+/// the continuation route cannot diverge in what they persist: same canonicalisation, same
+/// step binding, same approval requirement, same audit attribution.
+fn persist_proposal<S: SecretsContract>(
+    g: &mut (Daemon, S, TaskService),
+    write: ProposalWrite<'_>,
+) -> Result<orxnud_store::task_repo::ProposalRow, RequestError> {
+    // From here the model is out of the picture. What follows is the same path a human
+    // worker would take, and the proposer is an `Actor::Ai` derived from the task — never
+    // from the worker holding the lease.
+    g.2.propose_action(
+        write.proposal_id,
+        &TaskId::new(write.task_id),
+        write.worker,
+        &orxnud_domain::CapabilityId::new(write.validated.capability.as_str()),
+        write.validated.target.as_deref(),
+        write.canonical_params,
+        write.proposer,
+        write.now,
+    )
+    .map_err(task_fault)
+}
+
+/// Everything one durable proposal write needs, gathered so the call does not carry eight
+/// positional arguments.
+///
+/// A struct rather than a tuple: at eight arguments the call site can no longer tell which
+/// `&str` is the proposal id and which is the canonical params, and swapping those two
+/// produces a valid-looking write of the wrong thing.
+struct ProposalWrite<'a> {
+    /// The id the daemon minted for this proposal.
+    proposal_id: &'a str,
+    /// The task it proposes to.
+    task_id: &'a str,
+    /// The worker holding the lease. Never the proposer — see `proposer`.
+    worker: &'a str,
+    /// The validated action.
+    validated: &'a crate::proposer::ValidatedProposal,
+    /// Its parameters, already canonicalised.
+    canonical_params: &'a str,
+    /// Who is asking. Always a delegated actor, never the lease holder.
+    proposer: &'a orxnud_domain::actor::Actor,
+    /// When.
+    now: i64,
+}
+
+/// Advances a task across one step boundary and proposes what comes next.
+///
+/// # What one call does
+///
+/// Exactly three things, in this order, and then it stops:
+/// 1. claims the next logical step (one durable boundary crossing);
+/// 2. asks the configured provider what that step should do;
+/// 3. persists the resulting proposal — or completes the task if the model says no
+///    further work is needed.
+///
+/// It deliberately does **not** execute. Every consequential step therefore re-enters the
+/// ordinary route (`task/ai-propose` → durable proposal → approval → dispatcher → sandbox
+/// → verification → audit) with no continuation-specific shortcut, which is what makes
+/// "the governed path is the only path" a property of the code rather than a claim about
+/// it. A `task/continue` therefore ends in `waiting_for: human-approval`, exactly like a
+/// proposal any human worker could have written.
+///
+/// # Why one boundary and not a loop
+///
+/// The orchestrator is a single step, not a driver that runs a task to completion.
+/// A loop would need a place to record "this is the Nth retry", a rule for when to stop
+/// asking a model that keeps failing, and a way to resume after a crash — three decisions
+/// that each want their own record and their own review. Keeping the caller in charge of
+/// whether to continue makes the bound explicit and the cost visible: each call is one
+/// boundary and at most one provider call, and `max_steps` remains the only thing that
+/// bounds a task's length (ADR-0043, ADR-0047).
+///
+/// # The claim and the proposal are not atomic, deliberately
+///
+/// A model call can take seconds; holding a write transaction across one would hold the
+/// single SQLite writer for the duration of a network round trip. So the claim commits
+/// first, and if the model then cannot be asked the boundary is released again — see
+/// [`release_to_boundary`]. A crash between the two leaves a `Running` task with no
+/// proposal, which is recoverable in the ordinary way: the lease expires and the task
+/// returns to a claimable boundary.
+///
+/// # Errors
+///
+/// [`RequestError::ProviderRefused`] if no provider is configured or the model cannot be
+/// reached, [`RequestError::Declined`] with `reason: not-at-boundary` if the task is not
+/// sitting at one, or with the claim refusal's own reason if another worker got there
+/// first, and [`RequestError::Invalid`] if the task does not exist.
+async fn continue_task<S: SecretsContract>(
+    request: &Request,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+) -> Result<serde_json::Value, RequestError> {
+    let Some(provider) = provider else {
+        return Err(RequestError::ProviderRefused {
+            reason: crate::proposer::ProviderError::NotConfigured
+                .reason()
+                .to_owned(),
+            detail: Some(
+                "this daemon has no proposal provider; start it with a provider configured"
+                    .to_owned(),
+            ),
+        });
+    };
+    let params = request.params.clone().unwrap_or(json!({}));
+    let task_id = required_str(&params, "task")?;
+    check_len("task", &task_id, MAX_TASK_ID_BYTES)?;
+    let worker = required_str(&params, "worker")?;
+    check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+
+    let id = TaskId::new(task_id.as_str());
+    let mut g = governed.lock().await;
+    let now = g.2.clock_now_ms();
+
+    // Refused with the task's own state rather than a claim refusal, because the two mean
+    // different things to a caller: this task has no boundary to cross, which is a fact
+    // about the task, whereas a claim refusal is about losing a race.
+    let before =
+        g.2.task(&id)
+            .map_err(task_fault)?
+            .ok_or_else(|| RequestError::Invalid(format!("no task {task_id:?}")))?;
+    if before.state != TaskState::AwaitingNextStep {
+        return Err(RequestError::Declined {
+            reason: "not-at-boundary".to_owned(),
+            detail: Some(format!(
+                "task is {:?}, not {:?}; only a task between steps can be continued",
+                before.state,
+                TaskState::AwaitingNextStep
+            )),
+        });
+    }
+
+    // The one boundary crossing. Whoever gets here owns the next logical step; a second
+    // caller in the same instant is refused by the conditional UPDATE inside the store,
+    // not by anything this runtime decided.
+    let claimed =
+        g.2.claim_next_step(&id, &worker, now)
+            .map_err(|e| match e {
+                TaskFault::NotClaimable(r) => RequestError::Declined {
+                    reason: r.as_str().to_owned(),
+                    detail: Some(format!("the next step was not claimed: {r:?}")),
+                },
+                other => task_fault(other),
+            })?;
+    // The claimed step is `steps_completed + 1` of the row the claim returned, read from
+    // durable state rather than counted here.
+    let step = claimed.row.steps_completed + 1;
+
+    // From here the boundary is crossed, so every failure has to put it back — otherwise
+    // the task is left holding a lease for a step that will never be proposed and
+    // continuation can never be retried.
+    let outcome = match ask_next_step(&mut g, provider, &task_id).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let why = e.to_string();
+            release_to_boundary(&mut g, &id, &worker, now, &why);
+            return Err(e);
+        }
+    };
+
+    match outcome {
+        // The model says the work is finished. Completed through the same fenced engine
+        // completion every other terminal report uses, by a caller holding a live lease,
+        // with the reason recorded on the task. The model proposed "no further work is
+        // needed"; it did not move the task, approve anything, or assert that an effect
+        // succeeded — a `done` answer carries no capability, no target and no parameters,
+        // so there is nothing here it could have been used to smuggle (ADR-0047).
+        crate::proposer::ProposalOutcome::Done { summary } => {
+            let finished =
+                g.2.complete_task_with(
+                    &id,
+                    &worker,
+                    now,
+                    TaskState::Completed,
+                    false,
+                    Some(&format!("no work required: {summary}")),
+                    None,
+                )
+                .map_err(task_fault)?;
+            Ok(json!({
+                "continued": false,
+                "completed": true,
+                "step": step,
+                "steps_completed": finished.steps_completed,
+                "summary": summary,
+                "state": finished.state.as_wire_str(),
+                // Restated for the caller: a task that ends because a model said so must
+                // be attributable to that model in the reply, not only in the database.
+                "proposed_by": delegated_actor(&task_id, provider.model_id()).label(),
+                "model": provider.model_id(),
+            }))
+        }
+        crate::proposer::ProposalOutcome::Step(validated) => {
+            let canonical = orxnud_policy::canonical_params(&validated.params);
+            let proposal_id = format!("p-{task_id}-{now}");
+            let proposer = delegated_actor(&task_id, provider.model_id());
+            let proposed = match persist_proposal(
+                &mut g,
+                ProposalWrite {
+                    proposal_id: &proposal_id,
+                    task_id: &task_id,
+                    worker: &worker,
+                    validated: &validated,
+                    canonical_params: canonical.as_str(),
+                    proposer: &proposer,
+                    now,
+                },
+            ) {
+                Ok(row) => row,
+                Err(e) => {
+                    let why = e.to_string();
+                    release_to_boundary(&mut g, &id, &worker, now, &why);
+                    return Err(e);
+                }
+            };
+            Ok(json!({
+                "continued": true,
+                "step": step,
+                "steps_completed": before.steps_completed,
+                "max_steps": before.max_steps,
+                "proposal": proposal_json(&proposed),
+                "waiting_for": "human-approval",
+                "proposed_by": proposer.label(),
+                "model": provider.model_id(),
+            }))
+        }
+    }
+}
+
+/// Returns a claimed step to its boundary so continuation can be retried.
+///
+/// The claim and the proposal are two writes, and only the second one is wanted if the
+/// model cannot be asked. Releasing the boundary on that path is what keeps a provider
+/// outage from stranding a task at a step it will never work on: the claim is undone and
+/// the task is exactly where it was, with the lease released, so a later `task/continue`
+/// starts over cleanly rather than finding a half-open step.
+///
+/// Best-effort by design. If this write fails the lease still expires and the task is
+/// re-claimable at its boundary, which is a slower route to the same place — so this is
+/// worth a loud log and not worth failing the caller's request, which has already been
+/// failed for the real reason.
+fn release_to_boundary<S: SecretsContract>(
+    g: &mut (Daemon, S, TaskService),
+    id: &TaskId,
+    worker: &str,
+    now: i64,
+    why: &str,
+) {
+    if let Err(e) = g.2.complete_task_with(
+        id,
+        worker,
+        now,
+        TaskState::AwaitingNextStep,
+        false,
+        Some(why),
+        None,
+    ) {
+        tracing::error!(
+            error = ?e,
+            "could not return a claimed step to its boundary; its lease will expire instead"
+        );
+    }
 }
 
 /// The provider a deterministic test uses when it does not care which one.
@@ -991,7 +1307,7 @@ async fn execute_proposal<S: SecretsContract>(
     //    the dispatcher refuses it — which is the check, not this reconstruction.
     let approval_row =
         g.2.engine()
-            .approval_for(&proposal.task_id, proposal.attempt_no)
+            .approval_for(&proposal.task_id, proposal.step_no, proposal.attempt_no)
             .map_err(|e| RequestError::Refused(format!("approval unreadable: {e}")))?
             .ok_or_else(|| RequestError::Declined {
                 reason: "approval-required".to_owned(),
@@ -1538,6 +1854,15 @@ pub const MAX_TASK_CONTENT_BYTES: usize = 4 * 1024;
 /// neither is a cost a client should be able to impose.
 const MAX_TASK_ID_BYTES: usize = 128;
 
+/// The most logical steps one task may have.
+///
+/// `max_steps` is the only thing bounding how long a task can run, so it is bounded here
+/// as well as in the store: a caller asking for a million steps has not described a task,
+/// it has handed the daemon a number it will never finish. Sixty-four is far beyond any
+/// plausible plan and small enough that the worst case is a bounded number of governed
+/// steps rather than an open-ended one.
+const MAX_MAX_STEPS: u32 = 64;
+
 /// Routes a `task/*` method.
 ///
 /// # The boundary this draws
@@ -1578,8 +1903,40 @@ async fn tasks<S: SecretsContract>(
             let kind = TaskKind::from_wire_str(&kind_raw).ok_or_else(|| {
                 RequestError::Invalid(format!("`kind` is not a known task kind: {kind_raw:?}"))
             })?;
+            // Optional and defaulting to one, because a single-step task is the common
+            // case and must keep working unchanged. A caller that wants a task to continue
+            // across steps says so here; without this, `max_steps` stays at the schema
+            // default of 1 and the task completes on its first verified effect, so no task
+            // could ever reach the step boundary `task/continue` advances across.
+            let max_steps = match params.get("max_steps") {
+                None | Some(serde_json::Value::Null) => 1,
+                Some(serde_json::Value::Number(n)) => n
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| {
+                        RequestError::Invalid(format!(
+                            "`max_steps` must be a whole number, not {n}"
+                        ))
+                    })?,
+                Some(_) => {
+                    return Err(RequestError::Invalid(
+                        "`max_steps` must be a number".to_owned(),
+                    ));
+                }
+            };
+            // The store validates this too, but reporting it here keeps the refusal an
+            // `INVALID_REQUEST` naming the field rather than an opaque internal error
+            // from a repository the caller has no business knowing about.
+            orxnud_store::task_repo::validate_max_steps(max_steps)
+                .map_err(|e| RequestError::Invalid(format!("`max_steps` is unusable: {e}")))?;
+            if max_steps > MAX_MAX_STEPS {
+                return Err(RequestError::Invalid(format!(
+                    "`max_steps` must be at most {MAX_MAX_STEPS}, not {max_steps}"
+                )));
+            }
             let mut task = NewTask::new(TaskId::new(id), kind, now);
             task.payload = content;
+            task.max_steps = max_steps;
             let row = tasks.create(&task, now).map_err(task_fault)?;
             Ok(json!({ "task": task_json(&row) }))
         }
@@ -1717,6 +2074,11 @@ fn task_json(row: &orxnud_store::task_repo::TaskRow) -> serde_json::Value {
         "priority": row.priority,
         "attempts": row.attempts,
         "max_attempts": row.max_attempts,
+        // The step bound next to the attempt bound, because a caller that set one wants
+        // to see the other: `max_steps` is what decides whether a verified step finishes
+        // the task or parks it for continuation.
+        "max_steps": row.max_steps,
+        "steps_completed": row.steps_completed,
         "content": row.payload,
         "idempotent": row.idempotent,
         "effect_observed": row.effect_observed,

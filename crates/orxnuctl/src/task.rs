@@ -30,6 +30,12 @@ pub enum TaskCommand {
         kind: Option<String>,
         /// The task's human-visible content.
         content: Option<String>,
+        /// How many logical steps the task may have; the daemon's default of one when
+        /// absent.
+        ///
+        /// Optional rather than always present so the common case stays a short command,
+        /// and so a task created without it keeps behaving exactly as before.
+        max_steps: Option<u32>,
     },
     /// List every task.
     List,
@@ -90,6 +96,17 @@ pub enum TaskCommand {
         /// The worker holding the task's lease.
         worker: String,
     },
+    /// Advance a task that has finished one step to the next.
+    ///
+    /// Claims the next step, asks the proposer what it should do, and persists an
+    /// ordinary proposal for human approval. It does not execute, so running a task to
+    /// completion is a sequence of approve/execute/continue calls rather than one call.
+    Continue {
+        /// The task id.
+        task: String,
+        /// The worker taking ownership of the next step.
+        worker: String,
+    },
 }
 
 /// Runs a task command and returns what to print.
@@ -104,13 +121,21 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
     client.negotiate()?;
 
     match command {
-        TaskCommand::Create { id, kind, content } => {
+        TaskCommand::Create {
+            id,
+            kind,
+            content,
+            max_steps,
+        } => {
             let mut params = json!({ "id": id });
             if let Some(k) = kind {
                 params["kind"] = json!(k);
             }
             if let Some(c) = content {
                 params["content"] = json!(c);
+            }
+            if let Some(m) = max_steps {
+                params["max_steps"] = json!(m);
             }
             let reply = client.call("task/create", params)?;
             Ok(render_task_field(&reply, "created"))
@@ -152,6 +177,42 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             let mut out = render_proposal(&reply);
             // Stated plainly, because the reply's existence is not the interesting part:
             // what matters is that a model asked and a person still has to decide.
+            for key in ["proposed_by", "model"] {
+                if let Some(v) = reply.get(key).and_then(Value::as_str) {
+                    out.push_str(&format!("  {key}: {v}\n"));
+                }
+            }
+            Ok(out)
+        }
+        TaskCommand::Continue { task, worker } => {
+            let reply = client.call("task/continue", json!({ "task": task, "worker": worker }))?;
+            // The two outcomes are different enough that they are rendered differently:
+            // a completion has no proposal to show, and printing an empty one would read
+            // as a continuation that produced nothing to approve.
+            if reply.get("completed").and_then(Value::as_bool) == Some(true) {
+                let mut out = format!(
+                    "task finished after {} step(s)\n",
+                    reply
+                        .get("steps_completed")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                );
+                if let Some(summary) = reply.get("summary").and_then(Value::as_str) {
+                    out.push_str(&format!("  summary: {summary}\n"));
+                }
+                // Restated here for the same reason `ai-propose` does it: a task that ends
+                // because a model said so is only trustworthy if that is visible.
+                for key in ["proposed_by", "model"] {
+                    if let Some(v) = reply.get(key).and_then(Value::as_str) {
+                        out.push_str(&format!("  {key}: {v}\n"));
+                    }
+                }
+                return Ok(out);
+            }
+            let mut out = render_proposal(&reply);
+            if let Some(step) = reply.get("step").and_then(Value::as_u64) {
+                out.push_str(&format!("  step: {step}\n"));
+            }
             for key in ["proposed_by", "model"] {
                 if let Some(v) = reply.get(key).and_then(Value::as_str) {
                     out.push_str(&format!("  {key}: {v}\n"));
@@ -245,6 +306,8 @@ fn render_task_field(reply: &Value, heading: &str) -> String {
         ("kind", "kind"),
         ("state", "state"),
         ("attempts", "attempts"),
+        ("steps_completed", "steps_completed"),
+        ("max_steps", "max_steps"),
     ] {
         if let Some(v) = task.get(key) {
             out.push_str(&format!("  {label}: {}\n", scalar(v)));

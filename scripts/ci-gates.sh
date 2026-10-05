@@ -567,8 +567,16 @@ gate_G9() {
       # sandbox-dependent test in `platform::tests` is named individually, because the rest
       # of that module is the refusing-backend evidence and must keep running.
       #
-      # The `orxnud-daemon` tests are named individually because their module also holds
-      # the proposal, approval and restart evidence that holds on any host.
+      # The `orxnud-daemon` tests are named individually because their modules also hold
+      # proposal, approval, bound and disclosure evidence that holds on any host.
+      #
+      # The `continuation` ones are named for a sharper reason than the rest: reaching a
+      # step boundary requires a *verified* effect, and the only capability in this build
+      # that verifies is Tier-1 and sandboxed -- `text/word-count` deliberately returns
+      # `Undetermined` rather than `Verified`, because counting words has no effect to
+      # observe. So there is no host-independent way to put a task at a boundary, and the
+      # continuation evidence is sandbox evidence. The four tests in that file that do
+      # not execute a capability are NOT excluded and run here.
       filter=(
         -E 'not (binary(governed_path) or binary(read_text_real) or binary(write_text) or binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper)
               or test(linux::tests::)
@@ -577,13 +585,20 @@ gate_G9() {
               or test(a_proposal_and_its_waiting_task_survive_a_restart_unchanged)
               or test(an_approval_cannot_be_executed_twice)
               or test(an_approval_for_one_proposal_does_not_execute_another)
-              or test(an_ai_proposal_becomes_a_governed_action))'
+              or test(an_ai_proposal_becomes_a_governed_action)
+              or test(a_multi_step_task_advances_across_a_verified_step_boundary)
+              or test(a_single_step_task_completes_and_cannot_be_continued)
+              or test(a_provider_failure_returns_the_task_to_its_boundary_and_is_retryable)
+              or test(a_model_can_say_no_further_work_is_needed)
+              or test(continuation_without_a_provider_is_refused_before_the_boundary_is_crossed))'
       )
       note "host cannot isolate: excluding the Tier-1 sandbox-evidence tests."
       note "  governed_path, read_text_real, write_text, isolation, enforcement,"
       note "  resources, hostile_helper  -- binaries whose subject is a real sandbox."
       note "  linux::tests::              -- the Linux backend's own suite."
-      note "  6 named tests               -- sandbox-evidence tests inside larger modules."
+      note "  6 named tests               -- sandbox-evidence tests inside tasks.rs."
+      note "  5 named tests               -- continuation.rs, which cannot reach a step"
+      note "                                 boundary without a verified sandboxed effect."
       note "  Everything else runs, including every refusal-path assertion."
       note "  Positive evidence: scripts/run-sandbox-tests.sh (CI job sandbox-integration)."
 

@@ -464,6 +464,49 @@ struct RawProposal {
     params: serde_json::Value,
 }
 
+/// The model's *other* answer: that no further work is needed.
+///
+/// A second declared shape rather than a third field on [`RawProposal`], because the two
+/// answers are mutually exclusive and saying both at once is not a request we can
+/// interpret. Carrying a `done` key selects this shape, so `{"done": true, "capability":
+/// ...}` is refused as unreadable rather than resolved by preferring one half.
+///
+/// `summary` is the model's own account of why it is stopping. It is descriptive
+/// metadata with no authority -- it grants nothing, executes nothing, and is never read
+/// back as input to a decision -- so it is bounded rather than refused: an over-verbose
+/// summary must not strand a task that has correctly finished.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDone {
+    done: bool,
+    summary: String,
+}
+
+/// The longest `summary` kept from a `done` answer.
+///
+/// Describing the work in one short sentence is all this field is for; anything longer is
+/// cut rather than refused, so verbosity cannot become a way to fail to finish.
+pub const MAX_DONE_SUMMARY_CHARS: usize = 280;
+
+/// What the model said the next step is — or that there isn't one.
+///
+/// The type exists so "do the next thing" and "there is nothing left to do" are two
+/// named cases a reviewer can find, rather than one case plus a magic capability string
+/// that would have to be registered, allow-listed and dispatched in order to mean
+/// *nothing happens*. Nothing here is a capability: a [`ProposalOutcome::Done`] carries
+/// no target, no parameters and no authority, and cannot be proposed for, approved, or
+/// executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalOutcome {
+    /// The model proposed work to do.
+    Step(ValidatedProposal),
+    /// The model says no further work is needed.
+    Done {
+        /// Why, in the model's words. Descriptive only.
+        summary: String,
+    },
+}
+
 /// Why a provider's text did not become a proposal.
 ///
 /// Every variant is a refusal. There is no "best effort" path, because a proposal the
@@ -533,11 +576,20 @@ pub struct ValidatedProposal {
 
 /// Turns provider text into a proposal the runtime will persist.
 ///
-/// Three refusals, in order, and no fallbacks: unreadable text, a capability outside
-/// the allowlist, and a capability this build does not implement. Note what is *not*
-/// checked here — the capability's own parameter validation happens when the plan is
-/// built at execution, so a malformed parameter set becomes a refusal there rather than
-/// a proposal that cannot run.
+/// Returns which of the two declared shapes the provider answered with. Every failure is
+/// a refusal — there is no "best effort" path, because a proposal the runtime only
+/// half-understood is an action nobody approved.
+///
+/// A `done` answer short-circuits the checks below, because it names no capability and
+/// so has nothing to check against the allowlist: it cannot ask for a capability it was
+/// not offered. It is for the *runtime* to decide what to do with, since only the runtime
+/// knows whether a caller is entitled to stop the task.
+///
+/// Otherwise the refusals, in order: unreadable text, a capability outside the allowlist,
+/// and a capability this build does not implement. Note what is *not* checked here — the
+/// capability's own parameter validation happens when the plan is built at execution, so a
+/// malformed parameter set becomes a refusal there rather than a proposal that cannot
+/// run.
 ///
 /// # Errors
 ///
@@ -547,12 +599,34 @@ pub fn validate(
     text: &str,
     ctx: &ProposalContext,
     is_registered: &dyn Fn(&str) -> bool,
-) -> Result<ValidatedProposal, ProposalRejected> {
+) -> Result<ProposalOutcome, ProposalRejected> {
     // Parsed strictly: a bare string, a list, or an object with unexpected keys is not
-    // a proposal, and guessing at the intent is exactly the creative interpretation the
+    // an answer, and guessing at the intent is exactly the creative interpretation the
     // deterministic side exists to prevent.
+    //
+    // The two declared shapes are told apart by the presence of a `done` key, so neither
+    // is a special case of the other and a contradictory answer resolves to nothing
+    // rather than to whichever half happened to be readable.
+    let text = text.trim();
+    let shape: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| ProposalRejected::Unreadable)?;
+
+    if shape.get("done").is_some() {
+        let RawDone { done, summary } =
+            serde_json::from_value::<RawDone>(shape).map_err(|_| ProposalRejected::Unreadable)?;
+        // `{"done": false, ...}` asks for neither shape. Read as "keep going" it would
+        // be an invitation to keep asking a model that is answering badly; refused
+        // instead, so a malformed "done" is visible rather than silently reinterpreted.
+        if !done {
+            return Err(ProposalRejected::Unreadable);
+        }
+        return Ok(ProposalOutcome::Done {
+            summary: summary.chars().take(MAX_DONE_SUMMARY_CHARS).collect(),
+        });
+    }
+
     let raw: RawProposal =
-        serde_json::from_str(text.trim()).map_err(|_| ProposalRejected::Unreadable)?;
+        serde_json::from_value(shape).map_err(|_| ProposalRejected::Unreadable)?;
 
     // Whether the model was *offered* this capability. The menu is built by walking the
     // registry, so this is "not enabled in this build" rather than a curated list — a
@@ -584,11 +658,11 @@ pub fn validate(
         });
     }
 
-    Ok(ValidatedProposal {
+    Ok(ProposalOutcome::Step(ValidatedProposal {
         capability: raw.capability,
         target: raw.target,
         params: raw.params,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -644,6 +718,9 @@ mod tests {
             &registered,
         )
         .expect("a valid proposal");
+        let ProposalOutcome::Step(p) = p else {
+            panic!("a proposal asking for work must not read as a task finished")
+        };
         assert_eq!(p.capability, "filesystem/write-text");
         assert_eq!(p.params["contents"], "delegated governance works");
     }
@@ -658,6 +735,9 @@ mod tests {
             &registered,
         )
         .expect("valid");
+        let ProposalOutcome::Step(p) = p else {
+            panic!("a proposal asking for work must not read as a task finished")
+        };
         assert_eq!(p.target.as_deref(), Some("final.txt"));
     }
 
