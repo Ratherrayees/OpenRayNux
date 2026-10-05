@@ -330,6 +330,7 @@ fn a_consumed_approval_cannot_authorise_a_second_dispatch() {
         &params(),
         NOW,
         NOW + 60_000,
+        1,
     );
     let approval = ApprovalRecord {
         approver: human(),
@@ -340,6 +341,7 @@ fn a_consumed_approval_cannot_authorise_a_second_dispatch() {
         issued_at_ms: NOW,
         expires_at_ms: NOW + 60_000,
         risk: RiskClass::High,
+        step_no: 1,
         digest,
     };
 

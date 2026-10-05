@@ -324,6 +324,49 @@ impl DurableEngine {
             .map_err(EngineError::from)
     }
 
+    /// Completes one verified logical step, advancing the task if another step remains.
+    ///
+    /// The whole post-verification transition: the result, the counter, the state and the
+    /// lease release are one transaction in the repository, so this is a single call
+    /// because it is a single fact.
+    ///
+    /// # Errors
+    ///
+    /// As [`orxnud_store::task_repo::TaskRepository::complete_verified_step`].
+    pub fn complete_verified_step(
+        &mut self,
+        done: &orxnud_store::task_repo::VerifiedStep<'_>,
+    ) -> Result<orxnud_store::task_repo::StepAdvance, EngineError> {
+        self.repo()
+            .complete_verified_step(done)
+            .map_err(EngineError::from)
+    }
+
+    /// The durable results of a task's completed logical steps, oldest step first.
+    ///
+    /// Ordered by `step_no` rather than by insertion, so anything derived from this -- a
+    /// prompt, a report -- is deterministic rather than dependent on write order.
+    ///
+    /// # Errors
+    ///
+    /// Any [`EngineError`] from the store.
+    pub fn step_results_for(
+        &mut self,
+        id: &TaskId,
+    ) -> Result<Vec<orxnud_store::task_repo::StepResultRow>, EngineError> {
+        self.repo().step_results_for(id).map_err(EngineError::from)
+    }
+
+    /// The logical step currently being worked on: the task's `steps_completed + 1`.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if the task does not exist, or `InvalidComposition` if its counters are
+    /// impossible.
+    pub fn next_step_no(&mut self, id: &TaskId) -> Result<u32, EngineError> {
+        self.repo().next_step_no(id).map_err(EngineError::from)
+    }
+
     /// Extends a lease the caller still holds.
     ///
     /// # Errors
@@ -579,6 +622,15 @@ impl DurableEngine {
         let authority = proposer.authority_root().map(|u| u.as_str().to_owned());
         let proposer_json = serde_json::to_string(proposer)
             .map_err(|e| EngineError::storage(format!("proposer could not be encoded: {e}")))?;
+        // The logical step this proposal belongs to, read from the task's durable counter.
+        //
+        // Derived here rather than taken as a parameter because the step is not the
+        // caller's to choose: it is whatever the task has actually finished, plus one.
+        // Deriving it in the engine keeps one implementation, keeps every caller honest
+        // without threading a value through four call sites, and keeps the CLI from being
+        // able to name a step. `attempt_no` is deliberately not consulted: a third attempt
+        // is still step 1.
+        let step_no = self.repo().next_step_no(id)?;
         self.repo()
             .propose_action(
                 proposal_id,
@@ -589,6 +641,7 @@ impl DurableEngine {
                 canonical_params,
                 &proposer_json,
                 authority.as_deref(),
+                step_no,
                 now_ms,
             )
             .map_err(EngineError::from)
@@ -1101,6 +1154,7 @@ mod tests {
         ApprovalRow {
             task_id: tid(task),
             attempt_no: attempt,
+            step_no: 1,
             digest_hex: "ab".repeat(32),
             capability: "cap".into(),
             target: None,

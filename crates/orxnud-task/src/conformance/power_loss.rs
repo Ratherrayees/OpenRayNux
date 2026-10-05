@@ -257,6 +257,7 @@ fn is_known_state(s: &str) -> bool {
             | "failed"
             | "dead-lettered"
             | "needs-verification"
+            | "awaiting-next-step"
     )
 }
 
@@ -343,6 +344,7 @@ mod tests {
             "failed",
             "dead-lettered",
             "needs-verification",
+            "awaiting-next-step",
         ] {
             assert!(is_known_state(s), "{s} should be known");
         }

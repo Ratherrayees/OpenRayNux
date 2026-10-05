@@ -37,9 +37,20 @@ pub enum DigestError {
 /// is what makes "Human H approved Actor A doing C to T with P until X" a statement
 /// that can be checked rather than assumed.
 ///
-/// **The version prefix is `v2` because the tuple changed.** A `v1` digest must not
-/// verify against a `v2` computation, or an approval minted before this change would
-/// keep working with the approver field silently absent — the state V-69 describes.
+/// **The version prefix is `v3` because the tuple changed again.** A `v2` digest must not
+/// verify against a `v3` computation: v2 did not bind the logical step, so one approval
+/// would authorise the same action at every step of a multi-step task.
+///
+/// The field order is the v2 order, unchanged, with `step_no` appended last. Appending
+/// rather than inserting keeps every previously-bound field in its previously-hashed
+/// position, so the whole difference from v2 is one prefix and one field.
+///
+/// `step_no` is required, not defaulted. A caller that does not know which step it is
+/// minting for does not know what it is authorising.
+// The argument list is the canonical tuple itself, one field per argument, so that the
+// hashed bytes can be read straight off the signature. Collecting them into a struct
+// would hide exactly the ordering this function exists to pin down.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn canonical_bytes(
     approver: &Actor,
@@ -49,9 +60,10 @@ pub fn canonical_bytes(
     params: &NormalizedParams,
     issued_at_ms: i64,
     expires_at_ms: i64,
+    step_no: u32,
 ) -> Vec<u8> {
-    let mut s = String::with_capacity(320);
-    s.push_str("orxnud-approval-v2|");
+    let mut s = String::with_capacity(352);
+    s.push_str("orxnud-approval-v3|");
     s.push_str(approver.label());
     s.push('|');
     s.push_str(approver.authority_root().map_or("-", |u| u.as_str()));
@@ -69,10 +81,14 @@ pub fn canonical_bytes(
     s.push_str(&issued_at_ms.to_string());
     s.push('|');
     s.push_str(&expires_at_ms.to_string());
+    s.push('|');
+    s.push_str(&step_no.to_string());
     s.into_bytes()
 }
 
 /// Computes the digest of an operation.
+// Same tuple, same reasoning as `canonical_bytes`.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn digest_for(
     approver: &Actor,
@@ -82,6 +98,7 @@ pub fn digest_for(
     params: &NormalizedParams,
     issued_at_ms: i64,
     expires_at_ms: i64,
+    step_no: u32,
 ) -> ApprovalDigest {
     let bytes = canonical_bytes(
         approver,
@@ -91,6 +108,7 @@ pub fn digest_for(
         params,
         issued_at_ms,
         expires_at_ms,
+        step_no,
     );
     ApprovalDigest::from_bytes(*blake3::hash(&bytes).as_bytes())
 }
@@ -184,7 +202,7 @@ mod tests {
         i: i64,
         e: i64,
     ) -> ApprovalDigest {
-        digest_for(actor, actor, cap, target, p, i, e)
+        digest_for(actor, actor, cap, target, p, i, e, 1)
     }
 
     #[test]
@@ -437,10 +455,10 @@ mod tests {
     fn the_canonical_form_is_prefixed_with_its_version() {
         // So a future change to the field set cannot be confused with an old
         // approval.
-        let bytes = canonical_bytes(&human(), &human(), &cap(), Some("a"), &params(), 1, 2);
+        let bytes = canonical_bytes(&human(), &human(), &cap(), Some("a"), &params(), 1, 2, 1);
         let s = String::from_utf8_lossy(&bytes);
         assert!(
-            s.starts_with("orxnud-approval-v2|"),
+            s.starts_with("orxnud-approval-v3|"),
             "missing version prefix: {s}"
         );
     }
@@ -553,6 +571,7 @@ pub fn issue_approval(
     issued_at_ms: i64,
     expires_at_ms: i64,
     risk: orxnud_domain::enums::RiskClass,
+    step_no: u32,
 ) -> ApprovalRecord {
     // Refused here rather than only at dispatch. ADR-0037's central constraint is that
     // the approver field is decoration unless minting happens in a grant-capable
@@ -573,6 +592,7 @@ pub fn issue_approval(
         issued_at_ms,
         expires_at_ms,
         risk,
+        step_no,
         digest: digest_for(
             approver,
             actor,
@@ -581,7 +601,319 @@ pub fn issue_approval(
             params,
             issued_at_ms,
             expires_at_ms,
+            step_no,
         ),
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+    use orxnud_domain::actor::{Actor, AuthChannel};
+    use orxnud_domain::enums::RiskClass;
+    use orxnud_domain::ids::{CapabilityId, RunId, TaskId, UserId};
+
+    fn human() -> Actor {
+        Actor::Human {
+            user: UserId::new("local"),
+            via: AuthChannel::LocalInteractive,
+        }
+    }
+
+    fn ai() -> Actor {
+        Actor::Ai {
+            delegated_by: UserId::new("local"),
+            run: RunId::new("r"),
+            task: TaskId::new("t"),
+            provenance: orxnud_domain::actor::ModelProvenance::new(
+                "test/model",
+                "p",
+                orxnud_domain::ids::RequestId::new("q"),
+            ),
+        }
+    }
+
+    fn params() -> NormalizedParams {
+        canonical_params(&serde_json::json!({"path": "final.txt", "contents": "x"}))
+    }
+
+    /// The tuple is: approver label, approver root, proposer label, proposer root,
+    /// capability, target, canonical params, issued, expires, **step_no**.
+    fn v3(step: u32) -> Vec<u8> {
+        canonical_bytes(
+            &human(),
+            &ai(),
+            &CapabilityId::new("filesystem/write-text"),
+            Some("final.txt"),
+            &params(),
+            1_000,
+            2_000,
+            step,
+        )
+    }
+
+    /// The same tuple as it was under v2: the existing order, unchanged, and ending at
+    /// `expires_at`.
+    fn v2() -> Vec<u8> {
+        let mut s = String::new();
+        s.push_str("orxnud-approval-v2|");
+        s.push_str(human().label());
+        s.push('|');
+        s.push_str(human().authority_root().map_or("-", |u| u.as_str()));
+        s.push('|');
+        s.push_str(ai().label());
+        s.push('|');
+        s.push_str(ai().authority_root().map_or("-", |u| u.as_str()));
+        s.push('|');
+        s.push_str("filesystem/write-text");
+        s.push('|');
+        s.push_str("final.txt");
+        s.push('|');
+        s.push_str(params().as_str());
+        s.push('|');
+        s.push_str("1000");
+        s.push('|');
+        s.push_str("2000");
+        s.into_bytes()
+    }
+
+    #[test]
+    fn the_v3_tuple_is_the_v2_tuple_with_a_version_and_a_trailing_step() {
+        assert!(
+            String::from_utf8_lossy(&v3(1)).starts_with("orxnud-approval-v3|"),
+            "the version must be explicit in the canonical bytes"
+        );
+        // Every pre-existing field, in its existing position, untouched.
+        let text = String::from_utf8_lossy(&v3(1)).into_owned();
+        let fields: Vec<&str> = text
+            .trim_start_matches("orxnud-approval-v3|")
+            .split('|')
+            .collect();
+        assert_eq!(
+            fields.len(),
+            10,
+            "nine fields plus the trailing step_no: {fields:?}"
+        );
+        assert_eq!(fields[7], "1000", "issued_at keeps its position");
+        assert_eq!(fields[8], "2000", "expires_at keeps its position");
+        assert_eq!(fields[9], "1", "step_no is the final canonical field");
+    }
+
+    #[test]
+    fn v3_and_v2_differ_for_the_same_action() {
+        assert_ne!(
+            v3(1),
+            v2(),
+            "a v2 digest must not verify as v3; the version is inside the hashed bytes"
+        );
+    }
+
+    /// The point of the whole change.
+    #[test]
+    fn two_identical_actions_at_different_steps_have_different_digests() {
+        let one = digest_for(
+            &human(),
+            &ai(),
+            &CapabilityId::new("filesystem/write-text"),
+            Some("final.txt"),
+            &params(),
+            1_000,
+            2_000,
+            1,
+        );
+        let two = digest_for(
+            &human(),
+            &ai(),
+            &CapabilityId::new("filesystem/write-text"),
+            Some("final.txt"),
+            &params(),
+            1_000,
+            2_000,
+            2,
+        );
+        assert_ne!(
+            one, two,
+            "step 1 and step 2 writing the same bytes must be distinct approvals, or one \
+             human approval would authorise both"
+        );
+    }
+
+    /// Every field the digest used to bind must still bind it, or the v3 prefix would be
+    /// a licence to weaken it.
+    #[test]
+    fn every_pre_existing_field_still_changes_the_digest() {
+        let base = digest_for(
+            &human(),
+            &ai(),
+            &CapabilityId::new("filesystem/write-text"),
+            Some("final.txt"),
+            &params(),
+            1_000,
+            2_000,
+            1,
+        );
+
+        let other_approver = Actor::Human {
+            user: UserId::new("someone-else"),
+            via: AuthChannel::LocalInteractive,
+        };
+        let other_params =
+            canonical_params(&serde_json::json!({"path": "other.txt", "contents": "x"}));
+        let variants: Vec<(&str, ApprovalDigest)> = vec![
+            (
+                "approver",
+                digest_for(
+                    &other_approver,
+                    &ai(),
+                    &CapabilityId::new("filesystem/write-text"),
+                    Some("final.txt"),
+                    &params(),
+                    1_000,
+                    2_000,
+                    1,
+                ),
+            ),
+            (
+                "proposer",
+                digest_for(
+                    &human(),
+                    &ai(),
+                    &CapabilityId::new("text/word-count"),
+                    Some("final.txt"),
+                    &params(),
+                    1_000,
+                    2_000,
+                    1,
+                ),
+            ),
+            (
+                "target",
+                digest_for(
+                    &human(),
+                    &ai(),
+                    &CapabilityId::new("filesystem/write-text"),
+                    None,
+                    &params(),
+                    1_000,
+                    2_000,
+                    1,
+                ),
+            ),
+            (
+                "params",
+                digest_for(
+                    &human(),
+                    &ai(),
+                    &CapabilityId::new("filesystem/write-text"),
+                    Some("final.txt"),
+                    &other_params,
+                    1_000,
+                    2_000,
+                    1,
+                ),
+            ),
+            (
+                "issued_at",
+                digest_for(
+                    &human(),
+                    &ai(),
+                    &CapabilityId::new("filesystem/write-text"),
+                    Some("final.txt"),
+                    &params(),
+                    1_001,
+                    2_000,
+                    1,
+                ),
+            ),
+            (
+                "expires_at",
+                digest_for(
+                    &human(),
+                    &ai(),
+                    &CapabilityId::new("filesystem/write-text"),
+                    Some("final.txt"),
+                    &params(),
+                    1_000,
+                    2_001,
+                    1,
+                ),
+            ),
+            (
+                "step_no",
+                digest_for(
+                    &human(),
+                    &ai(),
+                    &CapabilityId::new("filesystem/write-text"),
+                    Some("final.txt"),
+                    &params(),
+                    1_000,
+                    2_000,
+                    2,
+                ),
+            ),
+        ];
+        let covered = variants.len();
+        for (field, digest) in &variants {
+            assert_ne!(*digest, base, "{field} must change the v3 digest");
+        }
+        assert_eq!(covered, 7, "every pre-existing field must be covered here");
+    }
+
+    /// A record minted under v2 cannot be honoured, and it fails through the ordinary
+    /// mismatch path rather than a special case.
+    ///
+    /// There is no version to read out of a stored digest -- it is a bare 32-byte hash,
+    /// and the `v2` marker lives *inside* the hashed bytes. So "superseded" and "wrong" are
+    /// genuinely indistinguishable here, and inventing a distinction would mean parsing
+    /// hash bytes, which would be a guess dressed as a check. Both are refused; the
+    /// authorization result is identical either way.
+    #[test]
+    fn a_v2_digest_does_not_verify_under_v3() {
+        let minted_v2 = ApprovalDigest::from_bytes(*blake3::hash(&v2()).as_bytes());
+        let expected_v3 = digest_for(
+            &human(),
+            &ai(),
+            &CapabilityId::new("filesystem/write-text"),
+            Some("final.txt"),
+            &params(),
+            1_000,
+            2_000,
+            1,
+        );
+        assert_ne!(
+            minted_v2, expected_v3,
+            "a v2 approval must not authorise a v3 step"
+        );
+    }
+
+    #[test]
+    fn a_minted_v3_record_carries_its_step() {
+        let record = issue_approval(
+            &human(),
+            &ai(),
+            &CapabilityId::new("filesystem/write-text"),
+            Some("final.txt"),
+            &params(),
+            1_000,
+            2_000,
+            RiskClass::High,
+            3,
+        );
+        assert_eq!(record.step_no, 3);
+        // And the record's own digest is the one its step produces.
+        assert_eq!(
+            record.digest,
+            digest_for(
+                &human(),
+                &ai(),
+                &CapabilityId::new("filesystem/write-text"),
+                Some("final.txt"),
+                &params(),
+                1_000,
+                2_000,
+                3
+            )
+        );
     }
 }
 
@@ -616,6 +948,7 @@ mod issue_tests {
             1_000,
             2_000,
             RiskClass::High,
+            1,
         );
 
         assert!(record.is_valid_at(1_500), "must be valid inside its window");
@@ -631,6 +964,7 @@ mod issue_tests {
                 &params,
                 1_000,
                 2_000,
+                1,
             )
         );
         assert_eq!(record.capability, "filesystem/write-text");
@@ -656,6 +990,7 @@ mod issue_tests {
             1_000,
             2_000,
             RiskClass::High,
+            1,
         );
 
         // Different contents: the same capability, the same target, a different
@@ -671,6 +1006,7 @@ mod issue_tests {
                 &other,
                 1_000,
                 2_000,
+                1,
             )
         );
         // Reordered keys: the same operation, so it must still verify.
@@ -687,6 +1023,7 @@ mod issue_tests {
                 &reordered,
                 1_000,
                 2_000,
+                1,
             )
         );
     }

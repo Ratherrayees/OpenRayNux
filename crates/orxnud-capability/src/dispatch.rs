@@ -185,6 +185,11 @@ pub struct DispatchOutcome {
     pub verification: VerificationOutcome,
     /// The capability that ran.
     pub capability: CapabilityId,
+    /// Whether `execution`'s output is ephemeral and must not be persisted.
+    ///
+    /// Taken from the bundle's declaration rather than recomputed here, so the answer is
+    /// the same one the adapter was built from.
+    pub output_is_ephemeral: bool,
 }
 
 impl DispatchOutcome {
@@ -906,6 +911,27 @@ pub trait AdapterBundle {
 
     /// How to verify its effects.
     fn verifier(&self) -> &dyn Verifier;
+
+    /// Whether this capability's execution output is **not** durable.
+    ///
+    /// Defaults to `false`, which is the behaviour every capability had before this method
+    /// existed: the output is whatever the sandboxed child wrote to stdout, and callers may
+    /// keep it. A bundle that returns `true` is declaring that its output is *ephemeral
+    /// execution output* — returned to the dispatcher, never written to durable task
+    /// state.
+    ///
+    /// It lives on the bundle rather than on the declaration because the bundle is what the
+    /// dispatcher has in hand when it assembles an outcome, and because this is a statement
+    /// about how the effect is obtained rather than about what the capability is. A read of
+    /// a workspace file is the case that needs it: the bytes are the point of the call, and
+    /// persisting them would copy file contents into `task_step_results` as a side effect
+    /// of nothing more than having read something.
+    ///
+    /// Defaulting to `false` is what makes this safe to add: a capability that says nothing
+    /// keeps behaving exactly as it did.
+    fn output_is_ephemeral(&self) -> bool {
+        false
+    }
 }
 
 /// Why a dispatch was refused, in one enum so callers match once.
@@ -1363,6 +1389,9 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             execution,
             verification,
             capability: capability.clone(),
+            // Read from the same `bundle` the plan and verifier came from, so the flag
+            // cannot disagree with the effect it describes.
+            output_is_ephemeral: bundle.output_is_ephemeral(),
         };
         let _ = decision;
 

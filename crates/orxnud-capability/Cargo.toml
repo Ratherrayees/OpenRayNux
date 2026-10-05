@@ -22,6 +22,9 @@ orxnud-audit = { workspace = true }
 # dependency is inward (capability sits above platform-*), so G2 permits it.
 orxnud-platform-fs = { workspace = true }
 orxnud-platform-sandbox = { workspace = true }
+# For the verifier's content digest in durable evidence. blake3 because that is what
+# the approval digest already uses, so evidence and approvals speak one dialect.
+blake3 = { workspace = true }
 
 [dev-dependencies]
 # Dev-only, so the bypass suite can name orxnud_task's public surface and assert the
@@ -46,3 +49,10 @@ proptest = { workspace = true }
 # `cargo build`, not only by `cargo test`.
 name = "orxnud-fswrite"
 path = "src/bin/orxnud-fswrite.rs"
+
+[[bin]]
+# The Tier-1 child for `filesystem/read-text`. A `[[bin]]` for the same reason as
+# `orxnud-fswrite`: the daemon executes it as the sandboxed program, so it must exist
+# outside the test harness and be built by a plain `cargo build`.
+name = "orxnud-fsread"
+path = "src/bin/orxnud-fsread.rs"

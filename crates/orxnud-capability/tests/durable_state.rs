@@ -132,6 +132,7 @@ fn approval(target: &str, issued: i64, expires: i64) -> orxnud_domain::ApprovalR
         &p,
         issued,
         expires,
+        1,
     );
     orxnud_domain::ApprovalRecord {
         approver: human(),
@@ -142,6 +143,7 @@ fn approval(target: &str, issued: i64, expires: i64) -> orxnud_domain::ApprovalR
         issued_at_ms: issued,
         expires_at_ms: expires,
         risk: RiskClass::High,
+        step_no: 1,
         digest,
     }
 }

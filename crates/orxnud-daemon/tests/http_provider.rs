@@ -292,6 +292,7 @@ fn ctx() -> ProposalContext {
             ]),
             target: orxnud_domain::TargetSemantics::Required,
         }],
+        prior_steps: Default::default(),
     }
 }
 
@@ -873,6 +874,307 @@ fn provider_errors_are_vocabulary_and_never_credentials() {
 // ---------------------------------------------------------------------------
 // Through a real daemon
 // ---------------------------------------------------------------------------
+
+/// The context a provider receives carries the declarations' own target semantics.
+///
+/// The prompt rendering is unit-tested inside the daemon; this asserts the other half —
+/// that the `TargetSemantics` the model is judged by is the one the capability declared,
+/// not something the proposer invented. Together they close the gap a real model fell
+/// into: enforced semantics that were never announced, and an announced menu that could
+/// have disagreed with what is enforced.
+#[test]
+fn the_context_a_provider_receives_carries_the_declared_target_semantics() {
+    use orxnud_daemon::Paths;
+    use std::sync::Mutex;
+
+    let rt = rt();
+    let seen: Arc<Mutex<Option<ProposalContext>>> = Arc::new(Mutex::new(None));
+
+    // Two daemons, two providers, one process: the isolation regression test, which also
+    // proves each daemon's provider sees only its own context.
+    rt.block_on(async {
+        for (tag, capability) in [
+            (
+                "iso-required",
+                AllowedCapability {
+                    id: "filesystem/write-text".into(),
+                    description: "Write one text file".into(),
+                    params: vec!["path".into(), "contents".into()],
+                    schema: ParamSchema::empty(),
+                    target: orxnud_domain::TargetSemantics::Required,
+                },
+            ),
+            (
+                "iso-none",
+                AllowedCapability {
+                    id: "text/word-count".into(),
+                    description: "Count words".into(),
+                    params: vec!["text".into()],
+                    schema: ParamSchema::empty(),
+                    target: orxnud_domain::TargetSemantics::None,
+                },
+            ),
+        ] {
+            let root = dir(tag);
+            let runtime = orxnud_daemon::runtime::Runtime::start_unconfigured(
+                Paths::under(&root),
+                FixedSecrets::empty(),
+            )
+            .await
+            .expect("the runtime starts")
+            .with_proposer(Arc::new(recorder_with(Arc::clone(&seen), capability)));
+            let endpoint = runtime.endpoint().to_path_buf();
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let _ = runtime
+                    .serve(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+            await_ready(&endpoint);
+            send(
+                &endpoint,
+                "c",
+                "task/create",
+                serde_json::json!({"id": "m", "content": "do the thing"}),
+            );
+            send(
+                &endpoint,
+                "c",
+                "task/claim",
+                serde_json::json!({"id": "m", "worker": "ai"}),
+            );
+            let _ = send(
+                &endpoint,
+                "p",
+                "task/ai-propose",
+                serde_json::json!({"task": "m", "worker": "ai"}),
+            );
+            let _ = tx.send(());
+            let _ = task.await;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    });
+
+    let ctx = seen
+        .lock()
+        .expect("recorder poisoned")
+        .clone()
+        .expect("the provider ran");
+    assert_eq!(ctx.allowed.len(), 1, "each daemon sees only its own menu");
+    // The last context recorded was the no-target capability; the assertion is on the
+    // invariant rather than on ordering.
+    assert_eq!(
+        ctx.allowed[0].target,
+        orxnud_domain::TargetSemantics::None,
+        "the model is judged by the semantics the declaration states"
+    );
+}
+
+/// A recorder provider carrying one capability.
+fn recorder_with(
+    seen: Arc<std::sync::Mutex<Option<ProposalContext>>>,
+    capability: AllowedCapability,
+) -> impl ProposalProvider {
+    struct One {
+        seen: Arc<std::sync::Mutex<Option<ProposalContext>>>,
+        capability: AllowedCapability,
+    }
+    impl ProposalProvider for One {
+        fn model_id(&self) -> &str {
+            "recorder/none"
+        }
+        fn complete(&self, ctx: &ProposalContext) -> Result<String, ProviderError> {
+            let mut with = ctx.clone();
+            with.allowed = vec![self.capability.clone()];
+            *self.seen.lock().expect("recorder poisoned") = Some(with);
+            Ok("{}".to_owned())
+        }
+    }
+    One { seen, capability }
+}
+
+/// The recorded provenance names the model that actually answered.
+///
+/// A real run recorded `openraynux/task-agent` while the provider that answered was
+/// `openai/gpt-oss-120b`. The proposal and the execution were both correct; the signed
+/// audit record was not, and an audit that misattributes the model is worse than no audit.
+///
+/// Asserted from the durable row rather than from the reply, because the reply was always
+/// right — `model: openai/gpt-oss-120b` — and it was the journal that lied.
+#[test]
+fn the_durable_proposal_names_the_model_that_actually_answered() {
+    use orxnud_daemon::Paths;
+    use orxnud_daemon::runtime::Runtime;
+
+    const DISTINCTIVE: &str = "test/provider-model-xyz";
+
+    let rt = rt();
+    rt.block_on(async {
+        let root = dir("provenance-model");
+        let (address, server) = serve_once(Reply::Content(
+            r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"ok"}}"#
+                .to_owned(),
+        ))
+        .await;
+
+        let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
+            .await
+            .expect("the runtime starts")
+            .with_proposer(Arc::new(
+                OpenAiCompatibleProvider::new(
+                    ProviderConfig::new(
+                        format!("http://{address}/v1"),
+                        DISTINCTIVE,
+                        SecretRef::new("provider-api-key", "local"),
+                    ),
+                    FixedSecrets::holding("sk-test-key"),
+                )
+                .with_plaintext_allowed(),
+            ));
+        let endpoint = runtime.endpoint().to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = runtime
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        await_ready(&endpoint);
+
+        send(
+            &endpoint,
+            "c",
+            "task/create",
+            serde_json::json!({"id": "pv", "content": "write final.txt containing ok"}),
+        );
+        send(&endpoint, "c", "task/claim", serde_json::json!({"id": "pv", "worker": "ai"}));
+        let reply = send(
+            &endpoint,
+            "p",
+            "task/ai-propose",
+            serde_json::json!({"task": "pv", "worker": "ai"}),
+        );
+        assert_eq!(reply["result"]["proposed_by"], "ai", "{reply}");
+        // Joined only now: the fake server was waiting for the request above.
+        let _ = server.await;
+
+        let _ = tx.send(());
+        let _ = task.await;
+
+        // Read the durable row, not the reply.
+        let recorded = recorded_provenance(&root);
+        assert_eq!(
+            recorded, DISTINCTIVE,
+            "the journal must name the provider that answered"
+        );
+        assert_ne!(
+            recorded, "openraynux/task-agent",
+            "the false identity must not come back"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
+/// Two daemons, two providers, two models: each proposal names only its own.
+///
+/// This is the per-Runtime isolation property restated over provenance. If provenance were
+/// derived from anything global — configuration, a process-wide default, a constant — this
+/// would fail, because the two proposals would carry the same model.
+#[test]
+fn two_daemons_record_their_own_providers_model() {
+    use orxnud_daemon::Paths;
+    use orxnud_daemon::runtime::Runtime;
+
+    let rt = rt();
+    rt.block_on(async {
+        let mut recorded = Vec::new();
+        for (tag, model) in [
+            ("prov-a", "test/provider-model-aaa"),
+            ("prov-b", "test/provider-model-bbb"),
+        ] {
+            let root = dir(tag);
+            let (address, server) = serve_once(Reply::Content(
+                r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"ok"}}"#
+                    .to_owned(),
+            ))
+            .await;
+            let mut config = ProviderConfig::new(
+                format!("http://{address}/v1"),
+                model,
+                SecretRef::new("provider-api-key", "local"),
+            );
+            config.completions_path = "/chat/completions".to_owned();
+
+            let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
+                .await
+                .expect("the runtime starts")
+                .with_proposer(Arc::new(
+                    OpenAiCompatibleProvider::new(config, FixedSecrets::holding("sk-test-key"))
+                        .with_plaintext_allowed(),
+                ));
+            let endpoint = runtime.endpoint().to_path_buf();
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let _ = runtime
+                    .serve(async move {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+            await_ready(&endpoint);
+            send(
+                &endpoint,
+                "c",
+                "task/create",
+                serde_json::json!({"id": "pv", "content": "write final.txt containing ok"}),
+            );
+            send(&endpoint, "c", "task/claim", serde_json::json!({"id": "pv", "worker": "ai"}));
+            let _ = send(
+                &endpoint,
+                "p",
+                "task/ai-propose",
+                serde_json::json!({"task": "pv", "worker": "ai"}),
+            );
+            let _ = server.await;
+            let _ = tx.send(());
+            let _ = task.await;
+            recorded.push(recorded_provenance(&root));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        assert_eq!(
+            recorded,
+            vec!["test/provider-model-aaa", "test/provider-model-bbb"],
+            "each daemon must record only its own provider"
+        );
+    });
+}
+
+/// The `provenance.model` recorded in the durable proposal table for `root`.
+fn recorded_provenance(root: &std::path::Path) -> String {
+    let db = root.join("state.db");
+    let wal = root.join("state.db-wal");
+    // The WAL holds the recent writes; a read-only open of the db alone can miss the row
+    // this test is about, which would make it pass for the wrong reason.
+    let _ = std::fs::copy(&wal, root.join("state.db-wal.copy")).ok();
+    let blob = std::fs::read(&db).unwrap_or_default();
+    let wal_blob = std::fs::read(&wal).unwrap_or_default();
+    let haystack = [blob, wal_blob].concat();
+    let text = String::from_utf8_lossy(&haystack).into_owned();
+    let marker = "\"model\":\"";
+    let Some(at) = text.find(marker) else {
+        panic!(
+            "no provenance model in the durable state under {}",
+            root.display()
+        );
+    };
+    let rest = &text[at + marker.len()..];
+    let end = rest.find('"').expect("an unterminated model string");
+    rest[..end].to_owned()
+}
 
 /// The provider inside a daemon, over the real IPC surface, end to end.
 ///

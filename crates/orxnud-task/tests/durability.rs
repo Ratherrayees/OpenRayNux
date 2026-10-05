@@ -268,6 +268,7 @@ fn an_approval_recorded_before_a_restart_is_still_scoped_to_its_attempt() {
     let approval = orxnud_store::task_repo::ApprovalRow {
         task_id: tid("t"),
         attempt_no: 1,
+        step_no: 1,
         digest_hex: "cd".repeat(32),
         capability: "cap".into(),
         target: None,
@@ -528,6 +529,10 @@ fn a_fresh_database_reaches_the_current_version_and_creates_only_the_task_schema
             "task_effects",
             "task_events",
             "task_proposals",
+            // Bounded linear composition, representation only (migration 7). Present on
+            // a fresh database because migration 7 adds it there too, so a new install
+            // and a migrated one converge rather than differing by a table.
+            "task_step_results",
             "tasks",
         ]
     );

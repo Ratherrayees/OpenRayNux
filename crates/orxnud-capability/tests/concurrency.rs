@@ -281,6 +281,7 @@ fn concurrent_approval_attempts_produce_exactly_one_execution() {
         issued_at_ms: NOW,
         expires_at_ms: NOW + 60_000,
         risk: RiskClass::High,
+        step_no: 1,
         digest: digest_for(
             &human(),
             &human(),
@@ -289,6 +290,7 @@ fn concurrent_approval_attempts_produce_exactly_one_execution() {
             &params(),
             NOW,
             NOW + 60_000,
+            1,
         ),
     };
 

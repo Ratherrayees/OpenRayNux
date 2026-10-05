@@ -44,6 +44,29 @@ pub fn write_text_params() -> ParamSpec {
     )
 }
 
+/// `filesystem/read-text`: which workspace file to read.
+///
+/// Shape only, and deliberately the narrowest schema in the crate: **one** required
+/// string. There is no offset, no length, no encoding and no glob, because each of those
+/// would be a way to ask for something other than "this file, in full". The 64 KiB ceiling
+/// is not expressible here either -- it depends on the file, not on the request -- so it is
+/// enforced where the file is actually read.
+///
+/// Path safety is not here on purpose: it belongs to `read_text::resolve`, and duplicating
+/// those rules would create two implementations that could disagree about what "inside the
+/// workspace" means.
+#[must_use]
+pub fn read_text_params() -> ParamSpec {
+    ParamSpec::new(
+        "Read one text file from the sandbox workspace.",
+        ParamSchema::new(vec![ParamField::required(
+            "path",
+            ParamKind::String,
+            "Path to the file, relative to the workspace root.",
+        )]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

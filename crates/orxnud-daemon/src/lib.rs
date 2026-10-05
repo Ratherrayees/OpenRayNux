@@ -58,6 +58,7 @@
 #![deny(missing_docs)]
 
 pub mod http_provider;
+pub mod observation;
 pub mod proposer;
 pub mod runtime;
 pub mod task_service;
@@ -551,6 +552,15 @@ fn shipped_bundles(paths: &Paths) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundl
             )),
         );
     }
+    if let Some(helper) = orxnud_capability::read_text::resolve_helper() {
+        bundles.insert(
+            CapabilityId::new(orxnud_capability::read_text::READ_TEXT_ID),
+            Arc::new(orxnud_capability::read_text::ReadTextBundle::new(
+                paths.workspace(),
+                helper,
+            )),
+        );
+    }
     bundles
 }
 
@@ -563,6 +573,7 @@ fn shipped_declarations() -> Vec<CapabilityDeclaration> {
     vec![
         orxnud_capability::text::declaration(),
         orxnud_capability::write_text::declaration(),
+        orxnud_capability::read_text::declaration(),
     ]
 }
 
@@ -1042,6 +1053,7 @@ mod tests {
         let shipped: Vec<String> = vec![
             orxnud_capability::text::WORD_COUNT_ID.to_owned(),
             orxnud_capability::write_text::WRITE_TEXT_ID.to_owned(),
+            orxnud_capability::read_text::READ_TEXT_ID.to_owned(),
         ];
         let mut declared: Vec<String> =
             d.registry().ids().iter().map(ToString::to_string).collect();
@@ -1201,7 +1213,7 @@ mod tests {
     fn the_description_reports_the_enabled_capabilities() {
         let d = daemon();
         let text = d.describe();
-        assert!(text.contains("capabilities enabled: 2"), "{text}");
+        assert!(text.contains("capabilities enabled: 3"), "{text}");
         assert!(text.contains("config schema version: 1"), "{text}");
     }
 
@@ -1328,6 +1340,7 @@ mod tests {
         assert_eq!(
             declared,
             vec![
+                "filesystem/read-text".to_owned(),
                 "filesystem/write-text".to_owned(),
                 "text/word-count".to_owned()
             ]
@@ -1368,7 +1381,7 @@ mod tests {
         let text = format!("{:?}", d.dispatch_wiring());
         // The count, not the identity: this test is about the Debug shape, and the
         // bundle count itself is asserted in the composition test above.
-        assert!(text.contains("bundles: 2"), "{text}");
+        assert!(text.contains("bundles: 3"), "{text}");
         assert!(text.contains("execution_backend: \"installed\""), "{text}");
     }
 

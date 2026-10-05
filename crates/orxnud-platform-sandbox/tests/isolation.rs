@@ -223,6 +223,42 @@ fn a_child_cannot_write_outside_its_grant() {
     );
 }
 
+/// The read capability's grant shape refuses a write.
+///
+/// `filesystem/read-text` grants the workspace `ro` and nothing writable, and its helper
+/// would have no reason to write. This proves the sandbox enforces that rather than trusting
+/// the helper: a **hostile** helper, given exactly the read capability's grants, cannot place
+/// a file inside the workspace.
+///
+/// Distinct from `a_child_cannot_write_outside_its_grant`, which proves a write does not
+/// escape to the host. This one is about a write that *stays inside* the granted tree and is
+/// still refused, because the whole point of a read-only grant is that nothing may be
+/// written there at all.
+#[test]
+fn a_read_only_grant_refuses_a_write_inside_it() {
+    let d = scratch("ro-write-denied");
+    let workspace = d.join("workspace");
+    let inside = workspace.join("planted.txt");
+    std::fs::create_dir_all(&workspace).expect("mkdir");
+    // The same shape `ReadTextBundle::sandbox_plan` produces: the workspace read-only, the
+    // helper visible, and no `grant_rw` at all.
+    let spec = closed_spec_arg("fs-write", &inside.display().to_string()).grant_ro(&workspace);
+
+    let result = run_helper(&spec);
+
+    assert!(
+        !inside.exists(),
+        "a read-only grant let a write land inside it: {}",
+        inside.display()
+    );
+    // And not vacuously: the sandbox really did run the helper.
+    assert!(
+        String::from_utf8_lossy(&result.stdout.bytes).contains("RESULT"),
+        "the helper produced no result, so the denial proved nothing: status={:?}",
+        result.status
+    );
+}
+
 #[test]
 fn a_granted_file_is_readable_so_the_test_is_not_vacuous() {
     // Without this, "it could not read anything" would pass every denial test above

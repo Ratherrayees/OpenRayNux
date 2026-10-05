@@ -65,6 +65,13 @@ pub enum FaultPoint {
     /// This is the interesting one: the task row and the attempt row disagree at
     /// this instant. Atomicity means neither half is visible afterwards.
     CompleteAfterUpdateBeforeAttempt,
+    /// Inside the post-verification step-advancement transaction, after the step result has
+    /// been written and before `steps_completed` has been moved.
+    ///
+    /// The window that matters: the result and the counter disagree for exactly as long as
+    /// the transaction is open, so this is the only moment at which a crash could leave a
+    /// verified step recorded against a task that has not counted it.
+    AdvanceStepAfterResultBeforeCounter,
     /// Inside `cancel`'s first transaction, between marking the tasks row and
     /// recording the cancellation event.
     CancelBeforeEvent,
@@ -76,6 +83,7 @@ impl FaultPoint {
         match self {
             Self::ClaimAfterTakeBeforeAttempt => "claim-after-take-before-attempt",
             Self::CompleteAfterUpdateBeforeAttempt => "complete-after-update-before-attempt",
+            Self::AdvanceStepAfterResultBeforeCounter => "advance-step-after-result-before-counter",
             Self::CancelBeforeEvent => "cancel-before-event",
         }
     }
@@ -86,6 +94,7 @@ pub fn all() -> Vec<FaultPoint> {
     vec![
         FaultPoint::ClaimAfterTakeBeforeAttempt,
         FaultPoint::CompleteAfterUpdateBeforeAttempt,
+        FaultPoint::AdvanceStepAfterResultBeforeCounter,
         FaultPoint::CancelBeforeEvent,
     ]
 }
@@ -206,6 +215,7 @@ mod tests {
             vec![
                 "claim-after-take-before-attempt",
                 "complete-after-update-before-attempt",
+                "advance-step-after-result-before-counter",
                 "cancel-before-event",
             ]
         );
@@ -225,7 +235,9 @@ mod atomicity {
     use super::*;
     use crate::migration::MigrationRunner;
     use crate::pragma::Pragma;
-    use crate::task_repo::{ClaimOutcome, NewTask, TaskRepository};
+    use crate::task_repo::{
+        ClaimOutcome, NewTask, StepStatus, TargetedClaimOutcome, TaskRepository, VerifiedStep,
+    };
     use orxnud_domain::ids::TaskId;
     use orxnud_domain::task_state::{TaskKind, TaskState};
     use std::path::{Path, PathBuf};
@@ -279,6 +291,50 @@ mod atomicity {
         TaskRepository::new(&mut c)
             .insert(&NewTask::new(TaskId::new("t"), TaskKind::Query, NOW), NOW)
             .expect("seed");
+        p
+    }
+
+    /// A database holding one task already running step 1 of a two-step composition, with
+    /// an approved proposal for that step.
+    ///
+    /// `TaskKind::Workflow` because a workflow is the kind that carries composition, and
+    /// `max_steps = 2` because a single-step task would complete rather than stop at the
+    /// boundary, which is the case already covered by the `complete` scenario.
+    fn seeded_running_step(tag: &str) -> PathBuf {
+        let p = db_path(tag);
+        let mut c = open(&p);
+        {
+            let mut repo = TaskRepository::new(&mut c);
+            repo.insert(
+                &NewTask::new(TaskId::new("t"), TaskKind::Workflow, NOW),
+                NOW,
+            )
+            .expect("seed");
+        }
+        c.execute("UPDATE tasks SET max_steps = 2 WHERE id = 't';", [])
+            .expect("bounds");
+        let mut repo = TaskRepository::new(&mut c);
+        assert!(matches!(
+            repo.claim_specific(&TaskId::new("t"), "w", NOW, LEASE),
+            Ok(TargetedClaimOutcome::Claimed(_))
+        ));
+        repo.propose_action(
+            "p1",
+            &TaskId::new("t"),
+            "w",
+            "filesystem/write-text",
+            Some("a.txt"),
+            "{}",
+            "{}",
+            None,
+            1,
+            NOW,
+        )
+        .expect("propose");
+        repo.decide_proposal("p1", "approved", NOW)
+            .expect("approve");
+        repo.begin_approved_execution("p1", "w", NOW, LEASE)
+            .expect("resume");
         p
     }
 
@@ -369,6 +425,22 @@ mod atomicity {
                 // Aborted after the state flipped to `cancelled`, before the event.
                 let _ = repo.request_cancel(&TaskId::new("t"), NOW);
             }
+            "advance-step" => {
+                // Aborted after the verified step result was written and before
+                // `steps_completed` moved: the two disagree for exactly as long as the
+                // transaction is open, which is the window this scenario exists to test.
+                let _ = repo.complete_verified_step(&VerifiedStep {
+                    task_id: TaskId::new("t"),
+                    worker: "w",
+                    step_no: 1,
+                    proposal_id: "p1",
+                    status: StepStatus::Verified,
+                    verification: Some("evidence".into()),
+                    structured_output: None,
+                    artifacts: None,
+                    recorded_at_ms: NOW,
+                });
+            }
             other => panic!("unknown scenario {other}"),
         }
 
@@ -413,10 +485,110 @@ mod atomicity {
         .expect("read the task")
     }
 
+    /// The step counters and the step results of task `t`, read together.
+    ///
+    /// Read as a pair because the property is about them agreeing: a counter that moved
+    /// without its result, or a result without its counter, is the contradiction this
+    /// scenario is looking for.
+    fn step_coherence(db: &Path) -> (String, i64, i64, i64) {
+        let c = rusqlite::Connection::open(db).expect("reopen");
+        c.query_row(
+            "SELECT t.state, t.steps_completed, t.max_steps,
+                    (SELECT COUNT(*) FROM task_step_results r WHERE r.task_id = t.id)
+               FROM tasks t WHERE t.id = 't';",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("read the task")
+    }
+
     fn attempts(db: &Path) -> i64 {
         let c = rusqlite::Connection::open(db).expect("reopen");
         c.query_row("SELECT COUNT(*) FROM task_attempts;", [], |r| r.get(0))
             .expect("count attempts")
+    }
+
+    /// The step-advancement transaction is all-or-nothing.
+    ///
+    /// The crash lands in the one window where the step result and the counter disagree --
+    /// after the result row is written, before `steps_completed` moves. Both are
+    /// uncommitted at that point, so recovery must find neither. The two states this rules
+    /// out are precisely the ones nothing else would complain about:
+    ///
+    /// ```text
+    /// result present + counter not advanced + terminal state
+    /// counter advanced + result absent
+    /// ```
+    #[test]
+    fn a_crash_inside_the_step_advancement_transaction_undoes_the_whole_step() {
+        let db = seeded_running_step("advance-step");
+        let out = run(
+            "advance-step",
+            FaultPoint::AdvanceStepAfterResultBeforeCounter,
+            &db,
+        );
+        assert_died_at_the_fault_point(
+            &out,
+            "advance-step",
+            FaultPoint::AdvanceStepAfterResultBeforeCounter,
+        );
+
+        let (state, steps_completed, max_steps, results) = step_coherence(&db);
+        assert_eq!(
+            results, 0,
+            "the verified result was written but rolled back, so it must not survive"
+        );
+        assert_eq!(steps_completed, 0, "the counter must not have moved either");
+        assert_eq!(max_steps, 2, "the bounds are untouched by a rollback");
+        assert_eq!(
+            state, "running",
+            "the task is still executing the step it had not finished"
+        );
+
+        // Not terminal, and not counting a step it has no result for.
+        assert!(
+            !matches!(state.as_str(), "completed" | "dead-lettered"),
+            "a rolled-back advancement must not leave a terminal task: {state}"
+        );
+        assert_eq!(results, steps_completed);
+    }
+
+    /// The complement: after recovery the step can be completed for real, exactly once.
+    ///
+    /// Worth stating separately because "the rollback was clean" and "the work can still be
+    /// finished" are different claims, and a transaction that rolled back but left the task
+    /// unclaimable would satisfy the first and fail this.
+    #[test]
+    fn a_step_rolled_back_by_a_crash_can_still_be_completed_once() {
+        let db = seeded_running_step("advance-retry");
+        let _ = run(
+            "advance-step",
+            FaultPoint::AdvanceStepAfterResultBeforeCounter,
+            &db,
+        );
+
+        let mut c = open(&db);
+        let advance = TaskRepository::new(&mut c).complete_verified_step(&VerifiedStep {
+            task_id: TaskId::new("t"),
+            worker: "w",
+            step_no: 1,
+            proposal_id: "p1",
+            status: StepStatus::Verified,
+            verification: Some("evidence".into()),
+            structured_output: None,
+            artifacts: None,
+            recorded_at_ms: NOW,
+        });
+        assert!(
+            advance.is_ok(),
+            "the step must still be completable: {advance:?}"
+        );
+        drop(c);
+
+        let (state, steps_completed, _, results) = step_coherence(&db);
+        assert_eq!(state, "awaiting-next-step");
+        assert_eq!(steps_completed, 1);
+        assert_eq!(results, 1, "one verified step, one result, one count");
     }
 
     #[test]

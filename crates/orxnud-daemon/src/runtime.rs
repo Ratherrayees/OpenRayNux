@@ -661,6 +661,14 @@ async fn route<S: SecretsContract>(
 
 /// The single actor this runtime acts as.
 ///
+/// The logical step an approval governs when it governs no task.
+///
+/// `orxnuctl capability approve` authorises one action outside any task, so it has exactly
+/// one logical step and that step is 1. Named and explained rather than written as a bare
+/// `1`, because a digest field that is always 1 is otherwise indistinguishable from one
+/// filled in without thought.
+const STANDALONE_APPROVAL_STEP: u32 = 1;
+
 /// Named, because it has to be *the same* actor at approval time and at dispatch time:
 /// the digest is computed over the actor's label and authority root, so two
 /// structurally identical actors that differed in either would produce approvals that
@@ -766,11 +774,29 @@ async fn ai_propose<S: SecretsContract>(
                 target: declaration.target(),
             })
             .collect();
+    // Prior-step metadata, derived from the durable step results at request time and used
+    // for this request only. Nothing is persisted: it is a projection of rows that are
+    // already committed, so there is no new record to keep in step with anything.
+    //
+    // A read failure here is not fatal to the proposal. Losing the *context* degrades what the
+    // model is told; refusing the proposal would mean a reporting fault stops the work.
+    let prior_steps = match g.2.step_results_for(&TaskId::new(task_id.as_str())) {
+        Ok(rows) => crate::proposer::prior_step_context_from(&rows),
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "prior-step context unavailable; proposing without it"
+            );
+            crate::proposer::PriorStepContext::default()
+        }
+    };
+
     let ctx = crate::proposer::ProposalContext {
         task_id: task_id.clone(),
         content: row.payload.clone().unwrap_or_default(),
         attempt_no: row.attempts,
         allowed,
+        prior_steps,
     };
 
     // The provider trait is synchronous, and a synchronous network call inside an async
@@ -813,7 +839,10 @@ async fn ai_propose<S: SecretsContract>(
     // from the worker holding the lease.
     let canonical = orxnud_policy::canonical_params(&validated.params);
     let proposal_id = format!("p-{task_id}-{now}");
-    let proposer = delegated_actor(&task_id);
+    // The provider instance that just answered is the only authority on which model
+    // produced this text. Read from it rather than from configuration, so the audit cannot
+    // name a model that did not answer.
+    let proposer = delegated_actor(&task_id, provider.model_id());
     let proposed =
         g.2.propose_action(
             &proposal_id,
@@ -859,14 +888,34 @@ pub fn scripted_proposer() -> Arc<dyn crate::proposer::ProposalProvider> {
 /// holding the lease. That is V-71 as code rather than as a comment: the two inputs a
 /// caller controls (task id, worker) and the two that determine authority (delegating
 /// human, task) are separate, and only the former is reachable from the request.
-fn delegated_actor(task_id: &str) -> orxnud_domain::Actor {
+/// Provenance for a proposal no model produced.
+///
+/// `task/propose` records a delegated `Actor::Ai` for a proposal asserted directly over the
+/// wire, with no provider involved. This is what it says about the model: nothing. The
+/// previous value here named a model that had not answered, which is the specific falsehood
+/// this function existed to stop.
+const NO_MODEL_PROPOSED: &str = "none/direct-proposal";
+
+/// The delegated proposer actor for a task.
+///
+/// `model` is supplied by the caller and must come from whichever component actually
+/// produced the proposal — [`ProposalProvider::model_id`] when a model answered,
+/// [`NO_MODEL_PROPOSED`] when none did. It is a parameter rather than a constant precisely
+/// so that no model identity can be written here: a hardcoded name in this function was
+/// recorded into the signed audit journal as though a model had answered, and it named
+/// `openraynux/task-agent` while the provider that actually answered was something else
+/// entirely.
+///
+/// `prompt_hash` stays a placeholder. It describes a prompt-framing version this code does
+/// not version, and changing it is a separate question from recording a truthful model.
+fn delegated_actor(task_id: &str, model: &str) -> orxnud_domain::Actor {
     use orxnud_domain::actor::ModelProvenance;
     orxnud_domain::Actor::Ai {
         delegated_by: orxnud_domain::ids::UserId::new("local"),
         run: orxnud_domain::ids::RunId::new(task_id),
         task: orxnud_domain::ids::TaskId::new(task_id),
         provenance: ModelProvenance::new(
-            "openraynux/task-agent",
+            model,
             "phase-2",
             orxnud_domain::ids::RequestId::new(task_id),
         ),
@@ -1010,20 +1059,48 @@ async fn execute_proposal<S: SecretsContract>(
     // is the honest state: something may have happened and nobody can say what. Reporting
     // completion there would be the task layer asserting an effect the verification stage
     // explicitly refused to confirm.
-    let completed = if o.is_verified() {
+    // Verified execution is where a logical step ends, and ending one is a durable fact
+    // rather than a task-level event: the step result, the counter and the state all have
+    // to agree, and they agree only inside one transaction. `complete_verified_step` is
+    // that transaction, and it decides between `AwaitingNextStep` and `Completed` from the
+    // task's own `max_steps`.
+    //
+    // The step number is read from the durable counter rather than carried in memory, and
+    // checked against the proposal this execution came from, so an approval minted for one
+    // step cannot advance another.
+    let advance = if o.is_verified() {
         let complete_at = g.2.clock_now_ms();
-        Some(
-            g.2.complete_task_with(
-                &began.task_id,
-                &worker,
-                complete_at,
-                TaskState::Completed,
-                true,
-                None,
-                None,
-            )
-            .map_err(task_fault)?,
-        )
+        let step_no = g.2.next_step_no(&began.task_id).map_err(task_fault)?;
+        let step = orxnud_store::task_repo::VerifiedStep {
+            task_id: began.task_id.clone(),
+            worker: &worker,
+            step_no,
+            proposal_id: &proposal_id,
+            status: orxnud_store::task_repo::StepStatus::Verified,
+            // Bounded metadata only, never the bytes. See `note_durable_evidence`: the
+            // verifier's evidence is already path/count/digest shaped, and the verifier is
+            // the component that established the content independently.
+            verification: Some(o.verification.to_string()),
+            // `structured_output` is durable, so it may only hold what a caller is willing to
+            // keep. A capability that declares its output ephemeral (a workspace read) has
+            // its output dropped here rather than written into the step result: the bytes
+            // were returned to the dispatcher, and persisting them would copy file contents
+            // into `task_step_results` merely because something read a file.
+            //
+            // Behaviour-neutral for every other capability: the default is `false`, and the
+            // branch below is the same expression as before in that case.
+            structured_output: durable_output(&o),
+            // The step's target, as a workspace-relative reference. This is the capability
+            // contract's own path vocabulary, already validated at dispatch, so it is the one
+            // string a later step needs in order to *ask* for the content through a governed
+            // read -- and it is a reference, not the content.
+            //
+            // `None` when the capability declared no target, and `Some` only when the stored
+            // proposal named one, so nothing is synthesised here.
+            artifacts: safe_artifact_reference(proposal.target.as_deref()),
+            recorded_at_ms: complete_at,
+        };
+        Some(g.2.complete_verified_step(&step).map_err(task_fault)?)
     } else {
         None
     };
@@ -1036,8 +1113,74 @@ async fn execute_proposal<S: SecretsContract>(
         "result": o.verification.to_string(),
         // `null` when the verifier did not confirm, so a client can tell "not completed"
         // from "completed, and here is the stored row".
-        "task": completed.as_ref().map(task_json),
+        "task": advance
+            .as_ref()
+            .map(|_| TaskId::new(began.task_id.as_str()))
+            .map(|id| g.2.task(&id))
+            .transpose()
+            .map_err(task_fault)?
+            .flatten()
+            .as_ref()
+            .map(task_json),
+        // Which logical step just concluded, and how far the task now is. Present only
+        // when the verifier confirmed, for the same reason `task` is.
+        "step": advance.as_ref().map(|a| {
+            json!({
+                "completed": a.step_no,
+                "steps_completed": a.steps_completed,
+                "max_steps": a.max_steps,
+                "next_step": a.steps_completed + 1,
+            })
+        }),
     }))
+}
+
+/// The execution output that may be written to durable step state, if any.
+///
+/// # Why this exists as its own function
+///
+/// `task_step_results.structured_output` is durable. A capability whose output is
+/// *ephemeral* -- a workspace read, where the bytes are the file's contents -- must have
+/// its output dropped here rather than persisted, or reading a file would copy its contents
+/// into the database as a side effect of nothing more than having read it.
+///
+/// Extracted so the decision is testable on its own. Left inline it would be a match arm
+/// buried in a large JSON assembly, where the only way to exercise it is to run a whole
+/// governed dispatch through a real sandbox -- and an untested version of this expression is
+/// exactly how file contents would end up in a durable row.
+fn durable_output(outcome: &orxnud_capability::dispatch::DispatchOutcome) -> Option<String> {
+    if outcome.output_is_ephemeral {
+        return None;
+    }
+    match &outcome.execution {
+        orxnud_capability::verification::ExecutionOutcome::Succeeded { output } => output.clone(),
+        _ => None,
+    }
+}
+
+/// A workspace-relative path rendered as a bounded artifact reference.
+///
+/// Reuses the same acceptance rule as [`crate::proposer`]'s own filtering, so a value that
+/// reaches a prompt is one that already satisfied it. Serialised as a one-element JSON array,
+/// which is the form `bounded_artifacts` reads.
+///
+/// Returns `None` rather than an empty list, so "this step produced nothing addressable" and
+/// "this step's target was not a path" do not have to be distinguished by a consumer.
+fn safe_artifact_reference(target: Option<&str>) -> Option<String> {
+    let path = target?;
+    if path.is_empty() || path.len() > 256 {
+        return None;
+    }
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return None;
+    }
+    for component in p.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+    }
+    Some(serde_json::json!([path]).to_string())
 }
 
 /// Rebuilds the approval record for dispatch from the stored row.
@@ -1057,6 +1200,19 @@ fn approval_record_from_row(
     })?;
     // The approval must be *for this action*. Cheap pre-check so the refusal names the
     // mismatch instead of surfacing as a digest failure deep in the dispatcher.
+    // Both rows name a step, and they must be the same one. The approval's own step is
+    // what its digest was computed over, so that is the step carried forward; the check
+    // exists so an approval recorded against a proposal for a different step is refused
+    // rather than quietly reinterpreted as belonging to this one.
+    if row.step_no != proposal.step_no {
+        return Err(RequestError::Declined {
+            reason: "approval-step-mismatch".to_owned(),
+            detail: Some(
+                "the approval was issued for a different logical step than the proposal it is recorded against"
+                    .to_owned(),
+            ),
+        });
+    }
     if row.capability != proposal.capability
         || row.params != proposal.params
         || row.target != proposal.target
@@ -1075,6 +1231,7 @@ fn approval_record_from_row(
         issued_at_ms: row.issued_at_ms,
         expires_at_ms: row.expires_at_ms,
         risk: orxnud_domain::enums::RiskClass::High,
+        step_no: row.step_no,
         digest,
     })
 }
@@ -1143,6 +1300,9 @@ async fn approve_proposal<S: SecretsContract>(
         now,
         now.saturating_add(ttl_ms),
         orxnud_domain::enums::RiskClass::High,
+        // From the durable proposal, not from the caller and not from `attempt_no`: a
+        // retried step keeps its step, so the two are not interchangeable.
+        proposal.step_no,
     );
 
     // Recorded against the attempt, so a retry would not inherit it (TP-6), and marked
@@ -1150,6 +1310,7 @@ async fn approve_proposal<S: SecretsContract>(
     let approval_row = orxnud_store::task_repo::ApprovalRow {
         task_id: proposal.task_id.clone(),
         attempt_no: proposal.attempt_no,
+        step_no: proposal.step_no,
         digest_hex: digest_hex(&record.digest),
         capability: record.capability.clone(),
         target: proposal.target.clone(),
@@ -1255,6 +1416,7 @@ async fn approve<S: SecretsContract>(
         // be a claim this method cannot make; it is recorded as the class the caller
         // asked to be treated as, which the runtime does not rely on.
         orxnud_domain::enums::RiskClass::High,
+        STANDALONE_APPROVAL_STEP,
     );
 
     Ok(json!({
@@ -1338,6 +1500,10 @@ fn approval_from_json(
         expires_at_ms: number("expires_at_ms")?,
         // Carried for display only; `authorise` derives risk from the declaration.
         risk: orxnud_domain::enums::RiskClass::High,
+        // Not read from the JSON. This approval governs no task and therefore has one
+        // step; letting the caller name the step would let it claim authority it was
+        // never granted for any other.
+        step_no: STANDALONE_APPROVAL_STEP,
         digest,
     })
 }
@@ -1470,7 +1636,7 @@ async fn tasks<S: SecretsContract>(
             // The proposer is **delegated**, and is built from the task identity rather
             // than from the worker. That separation is V-71 as code: the caller controls
             // the worker string, and the worker cannot reach the actor.
-            let proposer = delegated_actor(&task_id);
+            let proposer = delegated_actor(&task_id, NO_MODEL_PROPOSED);
             let canonical = orxnud_policy::canonical_params(&inner);
             // Derived from the task and the instant, so two proposals for one attempt in
             // the same millisecond collide in the primary key rather than both existing.
@@ -2051,5 +2217,95 @@ mod tests {
                 path: None,
             };
         });
+    }
+}
+
+/// The durable-vs-ephemeral boundary for execution output.
+///
+/// `task_step_results.structured_output` is a durable column. A read's output is the file's
+/// contents, so persisting it would copy workspace data into the database. These tests use a
+/// sentinel that would be unmistakable in the database, and assert on the *decision* rather
+/// than by running a whole governed dispatch through a real sandbox.
+#[cfg(test)]
+mod durable_output_tests {
+    use super::durable_output;
+    use orxnud_capability::dispatch::DispatchOutcome;
+    use orxnud_capability::verification::{ExecutionOutcome, VerificationOutcome};
+    use orxnud_domain::ids::CapabilityId;
+
+    /// Unmistakable if it ever reaches a durable row or a log.
+    const SENTINEL: &str = "SENTINEL-READ-CONTENT-MUST-NOT-PERSIST-9d1e77";
+
+    fn outcome(capability: &str, output: &str, ephemeral: bool) -> DispatchOutcome {
+        DispatchOutcome {
+            execution: ExecutionOutcome::Succeeded {
+                output: Some(output.to_owned()),
+            },
+            verification: VerificationOutcome::Verified {
+                evidence: "a.txt holds the 1 bytes the execution reported".to_owned(),
+            },
+            capability: CapabilityId::new(capability),
+            output_is_ephemeral: ephemeral,
+        }
+    }
+
+    /// The load-bearing assertion: a read's bytes never reach `structured_output`.
+    #[test]
+    fn an_ephemeral_output_is_never_persisted() {
+        let o = outcome(orxnud_capability::read_text::READ_TEXT_ID, SENTINEL, true);
+        let persisted = durable_output(&o);
+        assert!(
+            persisted.is_none(),
+            "file content would be written to a durable row: {persisted:?}"
+        );
+    }
+
+    /// Behaviour-neutral for everything else: a capability that does not declare its output
+    /// ephemeral keeps exactly the behaviour it had, output included.
+    #[test]
+    fn a_durable_output_is_still_persisted() {
+        let o = outcome(
+            orxnud_capability::write_text::WRITE_TEXT_ID,
+            "written",
+            false,
+        );
+        assert_eq!(durable_output(&o).as_deref(), Some("written"));
+    }
+
+    #[test]
+    fn a_failed_execution_persists_nothing_regardless() {
+        let mut o = outcome(orxnud_capability::write_text::WRITE_TEXT_ID, "x", false);
+        o.execution = ExecutionOutcome::Failed {
+            detail: "boom".into(),
+        };
+        assert!(durable_output(&o).is_none());
+    }
+
+    /// The sentinel must not appear anywhere in what the durable path would receive.
+    #[test]
+    fn no_content_reaches_the_durable_step_result() {
+        for capability in [
+            orxnud_capability::read_text::READ_TEXT_ID,
+            orxnud_capability::write_text::WRITE_TEXT_ID,
+        ] {
+            let o = outcome(capability, SENTINEL, true);
+            let row = orxnud_store::task_repo::StepResultRow {
+                task_id: orxnud_domain::ids::TaskId::new("t"),
+                step_no: 1,
+                status: orxnud_store::task_repo::StepStatus::Verified,
+                verification: Some(match &o.verification {
+                    VerificationOutcome::Verified { evidence } => evidence.clone(),
+                    _ => String::new(),
+                }),
+                structured_output: durable_output(&o),
+                artifacts: None,
+                recorded_at_ms: 0,
+            };
+            let rendered = format!("{row:?}");
+            assert!(
+                !rendered.contains(SENTINEL),
+                "{capability}: content leaked into the durable row: {rendered}"
+            );
+        }
     }
 }

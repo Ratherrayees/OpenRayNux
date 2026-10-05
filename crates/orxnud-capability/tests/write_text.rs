@@ -84,6 +84,7 @@ fn invocation(params: &serde_json::Value) -> orxnud_domain::invocation::Capabili
                 NOW,
                 NOW + 60_000,
                 RiskClass::High,
+                1,
             )),
             NOW,
         )
@@ -246,6 +247,7 @@ impl Fixture {
             NOW,
             NOW + ttl_ms,
             RiskClass::High,
+            1,
         )
     }
 }

@@ -722,7 +722,11 @@ fn task_management_is_not_a_capability_invocation() {
         // count.
         assert_eq!(
             ids,
-            vec!["filesystem/write-text", "text/word-count"],
+            vec![
+                "filesystem/read-text",
+                "filesystem/write-text",
+                "text/word-count"
+            ],
             "only the shipped capabilities exist"
         );
         for id in &ids {

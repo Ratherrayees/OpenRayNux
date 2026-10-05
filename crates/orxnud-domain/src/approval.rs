@@ -132,6 +132,12 @@ pub struct ApprovalRecord {
     pub expires_at_ms: i64,
     /// The risk class that made this approval necessary.
     pub risk: crate::enums::RiskClass,
+    /// The 1-based logical step this approval authorises.
+    ///
+    /// Part of the approval's identity since digest v3. A record that does not say which
+    /// step it speaks for cannot be told apart from one that speaks for a different step,
+    /// so two identical actions within one task would otherwise share a single approval.
+    pub step_no: u32,
     /// The digest of the tuple above.
     pub digest: ApprovalDigest,
 }
@@ -175,6 +181,7 @@ mod tests {
             issued_at_ms: 1_000,
             expires_at_ms: 2_000,
             risk: RiskClass::High,
+            step_no: 1,
             digest: ApprovalDigest::from_bytes([1u8; 32]),
         }
     }

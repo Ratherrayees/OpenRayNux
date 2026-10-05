@@ -1549,16 +1549,35 @@ fn the_provider_flags_are_wired_and_the_credential_is_required_before_any_reques
     );
 
     let refused = daemon.cli(&["task", "ai-propose", "--task", "k1", "--worker", "ai"]);
-    assert!(!refused.status.success(), "no credential means no proposal");
+    assert!(
+        !refused.status.success(),
+        "no usable request means no proposal"
+    );
     let said = format!("{}{}", stdout_of(&refused), stderr_of(&refused));
+
+    // Which refusal fires depends on the host, and the test asserts the invariant rather
+    // than one host's answer.
+    //
+    // With no credential in the platform store, the request stops at `authorization` with a
+    // credential reason. With one -- which is the state after anybody has actually used the
+    // provider -- that check passes and the request stops at the transport instead, because
+    // this test's endpoint is `http://` and plaintext may not carry a credential. Both prove
+    // the same thing: the flags produced a real provider instance, and nothing left this
+    // process.
+    //
+    // The earlier version asserted only the credential reason and therefore started failing
+    // the moment a human stored a key. A test whose subject is "the flags are wired" should
+    // not depend on whether the machine happens to hold a secret.
     assert!(
         said.contains("provider-credential-absent")
-            || said.contains("provider-credential-store-unavailable"),
-        "the refusal must be a credential reason: {said}"
+            || said.contains("provider-credential-store-unavailable")
+            || said.contains("provider-plaintext-refused"),
+        "the refusal must name a reason this daemon decided for itself: {said}"
     );
 
-    // And the provider was never contacted: no connection means the credential is checked
-    // first, so a deployment cannot leak a request it could not authenticate.
+    // And the provider was never contacted at all -- not even a TCP connection. The
+    // plaintext refusal is decided from the scheme before any socket is opened, so an
+    // `http://` endpoint configured on a real deployment is never dialled.
     assert!(
         !provider.was_contacted(),
         "the provider must not be contacted without a credential"
