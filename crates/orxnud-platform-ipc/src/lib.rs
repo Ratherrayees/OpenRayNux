@@ -212,6 +212,38 @@ impl TransportPrincipal {
     }
 }
 
+/// The operating-system user that owns a local endpoint, where the platform can say.
+///
+/// # Why this lives here and not above
+///
+/// The daemon needs the *installation's* owner to compare a peer's uid against, and
+/// getting it means reading filesystem metadata -- which is `cfg(target_os)`. Gate **G3**
+/// exists precisely so that knowledge stays below this crate, and putting a branch in the
+/// daemon to read a uid would have defeated it. This crate already owns the endpoint's
+/// lifecycle (it binds it, tightens its mode, and is the only thing permitted to unlink
+/// it), so it is the natural home for one more question about it.
+///
+/// # Returns `None` rather than a default
+///
+/// `None` means the platform cannot report it, and the caller must refuse rather than
+/// assume. The failure mode this avoids is a daemon that starts up, cannot learn who it
+/// serves, and then grants on the strength of not knowing.
+///
+/// Deliberately not `Result`: there is no error to distinguish and no detail worth
+/// returning. "Cannot answer" is the whole of it, and it maps to one refusal.
+pub fn endpoint_owner_uid(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// A connected local peer.
 ///
 /// Byte-oriented on purpose: framing is the caller's business, because only the

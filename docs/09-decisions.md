@@ -2033,6 +2033,16 @@ second human user exists — at which point `Human` gains real identity
 resolution and `AuthChannel` grows. Revisit if a "delegated authority" concept
 (e.g. an agent acting *for another agent* under a chain) proves necessary.
 
+**Amended by [ADR-0051](#adr-0051).** This record decided *what an `Actor` means*
+and was right about it. It left one thing unsaid, and the omission turned out to be
+load-bearing: it never said **who decides that a given caller may become which
+`Actor`**. As implemented, every handler built `local_actor()` — a function taking
+no arguments — so any peer that reached a request received `Human { user: "local" }`
+and could approve anything. The actor model was correct and the *boundary* that was
+supposed to produce those actors was absent, which meant the daemon asserted a human
+rather than having established one. ADR-0051 adds that boundary. The decision below
+stands unchanged.
+
 ---
 
 <a id="adr-0028"></a>
@@ -4313,3 +4323,167 @@ honest statement is that they are currently unobservable, not that they are veri
 | `task/continue` with no provider | `-32603` `internal` | `-32043` | `provider-not-configured` |
 | `task/ai-propose` with no provider | `-32603` `internal` | `-32043` | `provider-not-configured` |
 | `task/create` with `max_steps: 0` | `-32600` prose in `reason` | `-32600` | `invalid-request` + detail |
+
+<a id="adr-0051"></a>
+
+## ADR-0051 — An `Actor` is derived from the transport peer, never from the request
+
+**Status.** **Decided and implemented.** Closes V-89 (identity half) and V-90.
+
+**Context.** ADR-0027 made `Actor` first-class and got the model right: only a `Human`
+grants, an `Ai` carries delegated authority and is never additive, `External` can request
+but never grant, `System` is housekeeping, `Integration` and `Scheduled` derive authority
+from a human grant. It never said **who is allowed to become which `Actor`**.
+
+That gap was invisible in the type definitions, which is why it needed an evidence-first
+audit rather than a reading. Traced over the real daemon, the answer was worse than a
+missing check:
+
+```
+runtime.rs   fn local_actor() -> Actor      // no arguments
+                  Human { user: UserId::new("local"), via: LocalInteractive }
+                  called from 6 sites: every approver, every dispatch
+```
+
+Every handler called a zero-argument function and got `Human`. The authority was
+**real** — a `Human` genuinely could grant, and approvals genuinely were issued — but
+**attribution was fiction**: nothing had established anything about the caller. The only
+thing standing between a local process and full human authority was the socket's `0600`
+mode — a filesystem ACL, never checked, never mapped to an identity, and invisible to the
+code above it.
+
+**What the audit established, and what it did not.** A raw JSON-RPC caller **cannot forge
+an actor field**: `Request` has no actor member, `_meta` is never read for identity, no
+handler reads `params.actor` / `user_id` / `approver` / `delegated_by` / `granted_by` /
+`authorised_by`, and reproduced over the real socket, declaring all of them changed
+nothing. `approval_from_json` already refused a client-supplied `approver` structurally,
+before the digest arithmetic made it moot.
+
+That is the comfortable answer, and it is the wrong one to stop at. "We ignore what you say
+about who you are" and "we know who you are" are different properties, and only the second
+one makes an audit record mean anything. The caller obtained `Human` either way — from a
+constant, having proved nothing. Every audit record claiming a human approved something
+was a claim about a file mode.
+
+Two smaller findings fell out of the same trace. `delegated_by` was
+`UserId::new("local")` written inline, so every model proposal's delegation chain was an
+assertion about a string rather than a consequence of who was authenticated — harmless for
+*granting*, since an `Ai` can never grant, but it could attribute a proposal to a human who
+never asked for it, which is exactly what an audit record claims to be about. And
+`proposer_json` is deserialized back into an `Actor`, so storage is a real path from bytes
+to an actor — the one place "it was persisted earlier" could be mistaken for "it is
+authenticated".
+
+**Decision 1 — the identity comes from the kernel, at accept.**
+
+`orxnud-platform-ipc` reads `SO_PEERCRED` when a connection is accepted. It is the
+strongest native mechanism available for a Unix domain socket because it is answered by
+the kernel from the process it actually ran: **there is no request that changes the answer,
+because the answer is not in a request.** The alternatives were rejected for specific
+reasons rather than by preference — an application token is something to copy and so leaks
+to anything that can read the file; a username is a name the caller can influence and puts
+a lookup on the request path; a secret of any kind is heavier than a local socket needs and
+adds a second thing to protect.
+
+The result is an `Option`, and `LocalStream::principal()` turns `None` into an error rather
+than a default. A defaulted uid would be a *fabricated identity*, which is the one outcome
+this exists to prevent, so there is no value a caller could read past.
+
+**Decision 2 — the installation's owner is the reference, and it is read from the socket.**
+
+The daemon reads the bound endpoint's owner once at startup and compares. From the socket
+rather than `geteuid(2)`, because the two normally agree and stop agreeing exactly where it
+matters: under `sudo`, a system unit, or a launcher that drops privileges, the process uid
+need not be the user the installation is *for*, while the endpoint's owner is by definition
+— it is the user who can reach it.
+
+**Decision 3 — one function, called before a single byte is read.**
+
+```text
+accept()  ->  authenticate(stream, installation)  ->  AuthenticatedPrincipal | refusal
+                                                      |
+                            (then, and only then)     v
+                                            read a request, route it
+```
+
+`route` derives the `Actor` once and hands handlers the *actor*, not the principal, so
+nothing below that line can re-derive an identity and no handler can reach the uid at all.
+
+There is deliberately **no "unknown" variant** of `AuthenticatedPrincipal`. A connection
+whose identity could not be established is refused before it becomes one, so the absence of
+such a case is the type system saying an unauthenticated caller cannot be *represented* as a
+caller. That is the property; an `Option<AuthenticatedPrincipal>` threaded downward would
+have been the same work with the guarantee left to be re-established at each use.
+
+**Decision 4 — refusals use the ADR-0050 taxonomy by recovery, and say nothing about the OS.**
+
+A wrong peer is **`FORBIDDEN`**, not `CONFLICT`: nothing the caller does changes the
+outcome. Not retrying, not re-reading state, not obtaining another approval — either this
+peer is the installation's owner or it is not, and the kernel decided that. `CONFLICT`
+would say "try again" and `INVALID_REQUEST` would say "edit your request", both of which are
+false instructions. An unestablishable identity is **`ENVIRONMENT_UNAVAILABLE`**, and it
+refuses *everyone*: with no installation to compare against, "nothing to compare against"
+must not decay into "allowed".
+
+No refusal names a uid, a socket path, or a syscall. The caller is told it is not the owner;
+how the daemon knows is not information it is entitled to.
+
+**Decision 5 — the identity is a stable application identity, and the uid is discarded.**
+
+`UserId` stays `"local"`. It is what the approval digest already binds
+(`canonical_bytes` hashes the approver's label and authority root), so deriving it from a
+uid would invalidate every approval a previous daemon issued, for no security gain. The uid
+is used to decide *whether* a principal exists and then dropped — which also keeps an
+operating-system identifier out of every audit record, and out of every IPC error.
+
+**Decision 6 — the platform boundary is documented, not papered over.**
+
+| platform | mechanism | what is proven |
+|---|---|---|
+| Linux | `SO_PEERCRED` at accept | proven on every run: a test reads the principal off a real accepted connection and compares it to the connecting process's own uid |
+| Windows | none — no local transport exists | fails closed at `bind` (`Listener::Unsupported`). No identity claim is made, and none is faked |
+| other Unix | none claimed | `peer_principal` returns `None`, so every connection is refused. `getpeereid(3)` would be the right call and is **not** implemented: no CI exercises it, and an untested branch that looked like working authentication on a developer's laptop would be worse than an honest refusal |
+
+**What is not claimed.** `AuthChannel::LocalInteractive` records that the caller reached the
+daemon over a local, same-owner socket. It does **not** assert a person is at a keyboard: a
+Unix domain socket cannot tell an interactive shell from a cron job. Nothing depends on it
+— `AuthChannel` is not in the approval digest and no policy rule reads it — and it is
+recorded as a known limit rather than dressed up as evidence.
+
+Multi-user identity, session grants, remote exposure, and step-up authentication are all
+still absent, exactly as ADR-0027 left them. This record establishes *one* identity for
+*one* local installation.
+
+**Deliberately not changed.** Task state, claim/lease, approval expiry and replacement,
+continuation, observation, disclosure, provider identity matching, capability declarations,
+sandboxing and resource limits are untouched. No approval digest changes, so every approval
+issued by a previous daemon still verifies.
+
+**Revisit conditions.**
+
+* Revisit if a second human can use one installation — that is P4 multi-tenancy, and
+  `InstallationIdentity` becomes a set rather than a uid.
+* Revisit if a peer can be authenticated *without* being the owner, e.g. a paired device;
+  `AuthenticatedPrincipal` gains a variant and each must carry its own authority root.
+* Revisit if `SO_PEERCRED` is ever found insufficient — it reports a uid, not a session, so
+  it cannot distinguish a user from a compromised process of that user. Nothing here depends
+  on that distinction, and a future one should not assume it.
+* Revisit if a non-Linux Unix becomes supported: implement `getpeereid`, and only then, with
+  CI.
+* Revisit if Windows gains a local transport. It must establish peer identity before this
+  daemon will serve it, or the daemon must keep refusing.
+* Revisit if a capability ever needs to know *who* called — that is the confused-deputy
+  boundary ADR-0027 drew, and it does not move because identity got stronger.
+
+**Evidence.** `crates/orxnud-daemon/tests/identity.rs` (10 wire tests), the
+`identity_boundary` module in `runtime.rs` (4, over a real socket),
+`orxnud-platform-ipc::unix::tests::the_accepted_peer_is_the_connected_process` (1), and
+`crates/orxnud-store/tests/mutation_harness_is_safe.rs` (3, for the harness the mutation
+evidence depends on). 18 of 18 mutations caught, 0 unobserved. Workspace 1451 passing.
+
+**Boundary finding, recorded not fixed.** `capability/dispatch` answers a *policy* denial
+with `-32603 INTERNAL_ERROR`, which contradicts ADR-0050: an approval-digest mismatch is
+caller-fixable and belongs in `FORBIDDEN`. It is pre-existing and unrelated to identity —
+`dispatch` has always mapped `PolicyError` through `RequestError::Refused`, and V-89 fixed
+only the task routes. Fixing it would change error semantics this milestone is forbidden to
+touch, so it is asserted as-is and filed as V-90 in the register.

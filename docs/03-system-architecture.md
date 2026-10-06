@@ -248,6 +248,28 @@ means `windows-sys` and `unsafe`, and gate **G4** forbids `unsafe` outside a pla
 crate that has opted in. ADR-0003 chose UDS/named-pipe as the *shape*; only the Unix half
 is built. A Windows pipe is an addition behind `Listener`, not a redesign.
 
+**Peer identity (ADR-0051).** The transport also establishes *who a caller is*, because the
+actor model needs a boundary that produces those actors and no layer above the transport
+can name a peer it has not asked the kernel about. On Linux, `accept` reads `SO_PEERCRED`
+and records it on the stream; the daemon compares that uid against the bound endpoint's owner
+**before reading a request**, so an unauthenticated caller never reaches parsing.
+
+```text
+accept()  ->  authenticate(stream, owner)  ->  AuthenticatedPrincipal | refusal
+                                                     |
+                                       (then, and only then)  v
+                                               read a request, route it
+```
+
+The result is an `Option` with no default: a fabricated uid is the failure this prevents, so
+`LocalStream::principal()` returns an error where no identity was established. The uid is
+compared and then discarded — it never becomes a `UserId`, an audit field, or an IPC error.
+
+This is the platform crate's first `unsafe` (four lines, one function, gate **G4**'s opt-in),
+because the safe wrappers do not expose `SO_PEERCRED`. `getpeereid(3)` would be the
+equivalent on macOS and is **not** implemented: no CI exercises it, so it would be an
+untested branch that looked like working authentication on a developer's laptop.
+
 Protocol version is **1** (`orxnud-protocol::PROTOCOL_VERSION`), and it is exact: the
 daemon's supported range is `1..=1`, so a version mismatch is refused rather than
 best-effort parsed.
@@ -459,7 +481,7 @@ with nothing behind it.
 | `orxnud-platform-sandbox` | Tier-1 execution boundary and OS resource ceilings | Windows: binds the **refusing** `UnsupportedRunner`; no Job Object or AppContainer backend (ADR-0035, V-29) |
 | `orxnud-platform-secrets` | Credential storage via the platform keyring | — |
 | `orxnud-platform-notify` | Desktop notification | — |
-| `orxnud-platform-ipc` | Local transport | Windows: **refuses**. No named-pipe backend, because that needs `windows-sys` and `unsafe`, and gate G4 forbids `unsafe` outside a platform crate that has opted in |
+| `orxnud-platform-ipc` | Local transport **and local peer identity** (ADR-0051) | Windows: **refuses**. No named-pipe backend, because that needs `windows-sys` and `unsafe`, and gate G4 forbids `unsafe` outside a platform crate that has opted in. Non-Linux Unix: transport works, **peer identity does not**, so the daemon refuses every connection rather than assume an owner |
 
 **FUTURE:** `process`, `audio`, `net`, `single-instance`, `autostart`, `power`,
 `path-conventions`. Single-instance enforcement currently lives in `orxnud-daemon` as an
