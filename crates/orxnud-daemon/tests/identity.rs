@@ -227,6 +227,19 @@ fn the_local_owner_is_authenticated_as_the_human_and_can_approve() {
 /// Run end to end and asserted on its outcome, because the risk of adding an identity
 /// check is a *behavioural* regression in the ordinary path, and a test that only
 /// exercised approvals would not notice.
+///
+/// # Why this asserts two different things
+///
+/// The final step executes a capability, which needs a real sandbox. A GitHub-hosted
+/// runner cannot establish Tier-1 guarantees (V-87), so the execution is legitimately
+/// refused there — and "refused because the host cannot isolate" is the property that is
+/// true on that host. Asserting the verified outcome unconditionally would have made this
+/// suite fail on every hosted run, which is what V-85 records: a test that demands
+/// evidence the host cannot produce either gets excluded or asserts the refusal.
+///
+/// So this reads the host's own answer from `daemon/status` and asserts whichever outcome
+/// that host can honestly produce. The *identity* claim — that approval succeeded under the
+/// authenticated principal — is asserted on both paths, because it does not need a sandbox.
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "Unix-socket evidence: this test reaches the daemon through a real \
@@ -247,6 +260,21 @@ fn the_ordinary_governed_flow_still_works_end_to_end() {
             json!({"proposal": pid, "ttl_ms": 60_000}),
         );
         assert!(approved.get("result").is_some(), "{approved}");
+        // The approval carries the authenticated identity, which is the part of this
+        // test the identity boundary can affect.
+        assert_eq!(
+            approved["result"]["approval"]["approver"], "human",
+            "{approved}"
+        );
+        assert_eq!(
+            approved["result"]["approval"]["authority_root"], "local",
+            "{approved}"
+        );
+
+        let status = send(&s.endpoint, "st", "daemon/status", json!({}));
+        let can_execute = status["result"]["sandbox"]["tier1_executable"]
+            .as_bool()
+            .unwrap_or(false);
 
         let done = send(
             &s.endpoint,
@@ -254,13 +282,33 @@ fn the_ordinary_governed_flow_still_works_end_to_end() {
             "task/execute",
             json!({"proposal": pid, "worker": "w1"}),
         );
-        assert!(done.get("result").is_some(), "{done}");
-        let outcome = &done["result"];
-        assert_eq!(outcome["result"], "verified", "{done}");
-        assert_eq!(outcome["verified"], true, "{done}");
-        assert_eq!(outcome["refuted"], false, "{done}");
-        // The recorded authority is still the installation's, end to end.
-        assert_eq!(outcome["proposal"]["authority_root"], "local", "{done}");
+        if can_execute {
+            let outcome = &done["result"];
+            assert_eq!(outcome["result"], "verified", "{done}");
+            assert_eq!(outcome["verified"], true, "{done}");
+            assert_eq!(outcome["refuted"], false, "{done}");
+            assert_eq!(outcome["proposal"]["authority_root"], "local", "{done}");
+        } else {
+            // The host cannot isolate, so the governed path must refuse rather than run
+            // anything. What matters here is that the refusal is a refusal and not a
+            // silent success or an internal fault.
+            assert!(
+                done.get("error").is_some(),
+                "a host that cannot isolate must refuse to execute: {done}"
+            );
+            // Asserted by its reason rather than its code: the reason says *why* the host
+            // refused, which is the part that distinguishes a correct refusal from an
+            // unrelated failure. The code on this route is the pre-existing V-90 gap
+            // (`INTERNAL_ERROR` where the taxonomy wants a caller-actionable class), which
+            // `tests/taxonomy.rs` owns -- hard-coding it here would pin a second instance
+            // of a defect this milestone must not fix.
+            assert!(
+                done["error"]["data"]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("sandbox")),
+                "the refusal must name the sandbox as the reason: {done}"
+            );
+        }
 
         s.stop().await;
         let _ = std::fs::remove_dir_all(&d);
