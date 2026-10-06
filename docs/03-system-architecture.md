@@ -270,6 +270,28 @@ because the safe wrappers do not expose `SO_PEERCRED`. `getpeereid(3)` would be 
 equivalent on macOS and is **not** implemented: no CI exercises it, so it would be an
 untested branch that looked like working authentication on a developer's laptop.
 
+**The error boundary (ADR-0050).** Every refusal that reaches a client passes through one
+classification, and the rule is *recovery*, not severity:
+
+```text
+edit the request      -> INVALID_REQUEST      -32600
+refresh your view     -> NOT_FOUND / CONFLICT -32040 / -32041
+obtain authority      -> FORBIDDEN            -32042
+fix configuration     -> ENVIRONMENT_UNAVAILABLE -32043
+repair the daemon     -> INTERNAL_ERROR       -32603
+```
+
+`INTERNAL_ERROR` is a **positive claim** — nothing the caller can do changes the outcome —
+so it is the one class that requires naming a cause rather than being reached by default.
+`InternalFault` is a closed enum of the seven conditions that qualify, and
+`RequestError::Refused` — the free-form constructor that let a caller-actionable refusal
+acquire `-32603` by default — no longer exists (V-90). None of the three classifiers has a
+`_` arm, so a new refusal path that nobody classified is a compile error rather than a
+misreported server fault.
+
+`data.reason` is a fixed kebab-case vocabulary word that a client branches on; `data.detail`
+is the human sentence. No client parses English to learn which recovery applies.
+
 Protocol version is **1** (`orxnud-protocol::PROTOCOL_VERSION`), and it is exact: the
 daemon's supported range is `1..=1`, so a version mismatch is refused rather than
 best-effort parsed.
@@ -481,6 +503,7 @@ with nothing behind it.
 | `orxnud-platform-sandbox` | Tier-1 execution boundary and OS resource ceilings | Windows: binds the **refusing** `UnsupportedRunner`; no Job Object or AppContainer backend (ADR-0035, V-29) |
 | `orxnud-platform-secrets` | Credential storage via the platform keyring | — |
 | `orxnud-platform-notify` | Desktop notification | — |
+| `orxnud-daemon` (runtime.rs) | Error taxonomy, classified by recovery (ADR-0050) | — |
 | `orxnud-platform-ipc` | Local transport **and local peer identity** (ADR-0051) | Windows: **refuses**. No named-pipe backend, because that needs `windows-sys` and `unsafe`, and gate G4 forbids `unsafe` outside a platform crate that has opted in. Non-Linux Unix: transport works, **peer identity does not**, so the daemon refuses every connection rather than assume an owner |
 
 **FUTURE:** `process`, `audio`, `net`, `single-instance`, `autostart`, `power`,
