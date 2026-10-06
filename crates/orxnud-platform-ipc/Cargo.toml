@@ -20,5 +20,18 @@ publish.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+# Unix-only, and only for the peer-credential syscall that establishes *who a local
+# caller is*. `tokio` already depends on `libc` on this platform, so this adds no
+# build cost; it names the dependency explicitly rather than relying on a transitive
+# one. `libc` supplies `SO_PEERCRED` and `getsockopt(2)`.
+#
+# This is the crate's first dependency beyond `tokio`, and the reason is specific: peer
+# identity cannot be obtained from the safe wrappers, and hand-rolling the `extern "C"`
+# declaration to avoid a widely-used, already-vendored crate would trade a vetted
+# binding for unowned `unsafe`. The `unsafe` is four lines, confined to `unix.rs`, and
+# covered by the crate's own real-socket tests.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }

@@ -38,8 +38,23 @@
 //! Recording the gap rather than hiding it is the point. A Windows build of
 //! OpenRayNux will refuse to serve IPC and say why, instead of silently falling
 //! back to something that looks like it works.
+//!
+//! # The one exception to "no unsafe here", and why it is here
+//!
+//! `deny` rather than `forbid`, with a single named exception: the Unix backend's
+//! `peer_principal` calls `getsockopt(2)` to read `SO_PEERCRED`, because the safe wrappers
+//! do not expose
+//! it and the kernel's answer to "which operating-system user is this caller" is the
+//! only thing in the tree that can tell the daemon who it is talking to.
+//!
+//! This is the opt-in gate **G4** describes — `unsafe` is forbidden outside a platform
+//! crate that has chosen to have it — and the choice is recorded rather than implied:
+//! one function, four lines, a `SAFETY` comment, and tests that read the principal back
+//! off a real socket. Everything above this crate stays `forbid`, because the point of
+//! the boundary is that nothing above the transport can name a peer it did not ask the
+//! kernel about.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::path::{Path, PathBuf};
@@ -86,6 +101,20 @@ pub enum IpcError {
     #[error("no local IPC backend is implemented for this platform")]
     Unsupported,
 
+    /// The peer's operating-system identity could not be established.
+    ///
+    /// A distinct error rather than a variant of [`Self::Accept`], because the two mean
+    /// opposite things to the caller above: a failed `accept(2)` is a transport fault to
+    /// retry, while this is a **refusal to proceed with a peer whose identity is unknown**.
+    ///
+    /// It carries no detail on purpose. The underlying cause differs by platform — no
+    /// `SO_PEERCRED` on macOS, a refused `getsockopt(2)` anywhere — and neither is useful
+    /// to a caller, which needs to know only that there is no identity and therefore no
+    /// authority to derive. A client cannot use it to tell which platforms lack peer
+    /// credentials.
+    #[error("the local peer's identity could not be established")]
+    PeerIdentityUnavailable,
+
     /// Any other transport-level failure.
     #[error("local transport error: {0}")]
     Other(String),
@@ -124,6 +153,65 @@ fn peer_io(e: std::io::Error) -> IpcError {
     }
 }
 
+/// Who the kernel says a connected local peer is.
+///
+/// # Why this exists at the lowest layer
+///
+/// Until now the only thing standing between a local caller and the daemon's authority
+/// was the socket's mode. That is a real boundary, and it is the *only* one: `0600` on
+/// the socket and `0700` on its parent directory mean the kernel will not let another
+/// user `connect(2)`. But a permission bit is not an identity. Nothing anywhere in the
+/// daemon ever asked "who is this?" and compared the answer to anything, so the daemon
+/// asserted a human actor on the strength of a file mode that a different process, a
+/// different mount namespace, or a different uid after `setuid` could in principle be
+/// holding.
+///
+/// This type is the answer to that question, asked by the kernel rather than by us, and
+/// it is deliberately the *only* thing in the tree that can answer it. It lives here
+/// because this is the crate that owns the socket, and gate **G3** exists precisely so
+/// that knowledge of `cfg(target_os)` and syscalls stays below the daemon.
+///
+/// # What the kernel gives, and what it does not
+///
+/// `SO_PEERCRED` reports the peer's real uid, gid and pid **at connect time**, and it is
+/// not forgeable by the peer: those are the credentials of the process the kernel ran,
+/// not anything the process wrote. That is the strongest native mechanism available for
+/// a Unix domain socket and is why it was chosen over reading a username, over an
+/// application-level token file, and over anything the caller supplies.
+///
+/// It proves *which operating-system user* the caller is. It does not prove intent, and
+/// it does not prove the caller is interactive — so a caller must not read this as
+/// authority over anything on its own. Turning it into authority is the daemon's job, and
+/// the daemon compares it against the installation's owner before deciding anything.
+///
+/// Deliberately absent: any credential *material*. A uid is an identifier, not a secret,
+/// but there is no reason to carry a gid or pid into a higher layer that needs neither,
+/// so [`uid`](Self::uid) is the only accessor. Nothing here is ever serialised into an
+/// audit record — see the daemon's `installation_identity` for the stable application
+/// identity that is used instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportPrincipal {
+    uid: u32,
+}
+
+impl TransportPrincipal {
+    /// The peer's real user id, as the kernel reported it.
+    #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// Whether this peer is the installation's owner.
+    ///
+    /// A plain integer equality, and deliberately the *only* question a caller above
+    /// asks. "Is this the owner?" is answerable from this one fact; "may this peer drive
+    /// the daemon?" is not, and is not this function's business to decide.
+    #[must_use]
+    pub const fn is_owner(&self, owner_uid: u32) -> bool {
+        self.uid == owner_uid
+    }
+}
+
 /// A connected local peer.
 ///
 /// Byte-oriented on purpose: framing is the caller's business, because only the
@@ -133,6 +221,12 @@ fn peer_io(e: std::io::Error) -> IpcError {
 /// memory-exhaustion bug rather than a parse error.
 pub struct LocalStream {
     inner: Inner,
+    /// The peer the kernel identified, or `None` where it could not be established.
+    ///
+    /// `None` is the whole fail-closed posture in one field: it is not a default
+    /// identity, and [`Self::principal`] turns it into an error rather than letting a
+    /// caller read it as "no information means no restriction".
+    principal: Option<TransportPrincipal>,
 }
 
 #[cfg(unix)]
@@ -241,14 +335,41 @@ impl std::fmt::Debug for LocalStream {
 }
 
 impl LocalStream {
-    /// Wraps an accepted stream.
+    /// Wraps an accepted stream, recording who the kernel says the peer is.
     ///
     /// `#[cfg(unix)]` because the real backend is the only thing that produces one.
     /// On a platform with no backend this constructor must **not** exist: its absence
     /// is what makes [`LocalStream`] uninhabited there, rather than merely unlikely.
+    ///
+    /// The principal is read here, at accept, rather than on demand later: it is fixed
+    /// at connect time, so reading it once is both sufficient and cheaper than reading
+    /// it per request.
     #[cfg(unix)]
     fn wrap(inner: Inner) -> Self {
-        Self { inner }
+        let principal = unix::peer_principal(&inner);
+        Self { inner, principal }
+    }
+
+    /// Who the kernel says this peer is.
+    ///
+    /// # The one thing every caller above must do
+    ///
+    /// This returns an error wherever an identity could not be established, including on
+    /// a platform that has no peer-credential mechanism at all. There is deliberately no
+    /// "unknown peer" value to read past: a caller that wants a principal has to handle
+    /// the case where there isn't one, and the only way to make that impossible to skip
+    /// is to hand out a `Result` with no success branch on those platforms.
+    ///
+    /// The consequence for the daemon is deliberate. Where this fails, the daemon must
+    /// refuse the connection rather than fall back to treating the caller as somebody it
+    /// recognises — a fallback is how an unverified peer becomes an authenticated one.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::PeerIdentityUnavailable`] when the platform offers no peer-credential
+    /// mechanism, or when the kernel refused to report one for this connection.
+    pub fn principal(&self) -> Result<TransportPrincipal, IpcError> {
+        self.principal.ok_or(IpcError::PeerIdentityUnavailable)
     }
 
     /// Reads one newline-terminated message, refusing to exceed `limit`.

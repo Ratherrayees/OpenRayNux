@@ -415,6 +415,11 @@ pub struct Runtime<S: SecretsContract> {
     /// `None` means no provider is configured, and that is a refusal rather than a
     /// fallback. See [`scripted_proposer`].
     proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
+    /// The operating-system user this installation belongs to.
+    ///
+    /// Established once at startup from the bound endpoint's own metadata, and consulted
+    /// for every connection. See [`InstallationIdentity`].
+    installation: InstallationIdentity,
 }
 
 impl<S: SecretsContract> std::fmt::Debug for Runtime<S> {
@@ -500,6 +505,10 @@ impl<S: SecretsContract> Runtime<S> {
         let bound = listener
             .endpoint()
             .map_or_else(|| endpoint.clone(), Path::to_path_buf);
+        // Read before the endpoint moves into the struct: the owner is a property of the
+        // path on disk, and a runtime that could not read it will refuse every connection
+        // rather than serve an unattributable one.
+        let installation = InstallationIdentity::establish(&bound);
 
         Ok(Self {
             endpoint: bound,
@@ -509,6 +518,7 @@ impl<S: SecretsContract> Runtime<S> {
             backend: orxnud_platform_ipc::backend_name(),
             cleanup: Some(endpoint),
             proposer,
+            installation,
         })
     }
 
@@ -592,6 +602,10 @@ impl<S: SecretsContract> Runtime<S> {
         shutdown: impl std::future::Future<Output = ()>,
     ) -> Result<(), IpcError> {
         let listener = Arc::clone(&self.listener);
+        // Hoisted because the loop polls the listener and consults the installation in
+        // one `select!` arm; holding a borrow of `self` across that `.await` is not
+        // possible, and re-reading an immutable `Copy` field would be noise.
+        let installation = self.installation;
         // Taken before the loop and released on every exit, including the `?`s below.
         let _release = EndpointRelease {
             listener: Arc::clone(&self.listener),
@@ -611,12 +625,32 @@ impl<S: SecretsContract> Runtime<S> {
                         Err(IpcError::Disconnected) | Err(IpcError::Unsupported) => break,
                         Err(e) => return Err(e),
                     };
+                    // The identity decision is made here, before `handle_connection`
+                    // reads a single byte. That ordering is the property: no request is
+                    // ever parsed, let alone routed, by a caller whose identity is
+                    // unknown or wrong, so there is no path from "connected" to "granted
+                    // authority" that skips this check.
+                    let authenticated = match authenticate(&stream, installation) {
+                        Ok(principal) => principal,
+                        Err(refusal) => {
+                            // Answered and then dropped, so the peer learns *why* rather
+                            // than seeing a connection reset. The connection ends either
+                            // way: a refused caller gets no channel to speak on.
+                            let response = Response::err(
+                                RequestId::Text("unknown".to_owned()),
+                                refusal.to_rpc(),
+                            );
+                            let _ = write_response(&mut stream, &response).await;
+                            continue;
+                        }
+                    };
                     // One connection at a time, in the accept loop rather than in a
                     // spawned task. The governed path is single-writer anyway, so
                     // overlapping connections would only queue on the same mutex --
                     // and handling them here means the loop cannot outlive `self`.
                     let served = handle_connection(
                         &mut stream,
+                        authenticated,
                         &self.governed,
                         &self.proposer,
                         &self.observations,
@@ -682,6 +716,7 @@ impl Drop for EndpointRelease {
 /// we should let it do and learn that it was wrong.
 async fn handle_connection<S: SecretsContract>(
     stream: &mut LocalStream,
+    authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
@@ -720,7 +755,7 @@ async fn handle_connection<S: SecretsContract>(
     };
 
     let id = request.id.clone();
-    let outcome = route(&request, governed, provider, observations).await;
+    let outcome = route(&request, authenticated, governed, provider, observations).await;
     let response = match outcome {
         Ok(result) => Response::ok(id, result),
         Err(e) => Response::err(id, e.to_rpc()),
@@ -778,10 +813,15 @@ fn extract_id(bytes: &[u8]) -> Option<RequestId> {
 /// policy's seal, which is the point.
 async fn route<S: SecretsContract>(
     request: &Request,
+    authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
+    // Derived once per connection, before a method is chosen. Handlers receive the
+    // *actor* rather than the principal, so nothing below this line can re-derive an
+    // identity and no handler can reach the installation's uid at all.
+    let actor = authenticated.actor();
     let Some(method) = Method::from_wire(&request.method) else {
         return Err(RequestError::UnknownMethod(request.method.clone()));
     };
@@ -825,8 +865,8 @@ async fn route<S: SecretsContract>(
             }))
         }
         Method::Echo => Ok(request.params.clone().unwrap_or(json!({}))),
-        Method::CapabilityDispatch => dispatch(request, governed).await,
-        Method::CapabilityApprove => approve(request, governed).await,
+        Method::CapabilityDispatch => dispatch(request, &actor, governed).await,
+        Method::CapabilityApprove => approve(request, &actor, governed).await,
         // First-party durable state, not capability execution. These go to the
         // TaskService and to nothing else.
         // First-party durable state, not capability execution. These go to the
@@ -836,19 +876,33 @@ async fn route<S: SecretsContract>(
         | Method::TaskClaim
         | Method::TaskComplete
         | Method::TaskPropose
-        | Method::TaskCancel => tasks(method, request, governed).await,
+        | Method::TaskCancel => tasks(method, request, authenticated, governed).await,
         // Execution crosses from the task layer into the governed dispatcher, so it is
         // routed separately rather than through `tasks`: it needs the capability registry
         // and the sandbox backend, which `tasks` deliberately has no access to.
         Method::TaskExecute => {
-            execute_proposal(request, governed, provider.as_ref(), observations).await
+            execute_proposal(request, &actor, governed, provider.as_ref(), observations).await
         }
         Method::TaskAiPropose => {
-            ai_propose(request, governed, provider.as_ref(), observations).await
+            ai_propose(
+                request,
+                authenticated,
+                governed,
+                provider.as_ref(),
+                observations,
+            )
+            .await
         }
         // One boundary per call, and no execution: see `continue_task`.
         Method::TaskContinue => {
-            continue_task(request, governed, provider.as_ref(), observations).await
+            continue_task(
+                request,
+                authenticated,
+                governed,
+                provider.as_ref(),
+                observations,
+            )
+            .await
         }
     }
 }
@@ -863,13 +917,201 @@ async fn route<S: SecretsContract>(
 /// filled in without thought.
 const STANDALONE_APPROVAL_STEP: u32 = 1;
 
+/// The operating-system user this installation belongs to.
+///
+/// # Why this is the reference, and not the caller
+///
+/// The daemon needs one question answered before it grants anything: *is this peer the
+/// user this installation belongs to?* It answers it by comparing a kernel-reported uid
+/// against the uid that owns the bound endpoint. Both halves are decided outside any
+/// request, which is the entire point — a comparison against a value the caller could
+/// name would be a comparison against itself.
+///
+/// # `Unavailable` is the fail-closed case, not an absence of one
+///
+/// A platform that cannot report an owner lands in [`Self::Unavailable`], and every
+/// connection is then refused. That is the deliberate outcome for Windows, where no
+/// local transport exists at all, and for any Unix whose endpoint metadata cannot be
+/// read. The alternative — assume an owner so the daemon starts — would mean serving a
+/// socket that cannot be attributed to anyone, which is the state this change exists to
+/// end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallationIdentity {
+    /// The bound endpoint is owned by this uid.
+    Owned(u32),
+    /// The owner could not be established. Every connection is refused.
+    Unavailable,
+}
+
+impl InstallationIdentity {
+    /// Reads the owner of the bound endpoint.
+    ///
+    /// Unix-only in its implementation and total in its *result*: a platform without the
+    /// metadata produces [`Self::Unavailable`] rather than a compile error or a guess.
+    ///
+    /// Read from the socket rather than from `geteuid(2)` deliberately. The two normally
+    /// agree and stop agreeing in exactly the case that matters — a daemon started by
+    /// `sudo`, a system unit, or a launcher that drops privileges. There the process's
+    /// uid need not be the user the installation is *for*, while the endpoint's owner
+    /// is by definition: it is the user who can reach it.
+    fn establish(endpoint: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(endpoint) {
+                Ok(m) => Self::Owned(m.uid()),
+                Err(_) => Self::Unavailable,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = endpoint;
+            Self::Unavailable
+        }
+    }
+}
+
+/// What a connection proved about itself, established before any request is read.
+///
+/// # The smallest name that is accurate
+///
+/// A [`orxnud_platform_ipc::TransportPrincipal`] is a fact about a socket. An
+/// `AuthenticatedPrincipal` is a fact about a *caller*, and the difference is the whole
+/// boundary: the first is what the kernel said, the second is what the daemon concluded
+/// from it by comparison with the installation. Keeping them as separate types is what
+/// stops a uid being carried further up as though it were authority — becoming an
+/// [`orxnud_domain::Actor`] is the only way across, and it is a single conversion with
+/// one variant to convert to.
+///
+/// There is deliberately no "unknown" variant. A connection whose identity could not be
+/// established is refused before it becomes one of these, so the absence of such a case
+/// is the type saying that an unauthenticated caller cannot be *represented* as a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticatedPrincipal {
+    /// The peer is the operating-system user this installation belongs to.
+    ///
+    /// Carries no uid of its own: the installation already is the identity, and keeping a
+    /// second copy invites the two to be compared and found equal by accident.
+    InstallationOwner,
+}
+
+impl AuthenticatedPrincipal {
+    /// The actor this principal is entitled to be.
+    fn actor(self) -> orxnud_domain::Actor {
+        match self {
+            Self::InstallationOwner => local_actor(),
+        }
+    }
+
+    /// The human whose authority this principal spends.
+    ///
+    /// Exists so a delegated `Actor::Ai` is built from the authenticated principal rather
+    /// than from a string literal. Returning [`orxnud_domain::ids::UserId`] rather than an
+    /// `Option` is the load-bearing part: a root that *could* be absent would need a
+    /// fallback at the delegation site, and that fallback would be an invented identity —
+    /// the exact defect being removed. Here there is no way to write "no human to
+    /// delegate from", because this daemon has one principal and it is a human.
+    fn user(self) -> orxnud_domain::ids::UserId {
+        match self {
+            Self::InstallationOwner => orxnud_domain::ids::UserId::new("local"),
+        }
+    }
+}
+
+/// Decides who a freshly accepted connection is.
+///
+/// # The whole trust boundary, in one function
+///
+/// Everything the daemon will ever grant flows through here, and there are three
+/// outcomes: an authenticated principal, a refusal, or — on a platform that cannot
+/// answer — a refusal. The last is why there is no default arm.
+///
+/// # Why a wrong peer is FORBIDDEN and not CONFLICT
+///
+/// The taxonomy from ADR-0050 groups codes by *recovery*, and this is the case that
+/// makes the grouping worth stating: there is nothing the caller can do to change the
+/// outcome. Not retrying, not re-reading state, not obtaining another approval. Either
+/// this peer is the installation's owner or it is not, and the kernel decided that.
+/// `CONFLICT` would tell the client to try again and `INVALID_REQUEST` to edit a request
+/// that was never the problem. `FORBIDDEN` is the only one whose instruction — *this
+/// action is refused by authority* — is true.
+///
+/// # Why the refusals carry no detail
+///
+/// A refusal never names a uid, a socket path, or a syscall. The caller is told it is
+/// not the owner; how the daemon knows that is not information it is entitled to, and a
+/// uid in an error message would be an operating-system identifier leaving the daemon for
+/// no benefit.
+fn authenticate(
+    stream: &LocalStream,
+    installation: InstallationIdentity,
+) -> Result<AuthenticatedPrincipal, RequestError> {
+    // Refuse before asking who the peer is: with no installation to compare against
+    // every comparison would fail for the same reason, and a reason that is not about the
+    // caller is not worth transmitting.
+    let owner = match installation {
+        InstallationIdentity::Owned(uid) => uid,
+        InstallationIdentity::Unavailable => {
+            return Err(RequestError::Unavailable {
+                reason: "peer-identity-unavailable".to_owned(),
+                detail: Some(
+                    "this daemon cannot establish the identity of a local caller on this \
+                     platform, so no caller can be authenticated"
+                        .to_owned(),
+                ),
+            });
+        }
+    };
+
+    let principal = stream.principal().map_err(|_| RequestError::Unavailable {
+        reason: "peer-identity-unavailable".to_owned(),
+        detail: Some(
+            "the operating system did not report this caller's identity, so it cannot be \
+             authenticated"
+                .to_owned(),
+        ),
+    })?;
+
+    if !principal.is_owner(owner) {
+        return Err(RequestError::Forbidden {
+            reason: "not-installation-owner".to_owned(),
+            detail: Some(
+                "this daemon serves only the user it was installed for; this connection \
+                 is not from that user"
+                    .to_owned(),
+            ),
+        });
+    }
+
+    Ok(AuthenticatedPrincipal::InstallationOwner)
+}
+
 /// Named, because it has to be *the same* actor at approval time and at dispatch time:
-/// the digest is computed over the actor's label and authority root, so two
-/// structurally identical actors that differed in either would produce approvals that
-/// never verify, and the symptom would be a mysterious refusal rather than a bug.
+/// the digest is computed over the actor's label and authority root, so two structurally
+/// identical actors that differed in either would produce approvals that never verify,
+/// and the symptom would be a mysterious refusal rather than a bug.
+///
+/// # Not reachable from a request
+///
+/// Every actor the daemon constructs is now built from an [`AuthenticatedPrincipal`],
+/// and the only way to obtain one is [`authenticate`]. Note the empty parameter list:
+/// there is no variant of this call that accepts a caller-supplied identity, and adding
+/// one would be the regression this milestone exists to prevent.
 fn local_actor() -> orxnud_domain::Actor {
     orxnud_domain::Actor::Human {
+        // A *stable application identity*, not a derived value. It is what the approval
+        // digest already binds (`orxnud_policy::digest::canonical_bytes` hashes the
+        // approver's label and authority root), so deriving anything else would
+        // invalidate every approval a previous daemon issued, for no security gain. The
+        // uid is used to decide *whether* this principal exists and then discarded,
+        // which also keeps an operating-system identifier out of every audit record.
         user: orxnud_domain::ids::UserId::new("local"),
+        // Records that the caller reached the daemon over a local, same-owner socket.
+        // It does **not** assert the caller is a person at a keyboard: a Unix domain
+        // socket cannot tell an interactive shell from a cron job. Nothing here proves
+        // interactivity and nothing depends on it — `AuthChannel` is not in the approval
+        // digest and no policy rule reads it. Recorded as a known limit rather than
+        // dressed up as evidence.
         via: orxnud_domain::actor::AuthChannel::LocalInteractive,
     }
 }
@@ -892,10 +1134,12 @@ fn local_actor() -> orxnud_domain::Actor {
 /// model's output is not a proposal this build understands.
 async fn ai_propose<S: SecretsContract>(
     request: &Request,
+    authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
+    let delegated_by = authenticated.user();
     // No provider configured is a refusal with its own reason, never a scripted answer.
     // A daemon that cannot reach a model says so; it does not pretend the model agreed.
     let Some(provider) = provider else {
@@ -941,7 +1185,7 @@ async fn ai_propose<S: SecretsContract>(
                 "completed": true,
                 "summary": summary,
                 "state": finished.state.as_wire_str(),
-                "proposed_by": delegated_actor(&task_id, provider.model_id()).label(),
+                "proposed_by": delegated_actor(&delegated_by, &task_id, provider.model_id()).label(),
                 "model": provider.model_id(),
             }));
         }
@@ -952,7 +1196,7 @@ async fn ai_propose<S: SecretsContract>(
     // The provider instance that just answered is the only authority on which model
     // produced this text. Read from it rather than from configuration, so the audit cannot
     // name a model that did not answer.
-    let proposer = delegated_actor(&task_id, provider.model_id());
+    let proposer = delegated_actor(&delegated_by, &task_id, provider.model_id());
     let proposed = persist_proposal(
         &mut g,
         ProposalWrite {
@@ -1240,10 +1484,12 @@ struct ProposalWrite<'a> {
 /// first, and [`RequestError::Invalid`] if the task does not exist.
 async fn continue_task<S: SecretsContract>(
     request: &Request,
+    authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
+    let delegated_by = authenticated.user();
     let Some(provider) = provider else {
         return Err(RequestError::ProviderRefused {
             reason: crate::proposer::ProviderError::NotConfigured
@@ -1345,7 +1591,7 @@ async fn continue_task<S: SecretsContract>(
                 "state": finished.state.as_wire_str(),
                 // Restated for the caller: a task that ends because a model said so must
                 // be attributable to that model in the reply, not only in the database.
-                "proposed_by": delegated_actor(&task_id, provider.model_id()).label(),
+                "proposed_by": delegated_actor(&delegated_by, &task_id, provider.model_id()).label(),
                 "model": provider.model_id(),
                 // Content went with this request even though no proposal was made from it.
                 "disclosed": disclosed_json,
@@ -1354,7 +1600,7 @@ async fn continue_task<S: SecretsContract>(
         crate::proposer::ProposalOutcome::Step(validated) => {
             let canonical = orxnud_policy::canonical_params(&validated.params);
             let proposal_id = format!("p-{task_id}-{now}");
-            let proposer = delegated_actor(&task_id, provider.model_id());
+            let proposer = delegated_actor(&delegated_by, &task_id, provider.model_id());
             let proposed = match persist_proposal(
                 &mut g,
                 ProposalWrite {
@@ -1568,10 +1814,23 @@ const NO_MODEL_PROPOSED: &str = "none/direct-proposal";
 ///
 /// `prompt_hash` stays a placeholder. It describes a prompt-framing version this code does
 /// not version, and changing it is a separate question from recording a truthful model.
-fn delegated_actor(task_id: &str, model: &str) -> orxnud_domain::Actor {
+fn delegated_actor(
+    delegated_by: &orxnud_domain::ids::UserId,
+    task_id: &str,
+    model: &str,
+) -> orxnud_domain::Actor {
     use orxnud_domain::actor::ModelProvenance;
     orxnud_domain::Actor::Ai {
-        delegated_by: orxnud_domain::ids::UserId::new("local"),
+        // The delegating human, taken from the authenticated principal at the call site.
+        //
+        // This was `UserId::new("local")` written inline, which made the delegation
+        // chain of every model proposal an assertion about a string rather than a
+        // consequence of who was authenticated. An `Ai` actor can never *grant* —
+        // `can_grant` is `Human`-only, and `issue_approval` refuses a non-granting
+        // approver — so naming the wrong human here could not have granted anything. It
+        // could still have *attributed* a proposal to a human who never asked for it,
+        // which is precisely what an audit record claims to be about.
+        delegated_by: delegated_by.clone(),
         run: orxnud_domain::ids::RunId::new(task_id),
         task: orxnud_domain::ids::TaskId::new(task_id),
         provenance: ModelProvenance::new(
@@ -1611,6 +1870,7 @@ fn proposal_json(row: &orxnud_store::task_repo::ProposalRow) -> serde_json::Valu
 /// budget. This function adds no authorisation logic of its own.
 async fn execute_proposal<S: SecretsContract>(
     request: &Request,
+    actor: &orxnud_domain::Actor,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
@@ -1654,7 +1914,7 @@ async fn execute_proposal<S: SecretsContract>(
                 // the value unpredictable.
                 detail: Some("no approval is recorded for this proposal's attempt".to_owned()),
             })?;
-    let record = approval_record_from_row(&approval_row, &proposer, &proposal)?;
+    let record = approval_record_from_row(&approval_row, actor, &proposer, &proposal)?;
 
     // 3. Refuse an expired approval *before* taking the execution lease.
     //
@@ -2064,6 +2324,7 @@ fn workspace_relative_path(target: &str) -> Option<String> {
 /// quietly verifying.
 fn approval_record_from_row(
     row: &orxnud_store::task_repo::ApprovalRow,
+    approver: &orxnud_domain::Actor,
     proposer: &orxnud_domain::Actor,
     proposal: &orxnud_store::task_repo::ProposalRow,
 ) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
@@ -2097,7 +2358,9 @@ fn approval_record_from_row(
     }
     Ok(orxnud_domain::ApprovalRecord {
         actor_label: proposer.label().to_owned(),
-        approver: local_actor(),
+        // The approver is the authenticated actor, not a constant and not anything from
+        // the request. See [`authenticate`].
+        approver: approver.clone(),
         capability: row.capability.clone(),
         target: row.target.clone().unwrap_or_else(|| "-".to_owned()),
         params: orxnud_domain::NormalizedParams::canonical(row.params.clone()),
@@ -2133,6 +2396,7 @@ fn approval_record_from_row(
 /// already decided.
 async fn approve_proposal<S: SecretsContract>(
     request: &Request,
+    actor: &orxnud_domain::Actor,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
@@ -2221,10 +2485,13 @@ async fn approve_proposal<S: SecretsContract>(
 
     // The trusted approver, and the digest computed over BOTH parties plus the stored
     // action. Nothing here is taken from the request except the proposal id.
-    let approver = local_actor();
+    //
+    // `actor` is the authenticated principal's actor, threaded down from `route`. This
+    // used to be `local_actor()` called here, so the approver was a constant: real
+    // authority, attributed to whoever happened to hold the socket.
     let canonical = orxnud_domain::NormalizedParams::canonical(proposal.params.clone());
     let record = orxnud_policy::issue_approval(
-        &approver,
+        actor,
         &proposer,
         &orxnud_domain::CapabilityId::new(proposal.capability.as_str()),
         proposal.target.as_deref(),
@@ -2347,13 +2614,14 @@ async fn approve_proposal<S: SecretsContract>(
 /// [`RequestError::Invalid`] for a malformed request.
 async fn approve<S: SecretsContract>(
     request: &Request,
+    actor: &orxnud_domain::Actor,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
     // A named proposal takes a different path entirely: the caller supplies no action at
     // all, so there is nothing for it to have substituted.
     if params.get("proposal").is_some() {
-        return approve_proposal(request, governed).await;
+        return approve_proposal(request, actor, governed).await;
     }
     let capability = params
         .get("capability")
@@ -2372,20 +2640,18 @@ async fn approve<S: SecretsContract>(
     let now_ms = g.2.clock_now_ms();
     drop(g);
 
-    let actor = local_actor();
     let capability_id = orxnud_domain::CapabilityId::new(capability);
     // Canonicalised through the one function dispatch canonicalises with. Building the
     // canonical text here any other way is precisely the V-63 defect in a new place.
     let canonical = orxnud_policy::canonical_params(&inner);
-    // The approver is the trusted local human, derived here rather than supplied by the
-    // request (ADR-0037, V-69). An approval caller cannot nominate its own approver:
-    // this line is the whole reason the approver field is evidence rather than
-    // decoration. `issue_approval` independently refuses a non-granting principal, so a
-    // future caller cannot quietly widen it.
-    let approver = local_actor();
+    // The approver is the authenticated human, derived from the transport principal and
+    // threaded in rather than supplied by the request (ADR-0037, V-69). An approval caller
+    // cannot nominate its own approver: this line is the whole reason the approver field
+    // is evidence rather than decoration. `issue_approval` independently refuses a
+    // non-granting principal, so a future caller cannot quietly widen it.
     let record = orxnud_policy::issue_approval(
-        &approver,
-        &actor,
+        actor,
+        actor,
         &capability_id,
         target,
         &canonical,
@@ -2446,6 +2712,7 @@ fn digest_from_hex(text: &str) -> Option<orxnud_domain::ApprovalDigest> {
 /// [`RequestError::Invalid`] for anything malformed.
 fn approval_from_json(
     value: &serde_json::Value,
+    approver: &orxnud_domain::Actor,
 ) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
     let bad = |why: &str| RequestError::Invalid(format!("`approval` {why}"));
     let object = value.as_object().ok_or_else(|| bad("must be an object"))?;
@@ -2467,12 +2734,13 @@ fn approval_from_json(
         digest_from_hex(&digest_text).ok_or_else(|| bad("needs a 64-character hex `digest`"))?;
     Ok(orxnud_domain::ApprovalRecord {
         actor_label: text("actor_label")?,
-        // The approver is **not** read from the client. It is re-derived from the
-        // trusted local-human boundary at the point of use, so a client cannot present
-        // an approval naming an approver of its choosing — the digest check would fail
-        // anyway, but refusing to carry the field at all is what makes the guarantee
-        // structural rather than arithmetic.
-        approver: local_actor(),
+        // The approver is **not** read from the client, and is no longer a constant
+        // either: it is the actor derived from the authenticated transport principal and
+        // threaded in from `route`. So a client cannot present an approval naming an
+        // approver of its choosing — the digest check would fail anyway, but refusing to
+        // carry the field at all makes the guarantee structural rather than arithmetic,
+        // and deriving it makes it true of whoever actually connected.
+        approver: approver.clone(),
         capability: text("capability")?,
         target: text("target")?,
         params: orxnud_domain::NormalizedParams::canonical(text("params")?),
@@ -2532,8 +2800,10 @@ const MAX_MAX_STEPS: u32 = 64;
 async fn tasks<S: SecretsContract>(
     method: Method,
     request: &Request,
+    authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
+    let delegated_by = authenticated.user();
     let params = request.params.clone().unwrap_or(json!({}));
     let mut g = governed.lock().await;
     let (_daemon, _secrets, tasks) = &mut *g;
@@ -2657,7 +2927,7 @@ async fn tasks<S: SecretsContract>(
             // The proposer is **delegated**, and is built from the task identity rather
             // than from the worker. That separation is V-71 as code: the caller controls
             // the worker string, and the worker cannot reach the actor.
-            let proposer = delegated_actor(&task_id, NO_MODEL_PROPOSED);
+            let proposer = delegated_actor(&delegated_by, &task_id, NO_MODEL_PROPOSED);
             let canonical = orxnud_policy::canonical_params(&inner);
             // Derived from the task and the instant, so two proposals for one attempt in
             // the same millisecond collide in the primary key rather than both existing.
@@ -2873,6 +3143,7 @@ fn approval_params(action: &orxnud_domain::ActionRequest) -> orxnud_domain::Norm
 
 async fn dispatch<S: SecretsContract>(
     request: &Request,
+    actor: &orxnud_domain::Actor,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
@@ -2907,7 +3178,6 @@ async fn dispatch<S: SecretsContract>(
         class,
         class,
     );
-    let actor = local_actor();
     // An approval presented by the caller, if any. Reconstructed from the client's JSON
     // rather than looked up: the daemon keeps no approval store, because the ledger it
     // does keep records *spent digests*, and the digest is what binds an approval to an
@@ -2924,7 +3194,7 @@ async fn dispatch<S: SecretsContract>(
         .map(str::to_owned);
     let approval = match params.get("approval") {
         None | Some(serde_json::Value::Null) => None,
-        Some(value) => Some(approval_from_json(value)?),
+        Some(value) => Some(approval_from_json(value, actor)?),
     };
     let context = orxnud_domain::InvocationContext::new(
         format!("ipc-{task}-{step}"),
@@ -2943,7 +3213,7 @@ async fn dispatch<S: SecretsContract>(
     let now_ms = SystemClock::new().now_ms();
     match d.dispatch(
         action,
-        actor,
+        actor.clone(),
         context,
         target,
         approval_params,
@@ -3028,6 +3298,135 @@ mod tests {
     fn the_scripted_provider_is_available_and_identifies_itself() {
         let p = scripted_proposer();
         assert_eq!(p.model_id(), "scripted/none");
+    }
+
+    /// The identity boundary itself, exercised over a real socket.
+    ///
+    /// `authenticate` is one comparison against one kernel-reported integer, so the useful
+    /// thing a test can do is show that the comparison is real in both directions and that
+    /// its absence is a refusal rather than a pass. A test that only ever ran the matching
+    /// case would be satisfied by a function that returned `Ok` unconditionally.
+    ///
+    /// The stream is a genuine accepted connection, so the principal being compared came
+    /// from `SO_PEERCRED` and not from anything these tests could have supplied.
+    mod identity_boundary {
+        use super::*;
+        /// Binds a listener, connects to it, and returns one accepted peer.
+        ///
+        /// The client is parked on a sleep so the connection is live for the assertions,
+        /// which matters because the credential is read from the socket at accept.
+        async fn a_real_peer(tag: &str) -> (orxnud_platform_ipc::Listener, LocalStream) {
+            let dir = std::env::temp_dir().join(format!("orxnud-id-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let path = dir.join("s.sock");
+            let listener = orxnud_platform_ipc::bind(&path).await.expect("bind");
+            tokio::spawn(async move {
+                let _s = orxnud_platform_ipc::connect(&path).await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            });
+            let accepted = listener.accept().await.expect("accept");
+            (listener, accepted)
+        }
+
+        /// The uid this test process runs as, which is also the socket's owner.
+        #[cfg(unix)]
+        fn this_uid() -> u32 {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata("/proc/self").expect("metadata").uid()
+        }
+
+        #[cfg(not(unix))]
+        fn this_uid() -> u32 {
+            0
+        }
+
+        #[tokio::test]
+        async fn the_owner_is_authenticated_and_anyone_else_is_refused() {
+            let (_listener, stream) = a_real_peer("owner").await;
+            let uid = this_uid();
+
+            assert_eq!(
+                authenticate(&stream, InstallationIdentity::Owned(uid)).expect("authenticate"),
+                AuthenticatedPrincipal::InstallationOwner,
+                "the installation's own user must be authenticated"
+            );
+
+            // The same stream, an installation owned by a different user. A test run
+            // without privileges cannot become another user, so the comparison itself is
+            // what is exercised here -- naming a different owner is what a foreign peer
+            // would look like to this function, and a check that could not tell them
+            // apart is exactly the check worth pinning.
+            let wrong = authenticate(&stream, InstallationIdentity::Owned(uid.wrapping_add(1)))
+                .expect_err("a different uid must not be the owner");
+            assert!(
+                matches!(
+                    &wrong,
+                    RequestError::Forbidden { reason, .. } if reason == "not-installation-owner"
+                ),
+                "{wrong:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unestablishable_identity_refuses_everyone() {
+            let (_listener, stream) = a_real_peer("noowner").await;
+            // Even a real peer is refused: with no installation there is nothing to
+            // compare against, and "nothing to compare against" must not mean "allowed".
+            let err = authenticate(&stream, InstallationIdentity::Unavailable)
+                .expect_err("an unknown installation must refuse");
+            assert!(
+                matches!(
+                    &err,
+                    RequestError::Unavailable { reason, .. }
+                        if reason == "peer-identity-unavailable"
+                ),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_refusals_name_no_operating_system_detail() {
+            let (_listener, stream) = a_real_peer("redact").await;
+            let uid = this_uid();
+            let rendered = [
+                authenticate(&stream, InstallationIdentity::Owned(uid.wrapping_add(1))),
+                authenticate(&stream, InstallationIdentity::Unavailable),
+            ]
+            .into_iter()
+            .map(|e| match e {
+                Ok(_) => String::new(),
+                Err(e) => serde_json::to_string(&e.to_rpc()).expect("serialise"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+            assert!(
+                !rendered.is_empty(),
+                "the join above must contain at least one refusal"
+            );
+            let leaks: &[&str] = &[&uid.to_string(), "SO_PEERCRED", "getsockopt", "/proc"];
+            for leak in leaks {
+                assert!(
+                    !rendered.contains(leak),
+                    "a refusal disclosed {leak:?}: {rendered}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_principal_carries_no_uid_of_its_own() {
+            let (_listener, stream) = a_real_peer("nosuid").await;
+            let principal = authenticate(&stream, InstallationIdentity::Owned(this_uid()))
+                .expect("authenticate");
+            // The authenticated principal is a single field with no data in it, so no
+            // operating-system identifier can travel above this line.
+            assert_eq!(principal, AuthenticatedPrincipal::InstallationOwner);
+            let rendered = format!("{principal:?}");
+            assert!(
+                !rendered.contains(&this_uid().to_string()),
+                "the principal must not carry the uid: {rendered}"
+            );
+        }
     }
 
     /// The two mappings a socket test cannot reach, pinned where they are decided.

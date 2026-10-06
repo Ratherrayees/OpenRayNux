@@ -1315,6 +1315,7 @@ dependencies = [
 name = "orxnud-platform-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "thiserror",
  "tokio",
 ]
