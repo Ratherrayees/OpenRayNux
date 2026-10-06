@@ -52,7 +52,7 @@ pub mod limits;
 pub mod scheduler;
 
 pub use engine::DurableEngine;
-pub use error::{EngineError, EngineErrorKind};
+pub use error::{EngineError, EngineErrorKind, TaskCause};
 pub use limits::EngineLimits;
 pub use scheduler::{PassReport, SchedulePass, Scheduler};
 

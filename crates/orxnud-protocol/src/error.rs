@@ -25,6 +25,52 @@ impl RpcErrorCode {
     /// Version negotiation failed.
     pub const UNSUPPORTED_PROTOCOL_VERSION: Self = Self(-32022);
 
+    // ---- The project-defined classes -------------------------------------
+    //
+    // JSON-RPC 2.0 defines five codes, and none of them says "the thing you named does
+    // not exist" or "it exists but not in a state where that is legal". Reporting both as
+    // `INVALID_REQUEST` tells a client to *fix its request*, which is the wrong instruction
+    // for a task another worker just claimed; reporting them as `INTERNAL_ERROR` tells it to
+    // file a bug, which is worse.
+    //
+    // These four live in the server-reserved band (`is_server_reserved`) so a client can
+    // recognise "a code this server defines" without a registry, and they are spaced away
+    // from `-32022` so nothing existing has to move. The codes are **not** the taxonomy:
+    // `data.reason` carries the fine-grained, stable word (`proposal-already-decided`,
+    // `approval-expired`, `not-at-boundary`, …) and a client that needs to branch on the
+    // detail branches there. The code says which *kind* of recovery applies.
+
+    /// The referenced resource does not exist.
+    ///
+    /// Distinct from `INVALID_REQUEST` because the request was well-formed: there is simply
+    /// no such task or proposal. The recovery is to refresh the client's view, not to edit
+    /// the request.
+    pub const RESOURCE_NOT_FOUND: Self = Self(-32040);
+
+    /// The request was valid, but the resource is not in a state where it is legal.
+    ///
+    /// Already decided, already completed, already cancelled, a stale or foreign lease,
+    /// another worker winning a race, a continuation with no boundary to cross. One code for
+    /// all of them because the recovery is the same in every case: **re-read the state and
+    /// decide again**. `data.reason` separates them where it matters.
+    pub const CONFLICT: Self = Self(-32041);
+
+    /// Refused by policy or authority.
+    ///
+    /// No approval, a spent or expired one, a digest that no longer matches, a capability
+    /// that is not granted. Retrying the identical request will fail identically; what is
+    /// needed is a *new human decision*, which is why this is not `CONFLICT`.
+    pub const FORBIDDEN: Self = Self(-32042);
+
+    /// A dependency or the execution environment is unavailable.
+    ///
+    /// The provider could not be reached, a credential is missing, the sandbox guarantees
+    /// could not be established, the platform has no backend. The operation itself is
+    /// permitted; something it needs is not there. Distinct from `INTERNAL_ERROR` because
+    /// the remedy is external — fix the configuration, add the credential, wait for the
+    /// network — rather than report a defect.
+    pub const ENVIRONMENT_UNAVAILABLE: Self = Self(-32043);
+
     /// The numeric code.
     #[must_use]
     pub const fn code(self) -> i32 {

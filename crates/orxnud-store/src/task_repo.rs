@@ -2291,7 +2291,18 @@ impl<'a> TaskRepository<'a> {
     ) -> Result<ProposalRow, TaskRepoError> {
         let tx = self.tx()?;
 
-        let row: (String, String, Option<i64>, u32, i64) = tx.query_row(
+        // `lease_holder` is nullable — the schema says a lease is `(holder IS NULL) =
+        // (expires IS NULL)` — so it is read as `Option<String>`.
+        //
+        // It was typed `String`, which fails with `Invalid column type Null` for every task
+        // that holds *no* lease. That is not a cosmetic typing slip: the state check below
+        // is what turns "you cannot propose now" into a conflict, and it is only reachable
+        // when the row was read successfully. So for any task in `waiting-for-user` the read
+        // failed first and the caller saw a *storage* error instead of the state refusal the
+        // guard was written to produce — which is how `propose_action` reported
+        // `INTERNAL_ERROR` for a plain wrong-state request. Every existing test passed
+        // because they all propose while holding a lease, where the column is non-null.
+        let row: (String, Option<String>, Option<i64>, u32, i64) = tx.query_row(
             "SELECT state, lease_holder, lease_expires_at_ms, attempts, max_steps
                FROM tasks WHERE id = ?1;",
             rusqlite::params![task_id.as_str()],
@@ -2312,7 +2323,7 @@ impl<'a> TaskRepository<'a> {
         }
         // Ownership of the task, not authority over it. A proposal from a worker that
         // does not hold the live lease would let any caller speak for a running task.
-        if row.1.as_str() != worker || row.2.is_none_or(|e| now_ms >= e) {
+        if row.1.as_deref() != Some(worker) || row.2.is_none_or(|e| now_ms >= e) {
             return Err(TaskRepoError::ProposalNotInState {
                 id: proposal_id.to_owned(),
                 status: format!("the caller does not hold the live lease on {}", task_id),
