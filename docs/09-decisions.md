@@ -1,7 +1,7 @@
 # 09 — Architecture Decision Records
 
 Status: **Draft v0.3** · Adopted 2026-09-30 · index and metadata reconciled
-**2026-10-06** against `HEAD` (`e9fadbf`).
+**2026-10-06** against `HEAD` (`1ebe7b6`).
 
 Each ADR follows: Context · Problem · Options · Evidence · Decision · Why ·
 Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**45 ADRs, numbered ADR-0001 … ADR-0047.** Two numbers in that range are
+**46 ADRs, numbered ADR-0001 … ADR-0048.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -85,6 +85,7 @@ content.
 | [0045](#adr-0045) | **One approval, two acts: a read and its disclosure to a provider identity** | **Accepted + governance core implemented** |
 | [0046](#adr-0046) | **A missing host guarantee is a refusal to assert, not a test to skip** | **Accepted + implemented** |
 | [0047](#adr-0047) | **A continuation is one boundary and one proposal, and the caller decides whether to take another** | **Accepted + implemented** |
+| [0048](#adr-0048) | **An observation is released once, across one boundary, to the identity that asked for the read — and the read capability had to be made reachable to prove any of it** | **Accepted + implemented** |
 
 ---
 
@@ -3483,17 +3484,26 @@ routine path that shows a model anything about earlier steps. It did not change 
 decision: `PriorStepContext` still carries step number, status and workspace-relative
 artifact names and nothing else, and `prior_step_context_carries_status_and_names_but_
 never_content` now asserts that shape directly so a later content field cannot be added
-without failing a test. The observation wiring below remains absent.
+without failing a test.
+
+**Amendment, 2026-10-06 — the observation wiring has landed.** ADR-0048 wires it, and
+Decision 2's content boundary is now enforced in the production path rather than holding only
+because nothing was wired. Two things did **not** change. `PriorStepContext` is untouched: the
+approved content travels on `ProposalContext::disclosures`, a second channel with a different
+lifetime and different provenance, so the two cannot be conflated or widened together. And
+`3c8a413` remains the last commit at which no workspace content could reach a provider — which
+is now the *history* rather than the present, and the reason that entry exists.
 
 **Amendment, 2026-10-05.** "Implementation begins in Stage 4" understated what shipped.
 At `HEAD` both mechanisms exist and are tested: `filesystem/read-text` is a registered
 Tier-1 capability (`read_text.rs`, 1045 lines, 34 tests including 12 against a real
 sandbox), and `PriorStepContext` is derived from durable rows and carried into the provider
-request (29 `prior_step` tests). What does **not** exist is the wiring: `orxnud-daemon`'s
-runtime neither reads nor writes an `ObservationStore`, so a model can *propose* a read and
-has nowhere to receive the bytes. That absence is deliberate — `3c8a413` names itself the
+request (29 `prior_step` tests). What did **not** exist at `HEAD` when this was written is the wiring: `orxnud-daemon`'s
+runtime neither read nor wrote an `ObservationStore`, so a model could *propose* a read and
+has nowhere to receive the bytes. That absence was deliberate — `3c8a413` names itself the
 rollback point immediately before moving approved workspace content to a remote provider —
-and it means ADR-0044 Decision 2's content boundary is intact **in practice** today. See
+and it meant ADR-0044 Decision 2's content boundary held **in practice** at the time. ADR-0048
+now makes it hold *by construction*. See
 V-84 for the parallel gap on continuation and ADR-0045 for the disclosure decision this
 one forced.
 
@@ -3865,3 +3875,131 @@ number, so there is one spelling of a number and the daemon owns the bound.
   reason migration 10 exists.
 * Revisit if a terminal signal ever needs to carry more than a bounded, non-authoritative
   summary.
+
+
+---
+
+<a id="adr-0048"></a>
+
+## ADR-0048 — An observation is released once, across one boundary, to the identity that asked for the read
+
+**Status.** **Decided and implemented.** `task/continue` now discloses; ADR-0045's decision is
+unchanged and this record adds the four things it deliberately did not decide.
+
+**Context.** ADR-0044 left the observation wiring deliberately absent and `3c8a413` named
+itself the rollback point immediately before workspace content moved to a third party. ADR-0045
+decided what an approval would cover once that happened. What was left open was *where the
+bytes may go and who may cause them to*: the store keyed on `(task, provider identity)` and
+nothing else, the runtime called none of it, and — the part that turned out to matter most —
+`filesystem/read-text` was not reachable at all.
+
+**The exact question this answers.** Not "can we pass bytes", but: *what exact bytes, under
+what exact authorisation, to what exact destination, at what exact step, may leave this
+machine?*
+
+**Answer, as implemented.** The `ExecutionOutcome::Succeeded` output of a
+`filesystem/read-text` dispatch whose **verifier returned `Verified`**, proposed by an
+`Actor::Ai` naming the model this daemon is still configured to ask, with a
+workspace-relative target — released into **one** provider request for **the immediately
+following logical step** of **the same task**, to the **identical `(canonical endpoint,
+model)`** identity, as **whole blobs** under `min(caller budget, 32 KiB)`, at most 8 retained
+and only for 15 minutes, **consumed on release** and **never durable**.
+
+Nothing else may leave: not verifier evidence, not subprocess stdout or stderr, not audit
+records, not approval digests, not credentials, not absolute paths, not another task's or
+another step's content. `PriorStepContext` is unchanged and still carries step number, status
+and workspace-relative artifact names only — the content travels on a second, separate channel
+so widening one cannot widen the other.
+
+**Decision 1 — an observation informs exactly the next step, and never a later one.**
+
+`Observation` gains `step_no`, and eligibility is `observation.step_no + 1 == requesting
+step_no`.
+
+The store previously had no step at all, so a retained observation could inform *any* later
+proposal on the task — which turns one approval into standing permission for every proposal the
+task will ever make, including ones made after other steps have run. The rule is `+1` and not
+equality because the read and the proposal it informs are different acts on different steps.
+This is a narrowing of an existing type, not a new field for symmetry.
+
+**Decision 2 — a provider must state its own destination, and the default is to decline.**
+
+`ProposalProvider` gains `fn destination(&self) -> Option<ProviderIdentity>`, **defaulting to
+`None`**, and `None` releases nothing. A provider that cannot say where it sends gets
+metadata-only requests, which is the same position a daemon with no provider is in — not a
+licence to infer one from configuration the caller happens to hold.
+
+This gives the provider knowledge of exactly one thing about itself. It does **not** get the
+task store, the observation store, the approval ledger, policy, audit, or the filesystem:
+the authorised request is assembled before the trait is touched. The alternative — passing the
+`ProviderConfig` down from `main` — was rejected because the provider's own configured
+endpoint is the authoritative answer to "where does this send", and a value reconstructed at
+the call site is a value that can drift from it.
+
+**Decision 3 — a disclosure is recorded before the bytes are sent, and a record that cannot be
+written refuses the disclosure.**
+
+The disclosure audit record is appended before the provider request, not after the response.
+A record written afterwards can miss one that happened: the process can die between sending and
+receiving, and there is then no way to know whether the bytes left. Writing first means the log
+can over-report by at most one record whose transmission failed — the direction that tells an
+operator *more* than happened. Under-reporting is the failure the audit exists to prevent.
+
+Consequently a failed append is a **refusal to disclose** (`disclosure-audit-unavailable`),
+not a disclosure with a logging problem.
+
+**Decision 4 — consumption happens before the request, so a provider outage costs the content
+and a restart costs nothing.**
+
+`ObservationStore::take_for` consumes what it releases, and that happens while the context is
+being assembled, before the provider is called. A provider failure therefore loses the
+observation: the retry at the same boundary proposes without it. This is the documented
+recovery — the model re-proposes the read — and it is fail-safe in the direction that matters,
+because the alternative (releasing the bytes back into the store on failure) is a resurrection
+path for workspace content, which is precisely what a non-durable store exists to prevent.
+
+On restart there is nothing to resurrect: the store is process memory. **Single-use is therefore
+enforced by erasure rather than by a durable "consumed" flag**, which is a stronger form of the
+property than a flag a crash could roll back.
+
+**The defect this slice found, and why it is called out rather than filed as bookkeeping.**
+
+`filesystem/read-text` was in `shipped_declarations()`, so the dispatcher's registry held it and
+`ask_next_step`'s menu — walked from the registry — **offered it to the model**. Policy had no
+declaration for it in `SHIPPED_POLICY` and refused every attempt as `unknown-capability`. A
+capability the menu advertises and the pipeline always refuses is not a governed capability; it
+is a broken promise, and it meant the entire observation subsystem was unreachable in
+production for a reason that had nothing to do with the decision to leave it unwired.
+
+Adding the entry is what makes the two lists agree. It is called out here because it is the
+first time this build enables a capability whose output can leave the machine, and the security
+posture changed with it: `read-text` is `RiskClass::High`, needs a standing grant *and* a
+single-use, time-boxed, parameter-bound approval, so every read is a human round trip. Its
+output is declared ephemeral, so `structured_output` is dropped and the bytes exist only in
+memory.
+
+**What is deliberately still absent.**
+
+* No memory subsystem. An observation informs one explicitly authorised proposal and is gone.
+  There is no retrieval, no semantic search, no vectors, no embeddings, no summarisation cache.
+* No unrestricted content export. Only a verified, approved read's bytes, once.
+* No new `TaskState`. The disclosure happens while the task is `Running`, between claiming the
+  boundary and persisting the proposal, which the existing states already express.
+* No observation identifier, anywhere. The store is selected by `(task, step, provider
+  identity)` and by nothing else, so there is no selector for a request to iterate. A model
+  cannot choose an observation by naming one.
+
+**Evidence.** `crates/orxnud-daemon/tests/disclosure.rs` (10 socket tests), 9 gate tests in
+`runtime.rs::read_retention_gate`, 5 new store tests in `observation.rs`, and 3 rendering and
+trait tests moved next to the code they exercise. Mutation-checked: breaking the task check, the
+step check, the identity check, single-use consumption, the size limit, the verification
+requirement, or the audit record each fails the suite.
+
+**Revisit conditions.**
+
+* Revisit if a supervisor appears that could own an observation's lifetime durably — the
+  erasure argument above is what would have to be traded away.
+* Revisit if reads stop being the only ephemeral-output capability, since the retention path
+  selects on `output_is_ephemeral` rather than on a capability id and would then cover more.
+* Revisit if `attempt_no` ever becomes global rather than per-step, which is the invariant the
+  disclosure's step arithmetic rests on.

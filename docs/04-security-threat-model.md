@@ -533,12 +533,35 @@ content-free detail line. Nothing is durable: observations live in process memor
 consumed by exactly one proposal, and expire on a TTL (15 min, 8 entries per task, 32 KiB
 whole-blob ceiling; a truncated blob is dropped rather than released).
 
-**Status: the mechanism is implemented and tested (29 tests in `observation.rs`); the
-runtime wiring is absent.** `orxnud-daemon`'s runtime neither reads nor writes an
-`ObservationStore`, so today no workspace content can reach a provider at all. The exposure
-is real but currently unreachable, which is exactly why `3c8a413` is named the rollback
-point. **It becomes live the moment the wiring lands**, and the prompt and the register
-entry for `filesystem/read-text` must say so before it does.
+**Status: live since ADR-0048.** The mechanism and its runtime wiring are both implemented.
+Approved workspace content can now reach a provider — that is the feature — so the exposure is
+no longer hypothetical, and the controls below are what stand between a governed read and a
+third party.
+
+What the disclosure path enforces, and where each control is proved:
+
+| control | where | evidence |
+|---|---|---|
+| one approval covers the read *and* the disclosure to one identity, and nothing else | ADR-0045; `ObservationOrigin` cites the approver | `observation.rs` disclosure tests |
+| bound to `(canonical endpoint, model)`, not a model string | `ProviderIdentity::matches` | `a_different_endpoint_with_the_same_model_is_refused`, `a_changed_model_on_the_same_endpoint_receives_nothing` |
+| the provider must name its destination, or nothing is released | `ProposalProvider::destination`, default `None` | `a_provider_without_a_declared_destination_is_declined_by_the_trait` |
+| only a **verified** read produces content | `retain_read_observation` requires `is_verified()` | `a_refuted_read_is_not_retained`, `an_undetermined_read_is_not_retained` |
+| only an AI-proposed read, whose model this daemon still asks | `asking_provider_identity` | `a_non_ai_proposer_is_not_retained`, `a_read_from_another_model_is_not_retained` |
+| task-scoped | keyed in the store | `observations_are_never_visible_across_tasks`, `an_observation_never_crosses_a_task_boundary` |
+| **step-scoped**: informs step *n+1* only | `Observation::step_no` | `an_observation_informs_only_the_immediately_following_step` |
+| single-use, by erasure | `take_for` removes | `an_observation_is_consumed_by_one_proposal`, `a_consumed_observation_is_gone_rather_than_merely_marked_used` |
+| whole blobs, `min(caller budget, 32 KiB)`, never truncated | store ceiling | `a_never_truncated_blob_is_whole_or_absent`, `a_caller_cannot_exceed_the_stores_own_ceiling` |
+| no selector: `(task, step, identity)` and nothing else | no id exists | `a_client_cannot_select_an_observation_by_identifier` |
+| never durable | `output_is_ephemeral` drops `structured_output` | `the_disclosed_content_appears_in_no_durable_row` |
+| recorded before transmission; unrecordable ⇒ refused | `release_observations` | `the_disclosure_is_audited_on_its_own_correlation`, `no_disclosure_is_recorded_when_nothing_was_disclosed` |
+
+**What is still not reachable.** There is no observation identifier to name, no retrieval, no
+memory across proposals, no semantic search, and no path by which content reaches a provider
+without a human approving that specific read. `PriorStepContext` remains metadata-only, so
+prior steps cannot be summarised into a prompt on the model's behalf.
+
+`3c8a413` is the last commit at which no workspace content could reach a provider; that is now
+history rather than the present.
 
 ### T-n5 — a host that cannot isolate, and a test suite that wants it to
 
