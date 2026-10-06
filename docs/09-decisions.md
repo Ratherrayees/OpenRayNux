@@ -4049,6 +4049,10 @@ Three defects, one of which the register did not record:
 A fourth, smaller thing: a legitimate `task/propose` in that state answered
 `INTERNAL_ERROR` / `reason: "internal"`, because `TaskFault::Engine` maps there. INTERNAL_ERROR
 tells an operator the server is broken, which is the wrong thing to say about a client action.
+**Fixed, separately and later, by ADR-0050.** It was left alone here because it is not this
+defect's: it affects every task route, and a fix confined to the expiry paths would have left
+the same lie in place everywhere else. The reproduction above is what identified it as
+cross-cutting, and the expiry path merely happened to reach it first.
 
 **Decision 1 — an approval that is expired on arrival is never minted.**
 
@@ -4166,5 +4170,138 @@ nothing happened" is only informative if you say which.
 * Revisit if a scoped grant is ever adopted (Q-OPEN-14's open half): it would change what an
   approval *is*, and this record's "one approval, one attempt" framing would need restating
   rather than extending.
-* Revisit if `TaskFault::Engine` stops mapping to `INTERNAL_ERROR` for ordinary state refusals;
-  the mapping is recorded above as a known, unfixed taxonomy gap rather than a design.
+* ~~Revisit if `TaskFault::Engine` stops mapping to `INTERNAL_ERROR` for ordinary state
+  refusals.~~ **It did, under ADR-0050**, which replaced the flat mapping with four codes in the
+  server-reserved band. Condition closed. What would reopen it is a *fifth* class of refusal
+  with no honest home among not-found, conflict, forbidden or unavailable -- at which point the
+  question is whether the class or the code count grows, not whether the default becomes
+  `INTERNAL_ERROR` again.
+
+<a id="adr-0050"></a>
+
+## ADR-0050 — INTERNAL_ERROR means nothing the caller did could change the outcome
+
+**Status.** **Decided and implemented.** Closes V-89. Independent of ADR-0049: that record
+found this defect on the expiry path and deliberately left it, because it is wider than
+expiry.
+
+**Context.** ADR-0049 recorded, in passing and as "a fourth, smaller thing", that a
+legitimate `task/propose` answered `INTERNAL_ERROR` / `reason: "internal"`. Reproducing V-82
+over a real socket confirmed it was not an expiry-path quirk. It was the *only* answer an
+ordinary wrong-state refusal had.
+
+The chain that produced it had four separate breaks, and the mapping was the last of them:
+
+1. `TaskRepoError` distinguished `NotFound`, `NoSuchProposal`, `AlreadyExists`,
+   `ProposalNotInState` and `InvalidComposition`, and `From<TaskRepoError> for EngineError`
+   collapsed every one of them into `EngineErrorKind::InvalidInput`. The store's own
+   distinctions were discarded at the crate boundary.
+2. `TaskService` converted an `EngineError` into `TaskFault::Engine(String)`. The kind was
+   dropped there, so by the time `task_fault()` ran there was nothing to classify with.
+3. `task_fault()` mapped both `TaskFault::Engine` and `TaskFault::Stopped` to
+   `RequestError::Refused`, and `Refused` mapped to `INTERNAL_ERROR`. Stopping is not a
+   fault either.
+4. Separately and independently, `RequestError::Declined` — used at every direct semantic
+   refusal — mapped to `INVALID_REQUEST`, conflating "you named something absent", "the name
+   is taken", "you are not authorised" and "this is not configured" into one code whose only
+   instruction is *edit your request*.
+
+A fifth defect was found while fixing the fourth, and is the more interesting one.
+`TaskRepository::propose_action()` read `lease_holder` as `String` while the schema declares it
+nullable, with the constraint `(holder IS NULL) = (expires IS NULL)`. For any task holding no
+lease the read failed with `Invalid column type Null at index: 1, name: lease_holder` — so the
+state check *below* it never ran, and the caller saw a storage failure instead of the conflict
+that check existed to produce. Every existing test passed because they all proposed while
+holding a lease, where the column is non-null. **A type error in a query silently converted one
+error class into another;** the test suite's shape, not its assertions, was why it survived.
+
+**Decision 1 — four codes, chosen by recovery rather than by cause.**
+
+| code | class | the caller's recovery |
+|---|---|---|
+| `-32040` | `RESOURCE_NOT_FOUND` | refresh its view |
+| `-32041` | `CONFLICT` | re-read the state and decide again |
+| `-32042` | `FORBIDDEN` | obtain a new human decision |
+| `-32043` | `ENVIRONMENT_UNAVAILABLE` | fix configuration, add a credential, wait |
+
+They live in the server-reserved band (`-32099..=-32020`), spaced from the existing `-32022`,
+so a client can recognise "a code this server defines" without a registry and nothing existing
+had to move. The numeric values are part of the published contract.
+
+The grouping is by *recovery*, which is why all wrong-state refusals share one code: whether a
+task is completed, cancelled, already claimed, mid-proposal, or at a stale boundary, the client
+does the same thing next. Splitting them by code would hand a client a distinction it cannot
+act on. The distinctions that *are* actionable travel in `data.reason`.
+
+**Decision 2 — `INTERNAL_ERROR` is now a positive claim, not a fallback.**
+
+It is returned for storage and corruption faults, and for an unanticipated cause. A path that
+cannot classify a failure now fails the *tests*, not the reader's log: `task_fault()` has no
+fallback arm that dumps an unrecognised fault into `INTERNAL_ERROR`. The property is stated as
+one sentence so it can be checked: **INTERNAL_ERROR means nothing the caller did can change the
+outcome.** A daemon that is stopping reports `ENVIRONMENT_UNAVAILABLE`, not a fault.
+
+**Decision 3 — `data.reason` is a word, `data.detail` is a sentence.**
+
+`RequestError::Invalid` had been putting prose into the machine-readable field, so a client
+wanting to classify a malformed request had to string-match English — the very dependence this
+record exists to remove. All ~26 sites now emit the fixed word `invalid-request` as the reason
+and keep the explanation in `data.detail`. Where the reason already *is* the refusal
+(`ClaimRefusal::as_str`), `detail` is `None` rather than repeating it.
+
+`ClaimRefusal` is the case that shows why this is a real contract and not a tidiness rule: the
+coarse variant name is `not-claimable`, and the specific refusals are `not-found` (the task is
+gone) and `not-claimable` (someone else has it). Both are `CONFLICT`; a client choosing between
+"refresh" and "retry in a moment" branches on the reason, not the code.
+
+**Decision 4 — `ProviderRefused` is an environment fact.**
+
+It existed only to report that the *provider* could not be used: unconfigured, no credential,
+unreachable, refusing. The daemon and its code are working; a dependency is absent. As
+`INTERNAL_ERROR` this pointed an operator at a bug report when the fix is `configure` or
+`doctor`. This was the single most misleading mapping in the chain, because it actively
+redirects the reader away from the remedy.
+
+`task/continue` and `task/ai-propose` check for a provider *before* they look at the task, so a
+providerless daemon answers `ENVIRONMENT_UNAVAILABLE` even for a task that does not exist. That
+is deliberate and is now tested: the dependency is missing either way, and the alternative would
+imply the task exists.
+
+**What is not claimed.** No task-state, approval, continuation, observation, disclosure,
+authorization, sandbox or provider *semantics* changed — this record changes only which code
+reports them. Successes are byte-identical. No new dependency, no cross-crate error enum, no
+string matching on error text, and no raw SQL, host path, credential or content in any
+refusal; `no_refusal_carries_content_a_host_path_or_a_credential` checks the last of those over a
+refusal path with a real file behind it.
+
+**Revisit conditions.**
+
+* Revisit if a fifth class of refusal appears with no honest home among these four; the question
+  is then whether the class count or the code count grows, never whether the default becomes
+  `INTERNAL_ERROR` again.
+* Revisit if the codes are ever extended past `-32099`, which would leave the reserved band and
+  cost clients the registry-free recognition the band buys.
+* Revisit if a client is ever given an approval it can replay: `FORBIDDEN` is chosen for
+  single-use authority, and a replayable grant is a different recovery (`CONFLICT`).
+* Revisit if `data.detail` grows a caller that trusts it as structured data. It is a sentence by
+  contract; anything branchable belongs in `data.reason`.
+
+**Evidence.** `crates/orxnud-daemon/tests/taxonomy.rs` — 10 tests driven through a real daemon
+over a real socket, covering each class, the reason-word shape, redaction, a claim race and an
+approval race. Each defect above was reproduced against the real store before any edit, and the
+table below is the before/after.
+
+| refusal | before | after | reason |
+|---|---|---|---|
+| `task/propose` on a `waiting-for-user` task | `-32603` `internal` | `-32041` | `conflict` |
+| `task/propose` for an unknown capability | `-32603` `internal` | `-32041` | `conflict` |
+| `task/execute` for an unknown proposal | `-32600` prose | `-32040` | `proposal-not-found` |
+| `task/claim` for a missing task | `-32041` `not-claimable` | `-32041` | `not-found` |
+| `task/cancel`, `task/complete` for a missing task | `-32041` | `-32040` | `not-found` |
+| `task/create` for a duplicate id | `-32041` | `-32041` | `already-exists` |
+| `task/execute` on a decided proposal | `-32600` prose | `-32041` | `conflict` |
+| `capability/approve` with `ttl_ms: 0` | `-32042` | `-32042` | `approval-expired` |
+| `task/continue` off a boundary | `-32041` | `-32041` | `not-at-boundary` |
+| `task/continue` with no provider | `-32603` `internal` | `-32043` | `provider-not-configured` |
+| `task/ai-propose` with no provider | `-32603` `internal` | `-32043` | `provider-not-configured` |
+| `task/create` with `max_steps: 0` | `-32600` prose in `reason` | `-32600` | `invalid-request` + detail |
