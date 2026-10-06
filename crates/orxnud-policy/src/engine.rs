@@ -788,6 +788,37 @@ impl PolicyEngine {
         .finished(outcome, now_ms, detail);
         self.record(terminal).map(|_| ())
     }
+
+    /// Appends a record built elsewhere, through this engine's chain and journal.
+    ///
+    /// # Why this exists, and why it is narrow
+    ///
+    /// A **disclosure** is the consequence of an approval rather than a decision policy
+    /// makes: the policy engine authorised the local read, and the bytes then went to a
+    /// provider identity that approval already covered (ADR-0045). There is no second
+    /// decision to record, so `record_terminal` — which derives its capability and
+    /// correlation from the `ActionRequest` — cannot express it, and building the record in
+    /// the daemon is the only alternative. This is that alternative, kept as a single
+    /// function so there is exactly one way for a record to reach the chain from outside.
+    ///
+    /// It writes history; it grants nothing. Appending cannot authorise an action, mint or
+    /// consume an approval, or move task state, so the invariants policy owns are unaffected.
+    /// The record's *shape* is not this function's business: the caller that means a
+    /// disclosure builds one with a minted correlation and a content-free detail line, and
+    /// the chain's verification is what makes the resulting history trustworthy.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::AuditUnavailable`] if the record could not be persisted. **The caller
+    /// must treat that as a refusal to disclose**, not as a disclosure with a logging
+    /// problem: a record that cannot be written is a disclosure nobody could afterwards see
+    /// happened, which is the one outcome this whole path exists to make impossible.
+    pub fn append_audit_record(
+        &mut self,
+        record: orxnud_audit::AuditRecord,
+    ) -> Result<(), PolicyError> {
+        self.record(record).map(|_| ())
+    }
 }
 
 /// A stable correlation key for the two audit records of one authorisation.

@@ -750,6 +750,7 @@ fn a_done_answer_cannot_carry_an_action_and_contradictions_are_refused() {
             target: orxnud_domain::TargetSemantics::Required,
         }],
         prior_steps: Default::default(),
+        disclosures: orxnud_daemon::observation::DisclosureBatch::empty(),
     };
 
     /// A provider returning whatever text the test hands it.

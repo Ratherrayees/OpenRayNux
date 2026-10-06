@@ -291,6 +291,7 @@ fn ctx() -> ProposalContext {
             target: orxnud_domain::TargetSemantics::Required,
         }],
         prior_steps: Default::default(),
+        disclosures: orxnud_daemon::observation::DisclosureBatch::empty(),
     }
 }
 

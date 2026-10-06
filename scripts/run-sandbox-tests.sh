@@ -75,7 +75,8 @@ if [ "${1:-}" = "--host" ]; then
     "-p orxnud-capability --test write_text" \
     "-p orxnud-platform-sandbox --test isolation" \
     "-p orxnuctl --test cli_e2e" \
-    "-p orxnud-daemon --test continuation"; do
+    "-p orxnud-daemon --test continuation" \
+    "-p orxnud-daemon --test disclosure"; do
     # shellcheck disable=SC2086 # the suite is intentionally several words
     cargo nextest run $suite --no-fail-fast
   done

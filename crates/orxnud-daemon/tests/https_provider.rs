@@ -210,6 +210,7 @@ fn ctx() -> orxnud_daemon::proposer::ProposalContext {
         attempt_no: 1,
         allowed: vec![],
         prior_steps: Default::default(),
+        disclosures: orxnud_daemon::observation::DisclosureBatch::empty(),
     }
 }
 

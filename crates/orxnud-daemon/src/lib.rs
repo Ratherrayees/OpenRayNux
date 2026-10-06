@@ -429,10 +429,32 @@ impl std::fmt::Debug for DispatchWiring {
 ///
 /// `(id, risk, max data class)`. `networked` is false for all of them today and
 /// `cost` is 1, both stated at the grant site rather than inferred.
-const SHIPPED_POLICY: [(&str, RiskClass, DataClass); 2] = [
+const SHIPPED_POLICY: [(&str, RiskClass, DataClass); 3] = [
     (
         orxnud_capability::text::WORD_COUNT_ID,
         RiskClass::Low,
+        DataClass::Public,
+    ),
+    // High, and reachable only with a single-use, time-boxed, parameter-bound approval —
+    // the same treatment `write-text` gets, and for the same reason: this one reads
+    // workspace content out.
+    //
+    // This entry is new, and the reason is a defect this slice found rather than a
+    // decision it made. `filesystem/read-text` was in `shipped_declarations()`, so the
+    // dispatcher's registry held it and the proposer menu **offered it to the model** —
+    // while policy had no declaration for it and refused every attempt as
+    // `unknown-capability`. A capability the menu advertises and the pipeline always
+    // refuses is not a governed capability; it is a broken promise. The two lists are
+    // meant to agree (see `shipped_declarations`), and adding the entry is what makes
+    // them agree.
+    //
+    // It is the first capability in this build whose output can leave the machine
+    // (ADR-0045, ADR-0048), which is why enabling it is called out rather than treated as
+    // bookkeeping. The grant below still has to exist and the approval still has to be
+    // presented, so reaching it is a human round trip on every read.
+    (
+        orxnud_capability::read_text::READ_TEXT_ID,
+        RiskClass::High,
         DataClass::Public,
     ),
     // High, and that is the whole point: policy refuses this one unless a single-use,
@@ -910,6 +932,17 @@ impl Daemon {
     #[must_use]
     pub fn policy(&self) -> &PolicyEngine {
         &self.policy
+    }
+
+    /// The policy engine, mutably, so a record this crate builds itself can be appended
+    /// through the same chain and journal every other record goes through.
+    ///
+    /// Narrow on purpose: appending writes history and grants nothing, so the invariants
+    /// `orxnud-policy` owns — authorisation, budget, approval consumption — cannot be
+    /// reached through it. It exists for the disclosure record, which is the consequence of
+    /// an approval rather than a decision policy makes (ADR-0045).
+    pub fn policy_mut(&mut self) -> &mut PolicyEngine {
+        &mut self.policy
     }
 
     /// Starts the daemon.

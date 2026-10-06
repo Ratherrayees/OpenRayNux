@@ -579,7 +579,7 @@ gate_G9() {
       # here for that reason; the three that do not execute a capability are NOT excluded
       # and run everywhere.
       filter=(
-        -E 'not (binary(governed_path) or binary(read_text_real) or binary(write_text) or binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper)
+        -E 'not (binary(governed_path) or binary(read_text_real) or binary(write_text) or binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper) or binary(disclosure)
               or test(linux::tests::)
               or test(the_host_backend_is_selected_at_compile_time_and_reports_honestly)
               or test(a_proposed_action_is_approved_executed_verified_and_completes_its_task)
