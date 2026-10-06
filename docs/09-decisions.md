@@ -4324,6 +4324,131 @@ honest statement is that they are currently unobservable, not that they are veri
 | `task/ai-propose` with no provider | `-32603` `internal` | `-32043` | `provider-not-configured` |
 | `task/create` with `max_steps: 0` | `-32600` prose in `reason` | `-32600` | `invalid-request` + detail |
 
+
+---
+
+## ADR-0050, amended — the sweep that closed V-90
+
+**Status.** **Decided and implemented.** Closes V-90. The taxonomy below is unchanged; what
+changed is that the code now obeys it.
+
+**Context.** The taxonomy this record established shipped, and two routes did not obey it:
+`capability/dispatch` reported an approval-digest mismatch as `-32603`, and `task/execute`
+reported an unusable sandbox as `-32603`. Both are caller- or operator-actionable. Both were
+found *by accident*, by tests written for an unrelated milestone, which is the argument for
+the survey below rather than for patching the two.
+
+**The survey.** Ten `RequestError::Refused` construction sites, eleven `DispatchError`
+variants, five `PolicyError` variants and seventeen `DenialReason` variants sit behind them.
+Three independent causes produced the false `INTERNAL_ERROR`:
+
+1. **Two catch-alls.** `Err(e) => Refused { reason: e.to_string() }` on both dispatch paths
+   flattened all eleven `DispatchError` variants into one code — and put English prose in
+   `data.reason`, the field a client branches on.
+2. **`PolicyError::Denied` carried a `String`**, produced by `ToString` at the point of
+   refusal, with a `"refused without a stated reason"` fallback for a case the type system
+   already made unreachable. So the only route to classifying a policy denial was
+   substring-matching rendered JSON.
+3. **`RequestError::Malformed` put serde's own sentence in `data.reason`** — the same defect
+   as (1), on the frame-decode path, and found by the sweep's own prose test rather than by
+   reading.
+
+**Decision 1 — classification is by recovery, not by variant name.**
+
+The variant name is the *cause*; only the recovery is the *class*. So `Policy` is not one
+class — it contains both "we decided no" and "we could not decide" — and it is handed to a
+second classifier. `SandboxRefused` and both `Credential` variants are environment problems
+with operator remedies. `Execution` and `Verification` are daemon-side defects with none.
+`Disabled` is refused by configuration a person chose, which is `FORBIDDEN`'s recovery.
+
+| source | class | code | recovery |
+|---|---|---|---|
+| `DispatchError::SandboxRefused` | environment | `-32043` | run Tier-1 work somewhere that can isolate |
+| `Credential::Absent` / `::Unavailable` | environment | `-32043` | add the credential / fix the store |
+| `PolicyError::{Unavailable, AuditUnavailable, ApprovalLedgerUnavailable}` | environment | `-32043` | repair the subsystem |
+| `DenialReason::{PolicyUnavailable, AuditUnavailable}` | environment | `-32043` | repair the subsystem |
+| `DispatchError::NoImplementation` | invalid request | `-32600` | name a capability this build can run |
+| `DispatchError::ClassEscalation` | invalid request | `-32600` | declare the class the action needs |
+| `DenialReason::{UnknownCapability, InvalidParams, DataClassExceeded}` | invalid request | `-32600` | fix the request |
+| `DispatchError::Disabled` | forbidden | `-32042` | the owner switches it back on |
+| the thirteen remaining `DenialReason`s | forbidden | `-32042` | obtain a new human decision |
+| `DispatchError::{Execution, Verification, Reentrant}` | internal | `-32603` | none exists |
+| `PolicyError::InvalidSchema` | internal | `-32603` | none; the declaration is compiled in |
+
+The third group is deliberately one code. Every approval-related denial shares the same
+recovery — obtain a fresh approval, or one that describes this action — so `FORBIDDEN` is
+honest for all of them, and the distinctions that matter live in `data.reason`. The
+sharpest case is the fourth row: reporting an outage as `FORBIDDEN` would tell a client to
+obtain consent for an action the daemon **never evaluated**, which is the most damaging lie
+available in this file.
+
+**Decision 2 — the mechanism, which is the actual fix.**
+
+`RequestError::Refused` is **gone**. `INTERNAL_ERROR` is now
+
+```rust
+RequestError::Internal { fault: InternalFault, detail: Option<String> }
+```
+
+where `InternalFault` is a closed enum whose seven variants each carry their own argument
+for being unrecoverable by caller action. Three consequences, and the third is the point:
+
+* There is **no default**. Naming a fault is a deliberate act.
+* There is **no free-form string**, so the original escape hatch is closed rather than
+  discouraged.
+* There is **no `_` arm** in any of the three classifiers, so a new `DispatchError` or
+  `DenialReason` is a compile error. A future caller-actionable condition therefore cannot
+  silently acquire `INTERNAL_ERROR` by not being classified — it fails to build, which is
+  the outcome the old shape made impossible.
+
+`crates/orxnud-daemon/tests/refusal_completeness.rs` asserts all of this statically, so a
+later patch cannot quietly widen `INTERNAL_ERROR` again. Reintroducing a `_` arm is a caught
+mutation.
+
+**Decision 3 — `INTERNAL_ERROR` survives, and each entry is argued.**
+
+The property is not "zero `INTERNAL_ERROR`". It is that every one is intentional and
+unrecoverable by caller action: `durable-state-corrupt`, `storage-unavailable`,
+`disclosure-store-poisoned`, `capability-execution-failed`,
+`capability-verification-failed`, `reentrant-dispatch`, `invalid-capability-schema`. A real
+corrupt-row fixture is created in the test suite and asserted to remain `-32603`, because the
+only honest way to show a class is not over-used is to produce it on purpose.
+
+Two vocabulary decisions: `TaskCause::Storage` and `TaskCause::Corrupt` were joined on one
+code and are now split into `storage-unavailable` and `durable-state-corrupt`, so an operator
+can tell a full disk from a corrupt row. `proposal-corrupt` and `approval-corrupt` are
+*unified* under `durable-state-corrupt`, because they are one fault and the detail says
+which row. Both words shipped only in unreleased `main`.
+
+**Decision 4 — what was deliberately *not* changed.**
+
+No classification that was already correct was touched. `approval-already-consumed` and
+`no-grant` stay `FORBIDDEN` even though `CONFLICT` is arguable, because those words are on
+the wire and this milestone is about false `INTERNAL_ERROR`, not about re-litigating the
+taxonomy. Reclassifying a correct answer would be scope the task refused and churn a
+contract for no gain.
+
+**Decision 5 — four refusals stopped interpolating a raw error.**
+
+The storage and secret-store layers return `String`s that can contain a database path or a
+SQL fragment, and four sites formatted them into `detail`. Those now carry a fixed sentence
+and the cause stays in the server log. ADR-0051's rule that no operating-system identifier
+leaves this daemon applies to error text as much as to identities.
+
+**Evidence.** `crates/orxnud-daemon/tests/taxonomy.rs` grows from 10 to 14 tests: each class
+reachable for its own reason, a genuine internal fault still `-32603`, both previously-known
+routes pinned individually, and a sweep asserting no reachable refusal puts prose in
+`data.reason`. `refusal_completeness.rs` (5 static checks). Workspace 1460 passing.
+14 of 15 mutations caught, 0 unobserved, 1 skipped as a no-op.
+
+**Revisit conditions** (extending this record's own):
+
+* Revisit if a class is ever added to `INTERNAL_ERROR`'s siblings for convenience. The test
+  is whether a person reading the refusal would know what to do next, and "wait" and "fix
+  your request" and "get a human" are not interchangeable.
+* Revisit if `InternalFault` grows a variant that a caller can influence. That is the line:
+  if a caller's request can turn a fault on, it is not a fault.
+
 <a id="adr-0051"></a>
 
 ## ADR-0051 — An `Actor` is derived from the transport peer, never from the request
@@ -4481,9 +4606,10 @@ issued by a previous daemon still verifies.
 `crates/orxnud-store/tests/mutation_harness_is_safe.rs` (3, for the harness the mutation
 evidence depends on). 18 of 18 mutations caught, 0 unobserved. Workspace 1451 passing.
 
-**Boundary finding, recorded not fixed.** `capability/dispatch` answers a *policy* denial
-with `-32603 INTERNAL_ERROR`, which contradicts ADR-0050: an approval-digest mismatch is
-caller-fixable and belongs in `FORBIDDEN`. It is pre-existing and unrelated to identity —
-`dispatch` has always mapped `PolicyError` through `RequestError::Refused`, and V-89 fixed
-only the task routes. Fixing it would change error semantics this milestone is forbidden to
-touch, so it is asserted as-is and filed as V-90 in the register.
+**Boundary finding, since fixed.** `capability/dispatch` answered a *policy* denial with
+`-32603 INTERNAL_ERROR`, which contradicts ADR-0050. It was pre-existing and unrelated to
+identity — `dispatch` had always mapped `PolicyError` through `RequestError::Refused`, and
+V-89 fixed only the task routes — so it was asserted as-is and filed as V-90 rather than
+fixed inside a milestone forbidden to change error semantics. **V-90 is now closed**, by a
+dedicated milestone; see the amendment to [ADR-0050](#adr-0050) below for the full survey
+and the classification it produced.
