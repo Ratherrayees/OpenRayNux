@@ -507,7 +507,7 @@ than the work.
 
 ### The current baseline, precisely
 
-* **1372 tests, 1372 passed, 0 failed, 5 skipped** locally on a host that can create an
+* **1400 tests, 1400 passed, 0 failed, 5 skipped** locally on a host that can create an
   unprivileged user namespace.
 * The **5 skips** are `#[ignore]`d child-process entry points — re-exec targets for
   power-loss and failure injection, and the hostile sandbox helper. They are entry points,
@@ -543,6 +543,18 @@ than the work.
   caught it (`a_boundary_is_claimed_by_exactly_one_worker`). The lesson is that the
   exclusion list has to be derived from what a test must *set up*, not from what it
   asserts.
+
+  **The same argument covers `binary(disclosure)` in its entirety.** Every test in it has to
+  produce a *verified* `filesystem/read-text` before it can assert anything about disclosure,
+  so there is no host-independent test to keep in that binary. The three tests that do not need
+  a sandbox were moved next to the code they exercise — `observation.rs`,
+  `proposer.rs::tests` and `http_provider::disclosure_rendering_tests` — so the binary stays
+  wholly sandbox evidence and one name covers it instead of ten.
+
+  The general lesson, now recorded twice: **derive an exclusion from what a test must set up,
+  not from what it asserts.** Both mistakes were caught by hosted CI rather than locally, which
+  is itself worth noting — a filter that is wrong in the permissive direction fails loudly, and
+  the one nobody checks is the one that excludes too much.
 
 ### What a green CI run does and does not prove
 

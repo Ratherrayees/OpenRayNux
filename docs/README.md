@@ -120,6 +120,12 @@ The 4c *governance core* is delivered. The loop that would drive it is not.
   multi-step task stops at the boundary *by design*, not by accident (ADR-0043, V-84). The
   boundary is now crossed by `task/continue`, which claims one step and proposes the next
   through the ordinary approval gate (ADR-0047).
+* An **approved, verified read** now informs **one** subsequent proposal, to the
+  `(endpoint, model)` identity that asked for the read, and only across the **immediately
+  following** step. `PriorStepContext` is untouched and stays metadata-only — the content
+  travels on a separate, ephemeral channel that is consumed on release and never becomes
+  durable (ADR-0048, V-88). This is the first path in the build on which workspace content can
+  leave the machine.
 * **`PriorStepContext` exists and is tested; the observation store exists and is tested; the
   daemon's runtime does not read or write it.** A model can propose a read and has nowhere
   to receive the bytes. `3c8a413` names itself the rollback point immediately before moving
@@ -130,7 +136,7 @@ The 4c *governance core* is delivered. The loop that would drive it is not.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**1372 tests, 1372 passed, 5 skipped** locally, with 1–2 *leaky* results depending on
+**1400 tests, 1400 passed, 5 skipped** locally, with 1–2 *leaky* results depending on
 scheduling — both are pre-existing `cgroup.kill` tests that pass and are named in
 [`08`](08-testing-engineering-standards.md) §19. On the hosted runner, gate G9 runs fewer
 and all of those pass — the difference is the Tier-1 sandbox-evidence suites, which the
@@ -172,7 +178,7 @@ Tier-1 evidence should live, since GitHub-hosted runners cannot supply it.
 |---|----------|----------------|
 | **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, and **§9a: where the implementation actually stands.** |
 | **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 86 entries: every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
-| **09** | [Architecture Decision Records](09-decisions.md) | 45 ADRs, ADR-0001…ADR-0047 (0041 and 0042 deliberately unused). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
+| **09** | [Architecture Decision Records](09-decisions.md) | 46 ADRs, ADR-0001…ADR-0048 (0041 and 0042 deliberately unused). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
 | **06** | [Deployment & Platform Model](06-deployment-platform-model.md) | Profiles, the platform boundary, and **§2.3: the honest per-platform assessment.** |

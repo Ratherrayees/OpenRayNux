@@ -11,8 +11,8 @@ workspace manifest. Where a row describes something that does **not** exist, it 
 present tense, which made it impossible to tell a reader what was real. That distinction
 is now load-bearing rather than cosmetic, because the milestone boundary in
 [`12-verification-register.md`](12-verification-register.md) depends on it: the 4c
-*governance core* and its continuation wiring are delivered, and the 4c *observation
-wiring* is deliberately absent.
+*governance core* and both its continuation and observation/disclosure wiring are
+delivered.
 
 ---
 
@@ -648,19 +648,45 @@ the task is retryable — otherwise one outage would strand it holding a lease f
 will never be proposed. The generic claim path is deliberately still `Pending`-only, and a
 test pins that.
 
-### Observation: the runtime wiring remains deliberately absent
+### Observation and disclosure: wired, bounded, and separate from `PriorStepContext` (ADR-0048)
 
-* **Observation.** `filesystem/read-text` exists as a governed capability, and
-  `PriorStepContext` carries step number, status and workspace-relative artifact paths into
-  the provider request — never file contents, never prior `structured_output`, never prior
-  verification text. Alongside it, `crates/orxnud-daemon/src/observation.rs` implements the
-  provider-identity binding, the ephemeral observation store and the disclosure record
-  (29 tests). **The daemon's runtime neither reads nor writes an `ObservationStore`**, so a
-  model can propose a read and has nowhere to receive the bytes. `3c8a413` names itself the
-  rollback point immediately before moving approved workspace content to a third party.
+* **`PriorStepContext` is unchanged.** It carries step number, status and workspace-relative
+  artifact paths into the provider request — never file contents, never prior
+  `structured_output`, never prior verification text. `PriorStepContext` and the disclosure
+  channel are deliberately two fields with two lifetimes: `prior_steps` is a re-derivable
+  projection of committed rows, `disclosures` is ephemeral content that exists for one
+  request. Widening one cannot widen the other.
+* **The disclosure channel.** `ProposalContext::disclosures` is a `DisclosureBatch` — a
+  newtype with a private field, so the only way to build one is from what
+  `ObservationStore::take_for` released. It cannot be assembled from anything else.
+* **The full flow**, which is now production code rather than an unreachable primitive:
 
-So: **stages 1–4b are delivered, the 4c governance core is delivered, the 4c continuation
-wiring is delivered (ADR-0047), and the 4c observation wiring is intentionally not enabled.**
+  ```text
+  task/ai-propose  proposes filesystem/read-text
+  human approves   (RiskClass::High: grant + single-use, time-boxed, digest-v3 approval)
+  task/execute     sandboxed read → independent verification
+                   output_is_ephemeral + is_verified + Actor::Ai naming the configured model
+                   → ObservationStore::retain, bound to (task, step, endpoint, model)
+  task/continue    claims the next step; take_for(task, step+1, identity, now, ≤32 KiB)
+                   → one DisclosureRecord per released blob, on its own minted correlation
+                   → ProposalContext::disclosures → the provider request
+  ```
+
+* **What may leave:** the verified output of an approved `filesystem/read-text`, as whole
+  blobs, once, to the identity that asked for the read, for the immediately following step.
+  **What may not:** verifier evidence, subprocess output, audit records, digests, credentials,
+  absolute paths, another task's or another step's content. `PriorStepContext` and the audit
+  log are both asserted content-free by tests that search for a sentinel.
+* **Consumption is erasure.** `take_for` removes what it returns, and the store is process
+  memory, so a consumed observation cannot be restored by a crash or a restart — there is
+  nothing to restore. That is a stronger form of single-use than a durable flag, and it is why
+  ADR-0045 Decision 4's non-durability is a property rather than a compromise.
+* **`filesystem/read-text` became reachable in this slice**, because it was advertised by the
+  capability menu and refused by policy. That was a defect, not a decision — see ADR-0048.
+* **`3c8a413` remains the last commit at which no workspace content could reach a provider.**
+
+So: **stages 1–4b are delivered, and the 4c governance core is delivered with both its
+continuation wiring (ADR-0047) and its observation/disclosure wiring (ADR-0048).**
 
 ### Not implemented, and not planned into the near milestone
 
