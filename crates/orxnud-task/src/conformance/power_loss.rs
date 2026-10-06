@@ -50,10 +50,35 @@ fn bad(detail: impl Into<String>) -> PropertyOutcome {
     }
 }
 
-/// A deterministic directory for one test's artefacts.
+/// A scratch directory unique to **this call**, not to this process.
+///
+/// # Why the call and not the process
+///
+/// The key used to be `{pid}-{tag}` with a fixed tag, and `cargo test` runs the `#[test]`s
+/// of one binary as parallel threads of one process -- so three tests in
+/// `tests/conformance_production.rs` that each run the suite (`all_twelve_properties...`,
+/// `the_production_suite_is_reproducible`, and the deliberately-broken fixture) all reached
+/// TP-7 concurrently, all computed the *same* directory, and each one's first act was
+/// `remove_dir_all` on it. The result was a conformance report claiming
+///
+/// ```text
+/// TP-7 power loss cannot corrupt task state   VIOLATED: cannot read tasks: no such table
+/// ```
+///
+/// which is not a property violation at all: it is one thread deleting another's database,
+/// reported as a durability defect. Because it needed three threads racing rather than a
+/// deterministic bug, it surfaced only under added parallel load -- and the conformance
+/// report is exactly the kind of evidence that must not be able to say "violated" for a
+/// reason that has nothing to do with the property.
+///
+/// A per-call counter makes the directories disjoint regardless of how many threads run,
+/// and keeps the pid for readability when a stale directory has to be identified.
 #[must_use]
 pub fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("orxnud-tp7-{}-{tag}", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("orxnud-tp7-{}-{tag}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
@@ -320,13 +345,55 @@ pub fn tp7_power_loss_cannot_corrupt(
 mod tests {
     use super::*;
 
+    /// Two calls must not share a directory, even from the same thread.
+    ///
+    /// This test previously asserted the *opposite* — that the same tag yields the same
+    /// path — and that assertion was the bug. `cargo test` runs a binary's tests as parallel
+    /// threads of one process, so a PID-keyed directory with a fixed tag was shared by every
+    /// suite run in the binary, and each one's `remove_dir_all` deleted the others'
+    /// database. The conformance report then said `TP-7 power loss cannot corrupt task
+    /// state: VIOLATED`, which is a statement about a race in the harness rather than about
+    /// durability.
+    ///
+    /// So the property is now isolation, and this asserts it in the single-threaded case
+    /// where it is cheapest to see. The multi-threaded case is what actually broke; it is
+    /// covered by the fact that the full suite now runs clean under parallel load.
     #[test]
-    fn the_scratch_dir_is_deterministic_and_isolated() {
+    fn the_scratch_dir_is_isolated_per_call() {
         let a = scratch_dir("x");
         let b = scratch_dir("x");
-        assert_eq!(a, b, "the same tag must yield the same path");
-        assert!(a.exists());
+        assert_ne!(
+            a, b,
+            "two concurrent callers must not share a scratch directory; sharing is how a \
+             harness reports a property violation that is its own race"
+        );
+        assert!(a.exists() && b.exists());
         let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The isolation must survive actual concurrency, which is where it failed.
+    #[test]
+    fn concurrent_callers_never_share_a_scratch_dir() {
+        let paths: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| scratch_dir("par"))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        let mut seen = paths.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            paths.len(),
+            "concurrent callers collided: {:?}",
+            paths
+        );
+        for p in paths {
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 
     #[test]
