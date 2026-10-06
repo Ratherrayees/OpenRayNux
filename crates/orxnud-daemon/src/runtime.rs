@@ -149,14 +149,96 @@ pub enum RequestError {
     #[error("unknown method: {0}")]
     UnknownMethod(String),
 
-    /// The dispatch was refused by the governed path.
+    /// The request violates the resource's own rules.
     ///
-    /// The reason is the dispatcher's, quoted verbatim: it is already structured,
-    /// already redacted, and already distinguishes "we decided no" from "we could
-    /// not decide". Re-deriving a friendlier message here would create a second
-    /// set of reasons to keep in step.
-    #[error("dispatch refused: {0}")]
-    Refused(String),
+    /// Separate from [`Self::Invalid`] because that variant carries a *sentence* in
+    /// `data.reason`, which is fine for the many "you sent something malformed" call sites
+    /// and wrong here: this is a typed domain refusal whose stable word belongs in the
+    /// machine-readable field and whose explanation belongs in the detail.
+    #[error("invalid request: {reason}")]
+    InvalidInput {
+        /// A stable vocabulary word, never prose.
+        reason: String,
+        /// Optional detail. Already redacted.
+        detail: Option<String>,
+    },
+
+    /// The referenced resource does not exist.
+    ///
+    /// Separate from [`Self::Invalid`] because the request was well-formed: there is simply
+    /// no such task or proposal. A client told "invalid request" fixes its request; a client
+    /// told this refreshes its view, which is the only thing that helps.
+    #[error("the referenced resource does not exist: {reason}")]
+    NotFound {
+        /// A stable vocabulary word, never prose.
+        reason: String,
+        /// Optional detail. Already redacted.
+        detail: Option<String>,
+    },
+
+    /// The request was valid, but the resource is not in a state where it is legal.
+    ///
+    /// One variant for every such condition — already decided, already terminal, a stale
+    /// lease, another worker winning a race — because the *recovery* is the same in all of
+    /// them: re-read the state and decide again. What differs is only the reason, and that
+    /// travels in `data.reason` for a client that needs to tell them apart.
+    ///
+    /// A caller losing a race lands here, which is the point: one worker winning is a normal
+    /// outcome and reporting it as an internal fault is what makes a correct system look
+    /// broken.
+    #[error("the request conflicts with the current state: {reason}")]
+    Conflict {
+        /// A stable vocabulary word, never prose.
+        reason: String,
+        /// Optional detail. Already redacted.
+        detail: Option<String>,
+    },
+
+    /// Refused by policy or authority.
+    ///
+    /// No approval, a spent or expired one, a digest that no longer matches, a capability
+    /// that is not granted. Retry fails identically; what is needed is a new human decision.
+    #[error("the action was refused by policy or authority: {reason}")]
+    Forbidden {
+        /// A stable vocabulary word, never prose.
+        reason: String,
+        /// Optional detail. Already redacted.
+        detail: Option<String>,
+    },
+
+    /// A dependency or the execution environment is unavailable.
+    ///
+    /// The operation is permitted and something it needs is missing: a provider that cannot
+    /// be reached, an absent credential, sandbox guarantees that could not be established,
+    /// a platform with no backend. The remedy is external — fix configuration, add the
+    /// credential, wait — so this is deliberately not `INTERNAL_ERROR`.
+    #[error("a required dependency is unavailable: {reason}")]
+    Unavailable {
+        /// A stable vocabulary word, never prose.
+        reason: String,
+        /// Optional detail. Already redacted.
+        detail: Option<String>,
+    },
+
+    /// A refusal that is not one of the classified conditions: the dispatcher refused, or
+    /// the daemon's own state could not serve the request.
+    ///
+    /// The only class that maps to `INTERNAL_ERROR`, deliberately, because it is the only
+    /// one where **nothing the caller can do produces a different outcome**. A corrupt row, a
+    /// failed audit write and a dispatcher's own refusal all land here, and in each case the
+    /// useful thing for a client is to report a defect rather than retry or re-approve.
+    ///
+    /// Anything a client *could* act on belongs in one of the classes above. When a new
+    /// refusal turns out to be actionable, the fix is a new class and not a wider use of this
+    /// one, because widening it is exactly how "a stale lease is an internal error" happened
+    /// in the first place.
+    #[error("the request could not be served: {reason}")]
+    Refused {
+        /// A stable vocabulary word, never prose.
+        reason: String,
+        /// Optional detail. Already redacted.
+        detail: Option<String>,
+    },
 
     /// The proposal provider could not be asked, or could not answer.
     ///
@@ -182,9 +264,16 @@ impl RequestError {
                 .with_data(json!({
                     "reason": why,
                 })),
+            // The explanation is prose *because it has to be*: "which of your forty fields
+            // is wrong, and how" has no stable vocabulary word. So the word goes in the
+            // machine-readable field and the prose in the human one.
+            //
+            // This used to be the other way round, which meant every client that wanted to
+            // classify a malformed request had to string-match English.
             Self::Invalid(why) => RpcError::new(RpcErrorCode::INVALID_REQUEST, "invalid request")
                 .with_data(json!({
-                    "reason": why,
+                    "reason": "invalid-request",
+                    "detail": why,
                 })),
             Self::Declined { reason, detail } => {
                 let mut data = json!({ "reason": reason });
@@ -193,21 +282,84 @@ impl RequestError {
                 }
                 RpcError::new(RpcErrorCode::INVALID_REQUEST, "invalid request").with_data(data)
             }
+            // Typed domain refusal: the specific word is stable, so unlike `Invalid` it can
+            // be branched on directly.
+            Self::InvalidInput { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(RpcErrorCode::INVALID_REQUEST, "invalid request").with_data(data)
+            }
+            Self::NotFound { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(RpcErrorCode::RESOURCE_NOT_FOUND, "no such resource").with_data(data)
+            }
+            Self::Conflict { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(
+                    RpcErrorCode::CONFLICT,
+                    "the request conflicts with the current state",
+                )
+                .with_data(data)
+            }
+            Self::Forbidden { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(
+                    RpcErrorCode::FORBIDDEN,
+                    "the action was refused by policy or authority",
+                )
+                .with_data(data)
+            }
+            Self::Unavailable { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(
+                    RpcErrorCode::ENVIRONMENT_UNAVAILABLE,
+                    "a required dependency is unavailable",
+                )
+                .with_data(data)
+            }
             Self::UnknownMethod(m) => RpcError::method_not_found(m),
             Self::ProviderRefused { reason, detail } => {
                 let mut data = json!({ "reason": reason });
                 if let Some(d) = detail {
                     data["detail"] = json!(d);
                 }
+                // Environment, not internal. This variant only ever exists because the
+                // *provider* could not be used: no provider configured, no credential, an
+                // unreachable or refusing model. The daemon and its code are working; the
+                // thing it depends on is absent. Reporting `INTERNAL_ERROR` here told an
+                // operator their daemon was broken when the actual fix is `configure` or
+                // `doctor` -- the single most misleading thing this whole taxonomy could do,
+                // since it sends the reader to a bug report instead of their own config.
                 RpcError::new(
-                    RpcErrorCode::INTERNAL_ERROR,
+                    RpcErrorCode::ENVIRONMENT_UNAVAILABLE,
                     "the proposal provider could not be used",
                 )
                 .with_data(data)
             }
-            Self::Refused(why) => {
-                RpcError::new(RpcErrorCode::INTERNAL_ERROR, "the request was refused")
-                    .with_data(json!({ "reason": why }))
+            Self::Refused { reason, detail } => {
+                let mut data = json!({ "reason": reason });
+                if let Some(d) = detail {
+                    data["detail"] = json!(d);
+                }
+                RpcError::new(
+                    RpcErrorCode::INTERNAL_ERROR,
+                    "the request could not be served",
+                )
+                .with_data(data)
             }
         }
     }
@@ -854,7 +1006,12 @@ async fn ask_next_step<S: SecretsContract>(
     let row =
         g.2.task(&TaskId::new(task_id))
             .map_err(task_fault)?
-            .ok_or_else(|| RequestError::Invalid(format!("no task {task_id:?}")))?;
+            .ok_or_else(|| RequestError::NotFound {
+                reason: "task-not-found".to_owned(),
+                // The id is the caller's own, so naming it discloses nothing, and a client
+                // fixing a stale reference needs to see which reference missed.
+                detail: Some(format!("no task {task_id:?}")),
+            })?;
 
     // The menu is walked out of the capability registry: what exists, what parameters
     // each one declares, and whether it is enabled. Nothing here names a capability.
@@ -1114,9 +1271,14 @@ async fn continue_task<S: SecretsContract>(
     let before =
         g.2.task(&id)
             .map_err(task_fault)?
-            .ok_or_else(|| RequestError::Invalid(format!("no task {task_id:?}")))?;
+            .ok_or_else(|| RequestError::NotFound {
+                reason: "task-not-found".to_owned(),
+                // The id is the caller's own, so naming it discloses nothing, and a client
+                // fixing a stale reference needs to see which reference missed.
+                detail: Some(format!("no task {task_id:?}")),
+            })?;
     if before.state != TaskState::AwaitingNextStep {
-        return Err(RequestError::Declined {
+        return Err(RequestError::Conflict {
             reason: "not-at-boundary".to_owned(),
             detail: Some(format!(
                 "task is {:?}, not {:?}; only a task between steps can be continued",
@@ -1282,7 +1444,7 @@ fn release_observations<S: SecretsContract>(
             // A poisoned lock means a previous holder panicked while holding workspace
             // content. Refusing is the only answer: recovering would require deciding which
             // observations a panicked path had already consumed.
-            return Err(RequestError::Declined {
+            return Err(RequestError::Refused {
                 reason: "disclosure-store-unavailable".to_owned(),
                 detail: Some(
                     "the observation store is not usable; no content was disclosed".to_owned(),
@@ -1319,7 +1481,7 @@ fn release_observations<S: SecretsContract>(
         .to_audit_record(r.origin.approver.clone());
         g.0.policy_mut()
             .append_audit_record(record)
-            .map_err(|e| RequestError::Declined {
+            .map_err(|e| RequestError::Refused {
                 reason: "disclosure-audit-unavailable".to_owned(),
                 detail: Some(format!(
                     "the disclosure could not be recorded, so nothing was disclosed: {e}"
@@ -1466,7 +1628,10 @@ async fn execute_proposal<S: SecretsContract>(
     let proposal =
         g.2.proposal(&proposal_id)
             .map_err(task_fault)?
-            .ok_or_else(|| RequestError::Invalid(format!("no proposal {proposal_id:?}")))?;
+            .ok_or_else(|| RequestError::NotFound {
+                reason: "proposal-not-found".to_owned(),
+                detail: Some(format!("no proposal {proposal_id:?}")),
+            })?;
     let proposer = proposal
         .proposer()
         .map_err(|e| RequestError::Invalid(format!("proposal proposer unusable: {e}")))?;
@@ -1478,8 +1643,11 @@ async fn execute_proposal<S: SecretsContract>(
     let approval_row =
         g.2.engine()
             .approval_for(&proposal.task_id, proposal.step_no, proposal.attempt_no)
-            .map_err(|e| RequestError::Refused(format!("approval unreadable: {e}")))?
-            .ok_or_else(|| RequestError::Declined {
+            .map_err(|e| RequestError::Refused {
+                reason: "approval-unreadable".to_owned(),
+                detail: Some(e.to_string()),
+            })?
+            .ok_or_else(|| RequestError::Forbidden {
                 reason: "approval-required".to_owned(),
                 // A fixed word, not a formatted sentence: `detail` is a second term in a
                 // vocabulary a client branches on, and putting a task id in it would make
@@ -1501,7 +1669,7 @@ async fn execute_proposal<S: SecretsContract>(
     // and so to the policy stage. Two clock reads here would be two chances to decide an
     // authority question differently, which is exactly the bug class V-82 is.
     if !record.is_valid_at(now) {
-        return Err(RequestError::Declined {
+        return Err(RequestError::Forbidden {
             reason: "approval-expired".to_owned(),
             detail: Some(format!(
                 "the approval for this attempt expired at {}",
@@ -1556,7 +1724,7 @@ async fn execute_proposal<S: SecretsContract>(
     let stored_params: serde_json::Value = match serde_json::from_str(&proposal.params) {
         Ok(v) => v,
         Err(_) => {
-            return Err(RequestError::Declined {
+            return Err(RequestError::Refused {
                 reason: "proposal-corrupt".to_owned(),
                 detail: Some("the stored parameters are not readable JSON".to_owned()),
             });
@@ -1600,7 +1768,10 @@ async fn execute_proposal<S: SecretsContract>(
             // The dispatcher's own message, which is already structured and already
             // safe to show. `Refused` rather than `Declined` because the detail is the
             // dispatcher's to word, not a fixed term this layer owns.
-            return Err(RequestError::Refused(e.to_string()));
+            return Err(RequestError::Refused {
+                reason: e.to_string(),
+                detail: None,
+            });
         }
     };
 
@@ -1896,7 +2067,7 @@ fn approval_record_from_row(
     proposer: &orxnud_domain::Actor,
     proposal: &orxnud_store::task_repo::ProposalRow,
 ) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
-    let digest = digest_from_hex(&row.digest_hex).ok_or_else(|| RequestError::Declined {
+    let digest = digest_from_hex(&row.digest_hex).ok_or_else(|| RequestError::Refused {
         reason: "approval-corrupt".to_owned(),
         detail: Some("the stored digest is not 64 hex characters".to_owned()),
     })?;
@@ -1907,7 +2078,7 @@ fn approval_record_from_row(
     // exists so an approval recorded against a proposal for a different step is refused
     // rather than quietly reinterpreted as belonging to this one.
     if row.step_no != proposal.step_no {
-        return Err(RequestError::Declined {
+        return Err(RequestError::Forbidden {
             reason: "approval-step-mismatch".to_owned(),
             detail: Some(
                 "the approval was issued for a different logical step than the proposal it is recorded against"
@@ -1919,7 +2090,7 @@ fn approval_record_from_row(
         || row.params != proposal.params
         || row.target != proposal.target
     {
-        return Err(RequestError::Declined {
+        return Err(RequestError::Forbidden {
             reason: "approval-action-mismatch".to_owned(),
             detail: Some("the approval was issued for a different action".to_owned()),
         });
@@ -1978,7 +2149,10 @@ async fn approve_proposal<S: SecretsContract>(
     let proposal =
         g.2.proposal(&proposal_id)
             .map_err(task_fault)?
-            .ok_or_else(|| RequestError::Invalid(format!("no proposal {proposal_id:?}")))?;
+            .ok_or_else(|| RequestError::NotFound {
+                reason: "proposal-not-found".to_owned(),
+                detail: Some(format!("no proposal {proposal_id:?}")),
+            })?;
     // The proposal's status records *the decision to approve*, and expiry is a property of
     // the approval row rather than of that decision. Before this, an `approved` proposal was
     // refused unconditionally, so an approval that expired while the task waited left the
@@ -1991,7 +2165,7 @@ async fn approve_proposal<S: SecretsContract>(
     // do opposite things.
     let was_pending = proposal.is_pending();
     if !was_pending && proposal.status != "approved" {
-        return Err(RequestError::Declined {
+        return Err(RequestError::Conflict {
             reason: "proposal-already-decided".to_owned(),
             detail: Some("only a pending proposal can be approved".to_owned()),
         });
@@ -2003,13 +2177,15 @@ async fn approve_proposal<S: SecretsContract>(
             .2
             .engine()
             .approval_for(&proposal.task_id, proposal.step_no, proposal.attempt_no)
-            .map_err(|e| RequestError::Refused(format!("approval unreadable: {e}")))?
-        {
+            .map_err(|e| RequestError::Refused {
+                reason: "approval-unreadable".to_owned(),
+                detail: Some(e.to_string()),
+            })? {
             // No approval row at all, yet the proposal says approved. The durable state
             // disagrees with itself; refusing is the only answer, and it is recoverable
             // because nothing was written.
             None => {
-                return Err(RequestError::Declined {
+                return Err(RequestError::Forbidden {
                     reason: "approval-not-found".to_owned(),
                     detail: Some(
                         "the proposal is approved but no approval is recorded for it".to_owned(),
@@ -2023,14 +2199,14 @@ async fn approve_proposal<S: SecretsContract>(
     // Both refusals decided from durable state, and both before anything is written.
     if let Some(prior) = &replacing {
         if prior.consumed_at_ms.is_some() {
-            return Err(RequestError::Declined {
+            return Err(RequestError::Forbidden {
                 reason: "approval-already-consumed".to_owned(),
                 detail: Some("the approval for this attempt has already been used".to_owned()),
             });
         }
         // Half-open, matching `is_valid_at`: live while `now < expires_at_ms`.
         if now < prior.expires_at_ms {
-            return Err(RequestError::Declined {
+            return Err(RequestError::Forbidden {
                 reason: "approval-already-valid".to_owned(),
                 detail: Some(format!(
                     "an approval for this attempt is valid until {}",
@@ -2084,7 +2260,7 @@ async fn approve_proposal<S: SecretsContract>(
     // The half-open comparison is `is_valid_at`'s, so an approval expires at exactly
     // `expires_at_ms` rather than one instant either side of it.
     if !record.is_valid_at(now) {
-        return Err(RequestError::Declined {
+        return Err(RequestError::Forbidden {
             reason: "approval-expired".to_owned(),
             detail: Some(
                 "the requested time to live leaves the approval already expired".to_owned(),
@@ -2522,15 +2698,76 @@ async fn tasks<S: SecretsContract>(
 /// message, which can quote a constraint or a path, never reaches a peer.
 fn task_fault(fault: TaskFault) -> RequestError {
     let reason = fault.as_str();
+    // Read before the match, because the `Engine` arm binds its own `detail` and would
+    // otherwise shadow this one.
+    let fault_detail = fault.detail().map(str::to_owned);
+    // Every arm below is a *typed* decision. There is no branch that reads `reason` as
+    // prose, and no fallback that dumps an unrecognised failure into `INTERNAL_ERROR`
+    // merely because its shape was not anticipated here — an unanticipated cause is a real
+    // internal fault and is reported as one.
     match fault {
-        TaskFault::AlreadyExists
-        | TaskFault::NotFound
-        | TaskFault::NotClaimable(_)
-        | TaskFault::Fenced => RequestError::Declined {
+        // A well-formed request naming something that is not there.
+        TaskFault::NotFound => RequestError::NotFound {
             reason: reason.to_owned(),
-            detail: fault.detail().map(str::to_owned),
+            detail: fault_detail,
         },
-        TaskFault::Stopped | TaskFault::Engine(_) => RequestError::Refused(reason.to_owned()),
+        // Taken rather than invented: the name is taken, so the request is a conflict.
+        // Likewise a lease the caller does not hold, or held and lost: another worker
+        // winning is a normal outcome, and `CONFLICT` is the honest code for it.
+        TaskFault::AlreadyExists | TaskFault::Fenced => RequestError::Conflict {
+            reason: reason.to_owned(),
+            detail: fault_detail,
+        },
+        // The **specific** refusal is the reason, not the coarse variant name. "not-claimable"
+        // says only that a claim was refused; "not-found" says the task is gone, and a client
+        // choosing between "refresh my view" and "retry in a moment" needs the second. Both
+        // are `CONFLICT`, and `data.reason` is the branchable field.
+        //
+        // No detail: the reason already *is* the refusal (`ClaimRefusal::as_str`), so a
+        // detail would repeat it.
+        TaskFault::NotClaimable(r) => RequestError::Conflict {
+            reason: r.as_str().to_owned(),
+            detail: None,
+        },
+        // The service is stopping. Nothing is wrong and nothing can be retried until it is
+        // not stopping — which is an environment fact, not an internal fault.
+        TaskFault::Stopped => RequestError::Unavailable {
+            reason: reason.to_owned(),
+            detail: fault_detail,
+        },
+        TaskFault::Engine { cause, detail } => match cause {
+            orxnud_task::TaskCause::NotFound => RequestError::NotFound {
+                reason: reason.to_owned(),
+                detail: Some(detail),
+            },
+            orxnud_task::TaskCause::AlreadyExists | orxnud_task::TaskCause::Conflict => {
+                RequestError::Conflict {
+                    reason: reason.to_owned(),
+                    detail: Some(detail),
+                }
+            }
+            orxnud_task::TaskCause::Forbidden => RequestError::Forbidden {
+                reason: reason.to_owned(),
+                detail: Some(detail),
+            },
+            orxnud_task::TaskCause::Unavailable => RequestError::Unavailable {
+                reason: reason.to_owned(),
+                detail: Some(detail),
+            },
+            // A caller-fixable violation of the resource's own rules. Same class as a
+            // malformed request, and `INVALID_REQUEST` says "change the request", which is
+            // exactly right.
+            orxnud_task::TaskCause::InvalidInput => RequestError::Invalid(detail),
+            // Durable state that does not add up, or a database that failed. Both are
+            // genuine internal faults: no client action produces a different outcome, and
+            // `INTERNAL_ERROR` is the truthful answer.
+            orxnud_task::TaskCause::Corrupt | orxnud_task::TaskCause::Storage => {
+                RequestError::Refused {
+                    reason: reason.to_owned(),
+                    detail: fault_detail,
+                }
+            }
+        },
     }
 }
 
@@ -2758,11 +2995,15 @@ async fn dispatch<S: SecretsContract>(
         Err(DispatchError::NoImplementation(_)) => {
             // The expected answer while the registry is empty. Named distinctly so
             // a caller can tell "nothing is registered" from "something went wrong".
-            Err(RequestError::Refused(
-                "no implementation is registered".to_owned(),
-            ))
+            Err(RequestError::Refused {
+                reason: "no-implementation-registered".to_owned(),
+                detail: None,
+            })
         }
-        Err(e) => Err(RequestError::Refused(e.to_string())),
+        Err(e) => Err(RequestError::Refused {
+            reason: e.to_string(),
+            detail: None,
+        }),
     }
 }
 

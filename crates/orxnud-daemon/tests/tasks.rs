@@ -449,10 +449,9 @@ fn a_pending_task_cannot_be_completed_without_being_claimed() {
             "task/complete",
             json!({"id": "t-1", "worker": "anyone"}),
         );
-        assert_eq!(
-            refused["error"]["code"],
-            RpcErrorCode::INVALID_REQUEST.code()
-        );
+        // `CONFLICT`: valid request, wrong state. The task is not in a state where
+        // completing it is legal, and the recovery is to claim it first.
+        assert_eq!(refused["error"]["code"], RpcErrorCode::CONFLICT.code());
         assert_eq!(
             refused["error"]["data"]["reason"], "fenced",
             "a task with no lease is fenced out, not completed"
@@ -494,10 +493,9 @@ fn a_worker_cannot_complete_a_task_it_does_not_hold() {
             "task/complete",
             json!({"id": "t-1", "worker": "intruder"}),
         );
-        assert_eq!(
-            stolen["error"]["code"],
-            RpcErrorCode::INVALID_REQUEST.code()
-        );
+        // `CONFLICT`: another worker holding the lease is a race that was lost, not a bad
+        // request and not a fault in the daemon.
+        assert_eq!(stolen["error"]["code"], RpcErrorCode::CONFLICT.code());
         assert_eq!(stolen["error"]["data"]["reason"], "fenced");
 
         // The rightful owner can still finish it: the intruder changed nothing.
@@ -536,10 +534,11 @@ fn a_duplicate_task_id_is_refused_rather_than_overwriting() {
             "task/create",
             json!({"id": "t-1", "kind": "query", "content": "impostor"}),
         );
-        assert_eq!(
-            second["error"]["code"],
-            RpcErrorCode::INVALID_REQUEST.code()
-        );
+        // `CONFLICT`, not `INVALID_REQUEST`: the request was well-formed and the name was
+        // simply taken. `INVALID_REQUEST` tells a client to change what it sent, which would
+        // have it inventing a different id — the opposite of the advice. The reason word is
+        // unchanged, so nothing a client branched on moved.
+        assert_eq!(second["error"]["code"], RpcErrorCode::CONFLICT.code());
         assert_eq!(second["error"]["data"]["reason"], "already-exists");
 
         // The original survived: a plain INSERT, never an upsert.
@@ -568,8 +567,11 @@ fn claiming_what_cannot_be_claimed_is_refused_with_a_reason() {
             "task/claim",
             json!({"id": "nope", "worker": "w"}),
         );
-        assert_eq!(absent["error"]["data"]["reason"], "not-claimable");
-        assert_eq!(absent["error"]["data"]["detail"], "not-found");
+        // `data.reason` is the *specific* refusal, not the coarse variant name: "not-found"
+        // tells the client the task is gone, where "not-claimable" would only say the claim
+        // was refused. Both are CONFLICT -- see tests/taxonomy.rs.
+        assert_eq!(absent["error"]["data"]["reason"], "not-found");
+        assert_eq!(absent["error"]["code"], RpcErrorCode::CONFLICT.code());
 
         // A pending task is claimable; claim it, then ask again.
         send(
@@ -590,10 +592,13 @@ fn claiming_what_cannot_be_claimed_is_refused_with_a_reason() {
             "task/claim",
             json!({"id": "t-1", "worker": "w2"}),
         );
+        // The refusal is carried by `reason` alone: with no detail to repeat it, and with
+        // the two refusals distinguishable -- an already-running task is "not-claimable",
+        // a missing one is "not-found".
         assert_eq!(twice["error"]["data"]["reason"], "not-claimable");
-        assert_eq!(
-            twice["error"]["data"]["detail"], "not-claimable",
-            "an already-running task is not-claimable, which is different from missing"
+        assert!(
+            twice["error"]["data"].get("detail").is_none(),
+            "reason already is the refusal: {twice}"
         );
         s.stop().await;
     });
@@ -645,12 +650,16 @@ fn malformed_and_oversized_parameters_are_refused() {
             too_big["error"]["code"],
             RpcErrorCode::INVALID_REQUEST.code()
         );
-        let reason = too_big["error"]["data"]["reason"]
+        // The prose lives in `data.detail`, never in the machine-readable `data.reason`:
+        // which of forty fields is wrong has no stable word, so the class goes in `reason`
+        // and the explanation in the human-facing field.
+        assert_eq!(too_big["error"]["data"]["reason"], "invalid-request");
+        let detail = too_big["error"]["data"]["detail"]
             .as_str()
             .unwrap_or_default();
         assert!(
-            reason.contains("content") && reason.contains("limit"),
-            "the refusal must name the field and the bound: {reason}"
+            detail.contains("content") && detail.contains("limit"),
+            "the refusal must name the field and the bound: {detail}"
         );
 
         // An over-long id is refused the same way.
@@ -1054,7 +1063,13 @@ fn cancelling_a_task_that_does_not_exist_is_not_found() {
     rt().block_on(async {
         let s = Serving::start(dir("cancel-absent")).await;
         let out = send(&s.endpoint, "1", "task/cancel", json!({"id": "ghost"}));
-        assert_eq!(out["error"]["code"], RpcErrorCode::INVALID_REQUEST.code());
+        // `RESOURCE_NOT_FOUND`: the request named a task that does not exist. `INVALID_REQUEST`
+        // would have said "you asked wrongly", which sends a client looking at its own
+        // request rather than refreshing its view of the daemon.
+        assert_eq!(
+            out["error"]["code"],
+            RpcErrorCode::RESOURCE_NOT_FOUND.code()
+        );
         assert_eq!(out["error"]["data"]["reason"], "not-found");
         s.stop().await;
     });

@@ -507,8 +507,21 @@ mod tests {
 /// read an error *message* to tell "no such task" from "the database is gone" — and
 /// the endpoint is local and unauthenticated, so message text is also a disclosure
 /// surface. Every variant here carries a stable [`TaskFault::as_str`] instead, and
-/// [`TaskFault::Engine`] deliberately holds an opaque summary rather than the
-/// engine's own text.
+/// [`TaskFault::Engine`] holds the engine's **typed** cause rather than its text.
+///
+/// # Why the cause is typed
+///
+/// `Engine(String)` looked like the right boundary — one variant, an opaque summary, no
+/// engine internals escaping — but it threw away the classification along with the text.
+/// Everything behind it then became indistinguishable: a stale lease, an unknown
+/// capability, a lost race and a genuinely broken database all produced the same variant,
+/// and the daemon had to choose between "refused" and "internal" with nothing to choose
+/// with. The outcome was `INTERNAL_ERROR` for conditions a client can act on.
+///
+/// A typed cause is not the same as leaking the engine's hierarchy. `TaskCause` is a closed
+/// eight-value enum defined *here* at the service boundary, the detail is still opaque, and
+/// the daemon maps the cause onto the protocol's coarse classes. New internal errors pick an
+/// existing cause; they do not add variants to this enum.
 #[derive(Debug)]
 pub enum TaskFault {
     /// The id is already in use.
@@ -525,9 +538,14 @@ pub enum TaskFault {
     Fenced,
     /// The service is shutting down.
     Stopped,
-    /// The engine failed. `String` is an opaque summary for the log, not the
-    /// engine's message: the detail never crosses to a peer.
-    Engine(String),
+    /// A task-domain failure, with the reason it was one.
+    Engine {
+        /// Why the domain refused. Typed, and the only thing the daemon classifies with.
+        cause: orxnud_task::TaskCause,
+        /// The engine's own message. For logs and `data.detail`; **never** for
+        /// classification, because that is what reading a message for meaning looks like.
+        detail: String,
+    },
 }
 
 impl TaskFault {
@@ -544,7 +562,7 @@ impl TaskFault {
             Self::NotClaimable(_) => "not-claimable",
             Self::Fenced => "fenced",
             Self::Stopped => "stopped",
-            Self::Engine(_) => "internal",
+            Self::Engine { cause, .. } => cause.as_str(),
         }
     }
 
@@ -553,9 +571,14 @@ impl TaskFault {
     /// So a client can tell "not found" from "already running" from "not due yet"
     /// without parsing anything.
     #[must_use]
-    pub fn detail(&self) -> Option<&'static str> {
+    pub fn detail(&self) -> Option<&str> {
         match self {
             Self::NotClaimable(r) => Some(r.as_str()),
+            // The engine's own message, which is the only thing that says *which* storage
+            // failure or *which* corrupt row. It never crossed this boundary before, because
+            // the variant held a summary that `detail()` never read — and a refusal whose
+            // detail is always empty is one an operator cannot act on.
+            Self::Engine { detail, .. } => Some(detail),
             _ => None,
         }
     }
@@ -583,10 +606,16 @@ impl TaskService {
             Ok(TaskCreation::Created) => self
                 .engine
                 .task(&task.id)
-                .map_err(|e| TaskFault::Engine(e.to_string()))?
+                .map_err(|e| TaskFault::Engine {
+                    cause: e.cause,
+                    detail: e.to_string(),
+                })?
                 .ok_or(TaskFault::NotFound),
             Ok(TaskCreation::AlreadyExists) => Err(TaskFault::AlreadyExists),
-            Err(e) => Err(TaskFault::Engine(e.to_string())),
+            Err(e) => Err(TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            }),
         }
     }
 
@@ -596,9 +625,10 @@ impl TaskService {
     ///
     /// [`TaskFault::Engine`] if the read fails.
     pub fn task(&self, id: &TaskId) -> Result<Option<TaskRow>, TaskFault> {
-        self.engine
-            .task(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+        self.engine.task(id).map_err(|e| TaskFault::Engine {
+            cause: e.cause,
+            detail: e.to_string(),
+        })
     }
 
     /// Every task, ordered by id.
@@ -611,9 +641,10 @@ impl TaskService {
     ///
     /// [`TaskFault::Engine`] if the read fails.
     pub fn list(&self) -> Result<Vec<TaskRow>, TaskFault> {
-        self.engine
-            .all_tasks()
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+        self.engine.all_tasks().map_err(|e| TaskFault::Engine {
+            cause: e.cause,
+            detail: e.to_string(),
+        })
     }
 
     /// Claims **one named** task for `worker`, through the lease fence.
@@ -633,8 +664,10 @@ impl TaskService {
         match self
             .engine
             .claim_task_id(id, worker, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
-        {
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })? {
             ClaimAttempt::Claimed(c) => Ok(*c),
             ClaimAttempt::Refused(r) => Err(TaskFault::NotClaimable(r)),
         }
@@ -665,8 +698,10 @@ impl TaskService {
         match self
             .engine
             .claim_next_step(id, worker, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
-        {
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })? {
             TargetedClaimOutcome::Claimed(c) => Ok(*c),
             TargetedClaimOutcome::Refused(r) => Err(TaskFault::NotClaimable(r)),
         }
@@ -714,7 +749,10 @@ impl TaskService {
                 error,
                 retry_delay_ms,
             )
-            .map_err(|e| TaskFault::Engine(e.to_string()))?;
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?;
         if !ok {
             return Err(TaskFault::Fenced);
         }
@@ -722,7 +760,10 @@ impl TaskService {
         // stored, including `terminal_at_ms` and the effect bookkeeping.
         self.engine
             .task(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?
             .ok_or(TaskFault::Fenced)
     }
 
@@ -747,12 +788,18 @@ impl TaskService {
         let known = self
             .engine
             .task(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?
             .is_some();
         let committed = self
             .engine
             .complete_task(id, worker, now_ms, to, true, None)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?;
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?;
         if !committed {
             return Err(if known {
                 TaskFault::Fenced
@@ -762,7 +809,10 @@ impl TaskService {
         }
         self.engine
             .task(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?
             .ok_or(TaskFault::NotFound)
     }
 
@@ -799,7 +849,10 @@ impl TaskService {
                 proposer,
                 now_ms,
             )
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Completes one verified logical step, advancing the task if another step remains.
@@ -817,7 +870,10 @@ impl TaskService {
     ) -> Result<orxnud_store::task_repo::StepAdvance, TaskFault> {
         self.engine
             .complete_verified_step(done)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// The logical step currently being worked on: the task's `steps_completed + 1`.
@@ -826,9 +882,10 @@ impl TaskService {
     ///
     /// [`TaskFault::Engine`] if the task does not exist or its counters are impossible.
     pub fn next_step_no(&mut self, id: &TaskId) -> Result<u32, TaskFault> {
-        self.engine
-            .next_step_no(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+        self.engine.next_step_no(id).map_err(|e| TaskFault::Engine {
+            cause: e.cause,
+            detail: e.to_string(),
+        })
     }
 
     /// The durable results of a task's completed logical steps, oldest step first.
@@ -846,7 +903,10 @@ impl TaskService {
     ) -> Result<Vec<orxnud_store::task_repo::StepResultRow>, TaskFault> {
         self.engine
             .step_results_for(task_id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Marks an approval spent, so the task domain's own record says so.
@@ -868,7 +928,10 @@ impl TaskService {
         self.guard_running()?;
         self.engine
             .consume_approval(id, step_no, attempt_no, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Records an approval for a step, replacing one that expired without being used.
@@ -884,7 +947,10 @@ impl TaskService {
         self.guard_running()?;
         self.engine
             .record_approval_replacing_expired(approval, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Reads a proposal.
@@ -895,7 +961,10 @@ impl TaskService {
     pub fn proposal(&self, proposal_id: &str) -> Result<Option<ProposalRow>, TaskFault> {
         self.engine
             .proposal(proposal_id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Records a human decision on a proposal. Does not change the task's state.
@@ -912,7 +981,10 @@ impl TaskService {
         self.guard_running()?;
         self.engine
             .decide_proposal(proposal_id, status, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Takes the fresh execution lease for an approved proposal and resumes the task.
@@ -929,7 +1001,10 @@ impl TaskService {
         self.guard_running()?;
         self.engine
             .begin_approved_execution(proposal_id, worker, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
     }
 
     /// Cancels a task through the engine's existing cancellation.
@@ -945,17 +1020,26 @@ impl TaskService {
         if self
             .engine
             .task(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?
             .is_none()
         {
             return Err(TaskFault::NotFound);
         }
         self.engine
             .cancel_task(id, now_ms)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?;
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?;
         self.engine
             .task(id)
-            .map_err(|e| TaskFault::Engine(e.to_string()))?
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })?
             .ok_or(TaskFault::NotFound)
     }
 

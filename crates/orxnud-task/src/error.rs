@@ -90,6 +90,124 @@ impl fmt::Display for EngineErrorKind {
     }
 }
 
+/// Why the task domain refused, at the granularity a caller can act on.
+///
+/// # Why this exists alongside `EngineErrorKind`
+///
+/// `EngineErrorKind` classifies an error by *how the engine failed*, which is the right
+/// altitude for retry and budget decisions. It is the wrong altitude for a client deciding
+/// what to do next: `InvalidInput` covers "you named a task that does not exist", "that
+/// proposal is already decided", and "that step is out of range", and those three send a
+/// caller to three different places.
+///
+/// So `From<TaskRepoError> for EngineError` used to collapse five distinct repository
+/// refusals into one `InvalidInput`, and then `TaskService` discarded even that, leaving the
+/// daemon to decide between "refused" and "internal" by reading a sentence. This enum is the
+/// part that survives.
+///
+/// It stays **inside** `orxnud-task`. It is not the wire vocabulary and is never
+/// serialised: the daemon maps it onto the protocol's semantic classes, which are coarser
+/// and stable, and the internal hierarchy is free to grow without a protocol change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCause {
+    /// The referenced row does not exist.
+    NotFound,
+    /// The caller named something that is already taken.
+    AlreadyExists,
+    /// The request was valid, but the resource is not in a state where it is legal.
+    ///
+    /// Includes losing a race. Another worker claiming the task first is a normal outcome,
+    /// not a fault, and reporting it as one is what makes a correct system look broken.
+    Conflict,
+    /// Refused by policy or authority: no approval, a spent one, a digest that no longer
+    /// matches, a capability that is not granted.
+    ///
+    /// Distinct from `Conflict` because the answer differs: retrying an identical request
+    /// will fail identically, and what is needed is a *new approval*.
+    Forbidden,
+    /// The environment or a dependency is unavailable — a provider, a sandbox, a platform.
+    Unavailable,
+    /// The request violates the resource's own rules, and a different request would work.
+    InvalidInput,
+    /// Durable state is internally inconsistent.
+    ///
+    /// Kept apart from `Storage` deliberately: a corrupt row is not something a retry fixes
+    /// and not something a client can correct, so collapsing the two would hide a real fault
+    /// behind "try again".
+    Corrupt,
+    /// The database itself failed.
+    Storage,
+}
+
+impl TaskCause {
+    /// A stable, internal spelling. Never crosses the wire; the daemon maps to protocol
+    /// classes instead.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not-found",
+            Self::AlreadyExists => "already-exists",
+            Self::Conflict => "conflict",
+            Self::Forbidden => "forbidden",
+            Self::Unavailable => "unavailable",
+            Self::InvalidInput => "invalid-input",
+            Self::Corrupt => "corrupt",
+            Self::Storage => "storage",
+        }
+    }
+
+    /// The cause an engine-level failure carries when nothing more specific is known.
+    ///
+    /// The fallback for errors raised by the engine itself rather than by the repository. It
+    /// is deliberately a *table* rather than a guess: every `EngineErrorKind` has to say
+    /// something, and an unmapped one would be the next place information quietly went
+    /// missing.
+    #[must_use]
+    pub const fn from_kind(kind: EngineErrorKind) -> Self {
+        match kind {
+            EngineErrorKind::InvalidInput => Self::InvalidInput,
+            EngineErrorKind::PolicyRefused => Self::Forbidden,
+            EngineErrorKind::Unavailable | EngineErrorKind::Transient => Self::Unavailable,
+            EngineErrorKind::Timeout => Self::Unavailable,
+            EngineErrorKind::ConcurrencyConflict | EngineErrorKind::Cancelled => Self::Conflict,
+            EngineErrorKind::Permanent => Self::Conflict,
+            EngineErrorKind::Storage => Self::Storage,
+            EngineErrorKind::Invariant => Self::Corrupt,
+        }
+    }
+}
+
+impl From<&TaskRepoError> for TaskCause {
+    /// The precise repository meaning, before any collapse.
+    ///
+    /// Each arm is one repository refusal and one answer. `ProposalNotInState` and
+    /// `AlreadyExists` were previously indistinguishable from a malformed request at this
+    /// layer, which is why a stale lease and a typo both reached the client as the same code.
+    fn from(e: &TaskRepoError) -> Self {
+        match e {
+            TaskRepoError::NotFound(_) | TaskRepoError::NoSuchProposal(_) => Self::NotFound,
+            TaskRepoError::AlreadyExists(_) => Self::AlreadyExists,
+            // "Not in the state you need": already decided, already terminal, or the caller
+            // does not hold the lease. All three are conflicts, not bad input.
+            TaskRepoError::ProposalNotInState { .. } => Self::Conflict,
+            TaskRepoError::InvalidComposition(_) => Self::InvalidInput,
+            TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => Self::Corrupt,
+            // Busy and locked are another writer winning, which is a race outcome.
+            TaskRepoError::Sqlite(inner)
+                if matches!(
+                    inner.as_ref(),
+                    rusqlite::Error::SqliteFailure(e, _)
+                        if e.code == rusqlite::ErrorCode::DatabaseBusy
+                            || e.code == rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Self::Conflict
+            }
+            TaskRepoError::Sqlite(_) => Self::Storage,
+        }
+    }
+}
+
 /// A task-engine failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineError {
@@ -102,6 +220,13 @@ pub struct EngineError {
     pub task_id: Option<String>,
     /// The attempt involved, when there is one.
     pub attempt_no: Option<u32>,
+    /// Why the task domain refused, at caller-actionable granularity.
+    ///
+    /// Carried **alongside** `kind` rather than derived from it, because `kind` cannot
+    /// express it: every one of "no such task", "already decided" and "step out of range"
+    /// was an `InvalidInput`. `kind` still answers "how did the engine fail", which is what
+    /// retry and budget logic wants; `cause` answers "what does the caller do about it".
+    pub cause: TaskCause,
 }
 
 impl EngineError {
@@ -113,6 +238,9 @@ impl EngineError {
             message: message.into(),
             task_id: None,
             attempt_no: None,
+            // Defaulted from the kind, which is the honest answer when the engine raised the
+            // error itself and no repository refusal is behind it.
+            cause: TaskCause::from_kind(kind),
         }
     }
 
@@ -182,6 +310,10 @@ impl std::error::Error for EngineError {}
 
 impl From<TaskRepoError> for EngineError {
     fn from(e: TaskRepoError) -> Self {
+        // Taken *before* the match below consumes the value, and from a reference so the
+        // arms stay readable. This is the line that stops five distinct repository refusals
+        // from arriving at the daemon as one undifferentiated `InvalidInput`.
+        let cause = TaskCause::from(&e);
         // The mapping is by *meaning*, not by convenience. A constraint violation
         // on an id is invalid input; everything else from the repository is a
         // storage failure, because the repository only reports storage problems
@@ -213,7 +345,11 @@ impl From<TaskRepoError> for EngineError {
             }
             TaskRepoError::Sqlite(_) => EngineErrorKind::Storage,
         };
-        Self::new(kind, e.to_string())
+        // The kind is the engine's altitude; the cause is the caller's. Overriding the
+        // defaulted one here is the whole point of carrying both.
+        let mut out = Self::new(kind, e.to_string());
+        out.cause = cause;
+        out
     }
 }
 
