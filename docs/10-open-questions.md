@@ -309,11 +309,22 @@ Never silently show less and let the user approve blind.
 
 ## Q-OPEN-14 — What happens to a task whose *approval expires* mid-workflow? 🟡
 
-> **Reconciled 2026-10-05.** **Partly answered by the code, and the remaining half is V-82.** The per-step re-approval half of the interim position **shipped**: the approval digest is v3 and binds `step_no`, so one consent cannot cover a sibling step (ADR-0037, V-83). The scoped session-grant half is still prose — `grep -rn 'session_grant' crates` returns nothing. What the code actually does with an expired approval is recorded as **V-82**, still open: a proposal approved with an already-elapsed TTL becomes unrecoverable and can only be cancelled.
+> **Reconciled 2026-10-06.** **The expiry half is answered and closed; the session-grant half is still prose, and still open.** Two independent halves were conflated here and V-82 tracked only one of them.
+>
+> *Per-step re-approval* **shipped**: the approval digest is v3 and binds `step_no`, so one consent cannot cover a sibling step (ADR-0037, V-83).
+>
+> *What an expired approval means* **shipped**: an expired approval authorises nothing, and a proposal whose approval expired unconsumed can be approved again — a fresh digest, not an extension. ADR-0049; V-82 is closed.
+>
+> *The scoped session grant* is **still not implemented** — `grep -rn 'session_grant' crates` returns nothing, and ADR-0049 explicitly declines it. **This half remains open**, and deliberately so: recovery from an expiry is not a grant, and nothing in ADR-0049 shortens the re-approval round trip.
 
 **Question.** Approvals are short-lived and single-use (S6) and are never
 inherited by a retry. For a long workflow, does the user re-approve each
 consequential step (correct but tedious), or is there a scoped grant?
+
+**What is still open.** Only the ergonomics question, and only in its
+"should a long workflow not need a prompt per step" form. The failure mode is
+no longer "an expired approval bricks the task" — that is fixed and pinned —
+so what remains is the *tedium*, not the dead end.
 
 **Interim position.** Per-step re-approval for anything above L3, with the UI
 offering an explicit **scoped session grant** ("allow *sending mail to these

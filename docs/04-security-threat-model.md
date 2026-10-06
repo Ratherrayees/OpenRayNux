@@ -193,6 +193,19 @@ Because human approval is the last boundary, it must actually bind.
 - The digest is **re-verified immediately before execution**; mismatch ⇒ abort.
 - Approvals expire in seconds-to-minutes, are **single-use**, and are **never
   inherited by a retry or a resumed task**. A resumed task re-requests approval.
+- An **expired approval authorises nothing**, and it never leaves a dead end
+  behind it (ADR-0049, V-82). Three properties, each of which is a threat if it
+  fails:
+  * it is refused **before any write**, so a mistyped TTL cannot mint authority
+    that is unusable and mark the proposal decided anyway;
+  * it is refused **before the execution lease is taken**, using the same single
+    clock reading the policy stage receives — so a refusal cannot also park the
+    task in `running` under a lease, and so no two clock reads can disagree about
+    one authority question;
+  * a proposal whose approval lapsed **unconsumed** can be approved again, but
+    only with a **fresh digest**. Nothing of the old authority survives to be
+    presented, and a live or consumed approval may not be replaced at all, so
+    single-use is not weakened to buy the recovery.
 - Risk classification, approval validation, policy lookup, or audit write
   **failure ⇒ deny** (fail closed).
 

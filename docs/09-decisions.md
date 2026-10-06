@@ -1,7 +1,7 @@
 # 09 — Architecture Decision Records
 
 Status: **Draft v0.3** · Adopted 2026-09-30 · index and metadata reconciled
-**2026-10-06** against `HEAD` (`1ebe7b6`).
+**2026-10-06** against `HEAD` (`4ad1832`).
 
 Each ADR follows: Context · Problem · Options · Evidence · Decision · Why ·
 Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**46 ADRs, numbered ADR-0001 … ADR-0048.** Two numbers in that range are
+**47 ADRs, numbered ADR-0001 … ADR-0049.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -86,6 +86,7 @@ content.
 | [0046](#adr-0046) | **A missing host guarantee is a refusal to assert, not a test to skip** | **Accepted + implemented** |
 | [0047](#adr-0047) | **A continuation is one boundary and one proposal, and the caller decides whether to take another** | **Accepted + implemented** |
 | [0048](#adr-0048) | **An observation is released once, across one boundary, to the identity that asked for the read — and the read capability had to be made reachable to prove any of it** | **Accepted + implemented** |
+| [0049](#adr-0049) | **An expired approval is not a decision, and a proposal whose approval lapsed is not a dead end** | **Accepted + implemented** |
 
 ---
 
@@ -4003,3 +4004,167 @@ requirement, or the audit record each fails the suite.
   selects on `output_is_ephemeral` rather than on a capability id and would then cover more.
 * Revisit if `attempt_no` ever becomes global rather than per-step, which is the invariant the
   disclosure's step arithmetic rests on.
+
+
+---
+
+<a id="adr-0049"></a>
+
+## ADR-0049 — An expired approval is not a decision, and a proposal whose approval lapsed is not a dead end
+
+**Status.** **Decided and implemented.** Closes V-82 and the expiry half of Q-OPEN-14. The
+**scoped session grant** half of that question is explicitly **not** decided here.
+
+**Context.** V-82 recorded a liveness gap found by an operator during live verification, and
+deliberately left unfixed because "what does an expired-but-unconsumed approval *mean* —
+reclaimable, or terminal?" was called a policy question rather than a bug fix. That was the
+right call at the time and the reason it needed an ADR.
+
+**The defect, as reproduced before any edit.** Against the real store over a real socket:
+
+```
+approve(ttl_ms: 0)      -> success. expires_at == issued_at. proposal status := "approved"
+approve(ttl_ms: 60_000) -> refused: "proposal-already-decided"
+task/propose            -> refused: "internal"          (INTERNAL_ERROR, see below)
+task/execute            -> refused: "approval-expired"
+task/list               -> state "running", lease held by w1 for 30s
+task_proposals          -> ["status=approved"]          (terminal)
+task_approvals          -> ["expires==issued, consumed=None"]
+```
+
+Three defects, one of which the register did not record:
+
+1. **The liveness gap.** The proposal's `approved` status recorded *the decision to approve*
+   and was then read as *the authority to execute*. Expiry is a property of the approval row,
+   not of the decision, and nothing could ever bring the two apart again.
+2. **An over-short TTL was not the only route.** An approval that expired *while the task
+   waited* — the ordinary case, since a human wait is unbounded and a TTL is not — produced
+   exactly the same dead end. The register mentioned it in passing; reproducing it showed it
+   was the *more* common route.
+3. **Every expired attempt additionally parked the task.** `task/execute` took the execution
+   lease *before* the policy stage refused, flipping the task to `running` under a fresh
+   30-second lease. So even the refusal was followed by a state in which the task could not be
+   executed again until that lease expired.
+
+A fourth, smaller thing: a legitimate `task/propose` in that state answered
+`INTERNAL_ERROR` / `reason: "internal"`, because `TaskFault::Engine` maps there. INTERNAL_ERROR
+tells an operator the server is broken, which is the wrong thing to say about a client action.
+
+**Decision 1 — an approval that is expired on arrival is never minted.**
+
+`capability/approve` checks `is_valid_at(now)` on the record it has just built, *before* any
+write. A TTL that leaves the approval already expired is refused with `approval-expired`, and
+the proposal stays `pending` with the task in `waiting-for-user`.
+
+This removes the dead end at its cheapest point rather than making it recoverable afterwards:
+the one case an operator can cause by mistyping a flag can no longer occur at all, and the same
+call with a usable TTL simply works.
+
+**Decision 2 — the proposal's status is the decision; the approval row is the authority.**
+
+`task_proposals.status` keeps meaning "a decision was taken" and is **one-way**. Expiry is
+evaluated lazily against `task_approvals.expires_at_ms` at both `capability/approve` and
+`task/execute`. No new status, no new transition, and no background expiry worker.
+
+The schema already declares `'expired'` as a proposal status and `decide_proposal` already
+accepts it, and **neither is used** — deliberately. Expiry is not a decision anyone took, so
+writing it into the decision column would be asserting something that did not happen, and
+making the column two-way would buy a state the authority row already implies. The word stays
+available and unused, and this record says why so nobody re-litigates it.
+
+**Decision 3 — an expired, unconsumed approval may be replaced. A live or used one may not.**
+
+`TaskRepository::record_approval_replacing_expired` is the single place that answers "may this
+attempt be approved again?", and it answers from one IMMEDIATE transaction:
+
+* **no prior row** → `Recorded`;
+* **expired and unconsumed** → `ReplacedExpired`. The row is overwritten with a **new digest
+  and a new expiry**. The old authority ceases to exist rather than being extended, so there is
+  nothing left that could later be presented;
+* **still live** → `Refused(AlreadyValid)`. This is what keeps an approval single-use in the
+  sense that matters: a second `capability/approve` cannot silently supersede an unused one,
+  so "the approval a client holds" and "the approval in the database" cannot diverge;
+* **consumed, or the step has concluded** → `Refused(AlreadyConsumed)`.
+
+Refusals are values rather than errors, so the caller reports which of the two reasons applies
+instead of parsing prose, and the two map to two fixed wire reasons
+(`approval-already-valid`, `approval-already-consumed`) because they ask a client to do
+opposite things.
+
+**Decision 4 — an expired approval is refused before the execution lease is taken.**
+
+`task/execute` now checks `record.is_valid_at(now)` before `begin_approved_execution`, using
+**the same `now`** that is then handed to the dispatcher and so to the policy stage. Two clock
+reads here would be two chances to decide an authority question differently, which is the bug
+class V-82 is. The policy stage's own `approval_expired` refusal is unchanged and remains the
+authority; this check exists so that reaching it no longer costs the task a lease.
+
+**Decision 5 — `task_approvals.consumed_at_ms` is now actually written.**
+
+Found while implementing Decision 3 and worth recording on its own: the column was **never
+written by anything in the daemon**. Single-use is enforced by the policy engine's spent-digest
+ledger, written by `authorise`, and the task-domain copy was permanently `NULL` — a lookup on it
+returns "not used" and means "nobody ever wrote it down". A security decision came to depend on
+it, so `execute_proposal` now marks the row spent when the lease is taken, mirroring the
+ledger. It is written at the same point the ledger is, and it is best-effort with a logged
+error: the ledger is authoritative for single-use, so a reporting fault is not a reason to
+refuse an otherwise-authorised execution.
+
+The store's replacement guard additionally refuses when `steps_completed >= step_no`, read from
+the task row it already has open. That is an independent confirmation of "this approval was
+acted on", so the decision does not rest on a single write.
+
+**The exact expiry boundary.** `ApprovalRecord::is_valid_at` is `now < expires_at_ms`, so an
+approval is live on `[issued_at, expires_at)` and **expired at its expiry instant**. The store's
+replacement check uses the same operator, so the two cannot disagree about a boundary instant.
+`an_approval_is_expired_at_its_expiry_instant_and_not_one_millisecond_before` pins it, together
+with zero and negative TTLs never being live.
+
+**Concurrency.** Expiry is lazy: a property of a timestamp, evaluated where authority is
+decided. No timer, no polling, no per-approval task, no scan of expired rows — so there is no
+new subsystem and no hot-path cost beyond the read the replacement path already needs.
+
+Two callers racing to replace the same expired approval produce **one replacement and one
+refusal**, deterministically: the conditional `UPDATE` re-asserts both preconditions inside the
+transaction, so the loser's `WHERE` no longer holds.
+
+**Recovery is a human decision, and it stays one.** Nothing is re-approved automatically, no
+approval is inherited by a retry, and the fresh approval is minted from the proposal's durable
+`step_no` — so it binds the same logical step, the same capability, target and canonical
+parameters, and is single-use and time-bounded exactly as the first one was.
+
+**What this deliberately does not do.**
+
+* **No scoped session grant.** Q-OPEN-14's other half is untouched. Recovery from an expiry is
+  not a grant: it requires a human to approve again, and ADR-0049 does not shorten that.
+* **No `ApprovalExpired` task state.** Existing states already express the situation: the task
+  stays in `waiting-for-user`, which is exactly "waiting for a human to decide".
+* **No renewal workflow, no approval service, no new authority path.** One store operation, one
+  runtime check, one reordering.
+
+**Evidence.** `crates/orxnud-daemon/tests/expiry.rs` (12), `task_repo.rs`'s
+`replace_expired` module (7), and the rewritten `an_expired_approval_is_refused_and_writes_nothing`.
+
+**Mutation-checked.** Reverting to the pre-fix behaviour fails the suite. So does accepting an
+approval at its exact expiry instant, minting one already expired on arrival, letting an
+expired approval reach the dispatcher, replacing a *used* approval, and dropping the expiry
+precondition from the replacement's conditional update.
+
+Two preconditions did **not** fail the suite when removed, and both are defence in depth rather
+than the deciding guard: the store's early `now < prior_expires_at_ms` return (the `UPDATE`'s
+`WHERE ... AND expires_at_ms <= ?now` decides the same case and was shown to be caught), and the
+`AND consumed_at_ms IS NULL` clause (the early consumed return above it decides that case
+inside the same transaction). Recorded rather than quietly omitted, because "we mutated it and
+nothing happened" is only informative if you say which.
+
+**Revisit conditions.**
+
+* Revisit if approvals ever become durable across a restart *and* the ledger stops being
+  authoritative, since `consumed_at_ms` would then have to carry the single-use property alone.
+* Revisit if the proposal status ever becomes two-way, which would put `decided_at_ms` in
+  question and reopen Decision 2.
+* Revisit if a scoped grant is ever adopted (Q-OPEN-14's open half): it would change what an
+  approval *is*, and this record's "one approval, one attempt" framing would need restating
+  rather than extending.
+* Revisit if `TaskFault::Engine` stops mapping to `INTERNAL_ERROR` for ordinary state refusals;
+  the mapping is recorded above as a known, unfixed taxonomy gap rather than a design.
