@@ -2097,10 +2097,19 @@ impl<'a> TaskRepository<'a> {
             // The event kind must name what actually happened. Logging a
             // dead-letter as `completed` because the worker *asked* for `Failed`
             // would be a lie in the one log a support request reads.
+            //
+            // The same applies to `NeedsVerification`, and it is the case that matters
+            // most: an uncertain side effect is not a completion of anything, and an
+            // operator reading `completed` for the event that stopped their task would
+            // conclude the write had landed. Its own transition state is already in
+            // `to_state`, but `kind` is the column a query filters on, so it has to
+            // agree.
             if dead_lettered {
                 "dead-lettered"
             } else if requeue {
                 "failed-will-retry"
+            } else if final_state == TaskState::NeedsVerification {
+                "needs-verification"
             } else {
                 "completed"
             },

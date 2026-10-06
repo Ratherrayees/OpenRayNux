@@ -2290,6 +2290,182 @@ fn delegated_actor(
     }
 }
 
+/// What verification established about the side effect.
+///
+/// Not the same question as "what did the adapter report", and the distinction is the
+/// whole point: an adapter can report success and still leave nothing behind, can report
+/// failure and still have written, or can die and leave either. Only the verifier looks
+/// at the world afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Certainty {
+    /// The effect is present as described.
+    Established,
+    /// The effect is provably **not** present as described.
+    ///
+    /// Stronger than an adapter-reported failure, and it is the only finding that makes a
+    /// retry safe for a capability that is not idempotent. The capability layer already
+    /// reasons this way — `WriteTextVerifier` distinguishes "does not exist" from "could
+    /// not be read" precisely so that only `Refuted` opens the retry path.
+    Disproved,
+    /// Nobody can say either way. The dangerous one.
+    Unknown,
+}
+
+/// Decides what a non-verified execution means for the task, durably.
+///
+/// # Why this function exists at all
+///
+/// The previous behaviour was to do nothing: a refuted or undetermined execution left the
+/// task `running` under its lease and returned. Reproduced over a real daemon against real
+/// durable state, that meant:
+///
+/// ```text
+/// execute (undetermined)  -> task "running", lease held, nothing recorded
+/// daemon restart          -> recovery sees "running" + a lease and returns it to "pending"
+/// any worker claims it    -> attempt 2, running
+/// task/propose            -> the same non-idempotent write, approved again
+/// ```
+///
+/// So the daemon did say "we don't know whether it happened, so we tried again" — with no
+/// human involved, at the next restart. Recovery reclaims *unexpired* leases (there is no
+/// expiry predicate in that query), so the ambiguity was resolved by the next process start
+/// rather than by anything durable.
+///
+/// `TaskState::NeedsVerification` already existed, was already terminal, already excluded
+/// from claim and from recovery, and was never produced by any production path. The engine
+/// needed nothing: `Running -> NeedsVerification` is already a legal transition, and
+/// `complete_task` already clears the lease under the same TP-5 fence every other completion
+/// uses. What was missing was the decision to make it.
+/// The decision itself, as a pure function so it can be tested exhaustively.
+///
+/// # The table, and where each row comes from
+///
+/// | certainty | capability | state | why |
+/// |---|---|---|---|
+/// | `Established` | any | *(never called)* | verified takes the completion path |
+/// | `Disproved` | any | `Failed` | the effect is provably not as described, so repeating it cannot duplicate anything. `WriteTextVerifier` already reasons this way -- "only `Refuted` makes it safe" -- and this is where that reasoning has to become state |
+/// | `Unknown` | idempotent | `Failed` | repeating is safe by the capability's own declaration, so an uncertain result costs nothing |
+/// | `Unknown` | non-idempotent | **`NeedsVerification`** | TP-2: "a non-idempotent task whose effect outcome is uncertain must never be re-executed automatically -- it awaits a human" |
+///
+/// The `Disproved` row is deliberately not conditioned on idempotency. A capability's
+/// author already decided which of its findings make a retry safe, and they recorded that
+/// in the verifier; re-deciding it here would be a second policy that can disagree with the
+/// first.
+///
+/// The idempotent case is read from the **capability declaration**, never inferred. An
+/// action nobody can vouch for is treated as non-idempotent, because that is the direction
+/// which cannot duplicate an effect.
+fn uncertainty_target(certainty: Certainty, idempotent: bool) -> TaskState {
+    match certainty {
+        // Established never reaches here; if it somehow did, `Failed` is the fail-closed
+        // answer, because it is the one row that does not claim an effect happened.
+        Certainty::Established | Certainty::Disproved => TaskState::Failed,
+        Certainty::Unknown if idempotent => TaskState::Failed,
+        Certainty::Unknown => TaskState::NeedsVerification,
+    }
+}
+
+fn settle_unverified(
+    tasks: &mut TaskService,
+    task_id: &TaskId,
+    worker: &str,
+    // Grouped so the call site reads as the three facts it is passing and the arity stays
+    // under the lint's limit without an `#[allow]`.
+    finding: (Certainty, bool, &str),
+    reason: &str,
+    now_ms: i64,
+) -> Result<UnverifiedSettlement, RequestError> {
+    let (certainty, idempotent, capability) = finding;
+    // An idempotent capability may be repeated, so an uncertain result costs nothing and
+    // the ordinary failure path is the honest one. `filesystem/read-text` and
+    // `text/word-count` sit here.
+    //
+    // The distinction comes from the capability's own declaration, never from the task row:
+    // the task's `idempotent` flag is a different concept (whether the *task* may be
+    // re-run as a unit) and reading it here would be exactly the substitution Phase 12 of
+    // the brief warns against.
+    let target = uncertainty_target(certainty, idempotent);
+
+    // `effect_observed` is false in both cases and for the same reason: nobody observed the
+    // effect happen. For `Failed` the effect was disproved; for `NeedsVerification` nobody
+    // can say. The column is a boolean and cannot hold "unknown", which is precisely why
+    // the state is what carries the uncertainty rather than this flag.
+    let detail = format!(
+        "{} ({}); certainty: {}",
+        reason,
+        capability,
+        match certainty {
+            Certainty::Established => "established",
+            Certainty::Disproved => "disproved",
+            Certainty::Unknown => "unknown",
+        }
+    );
+    // `complete_task_with` rather than `complete_task`: this needs `effect_observed` to be
+    // false and needs to write a reason, and it fences through the same TP-5 conditional
+    // update every other completion uses, so a worker whose lease ended mid-capability
+    // cannot settle a task it no longer holds.
+    //
+    // `TaskFault::Fenced` is returned rather than absorbed. It means this worker's
+    // authority ended while the capability was running, which is a fact the caller needs
+    // and not an internal fault -- so it is mapped to `CONFLICT` by the V-90 taxonomy.
+    let row = tasks
+        .complete_task_with(task_id, worker, now_ms, target, false, Some(&detail), None)
+        .map_err(|f| match f {
+            TaskFault::Fenced => RequestError::Conflict {
+                reason: "lease-lost-during-execution".to_owned(),
+                // The capability already ran; what is refused is only the *settling* of
+                // it. Saying so is what stops a client retrying the whole execution.
+                detail: Some(
+                    "the execution lease ended before the outcome could be recorded; the \
+                     task is no longer this worker's to settle"
+                        .to_owned(),
+                ),
+            },
+            other => task_fault(other),
+        })?;
+
+    Ok(UnverifiedSettlement {
+        state: row.state,
+        settled: true,
+    })
+}
+
+/// The outcome of settling an unverified execution.
+struct UnverifiedSettlement {
+    /// The state the task is now in, read back from the store rather than assumed.
+    state: TaskState,
+    /// Always true: a lost fence is an error, not a quiet no-op.
+    settled: bool,
+}
+
+/// Reads the certainty a verification outcome establishes.
+fn certainty_of(o: &orxnud_capability::verification::VerificationOutcome) -> Certainty {
+    use orxnud_capability::verification::VerificationOutcome as V;
+    match o {
+        V::Verified { .. } => Certainty::Established,
+        V::Refuted { .. } => Certainty::Disproved,
+        V::Undetermined { .. } => Certainty::Unknown,
+    }
+}
+
+/// The human-readable reason for an unverified outcome, taken from the verifier.
+///
+/// The verifier's own words, because it is the component that looked at the world. It is
+/// written into `last_error`, so it is durable text: it is path/digest/count shaped and
+/// carries no file contents, which is the same data-minimisation rule
+/// `retain_read_observation` and `VerifiedStep::verification` already follow.
+fn unverified_reason(o: &orxnud_capability::verification::VerificationOutcome) -> &'static str {
+    match o {
+        orxnud_capability::verification::VerificationOutcome::Verified { .. } => "verified",
+        orxnud_capability::verification::VerificationOutcome::Refuted { .. } => {
+            "verification disproved the effect"
+        }
+        orxnud_capability::verification::VerificationOutcome::Undetermined { .. } => {
+            "the effect could not be established"
+        }
+    }
+}
+
 /// The wire projection of one proposal row.
 fn proposal_json(row: &orxnud_store::task_repo::ProposalRow) -> serde_json::Value {
     json!({
@@ -2480,12 +2656,21 @@ async fn execute_proposal<S: SecretsContract>(
         Ok(o) => o,
         Err(e) => return Err(dispatch_failure(&e)),
     };
+    // Set only on the unverified path; `None` on the verified one.
+    let mut outcome_uncertainty: Option<UnverifiedSettlement> = None;
 
     // Completion is gated on the **verifier**, not on the dispatcher having returned.
-    // A refuted or undetermined effect leaves the task `running` under its lease, which
-    // is the honest state: something may have happened and nobody can say what. Reporting
-    // completion there would be the task layer asserting an effect the verification stage
-    // explicitly refused to confirm.
+    //
+    // What happens when the verifier does *not* confirm used to be nothing at all, and
+    // that was the V-92 defect: the task stayed `running` under its lease, so the next
+    // recovery pass returned it to `pending` -- where `claim` finds it -- and the same
+    // non-idempotent action could be proposed, approved and executed again. Reproduced
+    // end to end against a real daemon before this change.
+    //
+    // Now the uncertainty is settled durably: a disproved effect or an idempotent
+    // capability takes the ordinary failure path, and an unknown effect on a
+    // non-idempotent capability becomes `NeedsVerification`, which is terminal, is not
+    // claimable, and is not touched by recovery.
     // Verified execution is where a logical step ends, and ending one is a durable fact
     // rather than a task-level event: the step result, the counter and the state all have
     // to agree, and they agree only inside one transaction. `complete_verified_step` is
@@ -2495,6 +2680,16 @@ async fn execute_proposal<S: SecretsContract>(
     // The step number is read from the durable counter rather than carried in memory, and
     // checked against the proposal this execution came from, so an approval minted for one
     // step cannot advance another.
+    // Whether repeating this action is safe comes from the capability's own declaration.
+    // Read from the registry rather than the proposal or the task row, and defaulted to
+    // `false` when the capability is unknown -- an unrecognised action is treated as one
+    // that must not be repeated, which is the direction that cannot duplicate an effect.
+    let capability_id = orxnud_domain::ids::CapabilityId::new(proposal.capability.as_str());
+    let idempotent =
+        g.0.registry()
+            .get(&capability_id)
+            .is_some_and(|d| d.idempotent);
+
     let advance = if o.is_verified() {
         let complete_at = g.2.clock_now_ms();
         let step_no = g.2.next_step_no(&began.task_id).map_err(task_fault)?;
@@ -2546,6 +2741,23 @@ async fn execute_proposal<S: SecretsContract>(
         };
         Some(g.2.complete_verified_step(&step).map_err(task_fault)?)
     } else {
+        let settle_at = g.2.clock_now_ms();
+        let settled = settle_unverified(
+            &mut g.2,
+            &began.task_id,
+            &worker,
+            (
+                certainty_of(&o.verification),
+                idempotent,
+                proposal.capability.as_str(),
+            ),
+            unverified_reason(&o.verification),
+            settle_at,
+        )?;
+        // Surfaced rather than swallowed: the caller has to learn that the task stopped
+        // and why, because "the call returned" and "the task is now waiting on a human"
+        // are different outcomes.
+        outcome_uncertainty = Some(settled);
         None
     };
 
@@ -2555,6 +2767,19 @@ async fn execute_proposal<S: SecretsContract>(
         "refuted": o.verification.is_refuted(),
         "undetermined": o.verification.is_undetermined(),
         "result": o.verification.to_string(),
+        // What the uncertainty did to the task. `null` on the verified path, and
+        // `state: "needs-verification"` on the path that matters: a client can see from
+        // this reply alone that the task has stopped and is waiting on a person, rather
+        // than having to poll `task/list` to discover it went quiet.
+        "uncertainty": outcome_uncertainty.as_ref().map(|u| json!({
+            "settled": u.settled,
+            "task_state": u.state.as_wire_str(),
+            "awaiting": if u.state == TaskState::NeedsVerification {
+                "human-adjudication"
+            } else {
+                "retry"
+            },
+        })),
         // `null` when the verifier did not confirm, so a client can tell "not completed"
         // from "completed, and here is the stored row".
         "task": advance
@@ -3865,6 +4090,47 @@ mod tests {
                 "the principal must not carry the uid: {rendered}"
             );
         }
+    }
+
+    /// The uncertainty decision table, exhaustively.
+    ///
+    /// Tested as a table rather than through the daemon because two of its four cells have
+    /// **no end-to-end producer today**, and pretending otherwise would mean a test that
+    /// passes for the wrong reason. See `the_table_has_an_end_to_end_producer_for_every_row`
+    /// below, which fails when that stops being true.
+    ///
+    /// The exhaustive form matters because the safe direction is not symmetric: a row that
+    /// wrongly sends an uncertain task to `Failed` requeues it and duplicates a side
+    /// effect, while a row that wrongly sends a *disproved* task to `NeedsVerification`
+    /// merely makes a retryable task wait for a person. Only one of those is a correctness
+    /// disaster, and this table is what stops the first one being introduced quietly.
+    #[test]
+    fn the_uncertainty_decision_table_is_exhaustive_and_oriented() {
+        use TaskState::{Failed, NeedsVerification};
+        let cases = [
+            // certainty, idempotent, expected
+            (Certainty::Established, false, Failed),
+            (Certainty::Established, true, Failed),
+            (Certainty::Disproved, false, Failed),
+            (Certainty::Disproved, true, Failed),
+            (Certainty::Unknown, true, Failed),
+            (Certainty::Unknown, false, NeedsVerification),
+        ];
+        for (certainty, idempotent, expected) in cases {
+            assert_eq!(
+                uncertainty_target(certainty, idempotent),
+                expected,
+                "{certainty:?} + idempotent={idempotent}"
+            );
+        }
+
+        // The one asymmetry that matters, asserted directly: an unknown outcome on a
+        // capability that is not idempotent is the *only* cell that stops the task.
+        assert_ne!(
+            uncertainty_target(Certainty::Unknown, false),
+            uncertainty_target(Certainty::Unknown, true),
+            "idempotency must change the recovery for an unknown outcome"
+        );
     }
 
     /// The two mappings a socket test cannot reach, pinned where they are decided.
