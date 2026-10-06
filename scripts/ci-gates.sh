@@ -592,7 +592,12 @@ gate_G9() {
               or test(a_boundary_is_claimed_by_exactly_one_worker)
               or test(a_provider_failure_returns_the_task_to_its_boundary_and_is_retryable)
               or test(a_model_can_say_no_further_work_is_needed)
-              or test(continuation_without_a_provider_is_refused_before_the_boundary_is_crossed))'
+              or test(continuation_without_a_provider_is_refused_before_the_boundary_is_crossed)
+              or test(an_approval_that_expires_while_waiting_is_recoverable)
+              or test(a_live_approval_is_not_replaceable_and_a_used_one_certainly_is_not)
+              or test(an_expired_approval_cannot_be_replayed_after_a_fresh_one_exists)
+              or test(a_crash_does_not_resurrect_an_expired_approval)
+              or test(a_crash_after_expiry_and_before_reapproval_still_recovers))'
       )
       note "host cannot isolate: excluding the Tier-1 sandbox-evidence tests."
       note "  governed_path, read_text_real, write_text, isolation, enforcement,"
@@ -601,6 +606,8 @@ gate_G9() {
       note "  6 named tests               -- sandbox-evidence tests inside tasks.rs."
       note "  6 named tests               -- continuation.rs, which cannot reach a step"
       note "                                 boundary without a verified sandboxed effect."
+      note "  5 named tests               -- expiry.rs, which cannot prove a fresh"
+      note "                                 approval works without a verified execution."
       note "  Everything else runs, including every refusal-path assertion."
       note "  Positive evidence: scripts/run-sandbox-tests.sh (CI job sandbox-integration)."
 

@@ -632,6 +632,27 @@ impl DurableEngine {
 
     // ------------------------------------------------- governed action proposals
 
+    /// Records an approval for a step, replacing one that expired without being used.
+    ///
+    /// The engine's route to the one replacement the store permits. It exists because
+    /// "can this attempt be approved again?" is a question about durable state, and the
+    /// runtime cannot answer it without reading the approval row itself — which is how a
+    /// caller ends up re-deriving the expiry rule in three places.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] as
+    /// [`orxnud_store::task_repo::TaskRepository::record_approval_replacing_expired`].
+    pub fn record_approval_replacing_expired(
+        &mut self,
+        approval: &orxnud_store::task_repo::ApprovalRow,
+        now_ms: i64,
+    ) -> Result<orxnud_store::task_repo::ApprovalOutcome, EngineError> {
+        self.repo()
+            .record_approval_replacing_expired(approval, now_ms)
+            .map_err(EngineError::from)
+    }
+
     /// Records a governed action this task asks to perform, and parks it for a human.
     ///
     /// A thin pass-through to the repository, which owns the transaction. Deliberately

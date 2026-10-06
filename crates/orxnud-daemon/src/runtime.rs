@@ -1488,12 +1488,62 @@ async fn execute_proposal<S: SecretsContract>(
             })?;
     let record = approval_record_from_row(&approval_row, &proposer, &proposal)?;
 
-    // 3. Take the fresh execution lease and resume the task, atomically.
+    // 3. Refuse an expired approval *before* taking the execution lease.
+    //
+    // This used to be left entirely to the policy stage, which does refuse it correctly and
+    // with nothing written -- but by then `begin_approved_execution` had already flipped the
+    // task to `running` under a fresh lease. So the refusal was correct and the aftermath was
+    // a task that could not be executed again until that lease expired, which is the same
+    // dead end as V-82 reached by a different route (and, unlike V-82, reached on *every*
+    // expired attempt rather than only the awkward ones).
+    //
+    // The check uses `now` -- the same single reading that is then handed to the dispatcher,
+    // and so to the policy stage. Two clock reads here would be two chances to decide an
+    // authority question differently, which is exactly the bug class V-82 is.
+    if !record.is_valid_at(now) {
+        return Err(RequestError::Declined {
+            reason: "approval-expired".to_owned(),
+            detail: Some(format!(
+                "the approval for this attempt expired at {}",
+                record.expires_at_ms
+            )),
+        });
+    }
+
+    // 4. Take the fresh execution lease and resume the task, atomically.
     let began =
         g.2.begin_approved_execution(&proposal_id, &worker, now)
             .map_err(task_fault)?;
 
-    // 4. Dispatch. The action comes from the proposal; `action.params` and
+    // 5. Mark the task-domain approval spent, mirroring the policy ledger.
+    //
+    // `PolicyEngine::authorise` spends the digest in its own ledger when it authorises, so
+    // single-use is already enforced -- but `task_approvals.consumed_at_ms` was never written
+    // by anything in the daemon. That column is the task domain's own record of its approvals,
+    // and leaving it permanently NULL while a *security* decision came to depend on it (this
+    // slice's replacement rule) is precisely the arrangement where a lookup reads as "not
+    // used" and means "nobody ever wrote it down".
+    //
+    // Written here, at the point the lease is taken and the dispatch is about to happen, so
+    // it means the same thing the ledger's spend means: this approval authorised one attempt.
+    // Best-effort by design, and deliberately so: the ledger is authoritative for single-use,
+    // so a failure to update the row is a reporting fault and not a reason to refuse an
+    // otherwise-authorised execution. It is logged rather than swallowed.
+    if let Err(e) = g.2.consume_approval(
+        &proposal.task_id,
+        proposal.step_no,
+        proposal.attempt_no,
+        now,
+    ) {
+        tracing::error!(
+            error = ?e,
+            task = %proposal.task_id.as_str(),
+            step_no = proposal.step_no,
+            "an approval was spent but its task-domain row could not be marked consumed"
+        );
+    }
+
+    // 6. Dispatch. The action comes from the proposal; `action.params` and
     //    `canonical_params` are the same value by construction, which is what the
     //    dispatcher's digest check then confirms.
     // The stored parameters are parsed, and a parse failure is **fatal**.
@@ -1929,11 +1979,65 @@ async fn approve_proposal<S: SecretsContract>(
         g.2.proposal(&proposal_id)
             .map_err(task_fault)?
             .ok_or_else(|| RequestError::Invalid(format!("no proposal {proposal_id:?}")))?;
-    if !proposal.is_pending() {
+    // The proposal's status records *the decision to approve*, and expiry is a property of
+    // the approval row rather than of that decision. Before this, an `approved` proposal was
+    // refused unconditionally, so an approval that expired while the task waited left the
+    // proposal decided with no authority behind it and no way to issue another: the only
+    // recovery was cancelling the task (V-82).
+    //
+    // So an `approved` proposal is re-approvable exactly when its approval has expired
+    // unconsumed, and refused otherwise — and the refusal says which, because "there is a
+    // live approval, use it" and "the approval was used, this step is done" ask a client to
+    // do opposite things.
+    let was_pending = proposal.is_pending();
+    if !was_pending && proposal.status != "approved" {
         return Err(RequestError::Declined {
             reason: "proposal-already-decided".to_owned(),
             detail: Some("only a pending proposal can be approved".to_owned()),
         });
+    }
+    let replacing = if was_pending {
+        None
+    } else {
+        match g
+            .2
+            .engine()
+            .approval_for(&proposal.task_id, proposal.step_no, proposal.attempt_no)
+            .map_err(|e| RequestError::Refused(format!("approval unreadable: {e}")))?
+        {
+            // No approval row at all, yet the proposal says approved. The durable state
+            // disagrees with itself; refusing is the only answer, and it is recoverable
+            // because nothing was written.
+            None => {
+                return Err(RequestError::Declined {
+                    reason: "approval-not-found".to_owned(),
+                    detail: Some(
+                        "the proposal is approved but no approval is recorded for it".to_owned(),
+                    ),
+                });
+            }
+            Some(row) => Some(row),
+        }
+    };
+
+    // Both refusals decided from durable state, and both before anything is written.
+    if let Some(prior) = &replacing {
+        if prior.consumed_at_ms.is_some() {
+            return Err(RequestError::Declined {
+                reason: "approval-already-consumed".to_owned(),
+                detail: Some("the approval for this attempt has already been used".to_owned()),
+            });
+        }
+        // Half-open, matching `is_valid_at`: live while `now < expires_at_ms`.
+        if now < prior.expires_at_ms {
+            return Err(RequestError::Declined {
+                reason: "approval-already-valid".to_owned(),
+                detail: Some(format!(
+                    "an approval for this attempt is valid until {}",
+                    prior.expires_at_ms
+                )),
+            });
+        }
     }
     let proposer = proposal
         .proposer()
@@ -1971,12 +2075,60 @@ async fn approve_proposal<S: SecretsContract>(
         expires_at_ms: record.expires_at_ms,
         consumed_at_ms: None,
     };
-    g.2.engine_mut()
-        .record_approval(&approval_row)
-        .map_err(|e| RequestError::Refused(format!("approval could not be recorded: {e}")))?;
-    let decided =
-        g.2.decide_proposal(&proposal_id, "approved", now)
+    // An approval that is expired the moment it is minted authorises nothing, so minting one
+    // would move the proposal to `approved` with no authority behind it — the dead end this
+    // whole change exists to remove, arrived at in a single request. Refused *before* any
+    // write, so the proposal stays `pending` and the task stays `waiting-for-user`, and the
+    // same call with a usable TTL simply works.
+    //
+    // The half-open comparison is `is_valid_at`'s, so an approval expires at exactly
+    // `expires_at_ms` rather than one instant either side of it.
+    if !record.is_valid_at(now) {
+        return Err(RequestError::Declined {
+            reason: "approval-expired".to_owned(),
+            detail: Some(
+                "the requested time to live leaves the approval already expired".to_owned(),
+            ),
+        });
+    }
+
+    let outcome =
+        g.2.record_approval_replacing_expired(&approval_row, now)
             .map_err(task_fault)?;
+    match outcome {
+        orxnud_store::task_repo::ApprovalOutcome::Recorded
+        | orxnud_store::task_repo::ApprovalOutcome::ReplacedExpired => {}
+        // The store re-reads inside its own transaction, so this is the answer as of the
+        // write rather than as of the read above. Reported as itself rather than retried:
+        // the caller has to know which of "a live approval exists" and "the approval was
+        // used" it is looking at, and one deterministic answer is worth more than a
+        // transparent retry here.
+        orxnud_store::task_repo::ApprovalOutcome::Refused(r) => {
+            return Err(RequestError::Declined {
+                reason: r.as_str().to_owned(),
+                detail: Some(match r {
+                    orxnud_store::task_repo::ApprovalRefusal::AlreadyValid { expires_at_ms } => {
+                        format!("an approval for this attempt is valid until {expires_at_ms}")
+                    }
+                    orxnud_store::task_repo::ApprovalRefusal::AlreadyConsumed { .. } => {
+                        "the approval for this attempt has already been used".to_owned()
+                    }
+                }),
+            });
+        }
+    }
+
+    // `decide_proposal` transitions a *pending* proposal. On the replacement path the
+    // proposal is already `approved` and there is nothing to decide, so the call is skipped
+    // rather than made tolerant: the transition table stays one-way, and an `approved`
+    // proposal that somehow lost its approval row is reported by the check above rather than
+    // papered over here.
+    let decided = if was_pending {
+        g.2.decide_proposal(&proposal_id, "approved", now)
+            .map_err(task_fault)?
+    } else {
+        proposal
+    };
 
     Ok(json!({
         "approval": {
