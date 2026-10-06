@@ -54,6 +54,11 @@ rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 # assert the linked version at compile time. Never linked into the library.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal", "net", "io-util"] }
+# Unix-only peer credentials (`SO_PEERCRED`), used by `orxnud-platform-ipc` to
+# establish who a local caller actually is. Already a transitive dependency of tokio on
+# this platform; named here so the platform crate depends on it directly rather than on
+# a transitive it does not own.
+libc = "0.2.189"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt", "std"] }
 clap = { version = "4.6.7", features = ["derive"] }
