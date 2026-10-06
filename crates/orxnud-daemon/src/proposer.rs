@@ -88,6 +88,24 @@ pub enum ProviderError {
         /// The deadline that elapsed.
         millis: u64,
     },
+    /// The request could not be sent because it exceeded this build's hard byte bound.
+    ///
+    /// Its own variant rather than [`Self::MalformedResponse`], because the two mean opposite
+    /// things to a caller and conflating them destroys the only fact worth having:
+    /// `MalformedResponse` is *the provider answered with something unreadable*, which is a
+    /// remote condition and may warrant a retry; this is *we declined to send it*, which is a
+    /// local decision that will fail identically forever.
+    ///
+    /// Reachable now that disclosed content can enlarge a request. It carries no content and
+    /// no excerpt — only the size and the bound, which are what an operator needs and are all
+    /// this build is willing to say about a body it chose not to send.
+    #[error("the request would be {bytes} bytes, over the {limit}-byte limit, so it was not sent")]
+    RequestTooLarge {
+        /// How large the body was.
+        bytes: usize,
+        /// The bound it exceeded.
+        limit: usize,
+    },
     /// The provider answered with a non-success status.
     ///
     /// Only the status code is retained. The response body is dropped unread: it is
@@ -132,6 +150,7 @@ impl ProviderError {
                 StatusKind::Other => "provider-http-error",
             },
             Self::MalformedResponse(_) => "provider-response-malformed",
+            Self::RequestTooLarge { .. } => "provider-request-too-large",
             Self::TransportUnsupported(_) => "provider-transport-unsupported",
         }
     }
@@ -358,7 +377,7 @@ fn bounded_artifacts(raw: Option<&str>) -> Vec<String> {
 ///
 /// The same rules the capability contract uses: not absolute, no `..`, no empty, and not so
 /// long that it could be used to fill a request.
-fn safe_relative_path(candidate: &str) -> Option<String> {
+pub(crate) fn safe_relative_path(candidate: &str) -> Option<String> {
     let trimmed = candidate.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_ARTIFACT_PATH {
         return None;
@@ -396,6 +415,19 @@ pub struct ProposalContext {
     /// keeps behaving as it did: a task with no prior steps renders exactly the message it
     /// rendered before this field existed.
     pub prior_steps: PriorStepContext,
+    /// Approved, verified read content released to *this* provider identity for *this* one
+    /// request.
+    ///
+    /// Deliberately not folded into [`Self::prior_steps`]. That field is durable metadata
+    /// derived from committed rows and is re-derivable at any time; this one is ephemeral
+    /// content that exists only for this request and is gone once it has been made. Two
+    /// channels with different lifetimes, different provenance and different consequences
+    /// (ADR-0044, ADR-0045) stay two channels, so widening `prior_steps` cannot quietly widen
+    /// this, and reading one cannot leak into the other.
+    ///
+    /// Defaulted to empty so a task with no approved read renders exactly the message it
+    /// rendered before this field existed.
+    pub disclosures: crate::observation::DisclosureBatch,
 }
 
 /// A source of proposal text.
@@ -406,6 +438,26 @@ pub struct ProposalContext {
 pub trait ProposalProvider: Send + Sync {
     /// Which model produced this, for the audit record's provenance.
     fn model_id(&self) -> &str;
+
+    /// Where this provider sends requests.
+    ///
+    /// Present so an approved read can be bound to one destination *before* any content is
+    /// released, and so a later request can prove it is the same destination. ADR-0045 binds a
+    /// disclosure to `(endpoint, model)` rather than to a model string, and that binding is
+    /// only enforceable if the provider can state where it is.
+    ///
+    /// The default is `None`, and `None` means **no observation may be disclosed to this
+    /// provider**. A provider that cannot name its destination gets metadata-only requests,
+    /// which is the same position a daemon with no provider is in — not a request to infer
+    /// one from configuration the caller happens to hold.
+    ///
+    /// What this deliberately does *not* give the provider: any knowledge of tasks, proposals,
+    /// approvals, policy, the audit chain, sandbox state, or the filesystem. It describes where
+    /// it sends bytes and answers a question about itself. The assembly of an authorised
+    /// request happens before this trait is touched.
+    fn destination(&self) -> Option<crate::observation::ProviderIdentity> {
+        None
+    }
 
     /// Produces proposal text for a task, or fails.
     ///
@@ -440,6 +492,19 @@ impl ScriptedProvider {
 }
 
 impl ProposalProvider for ScriptedProvider {
+    /// A fixed, non-routable scheme so a scripted provider is a destination like any other.
+    ///
+    /// Not omitted: a scripted provider that returned `None` would be unable to receive an
+    /// observation at all, which would make every test of the disclosure path either impossible
+    /// or dependent on a real provider. `scripted://` names a destination no request can be
+    /// sent to, so the identity is well-formed, stable, and cannot collide with a real one.
+    fn destination(&self) -> Option<crate::observation::ProviderIdentity> {
+        Some(crate::observation::ProviderIdentity::new(
+            "scripted://local",
+            &self.model,
+        ))
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -668,6 +733,36 @@ pub fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A provider that cannot name its destination gets metadata only.
+    ///
+    /// The fail-closed default on [`ProposalProvider::destination`]. Without it, "we could not
+    /// tell where this provider sends" would silently become "send anyway" — which is the
+    /// question ADR-0045 exists to make answerable.
+    #[test]
+    fn a_provider_without_a_declared_destination_is_declined_by_the_trait() {
+        struct Unnamed;
+        impl ProposalProvider for Unnamed {
+            fn model_id(&self) -> &str {
+                "unnamed"
+            }
+            fn complete(&self, _c: &ProposalContext) -> Result<String, ProviderError> {
+                Err(ProviderError::Unreachable("not used".to_owned()))
+            }
+        }
+        assert_eq!(
+            Unnamed.destination(),
+            None,
+            "the default must be to decline, so an unnamed provider is refused by construction"
+        );
+        assert_eq!(
+            ScriptedProvider::returning("m", "{}").destination(),
+            Some(crate::observation::ProviderIdentity::new(
+                "scripted://local",
+                "m"
+            )),
+            "and a provider that can name one is bound to it"
+        );
+    }
 
     /// The declared shape `filesystem/write-text` is registered with, so these tests
     /// check real enforcement rather than a permissive fixture.
@@ -703,6 +798,7 @@ mod tests {
             attempt_no: 1,
             allowed: vec![write_text()],
             prior_steps: Default::default(),
+            disclosures: crate::observation::DisclosureBatch::empty(),
         }
     }
 

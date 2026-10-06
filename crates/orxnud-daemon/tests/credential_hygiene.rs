@@ -152,6 +152,7 @@ fn ctx() -> orxnud_daemon::proposer::ProposalContext {
         attempt_no: 1,
         allowed: vec![],
         prior_steps: Default::default(),
+        disclosures: orxnud_daemon::observation::DisclosureBatch::empty(),
     }
 }
 
@@ -246,6 +247,7 @@ fn the_scripted_provider_needs_no_credential() {
             attempt_no: 1,
             allowed: vec![],
             prior_steps: Default::default(),
+            disclosures: orxnud_daemon::observation::DisclosureBatch::empty(),
         })
         .expect("the scripted provider always answers");
     assert!(!text.is_empty());

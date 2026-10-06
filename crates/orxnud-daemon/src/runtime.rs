@@ -235,6 +235,17 @@ pub struct Runtime<S: SecretsContract> {
     /// against governed dispatch — which is a throughput question, deliberately not
     /// answered here.
     governed: tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    /// Approved, verified reads waiting to inform the next proposal.
+    ///
+    /// Its own small lock rather than the governed one, and deliberately: the governed mutex
+    /// serialises task writes against governed dispatch, and a request that is only assembling
+    /// a prompt should not queue behind a sandboxed dispatch. Every operation on this store is
+    /// a bounded in-memory scan, so the lock is never held across I/O.
+    ///
+    /// Ephemeral by decision (ADR-0045 D4): a restart empties it, which is the fail-safe
+    /// direction. See `ObservationStore` for why erasure is a stronger form of single-use than
+    /// a durable flag would be.
+    observations: std::sync::Mutex<crate::observation::ObservationStore>,
     /// Held so a caller can report *which* backend answered.
     backend: &'static str,
     /// The endpoint removal to perform on shutdown, if any.
@@ -342,6 +353,7 @@ impl<S: SecretsContract> Runtime<S> {
             endpoint: bound,
             listener: Arc::new(listener),
             governed: tokio::sync::Mutex::new((daemon, secrets, tasks)),
+            observations: std::sync::Mutex::new(crate::observation::ObservationStore::new()),
             backend: orxnud_platform_ipc::backend_name(),
             cleanup: Some(endpoint),
             proposer,
@@ -451,7 +463,13 @@ impl<S: SecretsContract> Runtime<S> {
                     // spawned task. The governed path is single-writer anyway, so
                     // overlapping connections would only queue on the same mutex --
                     // and handling them here means the loop cannot outlive `self`.
-                    let served = handle_connection(&mut stream, &self.governed, &self.proposer).await;
+                    let served = handle_connection(
+                        &mut stream,
+                        &self.governed,
+                        &self.proposer,
+                        &self.observations,
+                    )
+                    .await;
                     if let Err(IpcError::Disconnected) = served {
                         // A client that opened and closed is not a failure, and
                         // neither is one that vanished while we were answering it.
@@ -514,6 +532,7 @@ async fn handle_connection<S: SecretsContract>(
     stream: &mut LocalStream,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<(), IpcError> {
     let bytes = match stream.read_line_bounded(MAX_REQUEST_BYTES).await {
         Ok(b) => b,
@@ -549,7 +568,7 @@ async fn handle_connection<S: SecretsContract>(
     };
 
     let id = request.id.clone();
-    let outcome = route(&request, governed, provider).await;
+    let outcome = route(&request, governed, provider, observations).await;
     let response = match outcome {
         Ok(result) => Response::ok(id, result),
         Err(e) => Response::err(id, e.to_rpc()),
@@ -609,6 +628,7 @@ async fn route<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
     let Some(method) = Method::from_wire(&request.method) else {
         return Err(RequestError::UnknownMethod(request.method.clone()));
@@ -668,10 +688,16 @@ async fn route<S: SecretsContract>(
         // Execution crosses from the task layer into the governed dispatcher, so it is
         // routed separately rather than through `tasks`: it needs the capability registry
         // and the sandbox backend, which `tasks` deliberately has no access to.
-        Method::TaskExecute => execute_proposal(request, governed).await,
-        Method::TaskAiPropose => ai_propose(request, governed, provider.as_ref()).await,
+        Method::TaskExecute => {
+            execute_proposal(request, governed, provider.as_ref(), observations).await
+        }
+        Method::TaskAiPropose => {
+            ai_propose(request, governed, provider.as_ref(), observations).await
+        }
         // One boundary per call, and no execution: see `continue_task`.
-        Method::TaskContinue => continue_task(request, governed, provider.as_ref()).await,
+        Method::TaskContinue => {
+            continue_task(request, governed, provider.as_ref(), observations).await
+        }
     }
 }
 
@@ -716,6 +742,7 @@ async fn ai_propose<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
     // No provider configured is a refusal with its own reason, never a scripted answer.
     // A daemon that cannot reach a model says so; it does not pretend the model agreed.
@@ -739,8 +766,9 @@ async fn ai_propose<S: SecretsContract>(
     let mut g = governed.lock().await;
     let now = g.2.clock_now_ms();
 
-    let outcome = ask_next_step(&mut g, provider, &task_id).await?;
-    let validated = match outcome {
+    let asked = ask_next_step(&mut g, provider, &task_id, observations).await?;
+    let disclosed_json = disclosure_json(&asked.disclosed);
+    let validated = match asked.outcome {
         crate::proposer::ProposalOutcome::Step(v) => v,
         // The model says there is nothing to do. Completing from here is the same fenced
         // engine completion any other terminal report goes through; the model did not move
@@ -794,6 +822,9 @@ async fn ai_propose<S: SecretsContract>(
         // the reply rather than only in the database.
         "proposed_by": proposer.label(),
         "model": provider.model_id(),
+        // Content that left the machine with this request, named and counted. An empty list
+        // here is the normal case and is not an error: most proposals carry no content.
+        "disclosed": disclosed_json,
     }))
 }
 
@@ -816,7 +847,8 @@ async fn ask_next_step<S: SecretsContract>(
     g: &mut (Daemon, S, TaskService),
     provider: &Arc<dyn crate::proposer::ProposalProvider>,
     task_id: &str,
-) -> Result<crate::proposer::ProposalOutcome, RequestError> {
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
+) -> Result<AskOutcome, RequestError> {
     // The task's own words. Read here, from durable state, so the model is shown what
     // was actually asked rather than what a caller says was asked.
     let row =
@@ -885,12 +917,22 @@ async fn ask_next_step<S: SecretsContract>(
         }
     };
 
+    // The disclosure channel, resolved before the context is assembled so that a failure to
+    // *record* one stops the request rather than sending content nobody could afterwards see
+    // had gone. Release itself cannot fail: the store filters by task, step and provider
+    // identity, and returns whatever survives those plus the budget.
+    let disclosures = release_observations(g, provider, task_id, observations)?;
+    // Summarised here, before the batch is moved into the context, so the caller's reply can
+    // report what was disclosed without keeping a second copy of the bytes.
+    let disclosed = disclosures.summary();
+
     let ctx = crate::proposer::ProposalContext {
         task_id: task_id.to_owned(),
         content: row.payload.clone().unwrap_or_default(),
         attempt_no: row.attempts,
         allowed,
         prior_steps,
+        disclosures,
     };
 
     // The provider trait is synchronous, and a synchronous network call inside an async
@@ -928,7 +970,25 @@ async fn ask_next_step<S: SecretsContract>(
                 detail: Some(e.to_string()),
             })?;
 
-    Ok(outcome)
+    Ok(AskOutcome { outcome, disclosed })
+}
+
+/// What one provider question produced: the answer, and what was sent to get it.
+struct AskOutcome {
+    /// The model's answer, already validated.
+    outcome: crate::proposer::ProposalOutcome,
+    /// Paths and byte counts of what was disclosed. Never the content.
+    disclosed: Vec<crate::observation::DisclosureSummary>,
+}
+
+/// Renders the content-free disclosure summary for a request reply.
+fn disclosure_json(disclosed: &[crate::observation::DisclosureSummary]) -> serde_json::Value {
+    serde_json::Value::Array(
+        disclosed
+            .iter()
+            .map(|d| json!({ "path": d.path, "byte_count": d.byte_count }))
+            .collect(),
+    )
 }
 
 /// Writes a validated step through the ordinary proposal path.
@@ -1025,6 +1085,7 @@ async fn continue_task<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
     let Some(provider) = provider else {
         return Err(RequestError::ProviderRefused {
@@ -1084,8 +1145,8 @@ async fn continue_task<S: SecretsContract>(
     // From here the boundary is crossed, so every failure has to put it back — otherwise
     // the task is left holding a lease for a step that will never be proposed and
     // continuation can never be retried.
-    let outcome = match ask_next_step(&mut g, provider, &task_id).await {
-        Ok(outcome) => outcome,
+    let asked = match ask_next_step(&mut g, provider, &task_id, observations).await {
+        Ok(asked) => asked,
         Err(e) => {
             let why = e.to_string();
             release_to_boundary(&mut g, &id, &worker, now, &why);
@@ -1093,7 +1154,8 @@ async fn continue_task<S: SecretsContract>(
         }
     };
 
-    match outcome {
+    let disclosed_json = disclosure_json(&asked.disclosed);
+    match asked.outcome {
         // The model says the work is finished. Completed through the same fenced engine
         // completion every other terminal report uses, by a caller holding a live lease,
         // with the reason recorded on the task. The model proposed "no further work is
@@ -1123,6 +1185,8 @@ async fn continue_task<S: SecretsContract>(
                 // be attributable to that model in the reply, not only in the database.
                 "proposed_by": delegated_actor(&task_id, provider.model_id()).label(),
                 "model": provider.model_id(),
+                // Content went with this request even though no proposal was made from it.
+                "disclosed": disclosed_json,
             }))
         }
         crate::proposer::ProposalOutcome::Step(validated) => {
@@ -1157,9 +1221,113 @@ async fn continue_task<S: SecretsContract>(
                 "waiting_for": "human-approval",
                 "proposed_by": proposer.label(),
                 "model": provider.model_id(),
+                "disclosed": disclosed_json,
             }))
         }
     }
+}
+
+/// Releases the observations this request may disclose, and records each disclosure.
+///
+/// # The whole of the data-release boundary
+///
+/// Four things have to hold before a byte of approved workspace content reaches a provider,
+/// and they are checked in this order, each of them by code that cannot be skipped:
+///
+/// 1. **The destination is nameable.** `provider.destination()` returning `None` releases
+///    nothing at all. A provider that cannot say where it sends is one no content may reach.
+/// 2. **The task matches.** Handled inside the store, keyed on the task this request is for.
+/// 3. **The step matches.** Handled inside the store: an observation is eligible only for the
+///    logical step immediately after the read that produced it.
+/// 4. **The identity matches.** Handled inside the store, on `(endpoint, model)`, compared
+///    against the identity recorded when the read was approved — not against a string from
+///    configuration read now.
+///
+/// The store consumes what it releases, so a second request finds nothing, and a restart finds
+/// nothing at all.
+///
+/// # Why the audit record is written *before* the request goes out
+///
+/// A disclosure record that is written after the response can miss one that happened: the
+/// process can die between sending and receiving, and there is then no way to know whether the
+/// bytes left. Writing first means the log can over-report by at most one record whose
+/// transmission failed, which is the direction that errs towards telling an operator more
+/// than happened. Under-reporting is the failure the audit exists to prevent, and
+/// ADR-0045's whole purpose is that "the model saw the file" is not invisible.
+///
+/// Failing to write is therefore a **refusal to disclose**: content whose disclosure cannot be
+/// recorded is content that leaves unobserved, which is precisely the outcome to refuse.
+/// `steps_completed` is read here rather than the step recomputed, because the store must be
+/// asked for the step the proposal belongs to and that is the durable counter plus one.
+fn release_observations<S: SecretsContract>(
+    g: &mut (Daemon, S, TaskService),
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+    task_id: &str,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
+) -> Result<crate::observation::DisclosureBatch, RequestError> {
+    let Some(identity) = provider.destination() else {
+        return Ok(crate::observation::DisclosureBatch::empty());
+    };
+    // The service clock, not a row's `updated_at_ms`: TTL is a statement about now, and a
+    // column that a task write may bump is the wrong thing to measure it from.
+    let now = g.2.clock_now_ms();
+    // Read from the durable counter rather than carried in from the caller, so the step the
+    // store is asked about is the one the database says the task is on.
+    let step_no =
+        g.2.next_step_no(&orxnud_domain::ids::TaskId::new(task_id))
+            .map_err(task_fault)?;
+
+    let released = {
+        let Ok(mut store) = observations.lock() else {
+            // A poisoned lock means a previous holder panicked while holding workspace
+            // content. Refusing is the only answer: recovering would require deciding which
+            // observations a panicked path had already consumed.
+            return Err(RequestError::Declined {
+                reason: "disclosure-store-unavailable".to_owned(),
+                detail: Some(
+                    "the observation store is not usable; no content was disclosed".to_owned(),
+                ),
+            });
+        };
+        store.take_for(
+            &orxnud_domain::ids::TaskId::new(task_id),
+            step_no,
+            &identity,
+            now,
+            crate::observation::DEFAULT_MAX_CONTENT_BYTES,
+        )
+    };
+
+    if released.is_empty() {
+        return Ok(crate::observation::DisclosureBatch::empty());
+    }
+
+    // Every released observation is recorded before any of them is attached. All-or-nothing:
+    // a partially recorded disclosure would leave bytes in a request with no record of the
+    // subset that travelled.
+    for r in &released {
+        let record = crate::observation::DisclosureRecord::from_verified_read(
+            r.origin.parent_read_request.clone(),
+            r.origin.parent_proposal_id.clone(),
+            orxnud_domain::ids::TaskId::new(task_id),
+            step_no,
+            r.path.clone(),
+            r.provider.clone(),
+            r.byte_count,
+            now,
+        )
+        .to_audit_record(r.origin.approver.clone());
+        g.0.policy_mut()
+            .append_audit_record(record)
+            .map_err(|e| RequestError::Declined {
+                reason: "disclosure-audit-unavailable".to_owned(),
+                detail: Some(format!(
+                    "the disclosure could not be recorded, so nothing was disclosed: {e}"
+                )),
+            })?;
+    }
+
+    Ok(crate::observation::DisclosureBatch::from_released(released))
 }
 
 /// Returns a claimed step to its boundary so continuation can be retried.
@@ -1282,6 +1450,8 @@ fn proposal_json(row: &orxnud_store::task_repo::ProposalRow) -> serde_json::Valu
 async fn execute_proposal<S: SecretsContract>(
     request: &Request,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
     let proposal_id = required_str(&params, "proposal")?;
@@ -1401,6 +1571,23 @@ async fn execute_proposal<S: SecretsContract>(
     let advance = if o.is_verified() {
         let complete_at = g.2.clock_now_ms();
         let step_no = g.2.next_step_no(&began.task_id).map_err(task_fault)?;
+
+        // The read's content becomes available to the *next* proposal on this task, and to
+        // nothing else. Placed here rather than inside the capability, because the capability
+        // does not know about providers, proposals or steps, and putting it there would make
+        // the sandboxed adapter responsible for an egress decision.
+        retain_read_observation(
+            VerifiedRead {
+                task_id: &began.task_id,
+                proposal: &proposal,
+                approval: &record,
+                outcome: &o,
+                step_no,
+                now_ms: complete_at,
+            },
+            provider,
+            observations,
+        );
         let step = orxnud_store::task_repo::VerifiedStep {
             task_id: began.task_id.clone(),
             worker: &worker,
@@ -1465,6 +1652,139 @@ async fn execute_proposal<S: SecretsContract>(
     }))
 }
 
+/// Retains a verified read's content so the next proposal on this task can be told about it.
+///
+/// # Every condition here is a refusal, and each exists for a stated reason
+///
+/// * **`output_is_ephemeral`** — the capability itself declared that its output is content
+///   that must not become durable. This is what selects the read path without the runtime
+///   naming `filesystem/read-text`: a second copy of the capability list would drift, and the
+///   capability's own declaration is the authoritative statement of what its output is.
+/// * **`is_verified`** — the verifier confirmed the bytes reported are the bytes on disk. A
+///   read that exited zero, or that the verifier could not confirm, produces no observation.
+///   `undetermined` in particular means "something may have happened and nobody can say what",
+///   which is not a basis for sending anything anywhere.
+/// * **Succeeded output** — the bytes are the dispatcher's own record of what the helper read.
+/// * **`Actor::Ai`, with the configured model** — ADR-0045's approval covers disclosure to
+///   *the provider identity that asked for the read*. A human reading a file creates no such
+///   identity, so there is nothing the approval could have authorised and nothing is retained.
+///   The model is then compared against the provider this daemon is actually configured to
+///   ask, which closes the case where the configuration changed between the read and the
+///   disclosure: the proposal names the model that asked, and only that model may be told.
+/// * **A workspace-relative path** — the same rule the durable artifact reference uses, so a
+///   string reaching a prompt and a string reaching an audit record are accepted identically.
+///
+/// # Nothing here can fail the request
+///
+/// A read that produces no observation is a normal outcome, not an error: the model re-proposes
+/// the read, which is the documented recovery. Failing here would mean an operator's provider
+/// configuration turned a completed, verified, correctly-recorded step into an error, which
+/// would be a worse outcome than not disclosing.
+fn retain_read_observation(
+    read: VerifiedRead<'_>,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+    observations: &std::sync::Mutex<crate::observation::ObservationStore>,
+) {
+    if !read.outcome.output_is_ephemeral || !read.outcome.is_verified() {
+        return;
+    }
+    let orxnud_capability::verification::ExecutionOutcome::Succeeded {
+        output: Some(content),
+    } = &read.outcome.execution
+    else {
+        return;
+    };
+    let Some(identity) = asking_provider_identity(read.proposal, provider) else {
+        return;
+    };
+    let Some(path) = workspace_relative_path(read.proposal.target.as_deref().unwrap_or_default())
+    else {
+        return;
+    };
+    let origin = crate::observation::ObservationOrigin {
+        // The read's own audit correlation, derived the same way policy derives it, so the
+        // disclosure cites the same key the read's records rode rather than inventing one.
+        parent_read_request: orxnud_domain::ids::RequestId::new(format!(
+            "{}#{}",
+            read.task_id.as_str(),
+            read.step_no
+        )),
+        parent_proposal_id: read.proposal.proposal_id.clone(),
+        approver: read.approval.approver.clone(),
+    };
+
+    let observation = crate::observation::Observation {
+        task_id: read.task_id.clone(),
+        step_no: read.step_no,
+        path,
+        provider: identity,
+        bytes: content.clone().into_bytes(),
+        recorded_at_ms: read.now_ms,
+        origin,
+    };
+
+    match observations.lock() {
+        Ok(mut store) => store.retain(observation),
+        Err(e) => {
+            // No content is disclosed, and the step itself still completes: the governed path
+            // has already done its work correctly and this is a loss of an optional channel.
+            tracing::error!(
+                error = ?e,
+                task = %read.task_id.as_str(),
+                step_no = read.step_no,
+                "an approved verified read could not be retained for disclosure"
+            );
+        }
+    }
+}
+
+/// One verified dispatch, as the retention step needs to see it.
+///
+/// Gathered because the call site would otherwise carry eight arguments, and at that count it
+/// is no longer possible to see which `&ProposalRow` is the executed one. A struct rather than a
+/// tuple for the same reason as [`ProposalWrite`]: a positional one would allow the proposal
+/// and the approval to be transposed.
+struct VerifiedRead<'a> {
+    /// The task it ran for.
+    task_id: &'a TaskId,
+    /// The proposal that was approved and executed.
+    proposal: &'a orxnud_store::task_repo::ProposalRow,
+    /// The approval that permitted it, recomposed against the trusted approver.
+    approval: &'a orxnud_domain::ApprovalRecord,
+    /// What the dispatcher and the verifier concluded.
+    outcome: &'a orxnud_capability::dispatch::DispatchOutcome,
+    /// The logical step it ran on.
+    step_no: u32,
+    /// When it was verified.
+    now_ms: i64,
+}
+
+/// The provider identity an AI-proposed action asked through, if it is still this one.
+///
+/// Returns `None` unless the proposal's proposer is an `Actor::Ai` **and** the model it names
+/// is the model this daemon is configured to ask. Both halves are load-bearing:
+///
+/// * a non-`Ai` proposer has no provider identity, and ADR-0045 authorises disclosure to an
+///   identity that asked for the read — so there is nothing to authorise;
+/// * the model comparison is what stops a *re-pointed or re-configured* provider from being
+///   told about a read proposed under the old configuration. The endpoint alone would not
+///   catch a same-endpoint model swap, and the model alone would not catch a re-point; the
+///   identity carries both, and the identity is what the store later compares.
+fn asking_provider_identity(
+    proposal: &orxnud_store::task_repo::ProposalRow,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+) -> Option<crate::observation::ProviderIdentity> {
+    let provider = provider?;
+    let proposer = proposal.proposer().ok()?;
+    let orxnud_domain::Actor::Ai { provenance, .. } = proposer else {
+        return None;
+    };
+    if provenance.model != provider.model_id() {
+        return None;
+    }
+    provider.destination()
+}
+
 /// The execution output that may be written to durable step state, if any.
 ///
 /// # Why this exists as its own function
@@ -1497,20 +1817,22 @@ fn durable_output(outcome: &orxnud_capability::dispatch::DispatchOutcome) -> Opt
 /// Returns `None` rather than an empty list, so "this step produced nothing addressable" and
 /// "this step's target was not a path" do not have to be distinguished by a consumer.
 fn safe_artifact_reference(target: Option<&str>) -> Option<String> {
-    let path = target?;
-    if path.is_empty() || path.len() > 256 {
-        return None;
-    }
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        return None;
-    }
-    for component in p.components() {
-        if !matches!(component, std::path::Component::Normal(_)) {
-            return None;
-        }
-    }
-    Some(serde_json::json!([path]).to_string())
+    Some(serde_json::json!([workspace_relative_path(target?)?]).to_string())
+}
+
+/// The one workspace-relative path rule, in the form a single path needs.
+///
+/// Delegates to [`crate::proposer::safe_relative_path`] rather than repeating the check. It
+/// previously kept a private copy with its own length bound, and two copies of "is this string
+/// safe to put in a prompt" is exactly the arrangement in which one of them is later loosened
+/// without the other. Both the durable artifact reference and the observation's own `path`
+/// field now come through here, so a path that can reach a prompt and a path that can reach an
+/// audit record are accepted by the same rule.
+///
+/// Returns `None` for an absolute path, for anything with a `..`, `.`, root or Windows
+/// prefix component, and for an over-long name.
+fn workspace_relative_path(target: &str) -> Option<String> {
+    crate::proposer::safe_relative_path(target)
 }
 
 /// Rebuilds the approval record for dispatch from the stored row.
@@ -2313,6 +2635,239 @@ mod tests {
     fn the_scripted_provider_is_available_and_identifies_itself() {
         let p = scripted_proposer();
         assert_eq!(p.model_id(), "scripted/none");
+    }
+
+    /// Every condition that must stop a read's content becoming an observation.
+    ///
+    /// Driven directly rather than through a socket, because the conditions are *about the
+    /// dispatch outcome* and arranging each one through a real sandboxed read would be a
+    /// race rather than a test — the read verifier refutes only when the file changes
+    /// between the child's read and its own. So the gate is exercised where it is decided,
+    /// over every outcome shape it can be handed.
+    ///
+    /// This is the test that makes `is_verified()` load-bearing: drop it and nothing else in
+    /// the suite notices, because a non-verified read cannot be produced on demand from the
+    /// outside.
+    mod read_retention_gate {
+        use super::*;
+        use orxnud_capability::verification::{ExecutionOutcome, VerificationOutcome};
+        use orxnud_domain::Actor;
+        use orxnud_domain::ids::TaskId;
+
+        const READ: &str = "filesystem/read-text";
+        const CONTENT: &str = "SENTINEL-READ-CONTENT-4a91c7e2";
+
+        /// A read outcome with the given verification, by default a successful read whose
+        /// content is the sentinel.
+        fn read(
+            verification: VerificationOutcome,
+            ephemeral: bool,
+        ) -> orxnud_capability::dispatch::DispatchOutcome {
+            orxnud_capability::dispatch::DispatchOutcome {
+                execution: ExecutionOutcome::Succeeded {
+                    output: Some(CONTENT.to_owned()),
+                },
+                verification,
+                capability: orxnud_domain::CapabilityId::new(READ),
+                output_is_ephemeral: ephemeral,
+            }
+        }
+
+        fn verified() -> VerificationOutcome {
+            VerificationOutcome::Verified {
+                evidence: "a.txt, 30 bytes, sha256:…".to_owned(),
+            }
+        }
+
+        /// An `Actor::Ai` proposal row whose provenance names `model`.
+        fn ai_proposal(model: &str) -> orxnud_store::task_repo::ProposalRow {
+            orxnud_store::task_repo::ProposalRow {
+                proposal_id: "p-1".to_owned(),
+                task_id: TaskId::new("t1"),
+                attempt_no: 1,
+                step_no: 1,
+                capability: READ.to_owned(),
+                target: Some("a.txt".to_owned()),
+                params: r#"{"path":"a.txt"}"#.to_owned(),
+                proposer_json: serde_json::to_string(&Actor::Ai {
+                    delegated_by: orxnud_domain::ids::UserId::new("local"),
+                    run: orxnud_domain::ids::RunId::new("t1"),
+                    task: TaskId::new("t1"),
+                    provenance: orxnud_domain::actor::ModelProvenance::new(
+                        model,
+                        "ph",
+                        orxnud_domain::ids::RequestId::new("r"),
+                    ),
+                })
+                .expect("an actor serialises"),
+                authority_root: Some("local".to_owned()),
+                created_at_ms: 0,
+                status: "approved".to_owned(),
+                decided_at_ms: None,
+            }
+        }
+
+        fn approval() -> orxnud_domain::ApprovalRecord {
+            orxnud_domain::ApprovalRecord {
+                actor_label: "ai".to_owned(),
+                approver: Actor::Human {
+                    user: orxnud_domain::ids::UserId::new("local"),
+                    via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+                },
+                capability: READ.to_owned(),
+                target: "a.txt".to_owned(),
+                params: orxnud_policy::canonical_params(&serde_json::json!({ "path": "a.txt" })),
+                issued_at_ms: 0,
+                expires_at_ms: 60_000,
+                risk: orxnud_domain::enums::RiskClass::High,
+                step_no: 1,
+                digest: orxnud_domain::approval::ApprovalDigest::from_bytes([1u8; 32]),
+            }
+        }
+
+        /// Retains `outcome` for `proposal` and reports whether anything was retained.
+        fn retains(
+            proposal: &orxnud_store::task_repo::ProposalRow,
+            outcome: &orxnud_capability::dispatch::DispatchOutcome,
+            provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+        ) -> bool {
+            let store = std::sync::Mutex::new(crate::observation::ObservationStore::new());
+            retain_read_observation(
+                VerifiedRead {
+                    task_id: &TaskId::new("t1"),
+                    proposal,
+                    approval: &approval(),
+                    outcome,
+                    step_no: 1,
+                    now_ms: 1_000,
+                },
+                provider,
+                &store,
+            );
+            !store.into_inner().expect("store").is_empty()
+        }
+
+        fn scripted() -> Arc<dyn crate::proposer::ProposalProvider> {
+            scripted_proposer()
+        }
+
+        /// The one combination that must retain.
+        #[test]
+        fn a_verified_ephemeral_read_by_the_configured_model_is_retained() {
+            assert!(
+                retains(
+                    &ai_proposal("scripted/none"),
+                    &read(verified(), true),
+                    Some(&scripted())
+                ),
+                "the positive case must retain, or the whole path is dead"
+            );
+        }
+
+        /// `refuted`: the verifier says the bytes are not what is on disk.
+        #[test]
+        fn a_refuted_read_is_not_retained() {
+            assert!(!retains(
+                &ai_proposal("scripted/none"),
+                &read(
+                    VerificationOutcome::Refuted {
+                        evidence: "does not match what is on disk".to_owned(),
+                    },
+                    true,
+                ),
+                Some(&scripted()),
+            ));
+        }
+
+        /// `undetermined`: nothing is known either way, which is emphatically not a licence.
+        #[test]
+        fn an_undetermined_read_is_not_retained() {
+            assert!(!retains(
+                &ai_proposal("scripted/none"),
+                &read(
+                    VerificationOutcome::Undetermined {
+                        reason: "the independent read failed".to_owned(),
+                    },
+                    true,
+                ),
+                Some(&scripted()),
+            ));
+        }
+
+        /// A capability whose output is durable is not a read at all, however well verified.
+        #[test]
+        fn a_durable_output_is_never_retained() {
+            assert!(
+                !retains(
+                    &ai_proposal("scripted/none"),
+                    &read(verified(), false),
+                    Some(&scripted())
+                ),
+                "a durable output would be a second copy of the content"
+            );
+        }
+
+        /// A proposal made by anything other than the model.
+        #[test]
+        fn a_non_ai_proposer_is_not_retained() {
+            let mut p = ai_proposal("scripted/none");
+            p.proposer_json = serde_json::to_string(&Actor::Human {
+                user: orxnud_domain::ids::UserId::new("local"),
+                via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+            })
+            .expect("an actor serialises");
+            assert!(!retains(&p, &read(verified(), true), Some(&scripted())));
+        }
+
+        /// The read names a model this daemon is no longer configured to ask.
+        #[test]
+        fn a_read_from_another_model_is_not_retained() {
+            assert!(
+                !retains(
+                    &ai_proposal("some/other-model"),
+                    &read(verified(), true),
+                    Some(&scripted())
+                ),
+                "a re-pointed or re-configured provider must not inherit the read"
+            );
+        }
+
+        /// No provider, so no identity, so nothing to authorise.
+        #[test]
+        fn no_provider_means_no_observation() {
+            assert!(!retains(
+                &ai_proposal("scripted/none"),
+                &read(verified(), true),
+                None
+            ));
+        }
+
+        /// A target that is not a workspace-relative path.
+        #[test]
+        fn an_absolute_or_traversing_target_is_not_retained() {
+            for target in ["/etc/passwd", "../escape.txt", "sub/../../out.txt", ""] {
+                let mut p = ai_proposal("scripted/none");
+                p.target = Some(target.to_owned());
+                assert!(
+                    !retains(&p, &read(verified(), true), Some(&scripted())),
+                    "{target:?} was retained"
+                );
+            }
+        }
+
+        /// A failed execution, whatever the verification says about it.
+        #[test]
+        fn a_failed_execution_is_not_retained() {
+            let mut outcome = read(verified(), true);
+            outcome.execution = ExecutionOutcome::Failed {
+                detail: "no such file".to_owned(),
+            };
+            assert!(!retains(
+                &ai_proposal("scripted/none"),
+                &outcome,
+                Some(&scripted())
+            ));
+        }
     }
 
     /// The menu a model is shown is the registry, walked — not a list written next to the

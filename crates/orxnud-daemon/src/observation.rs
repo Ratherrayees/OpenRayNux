@@ -144,6 +144,16 @@ fn canonical_endpoint(raw: &str) -> String {
 pub struct Observation {
     /// The task whose approved read produced it. Observations never cross tasks.
     pub task_id: TaskId,
+    /// The logical step whose approved, verified read produced it.
+    ///
+    /// This is what makes the disclosure bound to *one* boundary rather than to "the rest of
+    /// the task". A read approved at step 1 may inform the proposal for step 2, and nothing
+    /// else: without this field a retained observation could inform any later proposal, so an
+    /// approval given for "the next thing" would quietly become an approval for every later
+    /// thing, including ones made after other steps had run. The rule is `step_no + 1`, not
+    /// `step_no`, because the read and the proposal it informs are different acts on
+    /// different steps — which is also why it is exactly one boundary and not a range.
+    pub step_no: u32,
     /// The workspace-relative path that was read.
     pub path: String,
     /// The provider identity allowed to receive it.
@@ -152,6 +162,120 @@ pub struct Observation {
     pub bytes: Vec<u8>,
     /// When the read was verified.
     pub recorded_at_ms: i64,
+    /// What the disclosure record will cite about the read that produced these bytes.
+    pub origin: ObservationOrigin,
+}
+
+/// The approved read an observation came from, kept so the disclosure can cite it.
+///
+/// # Why this is a citation and not a second copy of the authority
+///
+/// The approval row stays authoritative: it is what permitted the read, and nothing here
+/// can change that. These three values exist because the disclosure happens *later*, on a
+/// different request, when the read's proposal and approval may be spent and unreadable —
+/// and an audit record is a statement about the past, so it must be able to name the human
+/// who approved the read and the correlation it rode, not re-derive them from rows that have
+/// since moved on.
+///
+/// Nothing here is a capability, a target or a parameter. The observation cannot be widened
+/// by editing this struct, because there is nothing in it that authorises anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationOrigin {
+    /// The correlation the read's own audit records rode, so the disclosure can cite its
+    /// parent without closing or being closed by it.
+    pub parent_read_request: RequestId,
+    /// The proposal that was approved and executed to produce these bytes.
+    pub parent_proposal_id: String,
+    /// The human who approved that read.
+    ///
+    /// The disclosure rests on this authority and on nothing else (ADR-0045): one approval
+    /// covered the local read *and* the sending of its result to one provider identity.
+    pub approver: Actor,
+}
+
+/// The disclosed reads attached to one proposal request.
+///
+/// A newtype with a private field rather than a `serde_json::Value`, a map, or a bare `Vec`.
+///
+/// The reason is not taste. This is the only structure in the system that carries workspace
+/// content toward a third party, so "what else could go in here" is the security question, and
+/// the answer should not be reachable by constructing a different value. There is exactly one
+/// way to build one — from what the store released — and it takes no extra arguments, so a
+/// caller cannot add content the store did not hand over, rename it, or attach an
+/// ungoverned blob. Everything a prompt may show about it comes from the store's own
+/// filtering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DisclosureBatch {
+    released: Vec<ReleasedObservation>,
+}
+
+impl DisclosureBatch {
+    /// No content. The value for any request with no eligible observation.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            released: Vec::new(),
+        }
+    }
+
+    /// Wraps what [`ObservationStore::take_for`] released.
+    #[must_use]
+    pub fn from_released(released: Vec<ReleasedObservation>) -> Self {
+        Self { released }
+    }
+
+    /// Whether this request carries any content.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.released.is_empty()
+    }
+
+    /// How many observations are attached.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.released.len()
+    }
+
+    /// The attached observations, in release order (newest read first).
+    pub fn iter(&self) -> impl Iterator<Item = &ReleasedObservation> {
+        self.released.iter()
+    }
+
+    /// Total bytes attached. Bounded by the store's own ceiling, which is the smaller of the
+    /// caller's budget and `max_content_bytes`.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.released.iter().map(|r| r.byte_count).sum()
+    }
+
+    /// What was disclosed, as paths and byte counts.
+    ///
+    /// For the request reply and the operator's benefit. Content-free by construction: there
+    /// is no field here that could hold bytes, so an operator can see that content left and
+    /// how much without a second disclosure channel existing.
+    #[must_use]
+    pub fn summary(&self) -> Vec<DisclosureSummary> {
+        self.released
+            .iter()
+            .map(|r| DisclosureSummary {
+                path: r.path.clone(),
+                byte_count: r.byte_count,
+            })
+            .collect()
+    }
+}
+
+/// One disclosed read, named but not quoted.
+///
+/// A distinct type from [`ReleasedObservation`] so that the reply value cannot accidentally
+/// gain a `bytes` field — it is constructed here from two fields and has nowhere else to
+/// look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureSummary {
+    /// The workspace-relative path that was read.
+    pub path: String,
+    /// How many bytes were disclosed.
+    pub byte_count: usize,
 }
 
 /// An observation handed to a proposal.
@@ -165,6 +289,11 @@ pub struct ReleasedObservation {
     pub byte_count: usize,
     /// The content.
     pub bytes: Vec<u8>,
+    /// What the disclosure audit record cites about the read this came from.
+    ///
+    /// Carried out with the bytes so the audit record is built from what was actually
+    /// released, rather than from a second lookup that could disagree with it.
+    pub origin: ObservationOrigin,
 }
 
 /// In-memory retention of approved observations, for one daemon process.
@@ -223,14 +352,18 @@ impl ObservationStore {
 
     /// Removes and returns the observations eligible for one proposal.
     ///
-    /// Eligible means: not expired, same task, same provider identity. Ordered newest-first.
-    /// Whole observations only -- a file is never truncated to fit, because a prefix presented
-    /// as a whole file is the one outcome a model cannot detect.
+    /// Eligible means: not expired, same task, the **immediately following** logical step, and
+    /// same provider identity. Ordered newest-first. Whole observations only -- a file is never
+    /// truncated to fit, because a prefix presented as a whole file is the one outcome a model
+    /// cannot detect.
     ///
     /// # Arguments
     ///
     /// * `task_id` — the task being proposed for. Observations from other tasks are never
     ///   visible, which is what stops one task's approved read reaching another's prompt.
+    /// * `step_no` — the logical step of the proposal being requested. An observation is
+    ///   eligible only when `observation.step_no + 1 == step_no`: the read happened on one
+    ///   step and informs the next, and never a later one.
     /// * `provider` — the identity asking. Compared on `(endpoint, model)`.
     /// * `now_ms` — for expiry.
     /// * `budget` — a per-request ceiling from the caller.
@@ -241,6 +374,7 @@ impl ObservationStore {
     pub fn take_for(
         &mut self,
         task_id: &TaskId,
+        step_no: u32,
         provider: &ProviderIdentity,
         now_ms: i64,
         budget: usize,
@@ -253,7 +387,12 @@ impl ObservationStore {
         let mut candidates: Vec<usize> = (0..self.entries.len()).rev().collect();
         candidates.retain(|&i| {
             let e = &self.entries[i];
-            e.task_id == *task_id && e.provider.matches(provider)
+            e.task_id == *task_id
+                // Saturating so a step-0 observation (which no store should hold, and which
+                // `retain` does not prevent a caller from constructing) is ineligible rather
+                // than eligible-by-overflow.
+                && e.step_no.saturating_add(1) == step_no
+                && e.provider.matches(provider)
         });
 
         let mut released = Vec::new();
@@ -273,6 +412,7 @@ impl ObservationStore {
                 provider: e.provider.clone(),
                 byte_count: e.bytes.len(),
                 bytes: e.bytes.clone(),
+                origin: e.origin.clone(),
             });
             consumed.push(i);
         }
@@ -531,13 +671,36 @@ mod tests {
         ProviderIdentity::new("https://api.groq.com/openai/v1", "openai/gpt-oss-120b")
     }
 
+    /// The read step every fixture here came from, so a fixture observation is eligible for
+    /// `READ_STEP + 1` and for nothing else.
+    const READ_STEP: u32 = 1;
+    /// The step the proposal asking for it is on.
+    const NEXT_STEP: u32 = READ_STEP + 1;
+
+    fn approver() -> Actor {
+        Actor::Human {
+            user: orxnud_domain::ids::UserId::new("local"),
+            via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+        }
+    }
+
+    fn origin() -> ObservationOrigin {
+        ObservationOrigin {
+            parent_read_request: RequestId::new("req-read-1"),
+            parent_proposal_id: "p-1".to_owned(),
+            approver: approver(),
+        }
+    }
+
     fn obs(path: &str, provider: ProviderIdentity, at: i64) -> Observation {
         Observation {
             task_id: TaskId::new("t-1"),
+            step_no: READ_STEP,
             path: path.to_owned(),
             provider,
             bytes: SENTINEL.as_bytes().to_vec(),
             recorded_at_ms: at,
+            origin: origin(),
         }
     }
 
@@ -600,7 +763,7 @@ mod tests {
         store.retain(obs("a.txt", provider(), NOW));
 
         let other_task = TaskId::new("t-2");
-        let released = store.take_for(&other_task, &provider(), NOW, 64 * 1024);
+        let released = store.take_for(&other_task, NEXT_STEP, &provider(), NOW, 64 * 1024);
         assert!(
             released.is_empty(),
             "one task's approved read reached another task's prompt: {released:?}"
@@ -617,7 +780,7 @@ mod tests {
     fn the_owning_task_releases_it() {
         let mut store = ObservationStore::new();
         store.retain(obs("a.txt", provider(), NOW));
-        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        let released = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024);
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].bytes, SENTINEL.as_bytes());
         assert_eq!(released[0].byte_count, SENTINEL.len());
@@ -630,7 +793,7 @@ mod tests {
         let mut store = ObservationStore::new();
         store.retain(obs("a.txt", provider(), NOW));
         let elsewhere = ProviderIdentity::new("https://elsewhere.test/v1", "openai/gpt-oss-120b");
-        let released = store.take_for(&TaskId::new("t-1"), &elsewhere, NOW, 64 * 1024);
+        let released = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &elsewhere, NOW, 64 * 1024);
         assert!(released.is_empty(), "{released:?}");
         assert_eq!(
             store.len(),
@@ -646,7 +809,7 @@ mod tests {
         let other_model = ProviderIdentity::new("https://api.groq.com/openai/v1", "other/model");
         assert!(
             store
-                .take_for(&TaskId::new("t-1"), &other_model, NOW, 64 * 1024)
+                .take_for(&TaskId::new("t-1"), NEXT_STEP, &other_model, NOW, 64 * 1024)
                 .is_empty()
         );
     }
@@ -657,9 +820,9 @@ mod tests {
     fn an_observation_is_consumed_by_one_proposal() {
         let mut store = ObservationStore::new();
         store.retain(obs("a.txt", provider(), NOW));
-        let first = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        let first = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024);
         assert_eq!(first.len(), 1);
-        let second = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        let second = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024);
         assert!(
             second.is_empty(),
             "the same approved bytes informed a second proposal: {second:?}"
@@ -667,12 +830,148 @@ mod tests {
         assert!(store.is_empty());
     }
 
+    /// The step boundary, in both directions.
+    ///
+    /// The read happened on one step and informs the *next* one. A request on the read's own
+    /// step would be the read telling itself what it already knows; a request two or more
+    /// steps later would turn one approval into standing permission for every proposal the
+    /// task will ever make, including ones made after other steps have run.
+    #[test]
+    fn an_observation_informs_only_the_immediately_following_step() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+
+        // The same step the read happened on.
+        assert!(
+            store
+                .take_for(&TaskId::new("t-1"), READ_STEP, &provider(), NOW, 64 * 1024)
+                .is_empty(),
+            "a step must not be told by the read it just performed"
+        );
+        // Two steps later.
+        assert!(
+            store
+                .take_for(
+                    &TaskId::new("t-1"),
+                    NEXT_STEP + 1,
+                    &provider(),
+                    NOW,
+                    64 * 1024
+                )
+                .is_empty(),
+            "an approval for the next proposal must not become permission for later ones"
+        );
+        assert_eq!(store.len(), 1, "and neither ineligible lookup consumed it");
+
+        // The one boundary it was approved for.
+        assert_eq!(
+            store
+                .take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024)
+                .len(),
+            1
+        );
+        assert!(store.is_empty());
+    }
+
+    /// Every wrong axis at once, with the right one unable to rescue it.
+    ///
+    /// Separated from the single-axis tests above because the interesting failure is a
+    /// *combination*: an observation that matches task and step but not provider is exactly
+    /// what a re-pointed endpoint produces, and it is the case a review is least likely to
+    /// notice.
+    #[test]
+    fn a_mismatched_provider_is_refused_even_on_the_right_task_and_step() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+
+        for elsewhere in [
+            ProviderIdentity::new("https://elsewhere.test/v1", "openai/gpt-oss-120b"),
+            ProviderIdentity::new("https://api.groq.com/openai/v1", "other/model"),
+        ] {
+            let released =
+                store.take_for(&TaskId::new("t-1"), NEXT_STEP, &elsewhere, NOW, 64 * 1024);
+            assert!(
+                released.is_empty(),
+                "content reached {elsewhere:?} on the right task and step: {released:?}"
+            );
+        }
+        assert_eq!(store.len(), 1, "and it survives for its own provider");
+    }
+
+    /// A restart cannot resurrect a consumed observation, because there is nothing to
+    /// resurrect.
+    ///
+    /// ADR-0045 Decision 4 made retention non-durable deliberately. The consequence worth
+    /// stating as a property rather than leaving implied: single-use is enforced by erasure,
+    /// not by a durable "consumed" flag that a crash could roll back. A restart yields an
+    /// empty store, so the strongest possible version of "one observation informs one
+    /// proposal" holds — a consumed observation is not merely marked used, it is gone.
+    #[test]
+    fn a_consumed_observation_is_gone_rather_than_merely_marked_used() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        assert_eq!(
+            store
+                .take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024)
+                .len(),
+            1
+        );
+        // A restart is a new process with a new, empty store.
+        let mut after_restart = ObservationStore::new();
+        assert!(
+            after_restart
+                .take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024)
+                .is_empty(),
+            "a restarted daemon must not be able to re-release a consumed observation"
+        );
+    }
+
+    /// The released bytes carry the read's citation with them.
+    ///
+    /// The disclosure audit record is built from this, so a mismatch between what was
+    /// released and what the record cites would let the audit name the wrong approval.
+    #[test]
+    fn the_release_carries_the_reads_citation() {
+        let mut store = ObservationStore::new();
+        store.retain(obs("a.txt", provider(), NOW));
+        let released = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].origin, origin());
+        assert_eq!(
+            released[0].byte_count,
+            released[0].bytes.len(),
+            "the recorded count must describe the bytes actually released"
+        );
+    }
+
+    /// The API selects by `(task, step, provider identity)` and offers nothing finer.
+    ///
+    /// There is deliberately no observation id anywhere in this module: an id a request could
+    /// name would be a selector, and selectors are what a confused-deputy attempt iterates.
+    /// The only caller is the runtime, which asks for "whatever belongs to the task and step I
+    /// am already working on" — so this asserts that asking is all-or-nothing over the
+    /// eligible set. A subset selection would mean something had chosen one.
+    #[test]
+    fn the_release_is_selected_only_by_task_step_and_provider() {
+        let mut store = ObservationStore::new();
+        for p in ["a.txt", "b.txt", "c.txt"] {
+            store.retain(obs(p, provider(), NOW));
+        }
+        let released = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024);
+        assert_eq!(
+            released.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["c.txt", "b.txt", "a.txt"],
+            "every eligible observation is released; none can be picked out"
+        );
+        assert!(store.is_empty(), "and all of them are consumed");
+    }
+
     #[test]
     fn an_observation_that_is_not_released_is_not_consumed() {
         let mut store = ObservationStore::new();
         store.retain(obs("big.txt", provider(), NOW));
         // A budget too small for it.
-        let none = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 4);
+        let none = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 4);
         assert!(none.is_empty());
         assert_eq!(
             store.len(),
@@ -680,7 +979,7 @@ mod tests {
             "an unreleased observation must survive for a later budget"
         );
         // And it is still whole when it does fit.
-        let some = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024);
+        let some = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024);
         assert_eq!(some[0].bytes, SENTINEL.as_bytes());
     }
 
@@ -692,7 +991,13 @@ mod tests {
         store.retain(obs("a.txt", provider(), NOW));
         assert_eq!(
             store
-                .take_for(&TaskId::new("t-1"), &provider(), NOW + 999, 64 * 1024)
+                .take_for(
+                    &TaskId::new("t-1"),
+                    NEXT_STEP,
+                    &provider(),
+                    NOW + 999,
+                    64 * 1024,
+                )
                 .len(),
             1
         );
@@ -700,7 +1005,13 @@ mod tests {
         // Still inside the TTL at +5_100, which is the boundary the check has to respect.
         assert_eq!(
             store
-                .take_for(&TaskId::new("t-1"), &provider(), NOW + 5_100, 64 * 1024)
+                .take_for(
+                    &TaskId::new("t-1"),
+                    NEXT_STEP,
+                    &provider(),
+                    NOW + 5_100,
+                    64 * 1024,
+                )
                 .len(),
             1,
             "100ms into a 1000ms TTL must not expire"
@@ -710,9 +1021,10 @@ mod tests {
             store
                 .take_for(
                     &TaskId::new("t-1"),
+                    NEXT_STEP,
                     &provider(),
                     NOW + 20_000 + 1_001,
-                    64 * 1024
+                    64 * 1024,
                 )
                 .is_empty(),
             "past the TTL it must be withheld"
@@ -741,7 +1053,13 @@ mod tests {
             1,
             "a stale version of the same path must not accumulate"
         );
-        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW + 1, 64 * 1024);
+        let released = store.take_for(
+            &TaskId::new("t-1"),
+            NEXT_STEP,
+            &provider(),
+            NOW + 1,
+            64 * 1024,
+        );
         assert_eq!(released[0].bytes, b"new".to_vec());
     }
 
@@ -752,7 +1070,13 @@ mod tests {
             store.retain(obs(&format!("f{i}.txt"), provider(), NOW + i64::from(i)));
         }
         assert_eq!(store.len(), 3, "the store is bounded");
-        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW + 5, 64 * 1024);
+        let released = store.take_for(
+            &TaskId::new("t-1"),
+            NEXT_STEP,
+            &provider(),
+            NOW + 5,
+            64 * 1024,
+        );
         assert_eq!(
             released.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
             vec!["f5.txt", "f4.txt", "f3.txt"],
@@ -772,7 +1096,7 @@ mod tests {
             });
         }
         // Room for two of the three.
-        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW + 3, 20);
+        let released = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW + 3, 20);
         assert_eq!(released.len(), 2);
         assert_eq!(released[0].path, "f3.txt", "newest first");
         assert_eq!(released[1].path, "f2.txt");
@@ -790,7 +1114,7 @@ mod tests {
             bytes: vec![b'x'; 100],
             ..obs("big.txt", provider(), NOW)
         });
-        let released = store.take_for(&TaskId::new("t-1"), &provider(), NOW, 99);
+        let released = store.take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 99);
         assert!(
             released.is_empty(),
             "a 100-byte blob must not be released into a 99-byte budget"
@@ -805,7 +1129,7 @@ mod tests {
                 store.retain(obs(&format!("f{i}.txt"), provider(), NOW));
             }
             store
-                .take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024)
+                .take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024)
                 .iter()
                 .map(|r| r.path.clone())
                 .collect::<Vec<_>>()
@@ -821,9 +1145,16 @@ mod tests {
     fn a_mismatched_task_or_provider_releases_nothing_and_consumes_nothing() {
         let mut store = ObservationStore::new();
         store.retain(obs("a.txt", provider(), NOW));
-        let _ = store.take_for(&TaskId::new("other"), &provider(), NOW, 64 * 1024);
+        let _ = store.take_for(
+            &TaskId::new("other"),
+            NEXT_STEP,
+            &provider(),
+            NOW,
+            64 * 1024,
+        );
         let _ = store.take_for(
             &TaskId::new("t-1"),
+            NEXT_STEP,
             &ProviderIdentity::new("https://x.test/v1", "m"),
             NOW,
             64 * 1024,
@@ -835,7 +1166,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .take_for(&TaskId::new("t-1"), &provider(), NOW, 64 * 1024)
+                .take_for(&TaskId::new("t-1"), NEXT_STEP, &provider(), NOW, 64 * 1024,)
                 .len(),
             1
         );
@@ -852,6 +1183,7 @@ mod ceiling_tests {
     use super::*;
 
     const NOW: i64 = 1_767_225_600_000;
+    /// The step these fixtures' reads happened on; the request is the next one.
 
     #[test]
     fn a_caller_cannot_exceed_the_stores_own_ceiling() {
@@ -860,13 +1192,22 @@ mod ceiling_tests {
         for i in 1..=3 {
             store.retain(Observation {
                 task_id: TaskId::new("t"),
+                step_no: 1,
                 path: format!("f{i}.txt"),
                 provider: provider.clone(),
                 bytes: vec![b'x'; 80],
                 recorded_at_ms: NOW + i64::from(i),
+                origin: ObservationOrigin {
+                    parent_read_request: RequestId::new("req"),
+                    parent_proposal_id: "p".to_owned(),
+                    approver: Actor::Human {
+                        user: orxnud_domain::ids::UserId::new("local"),
+                        via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+                    },
+                },
             });
         }
-        let released = store.take_for(&TaskId::new("t"), &provider, NOW + 3, 100_000);
+        let released = store.take_for(&TaskId::new("t"), 2, &provider, NOW + 3, 100_000);
         assert_eq!(
             released.len(),
             1,
@@ -882,14 +1223,23 @@ mod ceiling_tests {
         let provider = ProviderIdentity::new("https://p.test/v1", "m");
         store.retain(Observation {
             task_id: TaskId::new("t"),
+            step_no: 1,
             path: "a.txt".to_owned(),
             provider: provider.clone(),
             bytes: vec![b'x'; 500],
             recorded_at_ms: NOW,
+            origin: ObservationOrigin {
+                parent_read_request: RequestId::new("req"),
+                parent_proposal_id: "p".to_owned(),
+                approver: Actor::Human {
+                    user: orxnud_domain::ids::UserId::new("local"),
+                    via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+                },
+            },
         });
         assert!(
             store
-                .take_for(&TaskId::new("t"), &provider, NOW, 100)
+                .take_for(&TaskId::new("t"), 2, &provider, NOW, 100)
                 .is_empty(),
             "a per-request budget below the blob size must release nothing"
         );
