@@ -8,7 +8,9 @@ Two claims are worth correcting because a reader will otherwise treat them as cu
 rather than as requirements: IR-3 names six interfaces (GUI, TUI, CLI, voice, messaging,
 programmatic API) and **only `orxnuctl` exists**; and the task-state vocabulary in §2.4
 omits `NeedsVerification`, `DeadLettered` and `AwaitingNextStep`, all of which are in
-`orxnud-domain`'s `TaskState::ALL` today.
+`orxnud-domain`'s `TaskState::ALL` today. **`NeedsVerification` is now reachable as well as
+declared** — V-92 made the daemon produce it when a non-idempotent side effect's outcome
+cannot be established, so S7's "require human confirmation" has a durable state to mean.
 
 This document states what OpenRayNux must *be*, in a form that later phases can
 test against. Nothing here is a technology decision. Technology choices live in

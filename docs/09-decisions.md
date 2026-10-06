@@ -4697,3 +4697,116 @@ was the bug written down as an expectation, now asserting the opposite.
   Decision 2 with it.
 * Revisit if IPC latency becomes materially less noisy — a keep-alive transport would remove
   one connection per request from the measurement — at which point it becomes gateable.
+
+<a id="adr-0053"></a>
+
+## ADR-0053 — An uncertain side effect is a durable state, not a delay before a retry
+
+**Status.** **Decided and implemented.** Closes V-92. Settles the backend half of
+Q-OPEN-18; its user-facing half stays open.
+
+**Context.** ADR-0027 defined `TaskState::NeedsVerification` — *"a side effect may or may
+not have occurred. Terminal until a human adjudicates."* It was marked terminal, excluded
+from `claim`, excluded from lease recovery, and stored as a legal `Running ->
+NeedsVerification` transition.
+
+**No production path ever produced it.** Every handler did nothing when verification did not
+confirm. Reproduced over a real daemon with real durable state, before any edit:
+
+```text
+execute (undetermined)  ->  task "running", lease held, last_error null
+daemon restart          ->  recovery sees running + a lease, returns it to "pending"
+any worker claims it    ->  attempt 2, running
+task/propose            ->  the same non-idempotent write, pending approval
+```
+
+So the daemon did say *"we don't know whether it happened, so we tried again"* — with no
+human involved, at the next process start. The ambiguity was resolved by a restart, not by
+anything durable, which is the opposite of the contract the state was written for.
+
+**The root cause is one missing decision, not a missing state.** The engine needed nothing:
+`Running -> NeedsVerification` was already legal, `NeedsVerification` was already terminal,
+`claim` already selected only `pending`, `recover()` already selected only `running`, and
+`complete_with` already clears the lease under the same TP-5 fence every completion uses.
+What was missing was somebody deciding, from the verification outcome, which of those to use.
+
+**Decision 1 — classify by *certainty*, not by the adapter's outcome.**
+
+| certainty | capability | state |
+|---|---|---|
+| established | any | the existing completion path |
+| **disproved** (`Refuted`) | any | `Failed`, retryable |
+| **unknown** (`Undetermined`) | idempotent | `Failed`, retryable |
+| **unknown** (`Undetermined`) | non-idempotent | **`NeedsVerification`** |
+
+The distinction that matters is between *proven not to have happened* and *nobody can say*.
+The brief's suggested table had a `failed -> failed/retry` row; that row is not reachable for
+a non-idempotent capability, because `WriteTextVerifier` maps `ExecutionOutcome::Failed` to
+`Undetermined` — a subprocess can die *after* writing, so an adapter-reported failure is not
+evidence about the effect. The table is derived from the verifier's own contract rather than
+from the brief.
+
+**Decision 2 — `Refuted` is retryable regardless of idempotency.**
+
+This looks like the wrong way round and is deliberately so. The capability's verifier already
+decided which of its findings make a retry safe, and recorded that decision in its own
+comments: *"a missing file is `Refuted` — proven absent — which is the state that makes a
+retry safe, and only `Refuted` makes it safe."* Re-deciding it in the task layer would be a
+second policy free to disagree with the first, and the task layer has strictly less
+information than the verifier about what actually happened on disk.
+
+**Decision 3 — idempotency is read from the capability declaration, never inferred.**
+
+An action nobody can vouch for is treated as non-idempotent, because that is the direction
+which cannot duplicate an effect. This is the opposite of the tempting default: a capability
+that fails to declare itself idempotent must not be *granted* the benefit of the doubt.
+
+**Decision 4 — the lease is released, and that is safe because the state is terminal.**
+
+Holding a lease across an open question would park a task on a 30-second timer and hand it
+back to `pending` when it expired — the same defect by another route. Releasing it is safe
+*only* because `NeedsVerification` is terminal and unclaimable, which is why the two
+decisions are made together and not separately.
+
+**Decision 5 — a lost fence is refused, not absorbed.**
+
+If the lease ended while the capability was running, the outcome cannot be recorded by that
+worker. Mapping `TaskFault::Fenced` to `CONFLICT` (ADR-0050, by recovery) tells the caller
+that the *settling* was refused without suggesting it should retry the execution — which
+would duplicate the very effect whose status is in doubt.
+
+**Two smaller corrections found on the way.** The task event was logged as `completed` for
+any non-requeue transition, which is the same lie the adjacent comment already condemns for
+dead-lettering: an operator filtering the event log by `kind` would read "completed" for the
+event that stopped their task. It now reads `needs-verification`. And the execute reply
+carries an `uncertainty` object, so a client learns from the response that the task stopped
+rather than by polling and discovering it went quiet.
+
+**What is deliberately absent.** No user-facing adjudication. A human choosing "assume it
+succeeded" must not be recorded as `verified = true` — a person adjudicating an uncertainty
+and a verifier establishing a fact are different events, and the audit chain must keep them
+apart. The typed representation for that decision belongs to Q-OPEN-18's open half, and the
+state machine leaves the space free rather than guessing at it.
+
+**Evidence.** `crates/orxnud-daemon/tests/uncertain_outcome.rs` (8 tests, real daemon, real
+sandbox, real `WriteTextVerifier`, real restart and crash injection), plus an exhaustive
+decision-table test in `runtime.rs`. 1483 passing.
+
+**Known evidence gap.** Two of the four rows have **no deterministic end-to-end producer**.
+`Refuted` is unreachable through the shipped adapter/verifier pair: an over-limit read fails
+in the *helper* before the verifier's independent read runs, so the outcome is `Failed` ->
+`Undetermined`; the remaining `Refuted` branches need the file to change between two reads,
+which no test can schedule. The capability crate unit-tests both verifiers' `Refuted` branches
+directly, so the verifier logic is covered — what is missing is a *task-layer* producer, and a
+test now says so rather than letting the absence pass unnoticed.
+
+**Revisit conditions.**
+
+* Revisit if a per-capability probe lands (Q-OPEN-18): it would give `Refuted` a deterministic
+  producer and close the gap above.
+* Revisit if `Disproved` ever needs to condition on idempotency. That would mean a verifier
+  had concluded a retry was unsafe, and the right response would be for the verifier to say
+  `Undetermined` rather than for the task layer to second-guess it.
+* Revisit if `NeedsVerification` ever becomes claimable for an *idempotent* capability. Today
+  idempotency is decided before the state is chosen, so such a task never reaches
+  `NeedsVerification`; changing that would be a change to Decision 3.

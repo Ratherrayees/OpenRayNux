@@ -222,6 +222,41 @@ DB write. Providers that support idempotency keys get the key. Retries reuse the
 key; a **different** action requires a **new** key. Duplicate confirmation is
 required for genuinely non-idempotent, irreversible actions (NR-05).
 
+### S7a — An uncertain side effect is stopped, never retried (ADR-0053)
+
+TH-11 is duplicate submission, and its defence has two halves: idempotency keys for
+actions that *can* be keyed, and an uncertainty state for the ones that cannot.
+
+An execution whose verification does not establish the effect leaves the system
+not knowing whether a non-idempotent action happened. The only safe answer is to
+stop, and the stop has to be durable, because the alternative is silent duplication.
+
+- **`NeedsVerification` is produced, and it is terminal.** Not claimable, not
+  continuable, not touchable by lease recovery. The lease is *released* — holding
+  it would mean a task parked on a question, and releasing it is safe precisely
+  because the state is terminal rather than claimable.
+- **The uncertainty survives restart.** Recovery reclaims `running` tasks, so a
+  task left `running` after an uncertain outcome became `pending` at the next
+  process start and was re-executed with no human involved. That was the defect
+  V-92 closed.
+- **Idempotency is read from the capability's own declaration**, never inferred
+  and never defaulted optimistically. An unknown capability is treated as
+  non-idempotent, because that is the direction which cannot duplicate an effect.
+- **A disproved effect is retryable; an unknown one is not.** The capability's
+  verifier already draws that line, so the task layer follows it rather than
+  re-deciding.
+- **The audit records the uncertainty as itself** — `needs-verification`, not
+  `completed`. An operator filtering the event log by `kind` must not read a
+  completion for the event that stopped their task.
+- **A lost fence is refused, not absorbed.** If a worker's lease ended while its
+  capability ran, the *outcome* cannot be recorded by that worker, and it is told
+  so, because the alternative is a zombie committing state.
+
+**Not claimed:** the user-facing adjudication UX. How a person is shown this and
+what "assume it succeeded" does is Q-OPEN-18's open half. A human assumption must
+not be recorded as verification; the state machine deliberately leaves that typed
+representation free.
+
 ### S8 — Capability contracts are caller-agnostic
 
 A capability never learns *who* called it, so permission checks have exactly one
