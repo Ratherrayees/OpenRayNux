@@ -507,7 +507,7 @@ than the work.
 
 ### The current baseline, precisely
 
-* **1400 tests, 1400 passed, 0 failed, 5 skipped** locally on a host that can create an
+* **1419 tests, 1419 passed, 0 failed, 5 skipped** locally on a host that can create an
   unprivileged user namespace.
 * The **5 skips** are `#[ignore]`d child-process entry points — re-exec targets for
   power-loss and failure injection, and the hostile sandbox helper. They are entry points,
@@ -555,6 +555,12 @@ than the work.
   not from what it asserts.** Both mistakes were caught by hosted CI rather than locally, which
   is itself worth noting — a filter that is wrong in the permissive direction fails loudly, and
   the one nobody checks is the one that excludes too much.
+
+  `expiry.rs` splits the same way, for the same reason: five of its twelve tests have to execute
+  `filesystem/write-text` to a *verified* result to be able to assert that a fresh approval works
+  and a used one does not, so those five are named. The seven that only assert refusals — the
+  boundary case, the read case, both race cases, the store-level rules and the expiry-instant
+  arithmetic — run everywhere.
 
 ### What a green CI run does and does not prove
 
