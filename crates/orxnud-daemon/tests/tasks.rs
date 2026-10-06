@@ -1387,7 +1387,17 @@ fn an_approval_cannot_be_executed_twice() {
     });
 }
 
-/// An expired approval is refused, deterministically, with nothing written.
+/// An approval that would be expired on arrival is refused, and nothing is written.
+///
+/// The refusal has moved *earlier* than it used to be. This test previously approved with
+/// `ttl_ms: 0`, let the already-expired approval be written, and asserted that
+/// `task/execute` then refused it with `approval-expired`. That was correct about the
+/// execution and wrong about the approval: minting an authority that can never be used, and
+/// marking the proposal decided while doing it, is what turned an operator's mistyped TTL
+/// into an unrecoverable task (V-82).
+///
+/// So the TTL is now checked before anything is written, and this asserts where the refusal
+/// now happens as well as that every safety property it checked before still holds.
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "Unix-socket evidence: this test reaches the daemon through a real \
@@ -1400,24 +1410,79 @@ fn an_expired_approval_is_refused_and_writes_nothing() {
         let d = dir("governed-expired");
         let s = Serving::start(d.clone()).await;
         let pid = propose(&s, "g3", "w1", "late.txt", "expired");
-        send(
+
+        // Refused at the approval, before any row is written.
+        let refused = send(
             &s.endpoint,
             "a",
             "capability/approve",
             json!({"proposal": pid, "ttl_ms": 0}),
         );
+        assert_eq!(
+            refused["error"]["data"]["reason"], "approval-expired",
+            "a TTL that leaves the approval already expired must be refused: {refused}"
+        );
+
+        // And a negative one, which is the same mistake written differently.
+        let negative = send(
+            &s.endpoint,
+            "an",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": -1}),
+        );
+        assert_eq!(
+            negative["error"]["data"]["reason"], "approval-expired",
+            "{negative}"
+        );
+
+        // No approval exists, so there is nothing to execute.
         let out = send(
             &s.endpoint,
             "x",
             "task/execute",
             json!({"proposal": pid, "worker": "w1"}),
         );
-        let reason = out["error"]["data"]["reason"].as_str().unwrap_or_default();
-        assert!(reason.contains("approval-expired"), "{out}");
+        assert!(
+            out.get("error").is_some(),
+            "nothing may execute on a refused approval: {out}"
+        );
         assert!(
             !workspace(&d).join("late.txt").exists(),
             "an expired approval must not write"
         );
+
+        // The proposal is still approvable, and still pending -- the liveness half.
+        let db = conn(&d);
+        let approvals: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM task_approvals", [], |r| r.get(0))
+            .expect("count approvals");
+        assert_eq!(approvals, 0, "a refused approval must leave no row");
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM task_proposals WHERE proposal_id = ?1;",
+                [&pid],
+                |r| r.get(0),
+            )
+            .expect("proposal status");
+        assert_eq!(
+            status, "pending",
+            "a refused approval must leave the proposal approvable, not decided"
+        );
+
+        // Which is the recovery: approve again with a usable TTL.
+        let good = send(
+            &s.endpoint,
+            "a2",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        assert!(
+            good.get("result").is_some(),
+            "the proposal must still be approvable: {good}"
+        );
+
         s.stop().await;
         let _ = std::fs::remove_dir_all(&d);
     });

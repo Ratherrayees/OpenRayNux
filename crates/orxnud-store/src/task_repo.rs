@@ -329,6 +329,54 @@ impl NewTask {
     }
 }
 
+/// What [`TaskRepository::record_approval_replacing_expired`] did.
+///
+/// A value rather than an error because the caller has to report *which* of three things
+/// happened, and each one asks the client to do something different: recorded means execute,
+/// replaced-expired means execute, and a refusal means stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// There was no prior approval for this attempt; this one is now the only one.
+    Recorded,
+    /// A prior approval had expired without being used, and has been replaced.
+    ///
+    /// The replaced row's digest no longer exists anywhere. That is what makes this recovery
+    /// rather than a renewal: there is no surviving authority that could later be presented.
+    ReplacedExpired,
+    /// A prior approval exists and may not be replaced.
+    Refused(ApprovalRefusal),
+}
+
+/// Why an approval may not be replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRefusal {
+    /// An approval exists for this attempt and has not expired.
+    ///
+    /// Refused so a second `capability/approve` cannot silently supersede an unused one: a
+    /// client holding a live approval and the database could otherwise disagree about which
+    /// is authoritative, and the client would be the one holding the superseded one.
+    AlreadyValid {
+        /// When that approval expires.
+        expires_at_ms: i64,
+    },
+    /// The approval was already consumed, so the step it authorised has been acted on.
+    AlreadyConsumed {
+        /// When it was consumed.
+        consumed_at_ms: i64,
+    },
+}
+
+impl ApprovalRefusal {
+    /// A stable wire spelling, so a peer branches on data rather than on prose.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyValid { .. } => "approval-already-valid",
+            Self::AlreadyConsumed { .. } => "approval-already-consumed",
+        }
+    }
+}
+
 /// A claimed task: the row plus the attempt number this claim opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedTask {
@@ -2843,6 +2891,185 @@ impl<'a> TaskRepository<'a> {
         Ok(())
     }
 
+    /// Records an approval, or replaces one that has expired without being used.
+    ///
+    /// # Why this exists at all
+    ///
+    /// An approval is a point in time, and the task waits for a human. So an approval can
+    /// perfectly well expire while the task sits in `waiting-for-user` — and before this,
+    /// that was the end of the line: the proposal was already `approved`, a second
+    /// `capability/approve` was refused as `proposal-already-decided`, and the only way out
+    /// was cancelling the task (V-82).
+    ///
+    /// The defect was never the expiry. Expiry is correct, and `is_valid_at` already refused
+    /// an expired approval at the policy stage with nothing written. The defect was that the
+    /// proposal's `approved` status recorded *the decision to approve* and was then read as
+    /// *the authority to execute*, so the two could never come apart.
+    ///
+    /// So replacement is keyed on the approval row, not the proposal, and it is allowed for
+    /// exactly one prior state: **expired and unconsumed**. The replacement is a new row
+    /// content — a new digest, a new expiry — so the old authority ceases to exist rather
+    /// than being extended, and there is nothing left that could later be presented.
+    ///
+    /// # Refusals
+    ///
+    /// A prior approval that is still valid, or that was consumed, is refused rather than
+    /// replaced. Refusing a live approval is what keeps an approval single-use in the sense
+    /// that matters: a second `capability/approve` cannot silently supersede an unused one,
+    /// so "the approval a client holds" and "the approval in the database" cannot diverge.
+    ///
+    /// # Concurrency
+    ///
+    /// The read and the conditional update share one IMMEDIATE transaction, and the update's
+    /// `WHERE` re-asserts both preconditions. Two callers racing to replace the same expired
+    /// approval therefore produce one replacement and one refusal, deterministically: the
+    /// loser's `WHERE` no longer holds, because the row it would have replaced now carries a
+    /// fresh, unexpired approval.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskRepoError::NotFound`] if the task does not exist, [`TaskRepoError`]
+    /// `::InvalidComposition` if the step is not one the task has, or any SQLite error. A
+    /// refusal is **not** an error — it is [`ApprovalOutcome::Refused`], so the caller can
+    /// report which of the two reasons applies instead of parsing a message.
+    pub fn record_approval_replacing_expired(
+        &mut self,
+        approval: &ApprovalRow,
+        now_ms: i64,
+    ) -> Result<ApprovalOutcome, TaskRepoError> {
+        let tx = self.tx()?;
+
+        // The step must be one this task actually has, exactly as in `record_approval`.
+        // Checked before touching the row so a replacement cannot widen which steps an
+        // approval may name.
+        let max_steps: i64 = tx
+            .query_row(
+                "SELECT max_steps FROM tasks WHERE id = ?1;",
+                rusqlite::params![approval.task_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| TaskRepoError::NotFound(approval.task_id.to_string()))?;
+        validate_step_no(max_steps as u32, approval.step_no)
+            .map_err(|e| TaskRepoError::InvalidComposition(Box::new(e)))?;
+
+        let prior: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT expires_at_ms, consumed_at_ms FROM task_approvals
+                  WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3;",
+                rusqlite::params![
+                    approval.task_id.as_str(),
+                    approval.step_no,
+                    approval.attempt_no
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((prior_expires_at_ms, prior_consumed_at_ms)) = prior else {
+            let changed = tx.execute(
+                "INSERT INTO task_approvals
+                    (task_id, attempt_no, step_no, digest, capability, target, params,
+                     issued_at_ms, expires_at_ms, consumed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL);",
+                rusqlite::params![
+                    approval.task_id.as_str(),
+                    approval.attempt_no,
+                    approval.step_no,
+                    hex_to_bytes(&approval.digest_hex),
+                    approval.capability,
+                    approval.target,
+                    approval.params,
+                    approval.issued_at_ms,
+                    approval.expires_at_ms,
+                ],
+            )?;
+            // A concurrent insert for the same attempt can only have appeared between the
+            // read and here, which the IMMEDIATE transaction excludes; anything else is a
+            // uniqueness violation worth surfacing rather than ignoring.
+            if changed == 0 {
+                return Err(TaskRepoError::AlreadyExists(format!(
+                    "{} step {} attempt {} already has an approval",
+                    approval.task_id, approval.step_no, approval.attempt_no
+                )));
+            }
+            tx.commit()?;
+            return Ok(ApprovalOutcome::Recorded);
+        };
+
+        // Belt and braces on "this approval has been acted on". `consumed_at_ms` is the
+        // direct record, written when the approval authorised an attempt. `steps_completed`
+        // is the independent confirmation, read from the task row this transaction already
+        // opened: if the step has concluded, its approval was necessarily used, whatever the
+        // row happens to say. Depending on one alone would make this decision rest on a
+        // single write that some future path might skip.
+        let step_concluded: bool = tx
+            .query_row(
+                "SELECT steps_completed FROM tasks WHERE id = ?1;",
+                rusqlite::params![approval.task_id.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|completed| {
+                u64::try_from(completed).unwrap_or(u64::MAX) >= u64::from(approval.step_no)
+            })
+            .unwrap_or(false);
+
+        // The half-open convention, stated once and matching `is_valid_at`: an approval is
+        // live while `now < expires_at_ms`, so `expires_at_ms <= now_ms` is expired. The same
+        // operator is used here and by the policy check, which is what stops the store and the
+        // authority decision from disagreeing about a boundary instant.
+        if prior_consumed_at_ms.is_some() || step_concluded {
+            tx.commit()?;
+            return Ok(ApprovalOutcome::Refused(ApprovalRefusal::AlreadyConsumed {
+                consumed_at_ms: prior_consumed_at_ms.unwrap_or_default(),
+            }));
+        }
+        if now_ms < prior_expires_at_ms {
+            tx.commit()?;
+            return Ok(ApprovalOutcome::Refused(ApprovalRefusal::AlreadyValid {
+                expires_at_ms: prior_expires_at_ms,
+            }));
+        }
+
+        let replaced = tx.execute(
+            "UPDATE task_approvals
+                SET digest         = ?4,
+                    capability     = ?5,
+                    target         = ?6,
+                    params         = ?7,
+                    issued_at_ms   = ?8,
+                    expires_at_ms  = ?9,
+                    consumed_at_ms = NULL
+              WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3
+                AND consumed_at_ms IS NULL
+                AND expires_at_ms <= ?10;",
+            rusqlite::params![
+                approval.task_id.as_str(),
+                approval.step_no,
+                approval.attempt_no,
+                hex_to_bytes(&approval.digest_hex),
+                approval.capability,
+                approval.target,
+                approval.params,
+                approval.issued_at_ms,
+                approval.expires_at_ms,
+                now_ms,
+            ],
+        )?;
+        if replaced == 0 {
+            // The preconditions held when this transaction read the row and do not hold now,
+            // which within one IMMEDIATE transaction means another writer committed between
+            // them. Reported rather than retried, so the caller sees one deterministic answer.
+            tx.commit()?;
+            return Ok(ApprovalOutcome::Refused(ApprovalRefusal::AlreadyValid {
+                expires_at_ms: prior_expires_at_ms,
+            }));
+        }
+        tx.commit()?;
+        Ok(ApprovalOutcome::ReplacedExpired)
+    }
+
     /// Reads the approval for a **specific** attempt.
     ///
     /// Takes `attempt_no` rather than "the current approval" precisely so that
@@ -4402,6 +4629,217 @@ mod tests {
             issued_at_ms: NOW,
             expires_at_ms: expires,
             consumed_at_ms: None,
+        }
+    }
+
+    /// An approval may be replaced when — and only when — it has expired without being used.
+    ///
+    /// Pinned here rather than only through the daemon because these are the guards the store
+    /// owns, and the runtime happens to re-check both before calling in. A test that only
+    /// exercised the runtime would pass with every guard in this function deleted, which is
+    /// exactly what a mutation check found.
+    mod replace_expired {
+        use super::*;
+
+        /// A task with `max_steps = 2`, so a step-2 approval is representable.
+        fn task(c: &mut Connection) {
+            let mut repo = TaskRepository::new(c);
+            repo.insert(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
+                .expect("insert");
+            c.execute(
+                "UPDATE tasks SET max_steps = 2, steps_completed = 0 WHERE id = 't';",
+                [],
+            )
+            .expect("bounds");
+        }
+
+        /// An approval whose digest is `tag`, so a replacement is visible as a new digest.
+        fn with_digest(tag: &str, expires: i64) -> ApprovalRow {
+            ApprovalRow {
+                digest_hex: tag.repeat(32),
+                expires_at_ms: expires,
+                ..approval("t", 1, expires)
+            }
+        }
+
+        #[test]
+        fn a_first_approval_is_recorded() {
+            let mut c = mem();
+            task(&mut c);
+            let mut repo = TaskRepository::new(&mut c);
+            assert_eq!(
+                repo.record_approval_replacing_expired(&with_digest("aa", NOW + 100), NOW)
+                    .expect("record"),
+                ApprovalOutcome::Recorded
+            );
+            let stored = repo
+                .approval_for_attempt(&tid("t"), 1, 1)
+                .expect("read")
+                .expect("present");
+            assert_eq!(stored.expires_at_ms, NOW + 100);
+        }
+
+        #[test]
+        fn an_expired_unconsumed_approval_is_replaced() {
+            let mut c = mem();
+            task(&mut c);
+            let mut repo = TaskRepository::new(&mut c);
+            repo.record_approval(&approval("t", 1, NOW + 10))
+                .expect("first");
+
+            // `expires_at_ms <= now_ms` is expired, matching `is_valid_at`'s half-open window.
+            let at = repo
+                .record_approval_replacing_expired(&with_digest("bb", NOW + 9_000), NOW + 10)
+                .expect("replace");
+            assert_eq!(at, ApprovalOutcome::ReplacedExpired);
+
+            let stored = repo
+                .approval_for_attempt(&tid("t"), 1, 1)
+                .expect("read")
+                .expect("present");
+            assert_eq!(
+                stored.digest_hex.to_lowercase(),
+                "bb".repeat(32),
+                "the replacement must be new authority, not the old digest extended"
+            );
+            assert_eq!(stored.expires_at_ms, NOW + 9_000);
+            assert!(
+                stored.consumed_at_ms.is_none(),
+                "and it must not inherit a consumption"
+            );
+        }
+
+        #[test]
+        fn a_live_approval_is_refused() {
+            let mut c = mem();
+            task(&mut c);
+            let mut repo = TaskRepository::new(&mut c);
+            repo.record_approval(&approval("t", 1, NOW + 10_000))
+                .expect("first");
+
+            // One millisecond before expiry is still live, so it may not be superseded.
+            let out = repo
+                .record_approval_replacing_expired(&with_digest("bb", NOW + 9_000), NOW + 9_999)
+                .expect("refuse");
+            assert_eq!(
+                out,
+                ApprovalOutcome::Refused(ApprovalRefusal::AlreadyValid {
+                    expires_at_ms: NOW + 10_000
+                })
+            );
+            let stored = repo
+                .approval_for_attempt(&tid("t"), 1, 1)
+                .expect("read")
+                .expect("present");
+            assert_eq!(
+                stored.digest_hex.to_lowercase(),
+                "00".repeat(32),
+                "a refused replacement must not have touched the stored approval"
+            );
+        }
+
+        #[test]
+        fn a_consumed_approval_is_refused() {
+            let mut c = mem();
+            task(&mut c);
+            let mut repo = TaskRepository::new(&mut c);
+            repo.record_approval(&approval("t", 1, NOW - 1))
+                .expect("first");
+            repo.consume_approval(&tid("t"), 1, 1, NOW)
+                .expect("consume");
+
+            let out = repo
+                .record_approval_replacing_expired(&with_digest("bb", NOW + 9_000), NOW)
+                .expect("refuse");
+            assert!(
+                matches!(
+                    out,
+                    ApprovalOutcome::Refused(ApprovalRefusal::AlreadyConsumed { .. })
+                ),
+                "{out:?}"
+            );
+        }
+
+        /// The independent confirmation: even with the row claiming the approval is unused, a
+        /// step that has concluded cannot have its approval replaced.
+        #[test]
+        fn a_concluded_step_refuses_replacement_even_when_the_row_says_unused() {
+            let mut c = mem();
+            task(&mut c);
+            {
+                let mut repo = TaskRepository::new(&mut c);
+                repo.record_approval(&approval("t", 1, NOW - 1))
+                    .expect("first");
+            }
+            // The step completed, so its approval was acted on -- without anyone having
+            // written `consumed_at_ms`. This is the case that makes the guard worth having.
+            c.execute("UPDATE tasks SET steps_completed = 1 WHERE id = 't';", [])
+                .expect("advance");
+
+            let mut repo = TaskRepository::new(&mut c);
+            let out = repo
+                .record_approval_replacing_expired(&with_digest("bb", NOW + 9_000), NOW)
+                .expect("refuse");
+            assert!(
+                matches!(
+                    out,
+                    ApprovalOutcome::Refused(ApprovalRefusal::AlreadyConsumed { .. })
+                ),
+                "a concluded step's approval must not be replaceable: {out:?}"
+            );
+        }
+
+        /// A replacement on a *different* step is a different row and unaffected.
+        #[test]
+        fn a_step_with_no_approval_is_unaffected_by_another_steps() {
+            let mut c = mem();
+            task(&mut c);
+            let mut repo = TaskRepository::new(&mut c);
+            repo.record_approval(&approval("t", 1, NOW - 1))
+                .expect("step 1");
+            let mut second = with_digest("cc", NOW + 9_000);
+            second.step_no = 2;
+            assert_eq!(
+                repo.record_approval_replacing_expired(&second, NOW)
+                    .expect("record"),
+                ApprovalOutcome::Recorded
+            );
+        }
+
+        /// One replacement wins; the other is told so rather than both silently succeeding.
+        #[test]
+        fn a_second_replacement_of_the_same_row_is_refused() {
+            let mut c = mem();
+            task(&mut c);
+            let mut repo = TaskRepository::new(&mut c);
+            repo.record_approval(&approval("t", 1, NOW - 1))
+                .expect("first");
+
+            let first = repo
+                .record_approval_replacing_expired(&with_digest("bb", NOW + 9_000), NOW)
+                .expect("first replacement");
+            assert_eq!(first, ApprovalOutcome::ReplacedExpired);
+
+            // The row now holds a live approval, so a second replacement is refused -- the
+            // same path a concurrent caller takes, since it re-reads inside its transaction.
+            let second = repo
+                .record_approval_replacing_expired(&with_digest("cc", NOW + 9_000), NOW)
+                .expect("second replacement");
+            assert_eq!(
+                second,
+                ApprovalOutcome::Refused(ApprovalRefusal::AlreadyValid {
+                    expires_at_ms: NOW + 9_000
+                })
+            );
+            assert_eq!(
+                repo.approval_for_attempt(&tid("t"), 1, 1)
+                    .expect("read")
+                    .expect("present")
+                    .digest_hex
+                    .to_lowercase(),
+                "bb".repeat(32),
+                "the first replacement must be the one that stands"
+            );
         }
     }
 

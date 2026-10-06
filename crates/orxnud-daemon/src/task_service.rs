@@ -849,6 +849,44 @@ impl TaskService {
             .map_err(|e| TaskFault::Engine(e.to_string()))
     }
 
+    /// Marks an approval spent, so the task domain's own record says so.
+    ///
+    /// A thin pass-through. The authoritative single-use record is the policy engine's spent
+    /// digest ledger, which `authorise` writes; this is the task domain's own copy of the same
+    /// fact, and it is what a later approval-replacement decision reads.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if the write fails, or if the attempt has no unconsumed approval.
+    pub fn consume_approval(
+        &mut self,
+        id: &TaskId,
+        step_no: u32,
+        attempt_no: u32,
+        now_ms: i64,
+    ) -> Result<(), TaskFault> {
+        self.guard_running()?;
+        self.engine
+            .consume_approval(id, step_no, attempt_no, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
+    /// Records an approval for a step, replacing one that expired without being used.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if it cannot be written.
+    pub fn record_approval_replacing_expired(
+        &mut self,
+        approval: &orxnud_store::task_repo::ApprovalRow,
+        now_ms: i64,
+    ) -> Result<orxnud_store::task_repo::ApprovalOutcome, TaskFault> {
+        self.guard_running()?;
+        self.engine
+            .record_approval_replacing_expired(approval, now_ms)
+            .map_err(|e| TaskFault::Engine(e.to_string()))
+    }
+
     /// Reads a proposal.
     ///
     /// # Errors
