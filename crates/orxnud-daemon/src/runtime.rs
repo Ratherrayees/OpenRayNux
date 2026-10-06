@@ -51,7 +51,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use orxnud_capability::dispatch::{DispatchError, Dispatcher};
+use orxnud_capability::dispatch::Dispatcher;
 use orxnud_domain::ids::TaskId;
 use orxnud_domain::platform::SecretsContract;
 use orxnud_domain::task_state::{TaskKind, TaskState};
@@ -110,6 +110,104 @@ pub enum RuntimeError {
     Lifecycle(#[from] LifecycleError),
 }
 
+/// A condition in which **no caller action changes the outcome**.
+///
+/// # Why this is an enum and not a string
+///
+/// `INTERNAL_ERROR` is a positive claim, and V-90 exists because that claim was made by
+/// default: any failure that reached `RequestError::Refused { reason: e.to_string() }`
+/// became `INTERNAL_ERROR`, so a stale approval and a corrupt database row were
+/// indistinguishable to a client. `DispatchError` has eleven variants and `DenialReason`
+/// has seventeen, and both were flattened into one code.
+///
+/// Naming a fault here is therefore an assertion that has to be defended. Each variant
+/// below carries that argument, and adding one is a reviewable act rather than a free-form
+/// string. The converse also holds and is the more important half: **there is no way to
+/// write an `Internal` error without choosing from this list**, so a new caller-fixable
+/// condition cannot quietly become an internal fault merely because nobody classified it.
+///
+/// # What is deliberately *not* here
+///
+/// Anything a caller or an operator can repair. A missing credential, a host that cannot
+/// establish sandbox guarantees, an unwritable audit journal, an expired approval and an
+/// unknown capability are all refusals a person can act on, and each maps to the class
+/// named by its recovery. They are absences from this list on purpose: the list is the
+/// exhaustive answer to "what is actually unrecoverable", and adding to it should feel
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalFault {
+    /// Durable state does not add up: an unreadable parameters column, a digest that is
+    /// not hex, a task whose counters cannot be true.
+    ///
+    /// Not caller-actionable and not configuration-actionable. A caller cannot cause a row
+    /// to stop parsing, and no setting restores it; recovery is repair or rebuild of the
+    /// database, which is an operator action outside the protocol entirely.
+    DurableStateCorrupt,
+
+    /// The database could not be read or written.
+    ///
+    /// A storage fault rather than a logic fault, and retrying reaches the same fault. It
+    /// shares `INTERNAL_ERROR` with corruption because from the protocol's point of view
+    /// both are "the daemon cannot answer a question about its own state right now", and
+    /// neither is something a client can fix by changing its request.
+    StorageUnavailable,
+
+    /// The in-process observation store is unusable because a previous holder panicked
+    /// while holding workspace content.
+    ///
+    /// A poisoned lock is the *consequence* of a panic, and the panic is a daemon defect, so
+    /// reporting this as an environment outage would be dishonest about the cause. No
+    /// content was disclosed and nothing was written, so the disclosure is fail-closed.
+    DisclosureStorePoisoned,
+
+    /// A capability adapter ran and failed, timed out, or did not report.
+    ///
+    /// Not a permission problem — the invocation was already authorised — and not a caller
+    /// input problem: the request was valid. It is also not one of the known environment
+    /// gaps (no sandbox, no credential), which have their own variants and their own
+    /// remedies. A client told "internal" here files a report, which is the right action
+    /// for a capability that cannot do its job.
+    CapabilityExecutionFailed,
+
+    /// Verification could not be performed, so the effect is *undetermined* rather than
+    /// verified.
+    ///
+    /// Reported as a fault because the verifier is part of the daemon: a verifier that
+    /// cannot check an effect is a defect in the thing whose job is checking effects.
+    CapabilityVerificationFailed,
+
+    /// An adapter called back into the dispatcher while its own dispatch was running.
+    ///
+    /// An impossible invariant, kept as a variant so the daemon refuses and reports rather
+    /// than deadlocking or panicking on a reentrancy the type system did not prevent.
+    ReentrantDispatch,
+
+    /// A capability's declared schema could not be evaluated.
+    ///
+    /// The declaration is compiled in and there is no runtime configuration that could
+    /// change it, so no operator action reaches this: it is a defect in the build rather
+    /// than a misconfiguration of a correct build.
+    InvalidCapabilitySchema,
+}
+
+impl InternalFault {
+    /// The stable wire vocabulary word for this fault.
+    ///
+    /// Kebab-case and fixed, because it lands in `data.reason` and a client branches on
+    /// it. The human sentence belongs in `data.detail`.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::DurableStateCorrupt => "durable-state-corrupt",
+            Self::StorageUnavailable => "storage-unavailable",
+            Self::DisclosureStorePoisoned => "disclosure-store-poisoned",
+            Self::CapabilityExecutionFailed => "capability-execution-failed",
+            Self::CapabilityVerificationFailed => "capability-verification-failed",
+            Self::ReentrantDispatch => "reentrant-dispatch",
+            Self::InvalidCapabilitySchema => "invalid-capability-schema",
+        }
+    }
+}
 /// A request could not be answered, in terms the peer can act on.
 ///
 /// Every variant is a [`RpcError`] on the wire. No variant carries a filesystem
@@ -220,23 +318,24 @@ pub enum RequestError {
         detail: Option<String>,
     },
 
-    /// A refusal that is not one of the classified conditions: the dispatcher refused, or
-    /// the daemon's own state could not serve the request.
+    /// A condition no caller action repairs. The only class that maps to
+    /// `INTERNAL_ERROR`.
     ///
-    /// The only class that maps to `INTERNAL_ERROR`, deliberately, because it is the only
-    /// one where **nothing the caller can do produces a different outcome**. A corrupt row, a
-    /// failed audit write and a dispatcher's own refusal all land here, and in each case the
-    /// useful thing for a client is to report a defect rather than retry or re-approve.
+    /// This carries an [`InternalFault`] rather than a free `String`, which is the whole
+    /// mechanism. `RequestError::Refused { reason: <anything>, detail }` used to be how a
+    /// dispatcher failure reached the wire, so any caller-actionable condition could be
+    /// spelled into `INTERNAL_ERROR` by anyone who reached that constructor — which is
+    /// exactly what V-90 records, on two routes and probably more.
     ///
-    /// Anything a client *could* act on belongs in one of the classes above. When a new
-    /// refusal turns out to be actionable, the fix is a new class and not a wider use of this
-    /// one, because widening it is exactly how "a stale lease is an internal error" happened
-    /// in the first place.
-    #[error("the request could not be served: {reason}")]
-    Refused {
-        /// A stable vocabulary word, never prose.
-        reason: String,
-        /// Optional detail. Already redacted.
+    /// Naming a condition here is now a deliberate act that requires choosing one of the
+    /// enumerated faults, each of which has been argued for individually below. A new
+    /// caller-fixable refusal cannot acquire `INTERNAL_ERROR` by default, because there is
+    /// no default.
+    #[error("the request could not be served: {fault:?}")]
+    Internal {
+        /// Which internal condition, from a closed set.
+        fault: InternalFault,
+        /// Optional detail. Already redacted: never a raw `Error`, a path, or SQL.
         detail: Option<String>,
     },
 
@@ -260,9 +359,16 @@ impl RequestError {
     /// The JSON-RPC error this becomes.
     fn to_rpc(&self) -> RpcError {
         match self {
+            // Found by the V-90 sweep: this was the same defect as the dispatcher's
+            // `e.to_string()` calls, on the frame-decode path rather than the dispatch
+            // path -- "malformed frame: EOF while parsing a value at line 1 column 19" was
+            // landing in the field a client branches on, so classifying a parse failure
+            // meant substring-matching serde's English. Now the word is fixed and the
+            // parser's own explanation is the detail.
             Self::Malformed(why) => RpcError::new(RpcErrorCode::PARSE_ERROR, "malformed request")
                 .with_data(json!({
-                    "reason": why,
+                    "reason": "malformed-frame",
+                    "detail": why,
                 })),
             // The explanation is prose *because it has to be*: "which of your forty fields
             // is wrong, and how" has no stable vocabulary word. So the word goes in the
@@ -350,8 +456,8 @@ impl RequestError {
                 )
                 .with_data(data)
             }
-            Self::Refused { reason, detail } => {
-                let mut data = json!({ "reason": reason });
+            Self::Internal { fault, detail } => {
+                let mut data = json!({ "reason": fault.reason() });
                 if let Some(d) = detail {
                     data["detail"] = json!(d);
                 }
@@ -1684,8 +1790,8 @@ fn release_observations<S: SecretsContract>(
             // A poisoned lock means a previous holder panicked while holding workspace
             // content. Refusing is the only answer: recovering would require deciding which
             // observations a panicked path had already consumed.
-            return Err(RequestError::Refused {
-                reason: "disclosure-store-unavailable".to_owned(),
+            return Err(RequestError::Internal {
+                fault: InternalFault::DisclosureStorePoisoned,
                 detail: Some(
                     "the observation store is not usable; no content was disclosed".to_owned(),
                 ),
@@ -1721,11 +1827,21 @@ fn release_observations<S: SecretsContract>(
         .to_audit_record(r.origin.approver.clone());
         g.0.policy_mut()
             .append_audit_record(record)
-            .map_err(|e| RequestError::Refused {
+            .map_err(|_e| RequestError::Unavailable {
+                // The journal is a dependency the daemon needs and the operator can
+                // repair (free space, permissions, a moved file), so this is an
+                // environment outage rather than an internal fault.
+                //
+                // The underlying error is deliberately **dropped** rather than
+                // interpolated. It is a `String` from the storage layer, so it can contain
+                // a database path or a SQL fragment, and ADR-0051's rule is that an OS
+                // identifier never leaves this daemon in an error. The reason word says
+                // what happened and the detail says what it means; neither needs the
+                // cause to be useful, and the server log already has it.
                 reason: "disclosure-audit-unavailable".to_owned(),
-                detail: Some(format!(
-                    "the disclosure could not be recorded, so nothing was disclosed: {e}"
-                )),
+                detail: Some(
+                    "the disclosure could not be recorded, so nothing was disclosed".to_owned(),
+                ),
             })?;
     }
 
@@ -1796,6 +1912,345 @@ pub fn scripted_proposer() -> Arc<dyn crate::proposer::ProposalProvider> {
 /// this function existed to stop.
 const NO_MODEL_PROPOSED: &str = "none/direct-proposal";
 
+/// Classifies a [`DispatchError`] by recovery semantics.
+///
+/// # The property this maintains
+///
+/// Every arm is written out. There is no `_ =>` catch-all, and that is the entire point:
+/// the old shape was
+///
+/// ```text
+/// match e { known => known_class, _ => Refused { reason: e.to_string() } }
+/// ```
+///
+/// and the `_` became `INTERNAL_ERROR`, so any condition nobody had thought about was
+/// reported to the caller as a server fault. Adding a `DispatchError` variant now breaks
+/// the build here, where somebody has to say what a caller should do about it.
+///
+/// # Why classification is by recovery and not by name
+///
+/// `Policy` is not one class: it contains both "we decided no" and "we could not decide",
+/// so it is delegated to [`policy_failure`]. `SandboxRefused` and `Credential` are
+/// environment problems with operator remedies. `Execution` and `Verification` are
+/// daemon-side defects with no remedy at all. Naming a variant tells you the *cause*; only
+/// the recovery tells you the *class*, and the class is what a client branches on.
+fn dispatch_failure(e: &orxnud_capability::dispatch::DispatchError) -> RequestError {
+    use orxnud_capability::dispatch::DispatchError;
+    match e {
+        // --- the governed refusals, delegated to policy ---
+        //
+        // `Policy` carries `PolicyError`, which is itself a deny/error split, so this arm
+        // is a hand-off and not a decision.
+        DispatchError::Policy(p) => policy_failure(p),
+
+        // --- environment: a dependency the daemon needs and an operator can repair ---
+        //
+        // Nothing ran. The host could not establish the guarantees the capability requires,
+        // so the remedy is a different machine, a different kernel setting, or accepting
+        // that this host cannot run Tier-1 work. Retrying identical requests cannot help,
+        // which is why this is not a conflict.
+        //
+        // The detail names the missing guarantees, which are this daemon's own vocabulary
+        // (`visibility`, `tree_lifetime`, `resources`) and never a path or a syscall.
+        DispatchError::SandboxRefused(r) => RequestError::Unavailable {
+            reason: "sandbox-unavailable".to_owned(),
+            detail: Some(format!(
+                "the execution backend cannot establish the required sandbox guarantees \
+                 (missing: {})",
+                if r.missing.is_empty() {
+                    "none".to_owned()
+                } else {
+                    r.missing.join(", ")
+                }
+            )),
+        },
+
+        // A credential that is not configured is fixed by *adding the credential*, which is
+        // configuration work rather than a request edit -- hence environment rather than
+        // invalid-request. `CredentialError` splits this from a store that is merely
+        // unreachable, and both are environment; the reasons differ because a client may
+        // want to prompt for one and retry the other.
+        DispatchError::Credential(orxnud_capability::credential::CredentialError::Absent(_)) => {
+            RequestError::Unavailable {
+                reason: "credential-not-configured".to_owned(),
+                detail: Some("a required credential is not configured".to_owned()),
+            }
+        }
+        DispatchError::Credential(orxnud_capability::credential::CredentialError::Unavailable(
+            _,
+        )) => RequestError::Unavailable {
+            reason: "credential-store-unavailable".to_owned(),
+            // The store's own error is dropped: a `SecretService`/`DPAPI`/`Keychain`
+            // failure can carry a socket path or a service name, and an IPC error is not
+            // the place for it. The server log keeps it.
+            detail: Some("the credential store could not be reached".to_owned()),
+        },
+
+        // --- caller-actionable: the request itself names something unservable ---
+        //
+        // `NoImplementation` means policy accepted the capability but no adapter is
+        // registered for it. The caller cannot make it exist and cannot supply an approval
+        // that changes it; the only repair is naming a capability this build can run, which
+        // is an edit to the request.
+        DispatchError::NoImplementation(c) => RequestError::InvalidInput {
+            reason: "no-implementation-registered".to_owned(),
+            detail: Some(format!("no implementation is registered for {c}")),
+        },
+        // The invocation under-declared its data class against the implementation's own
+        // declaration. Purely a request edit: declare the class the action actually needs.
+        DispatchError::ClassEscalation {
+            id,
+            declared,
+            actual,
+        } => RequestError::InvalidInput {
+            reason: "class-escalation".to_owned(),
+            detail: Some(format!(
+                "{id} implements up to {declared:?} but was invoked at {actual:?}"
+            )),
+        },
+
+        // --- caller-actionable: refused by configuration the owner chose ---
+        //
+        // `Disabled` is a switch a person flipped, so the recovery is that person flipping
+        // it back -- which is "obtain authority", the same recovery `FORBIDDEN` names for
+        // every other owner-controlled refusal. It is deliberately *not* environment: the
+        // environment is working exactly as configured.
+        DispatchError::Disabled(c) => RequestError::Forbidden {
+            reason: "capability-disabled".to_owned(),
+            detail: Some(format!("{c} is switched off")),
+        },
+
+        // --- genuine internal faults ---
+        //
+        // No remedy exists for any of these at any layer, so `INTERNAL_ERROR` is the
+        // truthful answer and not a fallback. Each names a specific fault so the audit
+        // trail says which.
+        DispatchError::Execution(_) => RequestError::Internal {
+            fault: InternalFault::CapabilityExecutionFailed,
+            detail: Some("the capability ran and failed".to_owned()),
+        },
+        DispatchError::Verification(_) => RequestError::Internal {
+            fault: InternalFault::CapabilityVerificationFailed,
+            detail: Some("the effect could not be verified".to_owned()),
+        },
+        DispatchError::Audit(_) => RequestError::Unavailable {
+            // Fail-closed, and *after* execution too, which is the dangerous direction: an
+            // action with no audit record is worse than a refused one. But the cause is
+            // still an outage of a dependency the operator can repair, so it is
+            // environment rather than a defect in the daemon's logic.
+            reason: "audit-journal-unavailable".to_owned(),
+            detail: Some(
+                "the action could not be recorded, so it is not treated as \
+                          completed"
+                    .to_owned(),
+            ),
+        },
+        DispatchError::Reentrant(_) => RequestError::Internal {
+            fault: InternalFault::ReentrantDispatch,
+            detail: Some("a capability called back into the dispatcher".to_owned()),
+        },
+        // The effect is known *not* to have happened. That is a fact about the world, not
+        // a fault in the daemon, and the recovery is to re-read what actually happened --
+        // the same recovery a conflict names. The successful-dispatch path reports this
+        // inside the outcome rather than as an error; the arm exists so that if a route
+        // ever does surface it as `Err`, it is classified as a conflict and not a fault.
+        DispatchError::VerificationRefuted { .. } => RequestError::Conflict {
+            reason: "effect-refuted".to_owned(),
+            detail: Some("verification determined the effect did not happen".to_owned()),
+        },
+    }
+}
+
+/// Classifies a [`orxnud_policy::PolicyError`].
+///
+/// # Deny is not error
+///
+/// `PolicyError::Denied` is the policy engine saying "no" — a *decision*. Every other
+/// variant is the engine being unable to reach one, which is a different fact and lands in
+/// a different class. Collapsing them was how an outage became indistinguishable from a
+/// refusal.
+///
+/// `ApprovalLedgerUnavailable` is the sharpest case and it is why this function exists:
+/// we could not determine whether an approval was already spent. The only safe response is
+/// to refuse, but the *reason* is an outage, so it is `ENVIRONMENT_UNAVAILABLE` rather
+/// than `FORBIDDEN` — a client told "forbidden" would go and obtain an approval that would
+/// then be refused for the same unanswerable reason.
+fn policy_failure(e: &orxnud_policy::PolicyError) -> RequestError {
+    use orxnud_policy::PolicyError;
+    match e {
+        PolicyError::Denied { reason } => denial_failure(reason),
+        // An outage of a component the daemon depends on. No caller action reaches it.
+        PolicyError::Unavailable(_) => RequestError::Unavailable {
+            reason: "policy-unavailable".to_owned(),
+            detail: Some("the policy set could not be loaded".to_owned()),
+        },
+        PolicyError::AuditUnavailable(_) => RequestError::Unavailable {
+            reason: "audit-journal-unavailable".to_owned(),
+            detail: Some("the decision could not be recorded".to_owned()),
+        },
+        PolicyError::ApprovalLedgerUnavailable(_) => RequestError::Unavailable {
+            reason: "approval-ledger-unavailable".to_owned(),
+            detail: Some(
+                "the approval ledger could not be read, so no decision was reached".to_owned(),
+            ),
+        },
+        // Compiled-in and not runtime-configurable, so nothing an operator can change
+        // reaches it: a defect in the build rather than a misconfiguration of a sound one.
+        PolicyError::InvalidSchema(_) => RequestError::Internal {
+            fault: InternalFault::InvalidCapabilitySchema,
+            detail: Some("a capability's declared schema could not be evaluated".to_owned()),
+        },
+    }
+}
+
+/// Classifies a [`orxnud_policy::DenialReason`] — the engine's *decisions*.
+///
+/// # Why most of these are `FORBIDDEN` and that is not a lump
+///
+/// `FORBIDDEN` is defined by recovery, not by severity: nothing the caller can do by
+/// editing the request changes the outcome, and what is needed is a *new human decision*.
+/// Every approval-related denial has exactly that recovery — obtain a fresh approval, or
+/// one that actually describes this action — so they share a class honestly. The
+/// distinctions that matter are preserved in `data.reason`, which is a fixed vocabulary
+/// word rather than the previous rendering of this enum into a JSON string.
+///
+/// The four that are *not* `FORBIDDEN` are separated because their recoveries genuinely
+/// differ: `UnknownCapability`, `InvalidParams` and `DataClassExceeded` are fixed by
+/// editing the request; `PolicyUnavailable` and `AuditUnavailable` are outages that
+/// editing anything cannot fix, and reporting them as `FORBIDDEN` would send an operator
+/// to obtain consent for an action the daemon never evaluated.
+///
+/// Note the deliberate overlap with [`orxnud_policy::DenialReason::is_user_actionable`],
+/// which answers a different question -- "whose problem is it" -- and treats
+/// `NoAuthorityRoot` as not the user's to fix. Both can be true of the same reason: an
+/// external actor has no authority (not the user's fault) *and* the recovery is to obtain
+/// authority (`FORBIDDEN`). Recovery is what the class encodes.
+fn denial_failure(d: &orxnud_policy::DenialReason) -> RequestError {
+    use orxnud_policy::DenialReason as D;
+    let reason = denial_reason_word(d);
+    let detail = denial_detail(d);
+    match d {
+        // --- fixed by editing the request ---
+        D::UnknownCapability { .. } | D::InvalidParams { .. } | D::DataClassExceeded { .. } => {
+            RequestError::InvalidInput {
+                reason: reason.to_owned(),
+                detail: Some(detail),
+            }
+        }
+        // --- fixed by waiting for, or repairing, something outside the request ---
+        //
+        // The engine could not reach a decision. Reporting these as `FORBIDDEN` would be
+        // the most damaging kind of lie in this file: the action was never judged, and a
+        // client told it was refused would respond by obtaining consent it does not need.
+        D::PolicyUnavailable { .. } | D::AuditUnavailable { .. } => RequestError::Unavailable {
+            reason: reason.to_owned(),
+            detail: Some(detail),
+        },
+        // --- everything else needs a new human decision ---
+        D::NoAuthorityRoot { .. }
+        | D::ActorMayNotGrant { .. }
+        | D::EgressNotConsented { .. }
+        | D::NoGrant { .. }
+        | D::GrantExpired { .. }
+        | D::ApprovalRequired { .. }
+        | D::ApprovalExpired { .. }
+        | D::ApprovalDigestMismatch
+        | D::ApprovalApproverCannotGrant
+        | D::ApprovalApproverNotAuthorised { .. }
+        | D::ApprovalAlreadyUsed
+        | D::BudgetExceeded { .. } => RequestError::Forbidden {
+            reason: reason.to_owned(),
+            detail: Some(detail),
+        },
+    }
+}
+
+/// The human sentence for a denial, for `data.detail`.
+///
+/// # Why these are written out rather than rendered
+///
+/// `DenialReason`'s `Display` renders its `serde_json` form, which is *structured*, not
+/// readable: `ApprovalDigestMismatch` is a unit variant, so it renders as
+/// `{"reason":"approval-digest-mismatch"}` -- the same word `data.reason` already carries,
+/// wrapped in an object. That was the previous content of `data.detail`, and a client
+/// showing it to a person was showing them JSON.
+///
+/// `data.reason` is the machine field and these are the human ones, so the split is real:
+/// no sentence here is ever parsed, and no word here is ever branched on. The structured
+/// value is still available to anything that needs it, because it is in the audit record.
+fn denial_detail(d: &orxnud_policy::DenialReason) -> String {
+    use orxnud_policy::DenialReason as D;
+    match d {
+        D::NoAuthorityRoot { actor } => {
+            format!("a {actor} actor has no human authority behind it")
+        }
+        D::ActorMayNotGrant { actor } => {
+            format!("only a human may grant authority, and this is a {actor} actor")
+        }
+        D::UnknownCapability { capability } => format!("no such capability: {capability}"),
+        D::InvalidParams { capability, detail } => {
+            format!("{capability} rejected these parameters: {detail}")
+        }
+        D::DataClassExceeded {
+            required,
+            permitted,
+        } => format!("this action is {required:?} data, which exceeds the {permitted:?} permitted"),
+        D::EgressNotConsented { data_class } => {
+            format!("{data_class:?} data may not leave this machine without consent")
+        }
+        D::NoGrant { capability } => format!("there is no grant for {capability}"),
+        D::GrantExpired { capability, .. } => format!("the grant for {capability} has expired"),
+        D::ApprovalRequired { risk } => {
+            format!("this action is {risk:?} risk and needs an explicit approval")
+        }
+        D::ApprovalExpired { .. } => "the approval is outside its validity window".to_owned(),
+        D::ApprovalDigestMismatch => {
+            "the approval does not describe the action being performed".to_owned()
+        }
+        D::ApprovalApproverCannotGrant => {
+            "the approval was signed by something that cannot grant authority".to_owned()
+        }
+        D::ApprovalApproverNotAuthorised { approver, proposer } => {
+            format!("{approver} may not consent to an action proposed by {proposer}")
+        }
+        D::ApprovalAlreadyUsed => "the approval has already been used".to_owned(),
+        D::BudgetExceeded { .. } => "this actor's budget for this action is exhausted".to_owned(),
+        D::PolicyUnavailable { .. } => {
+            "the policy set could not be loaded, so nothing was decided".to_owned()
+        }
+        D::AuditUnavailable { .. } => {
+            "the decision could not be recorded, so nothing was decided".to_owned()
+        }
+    }
+}
+/// The stable wire vocabulary word for a denial.
+///
+/// Lives here rather than being derived from the enum's serde rendering, because
+/// `data.reason` is a contract: a client branches on it, so it has to be a fixed kebab-case
+/// word rather than whatever `serde_json` produces. The human sentence is
+/// `DenialReason`'s own `Display`, which renders the structured value.
+fn denial_reason_word(d: &orxnud_policy::DenialReason) -> &'static str {
+    use orxnud_policy::DenialReason as D;
+    match d {
+        D::NoAuthorityRoot { .. } => "no-authority-root",
+        D::ActorMayNotGrant { .. } => "actor-may-not-grant",
+        D::UnknownCapability { .. } => "unknown-capability",
+        D::InvalidParams { .. } => "invalid-capability-params",
+        D::DataClassExceeded { .. } => "data-class-exceeded",
+        D::EgressNotConsented { .. } => "egress-not-consented",
+        D::NoGrant { .. } => "no-grant",
+        D::GrantExpired { .. } => "grant-expired",
+        D::ApprovalRequired { .. } => "approval-required",
+        D::ApprovalExpired { .. } => "approval-expired",
+        D::ApprovalDigestMismatch => "approval-digest-mismatch",
+        D::ApprovalApproverCannotGrant => "approval-approver-cannot-grant",
+        D::ApprovalApproverNotAuthorised { .. } => "approval-approver-not-authorised",
+        D::ApprovalAlreadyUsed => "approval-already-used",
+        D::BudgetExceeded { .. } => "budget-exceeded",
+        D::PolicyUnavailable { .. } => "policy-unavailable",
+        D::AuditUnavailable { .. } => "audit-unavailable",
+    }
+}
 /// The delegated proposer actor for a task.
 ///
 /// `model` is supplied by the caller and must come from whichever component actually
@@ -1897,9 +2352,14 @@ async fn execute_proposal<S: SecretsContract>(
     let approval_row =
         g.2.engine()
             .approval_for(&proposal.task_id, proposal.step_no, proposal.attempt_no)
-            .map_err(|e| RequestError::Refused {
-                reason: "approval-unreadable".to_owned(),
-                detail: Some(e.to_string()),
+            .map_err(|_e| RequestError::Internal {
+                // Could not read the ledger, so we cannot know whether an approval was
+                // already spent. That is a storage fault and it is fail-closed, but it is
+                // not caller-actionable: retrying reaches the same fault. The cause is
+                // dropped rather than interpolated for the same redaction reason as the
+                // disclosure audit case.
+                fault: InternalFault::StorageUnavailable,
+                detail: Some("the approval ledger could not be read".to_owned()),
             })?
             .ok_or_else(|| RequestError::Forbidden {
                 reason: "approval-required".to_owned(),
@@ -1978,8 +2438,8 @@ async fn execute_proposal<S: SecretsContract>(
     let stored_params: serde_json::Value = match serde_json::from_str(&proposal.params) {
         Ok(v) => v,
         Err(_) => {
-            return Err(RequestError::Refused {
-                reason: "proposal-corrupt".to_owned(),
+            return Err(RequestError::Internal {
+                fault: InternalFault::DurableStateCorrupt,
                 detail: Some("the stored parameters are not readable JSON".to_owned()),
             });
         }
@@ -2018,15 +2478,7 @@ async fn execute_proposal<S: SecretsContract>(
 
     let o = match outcome {
         Ok(o) => o,
-        Err(e) => {
-            // The dispatcher's own message, which is already structured and already
-            // safe to show. `Refused` rather than `Declined` because the detail is the
-            // dispatcher's to word, not a fixed term this layer owns.
-            return Err(RequestError::Refused {
-                reason: e.to_string(),
-                detail: None,
-            });
-        }
+        Err(e) => return Err(dispatch_failure(&e)),
     };
 
     // Completion is gated on the **verifier**, not on the dispatcher having returned.
@@ -2322,8 +2774,8 @@ fn approval_record_from_row(
     proposer: &orxnud_domain::Actor,
     proposal: &orxnud_store::task_repo::ProposalRow,
 ) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
-    let digest = digest_from_hex(&row.digest_hex).ok_or_else(|| RequestError::Refused {
-        reason: "approval-corrupt".to_owned(),
+    let digest = digest_from_hex(&row.digest_hex).ok_or_else(|| RequestError::Internal {
+        fault: InternalFault::DurableStateCorrupt,
         detail: Some("the stored digest is not 64 hex characters".to_owned()),
     })?;
     // The approval must be *for this action*. Cheap pre-check so the refusal names the
@@ -2435,9 +2887,14 @@ async fn approve_proposal<S: SecretsContract>(
             .2
             .engine()
             .approval_for(&proposal.task_id, proposal.step_no, proposal.attempt_no)
-            .map_err(|e| RequestError::Refused {
-                reason: "approval-unreadable".to_owned(),
-                detail: Some(e.to_string()),
+            .map_err(|_e| RequestError::Internal {
+                // Could not read the ledger, so we cannot know whether an approval was
+                // already spent. That is a storage fault and it is fail-closed, but it is
+                // not caller-actionable: retrying reaches the same fault. The cause is
+                // dropped rather than interpolated for the same redaction reason as the
+                // disclosure audit case.
+                fault: InternalFault::StorageUnavailable,
+                detail: Some("the approval ledger could not be read".to_owned()),
             })? {
             // No approval row at all, yet the proposal says approved. The durable state
             // disagrees with itself; refusing is the only answer, and it is recoverable
@@ -3023,14 +3480,18 @@ fn task_fault(fault: TaskFault) -> RequestError {
             // exactly right.
             orxnud_task::TaskCause::InvalidInput => RequestError::Invalid(detail),
             // Durable state that does not add up, or a database that failed. Both are
-            // genuine internal faults: no client action produces a different outcome, and
-            // `INTERNAL_ERROR` is the truthful answer.
-            orxnud_task::TaskCause::Corrupt | orxnud_task::TaskCause::Storage => {
-                RequestError::Refused {
-                    reason: reason.to_owned(),
-                    detail: fault_detail,
-                }
-            }
+            // genuine internal faults -- no client action produces a different outcome --
+            // but they are different faults, and the reason word now says which. V-89
+            // joined them because both landed on one code; that code was right and the
+            // reason vocabulary was coarse.
+            orxnud_task::TaskCause::Corrupt => RequestError::Internal {
+                fault: InternalFault::DurableStateCorrupt,
+                detail: fault_detail,
+            },
+            orxnud_task::TaskCause::Storage => RequestError::Internal {
+                fault: InternalFault::StorageUnavailable,
+                detail: fault_detail,
+            },
         },
     }
 }
@@ -3256,18 +3717,7 @@ async fn dispatch<S: SecretsContract>(
                 "failure": failure,
             }))
         }
-        Err(DispatchError::NoImplementation(_)) => {
-            // The expected answer while the registry is empty. Named distinctly so
-            // a caller can tell "nothing is registered" from "something went wrong".
-            Err(RequestError::Refused {
-                reason: "no-implementation-registered".to_owned(),
-                detail: None,
-            })
-        }
-        Err(e) => Err(RequestError::Refused {
-            reason: e.to_string(),
-            detail: None,
-        }),
+        Err(e) => Err(dispatch_failure(&e)),
     }
 }
 

@@ -515,23 +515,30 @@ fn a_presented_approval_cannot_name_its_own_approver() {
             "the refusal must name the approval: {reply}"
         );
 
-        // BOUNDARY FINDING, recorded rather than fixed. This route answers a *policy*
-        // denial with `-32603 INTERNAL_ERROR`, which contradicts the taxonomy ADR-0050
-        // established — a digest mismatch is caller-fixable and should be `FORBIDDEN`.
-        //
-        // It is pre-existing and unrelated to the identity boundary: `dispatch` has
-        // always mapped `PolicyError` through `RequestError::Refused`, and V-89 fixed
-        // only the task routes. Fixing it here would change error semantics this
-        // milestone is explicitly forbidden to touch, so it is asserted as-is and
-        // filed in the register instead. The security property under test is unaffected:
-        // the forged approver was refused, which is what matters.
+        // The taxonomy is V-90: the forged approver produced an approval-digest mismatch,
+        // and that is a caller-actionable refusal rather than a server fault. Asserted
+        // positively, with the reason word, because a client recovering from this needs to
+        // be able to re-issue a correct approval without reading prose.
         assert_eq!(
             reply["error"]["code"].as_i64(),
-            Some(i64::from(RpcErrorCode::INTERNAL_ERROR.code())),
-            "the pre-existing taxonomy gap on this route changed unexpectedly; update \
-             ADR-0050's boundary note and this assertion together: {reply}"
+            Some(i64::from(RpcErrorCode::FORBIDDEN.code())),
+            "an approval that does not describe the action is a caller-actionable refusal: \
+             {reply}"
         );
-
+        assert_eq!(
+            reply["error"]["data"]["reason"], "approval-digest-mismatch",
+            "the reason must be the stable word a client branches on: {reply}"
+        );
+        // `detail` is the human sentence, not a JSON blob. It used to be the rendered
+        // `DenialReason`, which for a unit variant is `{"reason":"approval-digest-mismatch"}`
+        // -- the machine word again, wrapped in an object, shown to a person.
+        let detail = reply["error"]["data"]["detail"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            detail.contains("approval") && !detail.contains('{'),
+            "detail must be a human sentence, not a rendered structure: {detail:?}"
+        );
         s.stop().await;
         let _ = std::fs::remove_dir_all(&d);
     });

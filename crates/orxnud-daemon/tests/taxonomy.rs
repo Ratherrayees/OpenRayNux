@@ -894,3 +894,429 @@ fn an_approval_race_is_one_winner_and_one_forbidden() {
         let _ = std::fs::remove_dir_all(&d);
     });
 }
+
+// ---------------------------------------------------------------------------
+// V-90: exhaustive coverage of every class
+// ---------------------------------------------------------------------------
+//
+// The tests above establish that the classes exist and are distinct. What follows is the
+// other half of V-90: that each class is reachable *for the reason it exists*, and that
+// the class a refusal lands in follows the recovery rather than the shape of the enum.
+//
+// The property under test throughout is the one ADR-0050 states:
+//
+//   INTERNAL_ERROR is a positive claim: nothing the caller can do changes the outcome.
+//
+// So the `INTERNAL_ERROR` section is not a list of what was not fixed. It is a list of
+// conditions that were checked individually and are genuinely unrecoverable, including a
+// real corrupt-row fixture rather than a hypothetical one.
+
+/// A claimed task with one pending write proposal, so approval and execution are reachable.
+fn task_with_proposal(s: &Serving, id: &str) -> String {
+    send(
+        &s.endpoint,
+        "c",
+        "task/create",
+        json!({"id": id, "content": "x"}),
+    );
+    send(
+        &s.endpoint,
+        "cl",
+        "task/claim",
+        json!({"id": id, "worker": "w1"}),
+    );
+    let p = send(
+        &s.endpoint,
+        "p",
+        "task/propose",
+        json!({
+            "task": id, "worker": "w1", "capability": "filesystem/write-text",
+            "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}}),
+    );
+    p["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned()
+}
+
+fn conn(root: &Path) -> orxnud_store::security_state::SqliteAuditJournal {
+    orxnud_store::security_state::SqliteAuditJournal::open(&root.join("state.db"))
+        .expect("open the store the runtime wrote")
+}
+
+/// Every class V-90 names is reachable for its own reason, over a real socket.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+     Unix domain socket, and the local IPC transport refuses on Windows rather than \
+     binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn each_taxonomy_class_is_reachable_for_its_own_reason() {
+    rt().block_on(async {
+        let d = dir("v90-classes");
+        let s = Serving::start(d.clone()).await;
+
+        // --- INVALID_REQUEST: fixed by editing the request ---
+        let unknown_cap = send(
+            &s.endpoint,
+            "1",
+            "capability/dispatch",
+            json!({"capability": "send-message"}),
+        );
+        assert_eq!(
+            code_of(&unknown_cap),
+            (RpcErrorCode::INVALID_REQUEST.code()),
+            "naming a capability this build does not have is a request edit: {unknown_cap}"
+        );
+        assert_eq!(reason_of(&unknown_cap), "unknown-capability");
+
+        let missing_param = send(&s.endpoint, "2", "task/claim", json!({}));
+        assert_eq!(
+            code_of(&missing_param),
+            (RpcErrorCode::INVALID_REQUEST.code()),
+            "{missing_param}"
+        );
+
+        // --- NOT_FOUND: refresh your view ---
+        let gone = send(
+            &s.endpoint,
+            "3",
+            "task/execute",
+            json!({"proposal": "p-nope", "worker": "w"}),
+        );
+        assert_eq!(
+            code_of(&gone),
+            (RpcErrorCode::RESOURCE_NOT_FOUND.code()),
+            "{gone}"
+        );
+        assert_eq!(reason_of(&gone), "proposal-not-found");
+
+        // --- CONFLICT: re-read the state and decide again ---
+        let pid = task_with_proposal(&s, "v90c");
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let decided = send(
+            &s.endpoint,
+            "a2",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        assert_eq!(
+            code_of(&decided),
+            (RpcErrorCode::FORBIDDEN.code()),
+            "a decided proposal is an authority question, not a state one: {decided}"
+        );
+        let claimed = send(
+            &s.endpoint,
+            "5",
+            "task/claim",
+            json!({"id": "v90c", "worker": "w2"}),
+        );
+        assert_eq!(
+            code_of(&claimed),
+            (RpcErrorCode::CONFLICT.code()),
+            "a lost claim race is a conflict: {claimed}"
+        );
+
+        // --- FORBIDDEN: obtain a new human decision ---
+        let pid2 = task_with_proposal(&s, "v90f");
+        let no_approval = send(
+            &s.endpoint,
+            "6",
+            "task/execute",
+            json!({"proposal": pid2, "worker": "w1"}),
+        );
+        assert_ne!(
+            code_of(&no_approval),
+            (RpcErrorCode::INTERNAL_ERROR.code()),
+            "an unapproved proposal is not a server fault: {no_approval}"
+        );
+        let expired = send(
+            &s.endpoint,
+            "7",
+            "capability/approve",
+            json!({"proposal": task_with_proposal(&s, "v90e"), "ttl_ms": 0}),
+        );
+        assert_eq!(
+            code_of(&expired),
+            (RpcErrorCode::FORBIDDEN.code()),
+            "{expired}"
+        );
+        assert_eq!(reason_of(&expired), "approval-expired");
+
+        // --- ENVIRONMENT_UNAVAILABLE: fix configuration or wait ---
+        let providerless = Serving::start_providerless(dir("v90prov")).await;
+        send(
+            &providerless.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "vp", "content": "x"}),
+        );
+        send(
+            &providerless.endpoint,
+            "cl",
+            "task/claim",
+            json!({"id": "vp", "worker": "w1"}),
+        );
+        let no_provider = send(
+            &providerless.endpoint,
+            "8",
+            "task/ai-propose",
+            json!({"task": "vp", "worker": "w1"}),
+        );
+        assert_eq!(
+            code_of(&no_provider),
+            (RpcErrorCode::ENVIRONMENT_UNAVAILABLE.code()),
+            "an unconfigured provider is an environment fact, not a daemon fault: {no_provider}"
+        );
+        assert_eq!(reason_of(&no_provider), "provider-not-configured");
+        providerless.stop().await;
+
+        // A host that cannot isolate is the same class, and this test asserts whichever
+        // outcome the host can honestly produce. On a CI runner it is the *refusal* that
+        // matters; the point is that it is ENVIRONMENT_UNAVAILABLE and never a fault.
+        let pid3 = task_with_proposal(&s, "v90s");
+        send(
+            &s.endpoint,
+            "9",
+            "capability/approve",
+            json!({"proposal": pid3, "ttl_ms": 60_000}),
+        );
+        let executed = send(
+            &s.endpoint,
+            "10",
+            "task/execute",
+            json!({"proposal": pid3, "worker": "w1"}),
+        );
+        let status = send(&s.endpoint, "11", "daemon/status", json!({}));
+        if status["result"]["sandbox"]["tier1_executable"].as_bool() == Some(true) {
+            assert!(executed.get("result").is_some(), "{executed}");
+        } else {
+            assert_eq!(
+                code_of(&executed),
+                (RpcErrorCode::ENVIRONMENT_UNAVAILABLE.code()),
+                "a host that cannot establish sandbox guarantees is an environment fact: \
+                 {executed}"
+            );
+            assert_eq!(reason_of(&executed), "sandbox-unavailable");
+        }
+
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// A genuinely corrupt durable row is `INTERNAL_ERROR`, and says which kind of fault.
+///
+/// This is the section that matters most, because the mission's property is not "no
+/// `INTERNAL_ERROR`" — it is that **every** `INTERNAL_ERROR` is intentional and
+/// unrecoverable by caller action. The only way to show that is to create one on purpose
+/// and check that it is still reported as a fault rather than quietly reclassified into
+/// something a client would retry.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+     Unix domain socket, and the local IPC transport refuses on Windows rather than \
+     binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_genuine_internal_fault_is_still_an_internal_error() {
+    rt().block_on(async {
+        let d = dir("v90-internal");
+        let s = Serving::start(d.clone()).await;
+        let pid = task_with_proposal(&s, "v90i");
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        s.stop().await;
+
+        // Corrupt the durable parameters behind the daemon's back, in **both** the proposal
+        // and the approval row. Both, because corrupting only the proposal is caught
+        // earlier by the action-mismatch pre-check, which would mask the guard.
+        let db = conn(&d);
+        db.conn()
+            .execute("UPDATE task_proposals SET params = '{not json';", [])
+            .expect("corrupt the proposal params");
+        db.conn()
+            .execute("UPDATE task_approvals SET params = '{not json';", [])
+            .expect("corrupt the approval params");
+        drop(db);
+
+        let s = Serving::start(d.clone()).await;
+        let out = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+
+        // A corrupt row is not caller-fixable: no request produces a different outcome, and
+        // reporting it as anything but a fault would send an operator to debug their client.
+        assert_eq!(
+            code_of(&out),
+            (RpcErrorCode::INTERNAL_ERROR.code()),
+            "corrupt durable state is unrecoverable by caller action: {out}"
+        );
+        assert_eq!(
+            reason_of(&out),
+            "durable-state-corrupt",
+            "the reason must name the fault rather than say 'internal': {out}"
+        );
+
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// The two known V-90 routes, pinned individually so neither can regress.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+     Unix domain socket, and the local IPC transport refuses on Windows rather than \
+     binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn the_two_known_v90_routes_are_no_longer_internal_errors() {
+    rt().block_on(async {
+        let d = dir("v90-routes");
+
+        // Route 1: `capability/dispatch` with an approval that does not describe the action.
+        let s = Serving::start(d.clone()).await;
+        let pid = task_with_proposal(&s, "r1");
+        let approved = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let approval = approved["result"]["approval"].clone();
+        let mut forged = approval.as_object().expect("object").clone();
+        // Same digest, but the *approver* is claimed differently. The approver is not read
+        // from the client, so the recomputed digest cannot match.
+        forged.insert(
+            "approver".to_owned(),
+            json!({"kind": "human", "user": "attacker"}),
+        );
+        let mismatch = send(
+            &s.endpoint,
+            "d",
+            "capability/dispatch",
+            json!({
+                "capability": "filesystem/write-text", "target": "out.txt",
+                "params": {"path": "out.txt", "contents": "x"},
+                "approval": Value::Object(forged),
+            }),
+        );
+        assert_eq!(
+            code_of(&mismatch),
+            (RpcErrorCode::FORBIDDEN.code()),
+            "an approval that does not describe the action is caller-actionable: {mismatch}"
+        );
+        assert_eq!(reason_of(&mismatch), "approval-digest-mismatch");
+        s.stop().await;
+
+        // Route 2: `task/execute` on a host that cannot establish sandbox guarantees.
+        // Asserted only where the host cannot isolate, because on a capable host this path
+        // succeeds and there is nothing to classify. `PATH` shadowing is how the negative
+        // state is reached on a machine that otherwise could.
+        let s = Serving::start(d.clone()).await;
+        let pid = task_with_proposal(&s, "r2");
+        send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        let status = send(&s.endpoint, "st", "daemon/status", json!({}));
+        if status["result"]["sandbox"]["tier1_executable"].as_bool() != Some(true) {
+            let out = send(
+                &s.endpoint,
+                "x",
+                "task/execute",
+                json!({"proposal": pid, "worker": "w1"}),
+            );
+            assert_eq!(
+                code_of(&out),
+                (RpcErrorCode::ENVIRONMENT_UNAVAILABLE.code()),
+                "{out}"
+            );
+            assert_eq!(reason_of(&out), "sandbox-unavailable");
+        }
+        s.stop().await;
+
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// No refusal on any reachable route carries prose in the machine-readable field.
+///
+/// `data.reason` is the field a client branches on. A reason containing a space, a brace or
+/// a quote is a rendering that leaked into it, which is what V-90's `e.to_string()` calls
+/// did: every dispatch failure put an English sentence where a word belonged.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+     Unix domain socket, and the local IPC transport refuses on Windows rather than \
+     binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn no_reachable_refusal_puts_prose_in_the_reason_field() {
+    rt().block_on(async {
+        let d = dir("v90-prose");
+        let s = Serving::start(d.clone()).await;
+        let pid = task_with_proposal(&s, "prose");
+        send(&s.endpoint, "a", "capability/approve", json!({"proposal": pid, "ttl_ms": 60_000}));
+
+        let mut refusals = vec![
+            send(&s.endpoint, "1", "capability/dispatch", json!({"capability": "send-message"})),
+            send(&s.endpoint, "2", "task/claim", json!({})),
+            send(&s.endpoint, "3", "task/execute", json!({"proposal": "p-nope", "worker": "w"})),
+            send(&s.endpoint, "4", "task/claim", json!({"id": "prose", "worker": "w2"})),
+            send(&s.endpoint, "5", "capability/approve", json!({"proposal": pid, "ttl_ms": 0})),
+            send(&s.endpoint, "6", "task/nonexistent", json!({})),
+        ];
+        let raw = send_raw(&s.endpoint, b"{\"jsonrpc\": \"2.0\", ").expect("a reply");
+        refusals.push(raw);
+        if let Some(v) = send_raw(
+            &s.endpoint,
+            br#"{"jsonrpc":"2.0","id":"8","method":"daemon/version","params":{"actor":{"kind":"human"}}}"#,
+        ) {
+            refusals.push(v);
+        }
+
+        let mut checked = 0;
+        for reply in &refusals {
+            if reply.get("error").is_none() {
+                continue;
+            }
+            checked += 1;
+            let reason = reply["error"]["data"]["reason"].as_str();
+            if let Some(r) = reason {
+                assert!(
+                    !r.contains(' ') && !r.contains('{') && !r.contains('"') && !r.is_empty(),
+                    "data.reason must be a stable word, got {r:?} in {reply}"
+                );
+            }
+            // A detail, where present, is prose by design -- and must never be a rendered
+            // structure, which is what `DenialReason`'s serde form used to be.
+            if let Some(detail) = reply["error"]["data"]["detail"].as_str() {
+                assert!(
+                    !detail.contains("{\"reason\""),
+                    "data.detail must be a human sentence, not a rendered enum: {detail:?}"
+                );
+            }
+        }
+        assert!(checked >= 4, "the sweep must reach several refusals, saw {checked}");
+
+        s.stop().await;
+        let _ = std::fs::remove_dir_all(&d);
+    });
+}

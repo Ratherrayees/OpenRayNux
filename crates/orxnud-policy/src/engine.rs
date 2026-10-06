@@ -650,11 +650,16 @@ impl PolicyEngine {
             now_ms,
         )?;
         if decision.is_denied() {
+            // `is_denied` is `matches!(self, Self::Deny { .. })`, so a denial always
+            // carries its reason and there is no branch here that could invent one. The
+            // `expect` records that as an invariant rather than papering over it with a
+            // prose string: the old fallback wrote "refused without a stated reason"
+            // into what downstream layers would then have had to *parse*.
             return Err(PolicyError::Denied {
-                reason: decision.denial().map_or_else(
-                    || "refused without a stated reason".to_owned(),
-                    ToString::to_string,
-                ),
+                reason: decision
+                    .denial()
+                    .expect("a denied decision always carries a reason")
+                    .clone(),
             });
         }
         // `authorise` consumed `request`, `actor` and `context` and returned only a
