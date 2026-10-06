@@ -797,7 +797,11 @@ fn task_management_is_not_a_capability_invocation() {
             );
         }
 
-        // The governed path is unchanged: still refuses, still for its own reason.
+        // The governed path is unchanged: still refuses, still for its own reason, and
+        // still the policy engine's refusal rather than a task-layer shortcut. Under the
+        // V-90 vocabulary that means `reason` is policy's stable word and `detail` names
+        // the capability -- previously one English sentence sat in `reason` and a client
+        // had to substring-match it to learn anything.
         let dispatched = send(
             &s.endpoint,
             "4",
@@ -807,9 +811,16 @@ fn task_management_is_not_a_capability_invocation() {
         let reason = dispatched["error"]["data"]["reason"]
             .as_str()
             .unwrap_or_default();
+        let detail = dispatched["error"]["data"]["detail"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            reason, "unknown-capability",
+            "the governed refusal must still come from policy: {dispatched}"
+        );
         assert!(
-            reason.contains("policy") && reason.contains("send-message"),
-            "the governed refusal must still come from policy: {reason}"
+            detail.contains("send-message"),
+            "the detail must name the capability: {detail}"
         );
         s.stop().await;
     });
@@ -1994,8 +2005,11 @@ fn unreadable_stored_parameters_are_refused_rather_than_defaulted() {
             "task/execute",
             json!({"proposal": pid, "worker": "w1"}),
         );
+        // `durable-state-corrupt` is the one word for "a stored row does not parse",
+        // shared with `approval-corrupt` so an operator sees one class; which row was
+        // corrupt is in the detail. V-90 unified these because both are the same fault.
         let reason = out["error"]["data"]["reason"].as_str().unwrap_or_default();
-        assert_eq!(reason, "proposal-corrupt", "{out}");
+        assert_eq!(reason, "durable-state-corrupt", "{out}");
         assert!(
             !workspace(&d).join("c.txt").exists(),
             "unreadable durable parameters must produce no side effect at all"

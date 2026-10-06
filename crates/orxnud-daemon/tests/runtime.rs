@@ -330,18 +330,31 @@ fn a_governed_dispatch_reaches_policy_and_is_refused_there() {
                 .expect("encode"),
             )
             .expect("a response");
-            // The request reached the governed path: the refusal is policy's, and it
-            // names the capability policy could not find. A shortcut that bypassed
-            // policy could not produce this reason.
+            // The request reached the governed path: the refusal is policy's own
+            // `UnknownCapability` denial. A shortcut that bypassed policy could not
+            // produce this reason, which is what the test is for.
+            //
+            // `data.reason` is the stable vocabulary word and `data.detail` names the
+            // capability. This used to be the reverse -- one English sentence in `reason`
+            // that a client had to substring-match -- and `INTERNAL_ERROR` as the code,
+            // which told the reader their daemon was broken because they named a capability
+            // it does not have. Naming an unknown capability is fixed by editing the
+            // request, so it is `INVALID_REQUEST` (V-90).
             let reason = reply["error"]["data"]["reason"]
                 .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            assert!(
-                reason.contains("policy") && reason.contains("send-message"),
-                "the refusal must come from the governed path: {reason}"
+                .unwrap_or_default();
+            let detail = reply["error"]["data"]["detail"]
+                .as_str()
+                .unwrap_or_default();
+            assert_eq!(
+                reason, "unknown-capability",
+                "the refusal must be policy's own denial reason"
             );
-            assert_eq!(reply["error"]["code"], RpcErrorCode::INTERNAL_ERROR.code());
+            assert!(
+                detail.contains("send-message"),
+                "the detail must name the capability policy could not find: {detail}"
+            );
+            assert_eq!(reply["error"]["code"], RpcErrorCode::INVALID_REQUEST.code());
         })
         .await
     });

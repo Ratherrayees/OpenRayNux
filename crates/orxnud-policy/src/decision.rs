@@ -295,11 +295,18 @@ pub enum PolicyError {
     /// A distinct variant rather than reusing `Unavailable` or `InvalidSchema`,
     /// because "we decided no" and "we could not decide" must never be logged the
     /// same way. Both deny; only one of them is a bug or an outage.
+    ///
+    /// Carries a typed [`DenialReason`], not a rendered string.
+    ///
+    /// This was `reason: String`, built by `ToString` at the point of refusal, and that
+    /// was a string-shaped machine semantic: every layer above had to either parse that
+    /// text to classify the refusal or give up and call it an internal fault, and the
+    /// second of those is what V-90 records. Holding the enum means the daemon can
+    /// classify by variant, exhaustively, and compile-fails if a new reason appears.
     #[error("policy denied the invocation: {reason}")]
     Denied {
-        /// Why, as the enum's serde representation: structured, so a refusal is
-        /// auditable rather than a flat string.
-        reason: String,
+        /// Why, as the structured enum rather than its rendering.
+        reason: DenialReason,
     },
 }
 
