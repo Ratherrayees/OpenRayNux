@@ -41,6 +41,26 @@ on the world must confirm the world changed as intended, or report that it did
 not. Verification is not a detail of execution; it is a stage with its own
 records.
 
+**Change 2a — and an unverified effect is a state, not a delay (ADR-0053,
+V-92).** Verification can come back three ways, and the third is not a variant of
+the second:
+
+| what the verifier establishes | non-idempotent capability |
+|---|---|
+| the effect is present as described | normal completion, the step advances |
+| the effect is **provably not** as described | `Failed`, retryable — proven absent |
+| **nobody can say** | **`NeedsVerification`**, terminal, awaiting a human |
+
+The third is the dangerous one, and it used to be handled by doing nothing at
+all: the task stayed `running` under its lease, which meant the next lease
+recovery returned it to `pending`, where `claim` found it, and the same
+non-idempotent action could be proposed, approved and executed again. The
+ambiguity was resolved by a restart rather than by anything durable.
+
+Idempotency is read from the capability's **declaration**, never inferred and
+never defaulted optimistically. An unrecognised capability is treated as
+non-idempotent, because that is the direction which cannot duplicate an effect.
+
 **Change 3 — Identity/Actor and State are elevated to first-class concepts.**
 The brief listed Intent · Task · Policy · Capability · Audit. That is missing two
 things the product cannot work without:

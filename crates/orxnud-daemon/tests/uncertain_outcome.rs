@@ -234,10 +234,20 @@ fn an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped() {
         "task/execute",
         json!({"proposal": pid, "worker": "w1"}),
     );
+    // The precondition, stated before the assertion that depends on it. These tests drive
+    // a real sandbox, and a sandbox that fails to start produces a *refusal*, not an
+    // uncertain outcome -- so without this the failure would read as "the outcome was not
+    // uncertain", pointing at the thing under test rather than at the environment.
+    assert!(
+        x.get("result").is_some(),
+        "the execution was refused rather than attempted, so there is no outcome to be \
+         uncertain about -- most likely a sandbox that could not start under load: {x}"
+    );
     let result = &x["result"];
     assert_eq!(
         result["undetermined"], true,
-        "the outcome was not uncertain: {x}"
+        "the outcome was not uncertain. `verified` here means the write landed despite an \
+         unwritable workspace; `refuted` means the verifier disproved it: {x}"
     );
     assert_eq!(result["verified"], false, "{x}");
 

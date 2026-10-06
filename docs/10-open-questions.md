@@ -425,14 +425,44 @@ a message sent) leaves us unable to know whether the effect occurred. S7 says
 mark it `needs_verification` and require human confirmation. But how does the
 system *present* that to a user who may not remember the context?
 
+> **Reconciled 2026-10-06 — SPLIT. The backend half is closed by V-92; the
+> user-facing half remains open.** The reconciliation above said `NeedsVerification`
+> "exists and is reachable". **It existed and was not reachable** — no production
+> path produced it. Every handler instead left an uncertain task `running` under
+> its lease, which meant the next recovery pass returned it to `pending`, where
+> `claim` found it, and the same non-idempotent action could be proposed,
+> approved and executed again. The daemon was saying *"we don't know whether it
+> happened, so we tried again"* — with no human involved, at the next process
+> start.
+>
+> **Closed by V-92 (backend):** an uncertain effect on a non-idempotent capability
+> now becomes `NeedsVerification`, durably. Terminal, not claimable, not touched
+> by recovery, lease released, reason persisted, and it survives restart. A
+> disproved effect and an idempotent capability take the ordinary retry path.
+> Nothing about the three choices is implied by the state, and nothing guesses.
+>
+> **Still open (this question):** how a user is *shown* it and what the three
+> choices do. The state exists; the affordance does not.
+
 **Interim position.** The task record shows the exact action that may have
 succeeded, with the target, parameters, and timestamp, and offers three explicit
 choices: *assume it succeeded and continue* · *retry* · *verify externally first*.
 It never guesses.
 
 **What settles it.** Designing the failure UX, and possibly a per-capability
-"probe" operation (e.g. "did this application get submitted?"). **Owner:**
-implementer, Phase 3.
+"probe" operation (e.g. "did this application get submitted?"). Two constraints
+are now settled by V-92 and constrain that design:
+
+* **"Assume it succeeded" must not be recorded as verification.** A human
+  adjudicating an uncertainty and a verifier establishing a fact are different
+  events, and conflating them would write a false `verified = true` into the audit
+  chain. The adjudication needs its own typed representation; the state machine
+  deliberately leaves that space free.
+* **"Retry" must not reuse the old approval.** V-82's expiry/replacement rules
+  and TP-6 apply unchanged, and an adjudication that authorises a retry has to go
+  through the ordinary approval path rather than reviving the spent one.
+
+**Owner:** implementer, Phase 3.
 
 ---
 
