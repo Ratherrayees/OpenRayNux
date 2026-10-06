@@ -3030,6 +3030,91 @@ mod tests {
         assert_eq!(p.model_id(), "scripted/none");
     }
 
+    /// The two mappings a socket test cannot reach, pinned where they are decided.
+    ///
+    /// Both are correct and both are unreachable over the wire, which is exactly why they
+    /// need a test: nothing else in the suite can observe them, so reverting either would
+    /// be invisible until the day a call site that reaches them was added.
+    ///
+    /// * `Stopped` requires a request to arrive while the task subsystem is shutting down.
+    ///   Asserting it through a real daemon would mean racing the shutdown signal, which is
+    ///   a flaky test rather than a strong one. It matters because the old code reported a
+    ///   stopping daemon as `INTERNAL_ERROR`, telling the reader their daemon was broken
+    ///   during a restart they had asked for.
+    /// * `TaskCause::NotFound` is currently unreachable, measured: the whole workspace suite
+    ///   reaches it zero times, because every route that could hand the engine a missing id
+    ///   checks existence first and answers `RESOURCE_NOT_FOUND` directly. It is kept because
+    ///   the match is exhaustive by design -- there is no fallback arm -- so a future call
+    ///   site cannot silently acquire the old behaviour, and this test is what says the
+    ///   mapping is intentional rather than leftover.
+    #[test]
+    fn the_mappings_a_socket_cannot_reach_are_still_pinned() {
+        assert_eq!(
+            task_fault(TaskFault::Stopped).to_rpc().code,
+            RpcErrorCode::ENVIRONMENT_UNAVAILABLE,
+            "a stopping daemon is an environment fact, not a fault"
+        );
+        assert_eq!(
+            task_fault(TaskFault::Engine {
+                cause: orxnud_task::TaskCause::NotFound,
+                detail: "no such task".to_owned(),
+            })
+            .to_rpc()
+            .code,
+            RpcErrorCode::RESOURCE_NOT_FOUND,
+        );
+    }
+
+    /// Every cause the store can produce maps to the class a caller can act on.
+    ///
+    /// Enumerated rather than sampled, because the mapping is a table and a table is only as
+    /// good as its coverage. `Corrupt` and `Storage` are the two that must *stay* faults:
+    /// those are the ones where nothing the caller did could change the outcome, which is
+    /// the entire meaning of `INTERNAL_ERROR`.
+    #[test]
+    fn every_cause_maps_to_its_class_and_only_storage_is_internal() {
+        let cases = [
+            (
+                orxnud_task::TaskCause::NotFound,
+                RpcErrorCode::RESOURCE_NOT_FOUND,
+            ),
+            (
+                orxnud_task::TaskCause::AlreadyExists,
+                RpcErrorCode::CONFLICT,
+            ),
+            (orxnud_task::TaskCause::Conflict, RpcErrorCode::CONFLICT),
+            (orxnud_task::TaskCause::Forbidden, RpcErrorCode::FORBIDDEN),
+            (
+                orxnud_task::TaskCause::Unavailable,
+                RpcErrorCode::ENVIRONMENT_UNAVAILABLE,
+            ),
+            (
+                orxnud_task::TaskCause::InvalidInput,
+                RpcErrorCode::INVALID_REQUEST,
+            ),
+            (
+                orxnud_task::TaskCause::Corrupt,
+                RpcErrorCode::INTERNAL_ERROR,
+            ),
+            (
+                orxnud_task::TaskCause::Storage,
+                RpcErrorCode::INTERNAL_ERROR,
+            ),
+        ];
+        for (cause, expected) in cases {
+            assert_eq!(
+                task_fault(TaskFault::Engine {
+                    cause,
+                    detail: "detail".to_owned(),
+                })
+                .to_rpc()
+                .code,
+                expected,
+                "the cause maps to the wrong class"
+            );
+        }
+    }
+
     /// Every condition that must stop a read's content becoming an observation.
     ///
     /// Driven directly rather than through a socket, because the conditions are *about the
