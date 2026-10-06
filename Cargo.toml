@@ -120,6 +120,20 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 
+# Measurement-only profile, used by `scripts/measure-v25.sh` to report the
+# unstripped size alongside the shipped one. It exists because `release` sets
+# `strip = "symbols"`, so the shipped binary carries no symbol table and the
+# unstripped figure cannot be recovered from it after the fact.
+#
+# It is NOT a production profile: nothing ships with it, and it is deliberately
+# named so no one mistakes it for one. `inherits = "release"` means the two can
+# never drift on optimization, LTO or codegen-units -- the only difference is
+# that symbols and debug info are kept.
+[profile.v25-unstripped]
+inherits = "release"
+strip = "none"
+debug = 1
+
 [profile.test]
 # Keep test builds fast; durability tests do their own fsync accounting.
 opt-level = 1
