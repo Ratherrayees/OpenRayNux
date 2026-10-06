@@ -118,16 +118,19 @@ jobs:
 
       - name: Report the V-25 baseline
         if: always()
+        # Single-quoted: a backtick fence inside double quotes is command substitution in
+        # bash, and an odd number of them is a syntax error rather than a fence. The first
+        # version of this step failed the whole job on exactly that.
         run: |
           {
-            echo "### V-25 resource baseline (informational)"
-            echo ""
-            echo "Hosted runners are slower than the reference machine docs-05 names, so"
-            echo "these are reported and compared, never gated. See the job summary above."
-            echo ""
+            echo '### V-25 resource baseline (informational)'
+            echo ''
+            echo 'Hosted runners are slower than the reference machine docs-05 names, so'
+            echo 'these are reported and compared, never gated.'
+            echo ''
             echo '```'
-            echo "commit: ${{ github.sha }}"
-            echo "```"
+            echo 'commit: ${{ github.sha }}'
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build documentation
