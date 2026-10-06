@@ -4613,3 +4613,87 @@ V-89 fixed only the task routes — so it was asserted as-is and filed as V-90 r
 fixed inside a milestone forbidden to change error semantics. **V-90 is now closed**, by a
 dedicated milestone; see the amendment to [ADR-0050](#adr-0050) below for the full survey
 and the classification it produced.
+
+<a id="adr-0052"></a>
+
+## ADR-0052 — Two decisions the V-25 measurement had to make explicitly
+
+**Status.** **Decided and implemented.** Closes V-25.
+
+**Context.** V-25 stated three budgets (idle RSS < 60 MB, binary < 40 MB, cold start
+< 150 ms) with no benchmark behind them. Closing it required a harness, and building that
+harness surfaced two questions that the documents answered only by omission. Both had
+defensible-looking default answers, and one default would have made the result false.
+
+**Decision 1 — cold start is measured to an *answered request*, not to `exec`.**
+
+`Runtime::start` opens durable security state, verifies the audit chain, opens and recovers
+the task database, and only then binds the endpoint. Timing from process spawn to `exec`
+returning would report the cost of the runtime's work and silently drop the cost of starting
+the program — and against a 150 ms budget that is most of the quantity being budgeted.
+
+So the harness polls `daemon/version` over the real socket and stops the timer at the reply.
+That is also the boundary a client experiences: the first instant at which the daemon is
+useful is the first instant at which it answers.
+
+The alternative — an "endpoint file exists" probe — was rejected because it stops before the
+accept loop is serving. A socket that exists can be bound by a daemon that has not yet
+finished initialising, and measuring that would move the boundary earlier without making it
+more real.
+
+**Decision 2 — the 40 MB budget applies to the *stripped* binary, and that is a decision.**
+
+The release profile sets `strip = "symbols"`. The shipped binary is **7,492,472 B
+(7.15 MiB)**; the unstripped build of the same source is **51,183,016 B (48.8 MiB)**, which
+would **fail** the 40 MB budget.
+
+Both numbers are honest measurements of real artefacts. Only one is the shipped artefact.
+Recording the stripped figure as *the* figure without saying so would have left a future
+engineer comparing against 48.8 MiB and concluding the budget was missed; recording 48.8
+would have implied a regression that does not exist. So the choice is stated in the budget,
+in the register and in the harness's own output.
+
+A measurement-only cargo profile (`v25-unstripped`) exists so the comparison figure can be
+reproduced. It `inherits = "release"`, so it cannot drift on optimisation, LTO or codegen
+units — the only difference is that symbols are kept — and nothing ships with it.
+
+**Decision 3 — the measurement is reported in CI, not gated on it.**
+
+Measured variance: binary size is exact (it is a file size), cold start ~0.2%, idle RSS ~1%,
+IPC p50 ~17%. Gating a metric whose natural spread is 17% would produce a red build
+periodically for no reason, and a gate that cries wolf is worse than no gate — the same
+argument docs-08 makes about checks that cannot fail, in the other direction.
+
+So: binary size and the six static dependency-graph checks are **blocking**, because they are
+exactly reproducible. Cold start and RSS are **reported**, with the harness's own assertions
+set at 10× bounds so an order-of-magnitude regression still fails loudly. IPC latency is
+**reported only**, on the evidence that its noise exceeds the quantity anyone would want to
+gate on.
+
+**What this record does not do.** It does not claim the budgets are met. It records what was
+measured, on one host, with its limitations stated: 16 cores and NVMe rather than the 2c/4 GiB
+baseline §2 specifies, and page-cache-warm throughout because `drop_caches` needs privileges
+this environment does not have. Both are the favourable direction and both are named.
+
+**Evidence.** `scripts/measure-v25.sh`, `crates/orxnud-daemon/tests/v25_measure.rs` (7
+measurements), `crates/orxnud-daemon/tests/v25_architecture.rs` (6 static checks), and
+docs-05 §1a, which holds the full table with sample counts.
+
+**A finding worth more than the numbers.** The measurement work surfaced a defect in
+neighbouring evidence: `orxnud-task`'s conformance harness keyed TP-7's scratch directory by
+`{pid}-{tag}` with a fixed tag, and `cargo test` runs a binary's tests as parallel threads of
+one process. Three tests that each run the suite therefore deleted each other's database, and
+the conformance report printed `TP-7 power loss cannot corrupt task state: VIOLATED`. A
+conformance report claiming NON-CONFORMING for a race in its own harness is worse than no
+report, and it appeared only once added parallel load made the window reliable. Fixed by
+per-call isolation, with the old assertion — "the same tag must yield the same path" — which
+was the bug written down as an expectation, now asserting the opposite.
+
+**Revisit conditions.**
+
+* Revisit if a 2-core / 4 GiB host becomes available and does not meet the budgets. That is
+  the one unverified column and it is the honest gap in this record.
+* Revisit if `strip` is removed from the release profile: the budget comparison changes, and
+  Decision 2 with it.
+* Revisit if IPC latency becomes materially less noisy — a keep-alive transport would remove
+  one connection per request from the measurement — at which point it becomes gateable.
