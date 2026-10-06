@@ -4288,8 +4288,16 @@ refusal path with a real file behind it.
 
 **Evidence.** `crates/orxnud-daemon/tests/taxonomy.rs` — 10 tests driven through a real daemon
 over a real socket, covering each class, the reason-word shape, redaction, a claim race and an
-approval race. Each defect above was reproduced against the real store before any edit, and the
-table below is the before/after.
+approval race — plus three unit tests in `runtime.rs` pinning the mappings a socket cannot reach.
+Each defect above was reproduced against the real store before any edit, and the table below is
+the before/after.
+
+**What mutation checking could and could not confirm.** Eleven of thirteen mutations fail at
+least one test. The two that do not are `TaskRepoError::{NotFound, NoSuchProposal}` and
+`AlreadyExists` reaching `TaskCause`, which an instrumented `From` measured as **zero
+occurrences across the whole workspace suite** -- every route that could observe them checks
+existence first and answers directly. They are kept because a `From` impl should be total; the
+honest statement is that they are currently unobservable, not that they are verified.
 
 | refusal | before | after | reason |
 |---|---|---|---|
