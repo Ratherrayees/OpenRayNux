@@ -1,16 +1,19 @@
 # 05 — Resource & Performance Model
 
-Status: **Draft v0.2** · **All targets are budgets to be measured, not claims.**
-Reconciled **2026-10-05**.
+Status: **Draft v0.3** · **The V-25 budgets are now measured; see §1a.**
 
 **Correction to three claims of enforcement in this document.** All three said "measured in
-CI" or "CI enforcement". None is true. There is no feature-combination matrix in
-`ci-gates.sh` or in `.github/workflows/ci.yml`, no committed RSS or binary-size baseline,
-and no gate that measures either. The underlying budgets are **unmeasured**, which V-25's
-own row already states. The claims are corrected here rather than softened, because a
-documented enforcement that does not exist is worse than an admitted gap — it is the
-failure V-79 records.
-Nothing in this document asserts a performance figure we have not observed.
+CI" or "CI enforcement". None was true at the time. There is no feature-combination matrix
+in `ci-gates.sh` or in `.github/workflows/ci.yml`, no committed RSS or binary-size
+baseline, and no gate that measures either. The claims are corrected here rather than
+softened, because a documented enforcement that does not exist is worse than an admitted
+gap — it is the failure V-79 records.
+
+**What has changed, and what has not.** A measurement harness now exists
+(`crates/orxnud-daemon/tests/v25_measure.rs`, driven by `scripts/measure-v25.sh`) and the
+three V-25 budgets have measured results — §1a. The **feature-combination matrix still does
+not exist**, so "all features enabled" rows in §2 remain design intent and are labelled as
+such. Nothing in this document asserts a performance figure we have not observed.
 
 ---
 
@@ -38,13 +41,170 @@ opt-in.
 
 ---
 
+## 1a. Measured baseline (V-25)
+
+Every figure below was produced by `scripts/measure-v25.sh` on the commit named, in the
+`release` profile. **Re-run it rather than trusting this table**; it is a record of one
+commit on one host, and §1a.4 says what that does and does not establish.
+
+### 1a.1 What "core-only" means
+
+The `orxnud` binary, started **with no provider**, serving on its local socket. That is
+daemon + local IPC + SQLite task engine + policy + audit + identity boundary + core task
+lifecycle, and no provider client, no model, no GUI/TUI/MCP/voice.
+
+`--provider-scripted` is deliberately **not** used. It would add a proposer to the measured
+process for a cost no core-only user pays, and "is a provider resident" is a separate
+question from "what does the core daemon cost".
+
+**The provider TLS stack is linked in regardless** (`ring` + `rustls`, unconditionally, per
+ADR-0040), and it is not a contradiction: those pages are demand-paged, so a daemon with no
+provider configured never faults them in. They cost **binary size** and no idle RSS.
+Measured below.
+
+### 1a.2 Build profile and host
+
+| | |
+|---|---|
+| profile | `release` — `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"` |
+| rustc / cargo | 1.98.1 (48a229cea 2026-09-01) |
+| target | x86_64-unknown-linux-gnu, `Linux 7.2.8-200.fc44` |
+| CPU | Intel Core i5-12500H, 16 logical cores |
+| RAM | 15.3 GiB |
+| storage | **btrfs on LUKS-encrypted NVMe** — a pessimistic choice, deliberately |
+| SQLite | bundled (`bundled` feature), never the host library |
+| measurement dir | `target/tmp`, beside the build output, **verified not memory-backed** |
+
+The last row is load-bearing and inherited from `orxnud-task`'s measurements: `/tmp` is
+tmpfs, a tmpfs `fsync` is a no-op, and a durability figure taken there would report
+`synchronous = FULL` as free. `assert_on_a_real_filesystem` refuses to report otherwise.
+
+### 1a.3 The three budgets
+
+| budget | target | measured | verdict |
+|---|---|---|---|
+| **Core binary, stripped** | < 40 MB | **7.49 MB** (7,492,472 B = 7.15 MiB) | **PASS** — 18.7% used |
+| **Idle RSS** | < 60 MB | **9.11 MiB** (9,328 kB) | **PASS** — 15% used |
+| **Cold start, spawn → ready** | < 150 ms | **p50 81.9 ms** (N=30, p99 82.6 ms) | **PASS** — 55% used |
+
+**Which binary size is compared.** The stripped one. The release profile sets
+`strip = "symbols"`, so the shipped binary carries no symbol table, and the unstripped build
+of the *same source* is **51,183,016 B = 48.8 MiB** — which would **fail** the 40 MB budget.
+That makes "which number" a decision rather than a detail, and the decision is recorded here
+and in the harness. `cargo build --profile v25-unstripped` produces the comparison figure;
+that profile exists only for measurement and nothing ships with it.
+
+Section breakdown of the shipped binary: `.text` 6,070,648 · `.rodata` 550,992 ·
+`.eh_frame` 431,992 · `.rela.destroy`/`rela.dyn` 209,232 · `.data.rel.ro` 111,608. No debug
+sections (stripped). `orxnuctl` is 2.88 MB and is **not** counted against the daemon's
+budget; it is a client, not the daemon.
+
+**Readiness boundary.** Cold start is timed to the daemon **answering a request**, not to
+`exec` returning. `Runtime::start` establishes durable security state, then the task engine,
+then binds the endpoint, and only then can serve — so stopping the timer at exec would omit
+most of the work against a 150 ms budget. The harness polls `daemon/version` over the real
+socket, which is the boundary a client experiences.
+
+### 1a.4 What these numbers do and do not establish
+
+They establish that the current architecture **meets all three budgets with substantial
+headroom on this host**, and they establish the shape of the costs below.
+
+They do **not** establish that the budgets hold on a 2-core baseline machine, which is what
+§2's "modest baseline" column means. This host has 16 logical cores and NVMe. The budgets are
+product requirements for a class of hardware this measurement does not cover, and closing
+that gap needs a run on such a machine — recorded as V-25's remaining limitation, not
+papered over.
+
+Also **not** established: page-cache-cold startup. `drop_caches` needs privileges this
+environment does not have, so every figure above is with the binary warm in the page cache.
+That is the favourable direction and it is stated rather than assumed.
+
+### 1a.5 Where the costs actually are
+
+| cost | figure | note |
+|---|---|---|
+| **Durable task write** | p50 **2.07 ms** (create), 2.42 ms (claim), 2.32 ms (propose) | `synchronous = FULL`. One fsync each. Confirms V-30: `FULL` costs ~2.3 ms/commit |
+| Durable task write, throughput | **454 commits/s** sustained | ~400× what one user generates |
+| Task completion | p50 **26 µs** | ~80× cheaper than an insert — see below |
+| **Sandboxed execution** | p50 **67.8 ms** | bubblewrap: namespace setup + helper exec + teardown |
+| IPC request | p50 **90.8 µs** (connect 13.8 µs) | one request per connection |
+| Cold start | p50 81.9 ms | |
+| Idle RSS | 9.11 MiB | **86% file-backed**, 14% anonymous |
+
+Three findings worth stating rather than leaving in the table:
+
+**The RSS and binary-size budgets are substantially the same quantity.** 1,296 kB of the
+9,328 kB resident set is anonymous; the other 86% is the mapped binary and its libraries.
+So growing the binary grows idle RSS nearly one-for-one, and there is no separate "heap
+problem" to chase. The 60 MB budget is, in practice, a code-size budget.
+
+**Sandbox cost dominates everything else by two orders of magnitude.** A governed IPC
+request is 91 µs and a durable commit is 2.1 ms, but an isolated capability invocation is
+67.8 ms — 30× a durable commit. This is the cost of the isolation guarantee and it is
+*cheap relative to what it buys*: Tier-1 visibility, tree lifetime and OS-enforced resource
+ceilings. It is also the number that matters for anyone planning interactive capability
+work, because it dominates a GUI or TUI's feel far more than the request path does.
+
+**Task completion is 80× cheaper than task creation**, which was not expected. The
+measurement does not establish why, and this document does not guess. The plausible
+explanation is that a completion is a single-row `UPDATE` on pages already resident from the
+insert that preceded it, while a creation writes several tables, but that is a hypothesis
+and would need a `strace`/write-count to confirm. Recorded so the asymmetry is not mistaken
+for noise.
+
+### 1a.6 Variance, and what may be gated in CI
+
+Measured over repeated full runs on this host:
+
+| metric | observed spread | stable? |
+|---|---|---|
+| binary size | 7,492,472 B every time (it is a file size) | **exact** |
+| cold start p50 | 81.9 – 93.0 ms across runs | **stable** (~0.2% within a run) |
+| idle RSS | 9.11 – 9.25 MiB | **stable** (~1%) |
+| sustained insert throughput | 393 – 454 commits/s | moderate (~6%) |
+| IPC p50 | 90.8 – 135.2 µs | **noisy** (~17%) |
+| sandbox p50 | 67.8 – 86.2 ms | moderate |
+
+So: **binary size and the dependency graph are exactly reproducible** and are gated. Cold
+start and RSS are stable enough to be reported and compared. **IPC latency is too noisy to
+gate on** and is reported only. This is why the CI step carries `continue-on-error`: a
+measurement that blocks a commit because a hosted runner was busy teaches engineers to
+ignore it. What CI *does* block on is the harness's own order-of-magnitude assertions (10×
+bounds), which is a failure the shape of the code can cause rather than the weather.
+
+### 1a.7 Harness
+
+`scripts/measure-v25.sh` and `crates/orxnud-daemon/tests/v25_measure.rs`. The script
+refuses to run on a dirty worktree, records the commit and toolchain with the numbers, kills
+every daemon it starts on every exit path, and fails loudly rather than leaving a partial
+table that looks like a result.
+
+`crates/orxnud-daemon/tests/v25_architecture.rs` holds six **static** checks defending the
+architecture these budgets depend on — one TLS implementation, no telemetry exporter, a
+local file store rather than a database client, no GUI/server framework in the core. Those
+are properties of the source rather than of one machine, so they are asserted exactly rather
+than measured approximately.
+
+### 1a.8 Related measurement, elsewhere
+
+Resource **ceilings** are not re-measured here: `crates/orxnud-capability/tests/governed_path.rs`
+already observes the real cgroup rather than trusting a struct, and all 24 of its tests pass
+on this host — including `a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written`,
+`a_governed_hang_is_stopped_at_the_deadline`, `a_governed_flood_is_bounded` and
+`a_governed_descendant_spawn_is_contained`. Those are the controls that turn a declared
+budget into a runtime bound, and duplicating them here would be measuring the same thing
+twice.
+
+---
+
 ## 2. Budgets
 
 ### 2.1 Startup (cold = no OS page cache for our binaries)
 
-| Measurement | Target (baseline 2c/4 GiB) | Target (reference) |
-|---|---|---|
-| Daemon cold start, **core features only** | < 150 ms | < 80 ms |
+| Measurement | Target (baseline 2c/4 GiB) | Target (reference) | Measured |
+|---|---|---|---|
+| Daemon cold start, **core features only** | < 150 ms | < 80 ms | **81.9 ms p50** (§1a.3) |
 | Daemon cold start, **all features enabled** | < 400 ms | < 250 ms |
 | Daemon warm start | < 40 ms | < 25 ms |
 | Core DB open + migration check | < 30 ms | < 15 ms |
@@ -58,9 +218,9 @@ it (CR-2, ADR-0002).
 
 ### 2.2 Idle
 
-| Measurement | Target |
-|---|---|
-| **Daemon idle RSS, core only** | **< 60 MB** |
+| Measurement | Target | Measured |
+|---|---|---|
+| **Daemon idle RSS, core only** | **< 60 MB** | **9.11 MiB** (§1a.3) |
 | Daemon idle RSS, all features enabled but unused | < 120 MB |
 | Daemon idle CPU | **< 0.5%** of one core |
 | Daemon wakeups/sec while idle | < 2 |
