@@ -949,24 +949,18 @@ impl InstallationIdentity {
     /// Unix-only in its implementation and total in its *result*: a platform without the
     /// metadata produces [`Self::Unavailable`] rather than a compile error or a guess.
     ///
-    /// Read from the socket rather than from `geteuid(2)` deliberately. The two normally
-    /// agree and stop agreeing in exactly the case that matters — a daemon started by
+    /// Read from the socket rather than from `geteuid(2)` deliberately: the two normally
+    /// agree and stop agreeing in exactly the case that matters -- a daemon started by
     /// `sudo`, a system unit, or a launcher that drops privileges. There the process's
-    /// uid need not be the user the installation is *for*, while the endpoint's owner
-    /// is by definition: it is the user who can reach it.
+    /// uid need not be the user the installation is *for*, while the endpoint's owner is
+    /// by definition, because it is the user who can reach it.
+    ///
+    /// The platform knowledge lives in `orxnud-platform-ipc::endpoint_owner_uid`: reading
+    /// a uid is `cfg(target_os)`, and gate **G3** keeps that below this crate.
     fn establish(endpoint: &Path) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            match std::fs::metadata(endpoint) {
-                Ok(m) => Self::Owned(m.uid()),
-                Err(_) => Self::Unavailable,
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = endpoint;
-            Self::Unavailable
+        match orxnud_platform_ipc::endpoint_owner_uid(endpoint) {
+            Some(uid) => Self::Owned(uid),
+            None => Self::Unavailable,
         }
     }
 }
@@ -3311,40 +3305,35 @@ mod tests {
     /// from `SO_PEERCRED` and not from anything these tests could have supplied.
     mod identity_boundary {
         use super::*;
-        /// Binds a listener, connects to it, and returns one accepted peer.
+        /// Binds a listener, connects to it, and returns one accepted peer plus the
+        /// endpoint's owner uid.
         ///
         /// The client is parked on a sleep so the connection is live for the assertions,
         /// which matters because the credential is read from the socket at accept.
-        async fn a_real_peer(tag: &str) -> (orxnud_platform_ipc::Listener, LocalStream) {
+        ///
+        /// The owner uid is returned rather than looked up from the *process*, so these
+        /// tests need no `cfg` of their own -- gate **G3** keeps `cfg(target_os)` below
+        /// the platform crate -- and so what is compared is the exact pair the daemon
+        /// compares: the peer's kernel-reported uid against the endpoint's owner.
+        async fn a_real_peer(tag: &str) -> (u32, LocalStream) {
             let dir = std::env::temp_dir().join(format!("orxnud-id-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("mkdir");
             let path = dir.join("s.sock");
             let listener = orxnud_platform_ipc::bind(&path).await.expect("bind");
+            let owner = orxnud_platform_ipc::endpoint_owner_uid(&path)
+                .expect("this platform must report an endpoint owner");
             tokio::spawn(async move {
                 let _s = orxnud_platform_ipc::connect(&path).await;
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             });
             let accepted = listener.accept().await.expect("accept");
-            (listener, accepted)
-        }
-
-        /// The uid this test process runs as, which is also the socket's owner.
-        #[cfg(unix)]
-        fn this_uid() -> u32 {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata("/proc/self").expect("metadata").uid()
-        }
-
-        #[cfg(not(unix))]
-        fn this_uid() -> u32 {
-            0
+            (owner, accepted)
         }
 
         #[tokio::test]
         async fn the_owner_is_authenticated_and_anyone_else_is_refused() {
-            let (_listener, stream) = a_real_peer("owner").await;
-            let uid = this_uid();
+            let (uid, stream) = a_real_peer("owner").await;
 
             assert_eq!(
                 authenticate(&stream, InstallationIdentity::Owned(uid)).expect("authenticate"),
@@ -3370,7 +3359,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_unestablishable_identity_refuses_everyone() {
-            let (_listener, stream) = a_real_peer("noowner").await;
+            let (_uid, stream) = a_real_peer("noowner").await;
             // Even a real peer is refused: with no installation there is nothing to
             // compare against, and "nothing to compare against" must not mean "allowed".
             let err = authenticate(&stream, InstallationIdentity::Unavailable)
@@ -3387,8 +3376,7 @@ mod tests {
 
         #[tokio::test]
         async fn the_refusals_name_no_operating_system_detail() {
-            let (_listener, stream) = a_real_peer("redact").await;
-            let uid = this_uid();
+            let (uid, stream) = a_real_peer("redact").await;
             let rendered = [
                 authenticate(&stream, InstallationIdentity::Owned(uid.wrapping_add(1))),
                 authenticate(&stream, InstallationIdentity::Unavailable),
@@ -3415,15 +3403,15 @@ mod tests {
 
         #[tokio::test]
         async fn the_principal_carries_no_uid_of_its_own() {
-            let (_listener, stream) = a_real_peer("nosuid").await;
-            let principal = authenticate(&stream, InstallationIdentity::Owned(this_uid()))
-                .expect("authenticate");
+            let (uid, stream) = a_real_peer("nosuid").await;
+            let principal =
+                authenticate(&stream, InstallationIdentity::Owned(uid)).expect("authenticate");
             // The authenticated principal is a single field with no data in it, so no
             // operating-system identifier can travel above this line.
             assert_eq!(principal, AuthenticatedPrincipal::InstallationOwner);
             let rendered = format!("{principal:?}");
             assert!(
-                !rendered.contains(&this_uid().to_string()),
+                !rendered.contains(&uid.to_string()),
                 "the principal must not carry the uid: {rendered}"
             );
         }

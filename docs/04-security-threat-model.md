@@ -495,6 +495,49 @@ refused; an expired delegation is refused; an approval bound to actor A is
 rejected for actor B; an `Ai` actor's authority never exceeds its delegating
 `Human`'s under any policy.
 
+### S34 — A local caller's identity is established by the transport, not declared (ADR-0051)
+
+The socket's `0600` mode is a real boundary but it is a *filesystem ACL*: nothing in
+the daemon compared it to anything, and no code above the transport could name a
+peer it had not asked the kernel about. So every handler built `Actor::Human`
+from a zero-argument function, and any process that could reach the socket
+obtained human authority. The actor model was correct; the boundary that was
+supposed to *produce* those actors was absent.
+
+- **The peer identity comes from `SO_PEERCRED` at accept** (Linux). The kernel
+  answers from the process it actually ran, so no request can change the answer.
+- **It is compared against the installation's owner**, read from the bound
+  endpoint's own metadata at startup — not `geteuid`, which diverges under
+  privilege drop.
+- **The comparison happens before a byte is read**, so an unauthenticated caller
+  never reaches request parsing. There is no `AuthenticatedPrincipal` variant for
+  "unknown": an unauthenticated caller cannot be represented as a caller.
+- **An unestablishable identity refuses everyone.** "Nothing to compare against"
+  must not decay into "allowed" — which is why Windows, having no local transport
+  at all, keeps failing closed at `bind`, and why an unclaimed Unix reports no
+  identity rather than shipping an untested `getpeereid` branch.
+- **The uid is discarded after the comparison.** It never becomes a `UserId`, an
+  audit field, or an IPC error, so no OS identifier leaves the daemon.
+- **Declaring an identity changes nothing.** The wire protocol has no actor field
+  and no handler reads one; every identity-shaped parameter a caller can send is
+  ignored, and `approval_from_json` refuses a client-supplied approver
+  *structurally* rather than relying on the digest to catch it.
+- **Actor persistence is not authentication.** `proposer_json` is read back as an
+  `Actor`, so storage is a genuine path from bytes to an actor — and it grants
+  nothing, because the approval path re-derives the approver from the authenticated
+  principal and never from the stored proposer.
+
+**Verification (CI, not optional):** `crates/orxnud-daemon/tests/identity.rs`,
+the `identity_boundary` module in `runtime.rs`, and
+`orxnud-platform-ipc::unix::tests::the_accepted_peer_is_the_connected_process`,
+which reads a principal off a real accepted connection and compares it to the
+connecting process's own uid.
+
+**Stated limit:** `SO_PEERCRED` reports a *user*, not a *session*, so it cannot
+distinguish the owner from a compromised process of the owner. Nothing here depends
+on that distinction. `AuthChannel::LocalInteractive` likewise records that the
+caller is local and same-owner, not that a person is at a keyboard.
+
 
 ## 5. Approval levels
 
