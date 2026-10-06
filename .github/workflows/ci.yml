@@ -100,6 +100,36 @@ jobs:
           CI: "true"
         run: ./scripts/ci-gates.sh
 
+      # V-25's resource baseline. Reported, not gated on this runner.
+      #
+      # `continue-on-error` is deliberate and the reason is in docs-05 §8: a
+      # measurement that blocks a commit because a hosted runner was busy teaches
+      # engineers to ignore it. What this step does guarantee is that the harness
+      # itself stays runnable and that its own order-of-magnitude assertions -- which
+      # are 10x bounds, not budget bounds -- still fail loudly.
+      #
+      # The two numbers that *are* deterministic (binary size is a file size; the
+      # dependency graph is a graph) are checked without `continue-on-error` below,
+      # because a regression there is a real regression rather than a noisy one.
+      - name: Measure the V-25 resource baseline
+        id: v25
+        continue-on-error: true
+        run: ./scripts/measure-v25.sh
+
+      - name: Report the V-25 baseline
+        if: always()
+        run: |
+          {
+            echo "### V-25 resource baseline (informational)"
+            echo ""
+            echo "Hosted runners are slower than the reference machine docs-05 names, so"
+            echo "these are reported and compared, never gated. See the job summary above."
+            echo ""
+            echo '```'
+            echo "commit: ${{ github.sha }}"
+            echo "```"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build documentation
         # Missing docs are denied in the crates, and `cargo doc` also catches
         # broken intra-doc links, which nothing else does.

@@ -218,7 +218,8 @@ struct Client(orxnud_platform_ipc::BlockingClient);
 impl Client {
     fn connect(endpoint: &Path) -> Self {
         let c = orxnud_platform_ipc::connect_blocking(endpoint).expect("connect");
-        c.set_read_timeout(Some(Duration::from_secs(20))).expect("timeout");
+        c.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
         Self(c)
     }
 
@@ -295,6 +296,27 @@ fn sample(pid: u32) -> ProcSample {
         peak_rss_kb: field("VmHWM:"),
         threads: field("Threads:"),
     }
+}
+
+/// How much of the resident set is file-backed versus anonymous.
+///
+/// Not a curiosity: if most of the daemon's RSS is the mapped binary, then the RSS budget
+/// and the binary-size budget are the *same* budget, and one measurement bounds the other.
+/// If most of it were anonymous, the growth would be heap and the binary size would say
+/// nothing about it. Which of those is true changes what a regression means.
+fn rss_composition(pid: u32) -> (u64, u64) {
+    let Ok(rollup) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) else {
+        return (0, 0);
+    };
+    let kb = |name: &str| -> u64 {
+        rollup
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (kb("Rss:"), kb("Anonymous:"))
 }
 
 fn open_fds(pid: u32) -> usize {
@@ -490,6 +512,7 @@ fn the_idle_core_daemon_fits_its_memory_budget() {
     // working size. Sampling immediately would measure startup, not idle.
     std::thread::sleep(Duration::from_millis(500));
 
+    let (rss_total, rss_anon) = rss_composition(pid);
     let at_ready = sample(pid);
     let settled = sample(pid);
     let fds = open_fds(pid);
@@ -498,16 +521,23 @@ fn the_idle_core_daemon_fits_its_memory_budget() {
 
     let mib = |kb: u64| kb as f64 / 1024.0;
     println!("V25 | idle RSS: {startup_ms:?} to ready, then");
-    println!(
-        "V25 |   at ready   {:>7.2} MiB",
-        mib(at_ready.rss_kb)
-    );
+    println!("V25 |   at ready   {:>7.2} MiB", mib(at_ready.rss_kb));
     println!(
         "V25 |   steady idle {:>6.2} MiB  (peak {:.2} MiB)",
         mib(settled.rss_kb),
         mib(settled.peak_rss_kb)
     );
     println!("V25 |   threads {threads} | open fds {fds} | child processes {children}");
+    println!(
+        "V25 |   RSS {rss_total} kB total, of which {rss_anon} kB anonymous ({:.0}%) -- the \
+         rest is the mapped binary and libraries, so the RSS and binary-size budgets are \
+         substantially the same quantity",
+        if rss_total > 0 {
+            rss_anon as f64 / rss_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
 
     const BUDGET_MB: f64 = 60.0;
     let idle_mb = settled.rss_kb as f64 / 1024.0;
@@ -597,7 +627,6 @@ fn a_trivial_ipc_request_costs_what_it_should() {
     // bound is 100 ms per request, which is ~1000x the observed figure -- it would only
     // catch a daemon that had stopped answering quickly at all.
     tt.assert_under(Duration::from_millis(100), "IPC request");
-
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +731,11 @@ fn durable_task_transitions_cost_what_they_should() {
     const M: usize = 500;
     for i in 0..M {
         e.enqueue_new(
-            &NewTask::new(TaskId::new(format!("v25-sustained-{i}")), TaskKind::Query, NOW),
+            &NewTask::new(
+                TaskId::new(format!("v25-sustained-{i}")),
+                TaskKind::Query,
+                NOW,
+            ),
             NOW,
         )
         .expect("enqueue");
@@ -869,7 +902,10 @@ fn the_measured_error_taxonomy_is_the_one_this_harness_expects() {
 /// `Runtime::start` exists in this crate and would be the easy way to measure "the daemon",
 /// but it shares an address space with the harness: every allocation either makes is
 /// indistinguishable, so RSS would be meaningless. The spawn above is the point.
-#[allow(dead_code, reason = "documents why this file spawns rather than embeds")]
+#[allow(
+    dead_code,
+    reason = "documents why this file spawns rather than embeds"
+)]
 const MEASUREMENT_NOTES: &str = "\
 spawn a real process for RSS;
 measure to an answered request for readiness;
