@@ -945,3 +945,182 @@ fn two_concurrent_recoveries_converge_and_the_second_reports_nothing() {
     drop(first);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ------------------------------------------ V-94 interaction: the approval is spent
+//                                          in the same transaction as the lease
+
+/// The approval is consumed exactly once, and V-93's crash window still closes.
+///
+/// V-94 moved the task-domain approval spend into the same transaction that takes the
+/// execution lease, where it used to be a separate best-effort write. That is a change
+/// to the durable shape a crash can catch, so the interaction needs proving rather than
+/// assuming: the spend must have happened exactly once, and a crash after it must still
+/// leave the task uncertain rather than retryable.
+///
+/// Driven through the real production operation, then a real `SIGKILL` between the spend
+/// and the settlement -- which is now the only window there is, because the two writes
+/// are one transaction.
+#[test]
+fn an_approval_is_spent_once_and_a_crash_after_it_still_needs_verification() {
+    let d = dir("v94-interaction");
+    let db = db_in(&d);
+
+    // Drive the real sequence up to an approved proposal, then spend the approval and
+    // take the lease in one operation.
+    {
+        let mut e = open_engine(&db);
+        e.enqueue_new(
+            &orxnud_store::task_repo::NewTask::new(tid("v93-task"), TaskKind::Workflow, NOW),
+            NOW,
+        )
+        .expect("enqueue");
+        let attempt = e
+            .claim_task("doomed-worker", NOW)
+            .expect("claim")
+            .expect("claimed")
+            .attempts;
+
+        let mut repo = TaskRepository::new(e.conn_mut());
+        let proposal = repo
+            .propose_action(
+                "p",
+                &tid("v93-task"),
+                "doomed-worker",
+                "filesystem/write-text",
+                Some("out.txt"),
+                r#"{"path":"out.txt","contents":"x"}"#,
+                r#"{"kind":"human"}"#,
+                None,
+                1,
+                NOW,
+            )
+            .expect("propose")
+            .proposal_id;
+        repo.record_approval(&approval_row(attempt))
+            .expect("record the approval");
+        repo.decide_proposal(&proposal, "approved", NOW)
+            .expect("approve");
+
+        // One call: lease and spend, or neither.
+        repo.begin_execution_spending_approval(&proposal, "doomed-worker", NOW, 30_000)
+            .expect("begin the execution");
+
+        // Spent exactly once.
+        assert!(
+            repo.approval_for_attempt(&tid("v93-task"), 1, attempt)
+                .expect("read")
+                .expect("present")
+                .consumed_at_ms
+                .is_some(),
+            "the approval must be marked spent"
+        );
+        assert!(
+            repo.begin_execution_spending_approval(&proposal, "other", NOW, 30_000)
+                .is_err(),
+            "a second execution on the same proposal must be refused: the approval is \
+             already spent and the task is no longer waiting"
+        );
+
+        // Reserve the effect, then crash -- the V-93 window. The repository borrow must
+        // end first so the engine can be used again.
+        let key = DurableEngine::idempotency_key(&tid("v93-task"), "external-call", "1/1");
+        assert!(
+            e.reserve_effect(&key, &tid("v93-task"), attempt, "external-call", false, NOW)
+                .expect("reserve"),
+            "reserve"
+        );
+        drop(e);
+    }
+
+    // A real restart, which runs the real recovery.
+    let mut e = open_engine(&db);
+    e.recover(NOW).expect("recovery");
+    assert_terminally_uncertain(
+        &mut e,
+        &tid("v93-task"),
+        "crash after the approval was spent",
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A refusal to spend the approval grants no lease and leaves the task retryable.
+///
+/// The negative space V-94 exists for: if the spend fails, the *whole* operation rolls
+/// back, so there is no state in which a lease exists and the approval is unspent.
+#[test]
+fn a_refused_approval_spend_grants_no_lease() {
+    let d = dir("v94-no-lease");
+    let mut e = open_engine(&db_in(&d));
+    e.enqueue_new(
+        &orxnud_store::task_repo::NewTask::new(tid("v93-task"), TaskKind::Workflow, NOW),
+        NOW,
+    )
+    .expect("enqueue");
+    e.claim_task("w", NOW).expect("claim").expect("claimed");
+
+    let mut repo = TaskRepository::new(e.conn_mut());
+    let proposal = repo
+        .propose_action(
+            "p",
+            &tid("v93-task"),
+            "w",
+            "filesystem/write-text",
+            Some("out.txt"),
+            r#"{"path":"out.txt","contents":"x"}"#,
+            r#"{"kind":"human"}"#,
+            None,
+            1,
+            NOW,
+        )
+        .expect("propose")
+        .proposal_id;
+    repo.decide_proposal(&proposal, "approved", NOW)
+        .expect("approve");
+    // Deliberately no approval recorded: the spend has nothing to consume.
+
+    let err = repo
+        .begin_execution_spending_approval(&proposal, "w", NOW, 30_000)
+        .expect_err("an attempt with no approval must not begin an execution");
+    assert!(
+        matches!(err, orxnud_store::task_repo::TaskRepoError::NotFound(_)),
+        "expected the refusal to name the missing approval, got {err:?}"
+    );
+
+    let row = e.task(&tid("v93-task")).expect("read").expect("present");
+    assert_eq!(
+        row.state,
+        TaskState::WaitingForUser,
+        "the task must be untouched: {row:?}"
+    );
+    assert!(
+        row.lease_holder.is_none() && row.lease_expires_at_ms.is_none(),
+        "a refused spend must not leave a lease behind: {row:?}"
+    );
+    // And no success event, because the transition did not happen.
+    let repo = TaskRepository::new_readonly(e.conn());
+    assert!(
+        !repo
+            .all_events()
+            .expect("events")
+            .iter()
+            .any(|ev| ev.kind == "approved-execution-begun"),
+        "a refused spend emitted a success event"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Helper for the interaction test: an approval the execution will spend.
+fn approval_row(attempt_no: u32) -> orxnud_store::task_repo::ApprovalRow {
+    orxnud_store::task_repo::ApprovalRow {
+        task_id: tid("v93-task"),
+        step_no: 1,
+        attempt_no,
+        digest_hex: "ab".repeat(32),
+        capability: "filesystem/write-text".to_owned(),
+        target: Some("out.txt".to_owned()),
+        params: r#"{"path":"out.txt","contents":"x"}"#.to_owned(),
+        issued_at_ms: NOW,
+        expires_at_ms: NOW + 60_000,
+        consumed_at_ms: None,
+    }
+}

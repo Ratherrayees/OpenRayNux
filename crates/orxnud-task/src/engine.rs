@@ -744,16 +744,26 @@ impl DurableEngine {
     /// # Errors
     ///
     /// [`EngineError`] of kind `Storage`.
-    pub fn begin_approved_execution(
+    /// Takes the execution lease and spends the approval for that attempt, atomically.
+    ///
+    /// The daemon's only way to begin a governed execution. See
+    /// [`orxnud_store::task_repo::TaskRepository::begin_execution_spending_approval`]
+    /// for why the two are one operation.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of the cause the repository reports: the proposal is missing or
+    /// not approved, the task is not waiting, or the attempt has no unconsumed approval.
+    pub fn begin_execution_spending_approval(
         &mut self,
         proposal_id: &str,
         worker: &str,
         now_ms: i64,
     ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
-        let lease = self.limits.lease_duration_ms;
-        Ok(self
-            .repo()
-            .begin_approved_execution(proposal_id, worker, now_ms, lease)?)
+        let lease_ms = self.limits.lease_duration_ms;
+        self.repo()
+            .begin_execution_spending_approval(proposal_id, worker, now_ms, lease_ms)
+            .map_err(EngineError::from)
     }
 
     // ------------------------------------------------------------ schedules

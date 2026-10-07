@@ -190,7 +190,9 @@ impl From<&TaskRepoError> for TaskCause {
             // "Not in the state you need": already decided, already terminal, or the caller
             // does not hold the lease. All three are conflicts, not bad input.
             TaskRepoError::ProposalNotInState { .. } => Self::Conflict,
-            TaskRepoError::InvalidComposition(_) => Self::InvalidInput,
+            TaskRepoError::InvalidComposition(_) | TaskRepoError::InvalidDigest { .. } => {
+                Self::InvalidInput
+            }
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => Self::Corrupt,
             // Busy and locked are another writer winning, which is a race outcome.
             TaskRepoError::Sqlite(inner)
@@ -329,7 +331,14 @@ impl From<TaskRepoError> for EngineError {
             | TaskRepoError::ProposalNotInState { .. }
             // A composition field outside the range its task allows is likewise bad input,
             // not a storage failure: the caller named a step the task does not have.
-            | TaskRepoError::InvalidComposition(_) => EngineErrorKind::InvalidInput,
+            //
+            // A malformed approval digest joins them for the same reason, and the mapping
+            // matters more than usual here: a digest that is not a canonical 32-byte
+            // value is not a *storage* problem, so reporting it as one would tell the
+            // caller its database is broken when what it did was send an approval that
+            // could never be honoured. V-94.
+            | TaskRepoError::InvalidComposition(_)
+            | TaskRepoError::InvalidDigest { .. } => EngineErrorKind::InvalidInput,
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => {
                 EngineErrorKind::Invariant
             }
