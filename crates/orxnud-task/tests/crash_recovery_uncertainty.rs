@@ -1124,3 +1124,112 @@ fn approval_row(attempt_no: u32) -> orxnud_store::task_repo::ApprovalRow {
         consumed_at_ms: None,
     }
 }
+
+// ------------------------------------------ V-95: V-93 under concurrent recovery
+
+/// V-93's terminal contract, re-proven *after* the transaction mode changed.
+///
+/// V-93 deliberately relied on statement shape rather than on isolation, and said so:
+/// the guarantee had to come from the statement's shape because the transaction was
+/// deferred. Changing the transaction mode is therefore exactly the kind of change that
+/// could silently invalidate it -- a wider transaction that stays correct for the wrong
+/// reason is worse than a narrow one, because the next edit would remove the narrowness
+/// and the test would still pass. So this runs the real crash, the real recovery, and
+/// the real claim attempt, and checks the contract holds.
+#[test]
+fn v93_uncertainty_survives_the_transaction_mode_change() {
+    let d = dir("v95-v93-regression");
+    let db = db_in(&d);
+    kill_during_execution_with(&db, &d.join("ready"), "workflow", "non-idempotent");
+
+    let mut e = open_engine(&db);
+    let recovered = e.recover(NOW).expect("recover");
+    assert_eq!(recovered, 1, "the orphan was settled exactly once");
+
+    // The V-93 contract, unchanged: uncertain, and unclaimable.
+    let row = e.task(&tid("v93-task")).expect("read").expect("present");
+    assert_eq!(
+        row.state,
+        TaskState::NeedsVerification,
+        "V-93: uncertain work is never made retryable. {row:?}"
+    );
+
+    // And the claim that would re-run a non-idempotent effect must still be refused.
+    assert!(
+        e.claim_task("greedy-worker", NOW).expect("claim").is_none(),
+        "V-93: nothing may claim an uncertain task, or the effect runs a second time"
+    );
+
+    let settling: Vec<_> = TaskRepository::new_readonly(e.conn())
+        .all_events()
+        .expect("events")
+        .into_iter()
+        .filter(|ev| ev.kind.as_str().contains("needs-verification"))
+        .collect();
+    assert_eq!(
+        settling.len(),
+        1,
+        "one settling transition, not one per recovery"
+    );
+
+    drop(e);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// V-93's contract, with recovery racing a claim *and* a second recovery, on a task that
+/// has a reserved non-idempotent effect.
+///
+/// Three contenders for one task. The property is not "who wins" -- either outcome is
+/// legal -- it is that no interleaving produces automatic re-execution of the effect.
+#[test]
+fn v93_uncertainty_holds_when_recovery_races_claims_and_a_second_recovery() {
+    for round in 0..12 {
+        let d = dir(&format!("v95-v93-race-{round}"));
+        let db = db_in(&d);
+        kill_during_execution_with(&db, &d.join("ready"), "workflow", "non-idempotent");
+
+        let spawn = |p: std::path::PathBuf| {
+            std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&p).expect("open");
+                Pragma::critical().apply(&conn).expect("pragmas");
+                Pragma::critical().verify(&conn).expect("verify");
+                conn
+            })
+        };
+        let mut a = spawn(db.clone()).join().expect("conn a");
+        let mut b = spawn(db.clone()).join().expect("conn b");
+
+        let mut repo_a = TaskRepository::new(&mut a);
+        let mut repo_b = TaskRepository::new(&mut b);
+
+        let ra = repo_a.recover(NOW).expect("recovery a");
+        let rb = repo_b.recover(NOW).expect("recovery b");
+        // Exactly one of them settled the orphan. A failure here is the V-95 defect
+        // returning: a deferred loser was told "database is locked" instead of finding
+        // nothing to do, so `expect` is the assertion.
+        assert_eq!(
+            ra + rb,
+            1,
+            "round {round}: exactly one recovery transition, got {ra} + {rb}"
+        );
+
+        let mut check = open_engine(&db);
+        let row = check
+            .task(&tid("v93-task"))
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            row.state,
+            TaskState::NeedsVerification,
+            "round {round}: racing recoveries must not make uncertain work retryable: {row:?}"
+        );
+        assert!(
+            check
+                .claim_task("greedy-worker", NOW)
+                .expect("claim")
+                .is_none(),
+            "round {round}: nothing may claim an uncertain task"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
