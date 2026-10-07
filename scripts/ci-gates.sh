@@ -86,6 +86,7 @@ SKIPPED=()
 declare -A NAMES=(
   [G1]="format"
   [G2]="dependency graph"
+  [G2d]="policy seal"
   [G3]="platform boundary"
   [G4]="unsafe"
   [G5]="portable core (wasm)"
@@ -96,6 +97,7 @@ declare -A NAMES=(
   [G10]="secret hygiene"
   [G11]="vulnerabilities"
   [G12]="semver"
+  [G13]="boundary gate self-tests"
 )
 
 banner() { printf '\n\033[1m== %s: %s\033[0m\n' "$1" "${NAMES[$1]}"; }
@@ -131,21 +133,66 @@ manifest_deps() {
   ' "$1"
 }
 
-# Prints a Rust source file with its `#[cfg(test)]` modules removed.
+# Test-only region removal, and both boundary gates, live in scripts/gate_policy.py.
 #
-# Needed because a *test* may legitimately reach for a policy-only symbol (to build
-# a fixture), while a *production* path may not. G2's seal check reads the output
-# of this, so the gate distinguishes "reachable at runtime" from "reachable from a
-# test".
+# They were here as an awk script and two regular expressions, and all three failed in
+# the same way: a regular expression cannot tell code from a comment, so text that
+# merely *looks* like the forbidden thing switched the check off or evaded it. The
+# replacement classifies characters lexically (Rust's comment and literal grammar,
+# including nested block comments, raw strings and the char/lifetime ambiguity) and
+# then looks inside cfg predicates rather than at a prefix.
 #
-# The module's closing brace is the first line starting with `}` at column 0; inner
-# braces are indented, which is the rustfmt convention every file here follows.
-strip_cfg_test() {
-  awk '
-    /#\[cfg\(test\)\]/                        { in_test = 1 }
-    in_test          { if ($0 ~ /^\}/) in_test = 0; next }
-    { print }
-  ' "$1"
+# Kept in Python because `scripts/mutate.sh` already requires `python3`, so this adds no
+# new tool to CI. See scripts/rustscan.py for the reasoning.
+
+# The root under test. `ORXNUD_GATE_ROOT` points the boundary gates at a fixture tree
+# instead of this repository, which is how `scripts/gate-selftest.py` drives *these*
+# functions against temporary sources rather than against a reimplementation of them.
+gate_root() {
+  printf '%s' "${ORXNUD_GATE_ROOT:-$REPO_ROOT}"
+}
+
+# G2d -- the policy seal is reachable only from orxnud-policy.
+#
+# ADR-0013 makes `AuthorisationProof` unconstructible except through `PolicySeal::attest`,
+# which only `orxnud-policy` may name. That is the whole capability boundary: a
+# capability crate cannot *become* authorised, it can only ask.
+#
+# The invariant is about *minting*, not naming. A capability crate legitimately takes a
+# `CapabilityInvocation` as an argument -- that is the whole point of it -- and cannot
+# construct one, because the only constructor requires a `PolicySeal`. So the gate
+# forbids the root of the authority chain and the minting verbs, and
+# `gate_policy.py` re-derives the authority surface from the domain's own source so the
+# forbidden set cannot go stale unnoticed.
+gate_G2d() {
+  banner G2d
+  if python3 scripts/gate_policy.py g2d --root "$(gate_root)"; then
+    ok "the policy seal is reachable only from orxnud-policy (production code)"
+  else
+    fail_gate "a policy-seal symbol is reachable outside orxnud-policy in production code"
+  fi
+}
+
+# G3 -- no platform branch outside orxnud-platform-*.
+#
+# The boundary is only real if it is checked. A `cfg(target_os)` in the core means the
+# core has an opinion about the OS, which is what the trait boundary exists to prevent.
+#
+# The previous pattern required the platform key to be the *first* token inside `cfg(`,
+# so seven of the nine spellings of a platform branch were invisible -- including every
+# nested form, which is what `not`/`all`/`any` exist to produce. The predicate is now
+# read as a predicate and searched at any depth. See scripts/rustscan.py.
+gate_G3() {
+  banner G3
+  local out
+  out="$(python3 scripts/gate_policy.py g3 --root "$(gate_root)" 2>&1)" && out="" || true
+  if [ -z "$out" ]; then
+    ok "no platform branch or platform value outside orxnud-platform-*"
+    python3 scripts/gate_policy.py g3-platform-crates --root "$(gate_root)" | sed 's/^/   /'
+  else
+    printf '%s\n' "$out" | sed 's/^/   /'
+    fail_gate "a platform branch exists outside orxnud-platform-*"
+  fi
 }
 
 gate_G1() {
@@ -286,44 +333,11 @@ gate_G2() {
       done
     done
   done
-  # --- (d) the policy seal is reachable only from orxnud-policy ---
-  #
-  # ADR-0013 makes `AuthorisationProof` unconstructible except through
-  # `PolicySeal::attest`, which only `orxnud-policy` can name. That is the whole
-  # capability boundary: a capability crate cannot *become* authorised, it can only
-  # ask. A type-level property is only as good as the check that enforces it, and
-  # nothing was checking that -- a manifest gate cannot see symbols.
-  #
-  # So this greps the sealed symbols out of every production source file, after
-  # removing `#[cfg(test)]` modules. Two crates are exempt by design:
-  #   * orxnud-domain, which *defines* them (and orxnud-capability, which depends
-  #     on it, is the trap: naming a seal in production code is the violation);
-  #   * orxnud-policy, which is the only authoriser by definition.
-  # `tests/` is not scanned at all: `compile_fail/` must name them to prove the
-  # seal holds.
-  local sealed='AuthorisationProof|PolicySeal|\.authorise\('
-  local offenders f
-  offenders=""
-  for f in $(find crates -type f -name '*.rs' -path '*/src/*' | sort); do
-    local crate
-    crate="$(printf '%s' "$f" | cut -d/ -f2)"
-    case "$crate" in
-      orxnud-domain|orxnud-policy) continue ;;
-    esac
-    local hits
-    hits="$(strip_cfg_test "$f" | grep -nE "$sealed" || true)"
-    if [ -n "$hits" ]; then
-      offenders="$offenders$f: $hits\n"
-      printf '     %s\n' "$(printf '%s' "$hits" | head -3 | sed 's/^/  /')"
-      printf '     ^ in %s\n' "$f"
-    fi
-  done
-  if [ -n "$offenders" ]; then
-    fail_gate "a policy-seal symbol is reachable outside orxnud-policy in production code"
-    ok_all=0
-  else
-    ok "the policy seal is reachable only from orxnud-policy (production code)"
-  fi
+  # The policy-seal check was rule (d) here. It is now gate G2d, because a boundary
+  # that can only be exercised as part of a larger gate cannot be self-tested in
+  # isolation -- and an untested enforcement gate is the thing this milestone exists to
+  # repair. `ALL_GATES` includes G2d, so `scripts/ci-gates.sh` with no arguments still
+  # runs it; only a caller that asked for G2 alone now gets the dependency graph.
 
   # --- (e) the task engine cannot reach a capability ---
   #
@@ -369,29 +383,6 @@ gate_G2() {
   fi
 
   [ "$ok_all" -eq 1 ] && ok "all internal dependency edges point inward"
-}
-
-# G3 — no platform branch outside orxnud-platform-*.
-#
-# The boundary is only real if it is checked. A `cfg(target_os)` in the core means
-# the core has an opinion about the OS, which is what the trait boundary exists to
-# prevent.
-gate_G3() {
-  banner G3
-  local pattern='cfg[_a-z!]*\s*\(\s*(target_os|target_family|target_env|windows|unix|target_pointer_width)|env::consts::OS'
-  local hits
-  # Comment lines are excluded. `orxnud-domain/src/platform.rs` *documents* this
-  # rule and must name `cfg(target_os)` to do so; matching prose would force the
-  # documentation to become vague, which is the wrong trade for a lint.
-  hits="$(grep -RInE "$pattern" crates --include='*.rs' \
-    | grep -vE '^crates/orxnud-platform-[a-z]+/' \
-    | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!|\*|/\*)' || true)"
-  if [ -z "$hits" ]; then
-    ok "no cfg(target_os)/cfg(windows)/env::consts::OS outside orxnud-platform-*"
-  else
-    printf '%s\n' "$hits" | sed 's/^/     /'
-    fail_gate "a platform branch exists outside orxnud-platform-*"
-  fi
 }
 
 # G4 — zero unsafe outside orxnud-platform-*.
@@ -727,14 +718,30 @@ gate_G12() {
   fi
 }
 
-ALL_GATES=(G1 G2 G3 G4 G5 G6 G7 G8 G9 G10 G11 G12)
+# G13 -- the boundary gates, self-tested.
+#
+# An enforcement gate that is never exercised against a known violation is a gate whose
+# strength is unknown. This runs `scripts/gate-selftest.py`, which builds temporary
+# fixture trees and drives *these* gate functions over them via ORXNUD_GATE_ROOT. It
+# tests the real gates, not a copy of their logic -- a copy is a second implementation
+# that can agree with the first while both are wrong.
+gate_G13() {
+  banner G13
+  if python3 scripts/gate-selftest.py; then
+    ok "G2d and G3 self-tests pass (real gate logic, temporary fixtures)"
+  else
+    fail_gate "a boundary-gate self-test failed: the gate does not do what it claims"
+  fi
+}
+
+ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13)
 
 run() {
   case "$1" in
-    G1) gate_G1 ;;  G2) gate_G2 ;;  G3) gate_G3 ;;  G4) gate_G4 ;;  G5) gate_G5 ;;
-    G6) gate_G6 ;;  G7) gate_G7 ;;  G8) gate_G8 ;;  G9) gate_G9 ;; G10) gate_G10 ;;
-    G11) gate_G11 ;; G12) gate_G12 ;;
-    *) printf 'unknown gate: %s (expected G1..G12)\n' "$1" >&2; exit 2 ;;
+G1) gate_G1 ;;  G2) gate_G2 ;;  G2d) gate_G2d ;;  G3) gate_G3 ;;  G4) gate_G4 ;;
+    G5) gate_G5 ;;  G6) gate_G6 ;;  G7) gate_G7 ;;  G8) gate_G8 ;;  G9) gate_G9 ;;
+    G10) gate_G10 ;;  G11) gate_G11 ;;  G12) gate_G12 ;;  G13) gate_G13 ;;
+    *) printf 'unknown gate: %s (expected G1..G13)\n' "$1" >&2; exit 2 ;;
   esac
 }
 
