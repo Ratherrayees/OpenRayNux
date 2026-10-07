@@ -147,6 +147,82 @@ pub enum TaskRepoError {
         /// What the caller needed.
         expected: &'static str,
     },
+
+    /// The task's current execution still has an unresolved side effect, so it cannot
+    /// be handed back to a human for a fresh approval.
+    ///
+    /// # Why this refusal exists
+    ///
+    /// Releasing the execution lease is what makes an unresolved effect invisible to
+    /// recovery: [`TaskRepository::recover`] selects `state = 'running' AND lease_holder
+    /// IS NOT NULL`, and `waiting-for-user` is neither. A task could reach that state
+    /// holding a `pending` effect row, and the row would then never be examined by
+    /// anything — while the task itself was also unclaimable, unapprovable (its approval
+    /// was spent to take the lease) and un-re-executable (its idempotency key was
+    /// reserved). Permanently stuck, silently.
+    ///
+    /// So the invariant is enforced at the transition rather than assumed:
+    ///
+    /// ```text
+    /// reserved unresolved effect
+    ///     =>  a recoverable running execution
+    ///     or  an explicitly resolved effect
+    /// ```
+    ///
+    /// The scope is the *current* execution -- `(steps_completed + 1, attempts)` -- which
+    /// is exactly what `recover` reads. That matters: a stale row from an earlier attempt
+    /// of the same step must not block a legitimate retry, and a task interrupted while
+    /// its effect was idempotent is deliberately returned to `pending` by recovery so it
+    /// can be retried. Scoping the whole task, or scoping to `attempt_no` alone, would
+    /// break both.
+    #[error(
+        "task {id} step {step_no} attempt {attempt_no} has an unresolved side effect, \
+         so its outcome must be established before another proposal is accepted"
+    )]
+    EffectOutcomeUnresolved {
+        /// The task.
+        id: String,
+        /// The logical step the unresolved effect belongs to.
+        step_no: u32,
+        /// The attempt the unresolved effect belongs to.
+        attempt_no: u32,
+    },
+
+    /// A proposal already occupies this execution identity.
+    ///
+    /// # Why this is not [`Self::AlreadyExists`]
+    ///
+    /// The old mapping reported every `UNIQUE` violation as *"a proposal already exists
+    /// for {task} attempt {n}"*, chosen by substring-matching the error message. Migration
+    /// 14 gave the table a second unique constraint — `(task_id, step_no, attempt_no)` —
+    /// so one statement can now fail on either of two genuinely different keys, and the
+    /// single message was wrong for both:
+    ///
+    /// | violated | meaning |
+    /// |---|---|
+    /// | `task_proposals.task_id, .step_no, .attempt_no` | this execution identity is taken — [`Self::ExecutionIdentityTaken`] |
+    /// | `task_proposals.proposal_id` | the caller's chosen *name* collided — [`Self::AlreadyExists`] |
+    ///
+    /// They are not interchangeable. One says "someone already asked for this execution";
+    /// the other says "your identifier collided with an unrelated row", which is a client
+    /// naming bug and is fixed by choosing another identifier. Reporting the second as the
+    /// first tells a caller its attempt already asked, when what actually happened is that
+    /// its `proposal_id` — derived from `p-{task_id}-{milliseconds}` — was minted inside one
+    /// millisecond of another.
+    #[error(
+        "task {id} step {step_no} attempt {attempt_no} already has proposal {existing_id}, \
+         so this execution cannot be proposed for twice"
+    )]
+    ExecutionIdentityTaken {
+        /// The task.
+        id: String,
+        /// The logical step.
+        step_no: u32,
+        /// The attempt.
+        attempt_no: u32,
+        /// The proposal that already holds the identity.
+        existing_id: String,
+    },
 }
 
 /// A composition field that was handed a value its task cannot hold.
@@ -839,6 +915,88 @@ pub struct TaskRepository<'a> {
 
 fn unknown_state(id: String, raw: String) -> TaskRepoError {
     TaskRepoError::UnknownState(Box::new(UnknownStateDetail { id, raw }))
+}
+
+/// Turns a failed `INSERT INTO task_proposals` into the right refusal.
+///
+/// # Why classification rather than substring matching
+///
+/// This used to read `if e.to_string().contains("UNIQUE")`, which collapses every
+/// constraint family into one answer and, since migration 14, two *different* unique keys
+/// as well. The extended code and the column list are the evidence, and both are read here.
+///
+/// `SQLITE_CONSTRAINT_UNIQUE` covers a unique index and `SQLITE_CONSTRAINT_PRIMARYKEY`
+/// covers the table's own key, so the two are already distinguished by code before the
+/// message is consulted. The message is then used only to say *which* columns — which is
+/// the part SQLite does not put in a code — and if it cannot be read, the caller is told
+/// the identity was taken rather than being handed a raw SQLite error it cannot act on.
+///
+/// # The two cases, and why the caller must be able to tell them
+///
+/// * **`(task_id, step_no, attempt_no)` taken** — `ExecutionIdentityTaken`. Someone already
+///   asked for this execution. Retrying with a different `proposal_id` cannot help.
+/// * **`proposal_id` taken** — `AlreadyExists`. A naming collision, usually two proposals
+///   minted from `p-{task_id}-{now}` inside one millisecond. Retrying with a fresh
+///   identifier *will* succeed.
+///
+/// An `AlreadyExists` that was really an identity collision would send a caller round a
+/// loop; an identity collision reported as `AlreadyExists` would tell it the wrong thing
+/// about *why*.
+fn classify_proposal_insert(
+    e: rusqlite::Error,
+    tx: &Transaction<'_>,
+    proposal_id: &str,
+    task_id: &TaskId,
+    attempt_no: u32,
+    step_no: u32,
+) -> TaskRepoError {
+    let rusqlite::Error::SqliteFailure(f, msg) = &e else {
+        return TaskRepoError::Sqlite(Box::new(e));
+    };
+    if f.code != rusqlite::ErrorCode::ConstraintViolation
+        || !matches!(
+            f.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+        )
+    {
+        return TaskRepoError::Sqlite(Box::new(e));
+    }
+
+    // `task_proposals.task_id, task_proposals.step_no, task_proposals.attempt_no`
+    let identity_key = msg.as_deref().is_some_and(|m| {
+        m.contains("task_proposals.task_id")
+            && m.contains("task_proposals.step_no")
+            && m.contains("task_proposals.attempt_no")
+    });
+
+    if identity_key {
+        // The winning row is read rather than reported from the insert's own parameters, so
+        // the refusal names the proposal that is *actually* holding the identity. The read
+        // runs inside the transaction that is about to roll back, which is fine: this only
+        // builds a message, and an answer we cannot read degrades to the name we were
+        // given rather than to a wrong claim that no row holds it.
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT proposal_id FROM task_proposals
+                  WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3;",
+                rusqlite::params![task_id.as_str(), step_no, attempt_no],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        return TaskRepoError::ExecutionIdentityTaken {
+            id: task_id.to_string(),
+            step_no,
+            attempt_no,
+            existing_id: existing.unwrap_or_else(|| proposal_id.to_owned()),
+        };
+    }
+
+    TaskRepoError::AlreadyExists(format!(
+        "action proposal {proposal_id} already exists, so its identifier is already in use; \
+         the execution identity itself is free"
+    ))
 }
 
 impl From<rusqlite::Error> for TaskRepoError {
@@ -2302,6 +2460,18 @@ impl<'a> TaskRepository<'a> {
     /// never complete. Execution takes a fresh lease in
     /// [`Self::begin_approved_execution`].
     ///
+    /// **…unless the current execution still has an unresolved effect.** Releasing the
+    /// lease is what makes an unresolved `pending` row invisible to [`Self::recover`],
+    /// which selects `running`-and-leased and nothing else. So this refuses with
+    /// [`TaskRepoError::EffectOutcomeUnresolved`] while the current execution holds one.
+    /// The contract that preserves:
+    ///
+    /// ```text
+    /// reserved unresolved effect
+    ///     =>  a recoverable running execution
+    ///     or  an explicitly resolved effect
+    /// ```
+    ///
     /// The worker is verified to hold the live lease *before* the proposal is accepted,
     /// so only the task's current owner may propose on its behalf. That is a check that
     /// the caller owns the task — it grants nothing, and it is deliberately not how the
@@ -2392,6 +2562,37 @@ impl<'a> TaskRepository<'a> {
             )));
         }
 
+        // The task's *current* execution must not still be holding an unresolved effect
+        // when the lease is about to be released. See `EffectOutcomeUnresolved` for why
+        // releasing it is what hides the row from recovery, and why the scope is the
+        // current execution rather than the whole task.
+        //
+        // Read through the same `(steps_completed + 1, attempts)` pair that `recover`
+        // reads, from the task row this transaction already opened, so the two cannot
+        // disagree about which execution they mean.
+        //
+        // Deliberately *not* the whole task: an interrupted execution whose effect was
+        // idempotent is deliberately returned to `pending` by recovery so it can be
+        // retried, and its own stale row must not block that retry. That row is at an
+        // earlier `attempt_no`, so it does not match.
+        let current_attempt: u32 = row.3;
+        let unresolved: i64 = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM task_effects e
+               WHERE e.task_id = ?1
+                 AND (e.step_no IS NULL OR e.step_no = ?2)
+                 AND e.attempt_no = ?3
+                 AND e.status = 'pending');",
+            rusqlite::params![task_id.as_str(), step_no, current_attempt],
+            |r| r.get(0),
+        )?;
+        if unresolved != 0 {
+            return Err(TaskRepoError::EffectOutcomeUnresolved {
+                id: task_id.to_string(),
+                step_no,
+                attempt_no: current_attempt,
+            });
+        }
+
         tx.execute(
             "INSERT INTO task_proposals
                (proposal_id, task_id, attempt_no, step_no, capability, target, params,
@@ -2410,16 +2611,7 @@ impl<'a> TaskRepository<'a> {
                 now_ms,
             ],
         )
-        .map_err(|e| {
-            if String::from_utf8_lossy(e.to_string().as_bytes()).contains("UNIQUE") {
-                TaskRepoError::AlreadyExists(format!(
-                    "a proposal already exists for {task_id} attempt {}",
-                    row.3
-                ))
-            } else {
-                TaskRepoError::Sqlite(Box::new(e))
-            }
-        })?;
+        .map_err(|e| classify_proposal_insert(e, &tx, proposal_id, task_id, row.3, step_no))?;
 
         // `WaitingForUser` and the lease release in one statement, so there is no
         // interleaving in which the task is waiting while still holding a lease.
@@ -2956,14 +3148,36 @@ impl<'a> TaskRepository<'a> {
     /// ### Rows whose step was never recorded
     ///
     /// `task_effects.step_no` is nullable because a row written before version 13 has no
-    /// recorded step, and `NULL` asserts nothing. Such a row is treated as **matching any
-    /// step**, so a task owning one is settled rather than retried.
+    /// recorded step, and `NULL` asserts nothing. The predicate below reads `NULL` as
+    /// *"this row's step is unknown, so it is not excluded by the step test"* — and that is
+    /// the whole of its meaning.
     ///
-    /// That is deliberately the expensive direction. The alternative — guessing `1`, as
-    /// migrations 8 and 9 do for tables that predate composition outright — would assert
-    /// a step nobody recorded, and on a multi-step task the guess is wrong often enough
-    /// to matter. Failing safe here costs one human decision per affected task; guessing
-    /// costs an unknown number of duplicated effects.
+    /// **It does not make a row match every execution.** The scope is three conditions
+    /// conjoined, and `NULL` satisfies only the step one:
+    ///
+    /// ```sql
+    /// e.task_id    = t.id
+    /// AND (e.step_no IS NULL OR e.step_no = t.steps_completed + 1)
+    /// AND e.attempt_no = t.attempts          <-- NULL does not reach this
+    /// AND e.status <> 'not-performed'
+    /// AND e.idempotent = 0
+    /// ```
+    ///
+    /// So a `NULL`-step row matches **only while `tasks.attempts` still equals that row's
+    /// `attempt_no`**. Once the task has advanced to a later attempt, the row no longer
+    /// matches and the task is returned to `pending` — a repeatable outcome for a row whose
+    /// step nobody recorded and whose attempt has been superseded. `recovery_scope_is_not_a
+    /// _wildcard` asserts exactly that, so the behaviour is pinned rather than implied.
+    ///
+    /// Is that safe enough? It is a real gap and it is deliberate. `origin/main`'s
+    /// `recover()` consulted no ledger at all and returned every interrupted task to
+    /// `pending`, so the only way to produce this shape is a database that was written by a
+    /// build older than this one *and* whose task has since been retried. Broadening `NULL`
+    /// to match every attempt would close it, at the cost of making one abandoned effect
+    /// row on an old task permanently unrecoverable — and it would do so by making the
+    /// predicate say something false: "this row might be any attempt of this task" is not
+    /// what "this row's step is unknown" means. The narrower reading is stated here, tested
+    /// below, and recorded as a known limit rather than papered over.
     ///
     /// Every clause is load-bearing, and the distinctions are the point:
     ///
