@@ -469,6 +469,16 @@ impl DurableEngine {
     /// [`EffectStatus::Unknown`] and why an unresolved effect blocks a
     /// non-idempotent retry.
     ///
+    /// # `idempotent` is the effect's, not the task's
+    ///
+    /// Whether *this capability* may be repeated, taken from its declaration rather
+    /// than from `tasks.idempotent`. The task's flag answers "may this task be re-run
+    /// as a unit", which is a different question: a task is created before the
+    /// capability that will run on it is chosen, so most tasks are flagged idempotent
+    /// at the task level whatever they are about to do. Recovery reads this column
+    /// (see `TaskRepository::recover`), so passing the task's flag here would let a
+    /// crashed non-idempotent dispatch be re-run — the exact hole this records.
+    ///
     /// # Errors
     ///
     /// [`EngineError`] of kind `Storage` if the write fails.
@@ -478,10 +488,11 @@ impl DurableEngine {
         id: &TaskId,
         attempt_no: u32,
         step_key: &str,
+        idempotent: bool,
         now_ms: i64,
     ) -> Result<bool, EngineError> {
         self.repo()
-            .reserve_effect(key, id, attempt_no, step_key, now_ms)
+            .reserve_effect(key, id, attempt_no, step_key, idempotent, now_ms)
             .map(|o| o.is_some())
             .map_err(EngineError::from)
     }
@@ -1174,11 +1185,11 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         let key = DurableEngine::idempotency_key(&tid("t"), "send", "initial");
         assert!(
-            e.reserve_effect(&key, &tid("t"), 1, "send", NOW)
+            e.reserve_effect(&key, &tid("t"), 1, "send", false, NOW)
                 .expect("reserve")
         );
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 2, "send", NOW)
+            !e.reserve_effect(&key, &tid("t"), 2, "send", false, NOW)
                 .expect("reserve"),
             "a retry must not be able to dispatch the same effect again"
         );
@@ -1193,7 +1204,7 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         let key = DurableEngine::idempotency_key(&tid("t"), "s", "initial");
         let _ = e
-            .reserve_effect(&key, &tid("t"), 1, "s", NOW)
+            .reserve_effect(&key, &tid("t"), 1, "s", false, NOW)
             .expect("reserve");
         assert!(!e.all_effects_resolved(&tid("t")).expect("unresolved"));
         assert!(

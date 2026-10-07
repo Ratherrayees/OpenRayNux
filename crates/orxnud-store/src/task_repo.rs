@@ -506,6 +506,13 @@ pub struct ReservedEffect {
     pub step_key: String,
     /// `observed`, `unknown`, or `not-performed`.
     pub status: String,
+    /// Whether repeating **this effect** is safe.
+    ///
+    /// Not the task's own `idempotent` flag: that answers "may this task be re-run
+    /// as a unit", which is a different question. This one answers "would running
+    /// this capability again duplicate something", and it is the capability's
+    /// declaration, recorded where [`TaskRepository::recover`] can read it.
+    pub idempotent: bool,
     /// Detail. Never a secret.
     pub detail: Option<String>,
 }
@@ -2616,6 +2623,18 @@ impl<'a> TaskRepository<'a> {
 
     // ---------------------------------------------------------------- recover
 
+    /// The `last_error` and event `detail` written when recovery settles an
+    /// orphaned task into [`TaskState::NeedsVerification`].
+    ///
+    /// A constant rather than a composed string so the reason a task stopped can be
+    /// matched exactly by a reader, and so it cannot drift between the `UPDATE`,
+    /// the event and the documentation. It names the *cause* and nothing else: no
+    /// capability, no target, no parameter, no payload. The content that may or may
+    /// not have been written is exactly what must not be copied into an audit
+    /// surface.
+    const UNCERTAIN_RECOVERY_REASON: &'static str =
+        "the process died with this task's side effect unresolved";
+
     /// Reclaims work abandoned by a restart, and returns how many rows changed.
     ///
     /// "Restart", not "expired lease": a restart means the previous process is
@@ -2626,6 +2645,79 @@ impl<'a> TaskRepository<'a> {
     /// A task past its retry budget goes to `dead-lettered` rather than back to
     /// `pending`, because re-queueing it would start a retry loop that no amount of
     /// waiting ends.
+    ///
+    /// # Why an effect row can stop a task becoming claimable (TP-2)
+    ///
+    /// V-92 made an uncertain side effect durable, but only on the path where the
+    /// dispatcher **returns**: the caller reads the verification outcome and writes
+    /// [`TaskState::NeedsVerification`]. There is a window on either side of that —
+    /// between the execution lease being taken and the outcome being settled — in
+    /// which the process can die and nothing has recorded the uncertainty. What
+    /// survives the crash is a task that is `running` under a dead owner's lease,
+    /// which this function used to return to `pending` and thereby make claimable.
+    ///
+    /// The durable evidence that distinguishes that case from an ordinary abandoned
+    /// task is the effect ledger, and this function now reads it.
+    ///
+    /// ## What an effect row means here
+    ///
+    /// `task_effects` rows are written by [`Self::reserve_effect`] *before* a
+    /// dispatch (ADR-0007 invariant 3 — the dedupe row is written in the same
+    /// transaction as the dispatch decision), and resolved afterwards by
+    /// [`Self::resolve_effect`], which refuses to write `pending`. So:
+    ///
+    /// | status | meaning | may a repeat duplicate an effect? |
+    /// |---|---|---|
+    /// | `pending` | a dispatch was authorised and its outcome was never established | **yes** — nobody knows whether it fired |
+    /// | `unknown` | TP-12's explicit verdict: it may or may not have happened | **yes** |
+    /// | `observed` | it happened, and the verifier said so | **yes** — it happened, so repeating duplicates it |
+    /// | `not-performed` | it definitely did not happen | no |
+    /// | anything else | a row this build cannot read | treated as `pending` |
+    ///
+    /// ## The rule
+    ///
+    /// An orphaned task is settled into [`TaskState::NeedsVerification`] **iff** it
+    /// holds at least one effect row that is both **not** `not-performed` **and
+    /// flagged non-idempotent**. Everything else keeps the previous behaviour.
+    ///
+    /// Every clause is load-bearing, and the distinctions are the point:
+    ///
+    /// * A task with **no** effect rows crashed before dispatching anything, so the
+    ///   world is unchanged and re-running is safe. Conflating "non-idempotent" with
+    ///   "uncertain" would park every such task forever.
+    /// * An effect recorded `not-performed` was disproved, which is the one finding a
+    ///   retry cannot duplicate — the same reasoning V-92 applies when it maps a
+    ///   refuted outcome to `Failed`.
+    /// * An effect whose capability declares itself **idempotent** stays recoverable
+    ///   whatever its status, because repeating it cannot duplicate anything by its own
+    ///   declaration. Without this the fix would fill the queue with terminal tasks.
+    /// * A status outside the vocabulary counts as not-`not-performed`, so it fails
+    ///   closed rather than reading as benign.
+    ///
+    /// The flag consulted is the **effect's** repeat-safety, not `tasks.idempotent`.
+    /// See the comment on the `EXISTS` below for why that substitution would be wrong
+    /// and would leave this hole open.
+    ///
+    /// Uncertainty also takes precedence over the retry budget. An exhausted budget
+    /// is not a licence to repeat work whose outcome is unknown, and `dead-lettered`
+    /// would report "retries exhausted" as the reason when the truth is that a
+    /// person has to decide.
+    ///
+    /// ## Two properties of the implementation
+    ///
+    /// **The decision is one statement.** The whole classification is a `CASE`
+    /// expression inside the `UPDATE`, with no preceding read, so there is no
+    /// read-then-write window for another connection to slip through — which
+    /// matters because every transaction here is `BEGIN DEFERRED`
+    /// (`Self::tx`). The row is read back afterwards only to name the event, never
+    /// to choose the state.
+    ///
+    /// **Failure to read the ledger is a failure to recover.** A status outside the
+    /// vocabulary is not "probably fine"; it is a row whose meaning is unknown, and
+    /// the safe reading of an unknown row for a non-idempotent task is "do not
+    /// repeat this". A SQLite error while reading it propagates, which
+    /// `TaskService::open` turns into a refusal to start — a daemon that cannot
+    /// establish what happened does not serve requests.
     ///
     /// # Errors
     ///
@@ -2644,18 +2736,71 @@ impl<'a> TaskRepository<'a> {
                 .collect()
         };
         for id in &orphaned {
+            // The `EXISTS` sub-select is what makes this TP-2 rather than a
+            // blanket "any effect means stuck". See the table above for why
+            // `not-performed` is excluded and every other status is not.
+            //
+            // `e.idempotent` is the *effect's* repeat-safety, not `tasks.idempotent`.
+            // That is deliberate and load-bearing: the task's own flag answers "may this
+            // task be re-run as a unit", which is not the question. A task is created
+            // before the capability that will run on it is chosen -- and the daemon's
+            // `task/create` defaults to a `query` kind -- so most tasks are flagged
+            // idempotent at the task level no matter what they are about to do. Reading
+            // it here would leave this hole wide open. V-92 already reached the same
+            // conclusion for the same reason, reading the capability's declaration
+            // rather than the task row; the dispatcher is the only place that knows it,
+            // so it is written into the ledger at reservation time.
+            //
+            // It is evaluated once, in the `uncertainty` CTE, and referenced
+            // afterwards. Writing the sub-select out per column would be three
+            // copies of the load-bearing predicate, and two of them have to agree
+            // with the first or the row ends up internally contradictory -- a task
+            // settled into `needs-verification` with a `dead_lettered_at_ms`, say.
             tx.execute(
-                "UPDATE tasks
-                    SET state = CASE WHEN attempts >= max_attempts THEN 'dead-lettered'
-                                     ELSE 'pending' END,
+                "WITH uncertainty AS (
+                     SELECT t.id AS id,
+                            CASE WHEN EXISTS (SELECT 1 FROM task_effects e
+                                               WHERE e.task_id = t.id
+                                                 AND e.status <> 'not-performed'
+                                                 AND e.idempotent = 0)
+                                 THEN 1 ELSE 0 END AS uncertain
+                       FROM tasks t
+                      WHERE t.id = ?1
+                 )
+                 UPDATE tasks
+                    SET state = CASE
+                                  WHEN (SELECT uncertain FROM uncertainty) = 1
+                                    THEN 'needs-verification'
+                                  WHEN attempts >= max_attempts THEN 'dead-lettered'
+                                  ELSE 'pending'
+                                END,
                         lease_holder = NULL,
                         lease_expires_at_ms = NULL,
                         updated_at_ms = ?2,
-                        dead_lettered_at_ms = CASE WHEN attempts >= max_attempts THEN ?2
-                                                  ELSE dead_lettered_at_ms END
+                        dead_lettered_at_ms = CASE
+                                  WHEN (SELECT uncertain FROM uncertainty) = 1
+                                    THEN dead_lettered_at_ms
+                                  WHEN attempts >= max_attempts THEN ?2
+                                  ELSE dead_lettered_at_ms END,
+                        last_error = CASE
+                                  WHEN (SELECT uncertain FROM uncertainty) = 1
+                                    THEN COALESCE(last_error, ?3)
+                                  ELSE last_error END
                   WHERE id = ?1;",
-                rusqlite::params![id, now_ms],
+                rusqlite::params![id, now_ms, Self::UNCERTAIN_RECOVERY_REASON],
             )?;
+
+            // Read back to name the event. The state was already decided by the
+            // statement above; this is bookkeeping, and it happens inside the same
+            // transaction so the two cannot disagree.
+            let settled: String = tx.query_row(
+                "SELECT state FROM tasks WHERE id = ?1;",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )?;
+            let to = TaskState::from_wire_str(&settled)
+                .ok_or_else(|| unknown_state(id.to_owned(), settled.clone()))?;
+
             // The attempt never finished; record that, so "we do not know whether
             // the work happened" is visible rather than assumed to have succeeded.
             tx.execute(
@@ -2668,12 +2813,25 @@ impl<'a> TaskRepository<'a> {
                 &tx,
                 Some(&TaskId::new(id)),
                 now_ms,
-                "recovered",
+                // Three distinct events rather than one, because `recovered` alone
+                // cannot answer the question that matters afterwards: may this be
+                // run again? `needs-verification-recovered` is the one that says a
+                // person has to decide, and it is the only one that may ever name
+                // `needs-verification`.
+                if to == TaskState::NeedsVerification {
+                    "needs-verification-recovered"
+                } else {
+                    "recovered"
+                },
                 Some(TaskState::Running),
+                Some(to),
                 None,
                 None,
-                None,
-                Some("lease orphaned by restart"),
+                Some(if to == TaskState::NeedsVerification {
+                    Self::UNCERTAIN_RECOVERY_REASON
+                } else {
+                    "lease orphaned by restart"
+                }),
             )?;
         }
 
@@ -2726,18 +2884,20 @@ impl<'a> TaskRepository<'a> {
         task_id: &TaskId,
         attempt_no: u32,
         step_key: &str,
+        idempotent: bool,
         now_ms: i64,
     ) -> Result<Option<ReservedEffect>, TaskRepoError> {
         let tx = self.tx()?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO task_effects
-                (idempotency_key, task_id, attempt_no, step_key, status, reserved_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5);",
+                (idempotency_key, task_id, attempt_no, step_key, status, idempotent, reserved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6);",
             rusqlite::params![
                 idempotency_key,
                 task_id.as_str(),
                 attempt_no,
                 step_key,
+                i64::from(idempotent),
                 now_ms
             ],
         )?;
@@ -2751,6 +2911,7 @@ impl<'a> TaskRepository<'a> {
             attempt_no,
             step_key: step_key.to_owned(),
             status: "pending".to_owned(),
+            idempotent,
             detail: None,
         }))
     }
@@ -2762,10 +2923,20 @@ impl<'a> TaskRepository<'a> {
     /// nothing knows, and that is a legitimate recorded state — whereas leaving the
     /// row `pending` forever would mean the same thing invisibly.
     ///
+    /// A row left at `pending` is not inert. It is the durable evidence that a
+    /// dispatch was authorised and its outcome never established, which is what
+    /// [`Self::recover`] reads to decide whether a crashed non-idempotent task may
+    /// be run again. This is the other reason the refusal above exists: if
+    /// `pending` were writable as a resolution, "never resolved" and "explicitly
+    /// recorded as unresolved" would become the same row, and only one of them is
+    /// evidence about a crash.
+    ///
     /// # Errors
     ///
-    /// `TaskRepoError::CorruptRow` for a status outside the vocabulary. There is no
-    /// `CorruptRow` variant; the error is reported as `TaskRepoError::Corrupt`.
+    /// [`TaskRepoError::Corrupt`] for a status inside `pending`. The doc comment in
+    /// the repository previously referred to a `CorruptRow` variant that does not
+    /// exist; the error has always been reported as
+    /// [`TaskRepoError::Corrupt`].
     pub fn resolve_effect(
         &mut self,
         idempotency_key: &str,
@@ -2796,7 +2967,7 @@ impl<'a> TaskRepository<'a> {
         Ok(self
             .conn
             .query_row(
-                "SELECT idempotency_key, task_id, attempt_no, step_key, status, detail
+                "SELECT idempotency_key, task_id, attempt_no, step_key, status, idempotent, detail
                    FROM task_effects WHERE idempotency_key = ?1;",
                 [idempotency_key],
                 |r| {
@@ -2806,7 +2977,12 @@ impl<'a> TaskRepository<'a> {
                         attempt_no: r.get(2)?,
                         step_key: r.get(3)?,
                         status: r.get(4)?,
-                        detail: r.get(5)?,
+                        // The column carries no CHECK of its own (`ALTER TABLE` cannot add
+                        // one), so the 0/1 restriction is enforced here instead. A value
+                        // outside it is corruption, and the only safe reading of a
+                        // corrupted repeat-safety flag is "not safe to repeat".
+                        idempotent: matches!(r.get::<_, i64>(5)?, 1),
+                        detail: r.get(6)?,
                     })
                 },
             )
@@ -2820,7 +2996,7 @@ impl<'a> TaskRepository<'a> {
     /// Any SQLite error.
     pub fn effects_for(&self, task_id: &TaskId) -> Result<Vec<ReservedEffect>, TaskRepoError> {
         let mut stmt = self.conn.prepare(
-            "SELECT idempotency_key, task_id, attempt_no, step_key, status, detail
+            "SELECT idempotency_key, task_id, attempt_no, step_key, status, idempotent, detail
                FROM task_effects WHERE task_id = ?1 ORDER BY reserved_at_ms, idempotency_key;",
         )?;
         let rows = stmt.query_map([task_id.as_str()], |r| {
@@ -2830,7 +3006,8 @@ impl<'a> TaskRepository<'a> {
                 attempt_no: r.get(2)?,
                 step_key: r.get(3)?,
                 status: r.get(4)?,
-                detail: r.get(5)?,
+                idempotent: matches!(r.get::<_, i64>(5)?, 1),
+                detail: r.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -3548,6 +3725,89 @@ mod tests {
     use super::*;
     use crate::migration::MigrationRunner;
     use crate::pragma::Pragma;
+
+    /// A database written before the effect's repeat-safety existed upgrades to the
+    /// fail-closed reading.
+    ///
+    /// V-93. The column is added `NOT NULL DEFAULT 0`, so a row written by an older
+    /// build -- whose effect's repeat-safety nobody recorded -- becomes one that must
+    /// not be repeated. That is the only safe direction for a row whose meaning is
+    /// unknown, and it is what makes recovery conservative rather than permissive for
+    /// every database already on disk.
+    #[test]
+    fn a_legacy_effect_row_upgrades_to_the_fail_closed_repeat_safety() {
+        use crate::migration::{CURRENT_VERSION, MIGRATIONS};
+
+        let c = rusqlite::Connection::open_in_memory().expect("open");
+        // Stand up a version-10 database: everything except the effect's flag.
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 10) {
+            c.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("{}: {e}", m.name));
+            c.execute(
+                "INSERT OR REPLACE INTO schema_meta (version, name, applied_at) VALUES (?1, ?2, 0);",
+                rusqlite::params![i64::from(m.version), m.name],
+            )
+            .expect("record");
+        }
+        c.execute(
+            "INSERT INTO tasks (id, kind, state, idempotent, max_attempts, run_after_ms,
+                                 created_at_ms, updated_at_ms)
+             VALUES ('t','workflow','pending',0,3,0,0,0);",
+            [],
+        )
+        .expect("task");
+        c.execute(
+            "INSERT INTO task_effects (idempotency_key, task_id, attempt_no, step_key, status, reserved_at_ms)
+             VALUES ('k','t',1,'write','pending',0);",
+            [],
+        )
+        .expect("a pre-V-93 effect row");
+
+        // The column does not exist yet.
+        let before: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('task_effects') WHERE name = 'idempotent';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("probe");
+        assert_eq!(before, 0, "precondition: version 10 has no such column");
+
+        MigrationRunner::new(&c)
+            .run(true)
+            .expect("upgrade to current");
+        let version: u32 = c
+            .query_row("SELECT MAX(version) FROM schema_meta;", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(
+            version, CURRENT_VERSION,
+            "the runner must reach the current version"
+        );
+
+        // The legacy row is now flagged non-idempotent: not safe to repeat.
+        let flagged: i64 = c
+            .query_row(
+                "SELECT idempotent FROM task_effects WHERE idempotency_key = 'k';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read back");
+        assert_eq!(
+            flagged, 0,
+            "an effect whose repeat-safety was never recorded must not be treated as safe"
+        );
+
+        // And the schema still refuses to write a status outside the vocabulary.
+        assert!(
+            c.execute(
+                "UPDATE task_effects SET status = 'in-flux' WHERE idempotency_key = 'k';",
+                [],
+            )
+            .is_err(),
+            "the status CHECK must survive the ALTER"
+        );
+        let _ = c;
+    }
 
     const NOW: i64 = 1_767_225_600_000;
     const LEASE: i64 = 5_000;
@@ -4546,11 +4806,11 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let first = repo
-            .reserve_effect("key-1", &tid("t"), 1, "step-1", NOW)
+            .reserve_effect("key-1", &tid("t"), 1, "step-1", false, NOW)
             .expect("reserve");
         assert!(first.is_some());
         let second = repo
-            .reserve_effect("key-1", &tid("t"), 2, "step-1", NOW)
+            .reserve_effect("key-1", &tid("t"), 2, "step-1", false, NOW)
             .expect("reserve");
         assert!(
             second.is_none(),
@@ -4573,7 +4833,7 @@ mod tests {
         {
             let key = format!("k{i}");
             let _ = repo
-                .reserve_effect(&key, &tid("t"), 1, "s", NOW)
+                .reserve_effect(&key, &tid("t"), 1, "s", false, NOW)
                 .expect("reserve");
             assert!(
                 repo.resolve_effect(&key, status, None, NOW + 1)
@@ -4592,7 +4852,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", NOW)
+            .reserve_effect("k", &tid("t"), 1, "s", false, NOW)
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Pending, None, NOW)
@@ -4606,7 +4866,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", NOW)
+            .reserve_effect("k", &tid("t"), 1, "s", false, NOW)
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Unknown, None, NOW)
@@ -4628,7 +4888,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", NOW)
+            .reserve_effect("k", &tid("t"), 1, "s", false, NOW)
             .expect("reserve");
         assert!(!repo.all_effects_resolved(&tid("t")).expect("resolved?"));
         let _ = repo.resolve_effect("k", EffectStatus::Unknown, None, NOW);
@@ -5073,7 +5333,14 @@ mod tests {
         insert(&mut repo, "t", TaskKind::Workflow);
         for i in 0..3 {
             let _ = repo
-                .reserve_effect(&format!("k{i}"), &tid("t"), 1, &format!("s{i}"), NOW + i)
+                .reserve_effect(
+                    &format!("k{i}"),
+                    &tid("t"),
+                    1,
+                    &format!("s{i}"),
+                    false,
+                    NOW + i,
+                )
                 .expect("r");
         }
         let keys: Vec<String> = repo

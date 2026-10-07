@@ -602,6 +602,32 @@ DROP TABLE task_approvals;
 ALTER TABLE task_approvals_scoped RENAME TO task_approvals;
 "#;
 
+/// Migration 11 — the side-effect ledger records its own repeat-safety. V-93.
+pub const MIGRATION_EFFECT_IDEMPOTENCY: &str = r#"
+-- The repeat-safety of the *effect*, recorded when it is reserved.
+--
+-- V-93. `tasks.idempotent` says whether the task may be re-run as a unit; this says
+-- whether *this* side effect may be repeated. They are different facts and V-92
+-- already made that point deliberately, reading the capability's own declaration
+-- rather than the task row. Recovery needs the same answer at a point where the
+-- task row cannot supply it: a task is created before the capability that will run
+-- on it is known, and the daemon's `task/create` defaults to a `query` kind, so a
+-- task that goes on to run a non-idempotent capability is very often flagged
+-- idempotent at the task level. Deciding recovery from that flag would leave the
+-- hole open.
+--
+-- `NOT NULL DEFAULT 0` is the fail-closed direction: a row written before this
+-- column existed, or by any writer that did not supply it, is treated as one that
+-- must not be repeated. That is the correct reading of an effect whose repeat-safety
+-- nobody recorded.
+--
+-- Added by `ALTER TABLE` rather than by recreating the table, so the existing CHECK
+-- and the foreign key are untouched. The column therefore carries no CHECK of its
+-- own, which is why `idempotent IN (0,1)` is enforced in `decode_effect` instead --
+-- `max_steps` and `steps_completed` have the same gap.
+ALTER TABLE task_effects ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

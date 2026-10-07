@@ -59,7 +59,7 @@ use orxnud_platform_ipc::{IpcError, LocalStream, endpoint_for};
 use orxnud_protocol::error::{ProtocolError, RpcError, RpcErrorCode};
 use orxnud_protocol::frame::{Request, RequestId, Response};
 use orxnud_protocol::method::Method;
-use orxnud_store::task_repo::NewTask;
+use orxnud_store::task_repo::{EffectStatus, NewTask};
 use serde_json::json;
 
 use orxnud_task::EngineLimits;
@@ -2601,6 +2601,82 @@ async fn execute_proposal<S: SecretsContract>(
         );
     }
 
+    // 5b. Reserve the side effect, *before* it is dispatched.
+    //
+    // This is the durable record that the world may already have changed, and it is
+    // written here for the same reason the dedupe row is written before the call
+    // rather than after: a record made afterwards cannot describe a crash. The
+    // window between this line and the settlement below is the one V-93 exists to
+    // close, and it is only closeable because something durable already says "a
+    // dispatch was authorised and its outcome is not established".
+    //
+    // Before this existed the ledger was only written by tests, so
+    // `TaskRepository::recover` had nothing to consult and an interrupted
+    // non-idempotent task went back to `pending` on the next start.
+    //
+    // The key is scoped to `(task, capability, step, attempt)` — the same tuple
+    // `task_approvals` uses as its primary key. All four parts are needed, and two
+    // of the obvious narrower choices are wrong:
+    //
+    //  * `(task, capability, attempt)` is **not** unique: the attempt counter
+    //    restarts at every step boundary (`complete_verified_step` clears it), so a
+    //    two-step task that runs the same capability twice would collide on step 2
+    //    and be refused as a duplicate dispatch. A real test caught this.
+    //  * `(task, capability, step)` is **too** narrow: a retry of a disproved step
+    //    keeps its step number and advances only its attempt, so the step-scoped
+    //    key would make a step permanently un-retryable — including the
+    //    `Refuted -> Failed` retry V-92 deliberately allows.
+    //
+    // So: within one `(step, attempt)` a resumed or duplicated dispatch is refused,
+    // which is the dedupe guarantee ADR-0007 asks for; and a genuine retry gets a
+    // fresh key. Recovery reasons over *every* row for the task rather than over
+    // this key, so an unresolved row from an earlier step or attempt still holds
+    // the task.
+    // Whether repeating *this action* is safe comes from the capability's own
+    // declaration. Read from the registry rather than the proposal or the task row,
+    // and defaulted to `false` when the capability is unknown -- an unrecognised
+    // action is treated as one that must not be repeated, which is the direction that
+    // cannot duplicate an effect.
+    //
+    // Read here, before the reservation, because the reservation records it and the
+    // recovery path reads it back. V-92 established the same source for the same
+    // reason: the task row cannot answer this question.
+    let capability_id = orxnud_domain::ids::CapabilityId::new(proposal.capability.as_str());
+    let idempotent =
+        g.0.registry()
+            .get(&capability_id)
+            .is_some_and(|d| d.idempotent);
+
+    let effect_attempt_class = format!("{}/{}", proposal.step_no, proposal.attempt_no);
+    let effect_key = orxnud_task::DurableEngine::idempotency_key(
+        &proposal.task_id,
+        &proposal.capability,
+        &effect_attempt_class,
+    );
+    if !g
+        .2
+        .reserve_effect(
+            &effect_key,
+            &proposal.task_id,
+            proposal.attempt_no,
+            &proposal.capability,
+            idempotent,
+            now,
+        )
+        .map_err(task_fault)?
+    {
+        // This attempt already reserved this effect. Dispatching again would be the
+        // duplicate ADR-0007's invariant 3 exists to prevent, so it is a conflict
+        // and not a silent second run.
+        return Err(RequestError::Conflict {
+            reason: "effect-already-reserved".to_owned(),
+            detail: Some(
+                "this attempt already reserved the side effect; it cannot be dispatched twice"
+                    .to_owned(),
+            ),
+        });
+    }
+
     // 6. Dispatch. The action comes from the proposal; `action.params` and
     //    `canonical_params` are the same value by construction, which is what the
     //    dispatcher's digest check then confirms.
@@ -2652,10 +2728,65 @@ async fn execute_proposal<S: SecretsContract>(
         )
     };
 
+    // 7. Record what the effect turned out to be.
+    //
+    // The reservation above stays `pending` if the process dies here, and `pending`
+    // is precisely the evidence recovery reads to refuse re-running uncertain
+    // non-idempotent work. So *every* exit from a dispatch that reached the
+    // capability has to resolve it, or the task stays uncertain forever.
+    //
+    // This mirrors the mapping V-92 already makes for the task state, from the same
+    // `VerificationOutcome`, and is deliberately the same table:
+    //
+    // | verification | effect | task |
+    // |---|---|---|
+    // | `Verified`   | `observed`      | completes the step |
+    // | `Refuted`    | `not-performed` | `Failed`, retryable |
+    // | `Undetermined` | `unknown`     | `Failed` if idempotent, else `needs-verification` |
+    //
+    // An adapter-reported failure is not used here. A subprocess can die after
+    // writing, so `ExecutionOutcome::Failed` is not evidence about the effect -- the
+    // same reason V-92 does not treat it as a disproof.
+    //
+    // A `dispatch` error is *not* a resolution either: `dispatch` can fail before
+    // the capability runs at all (unresolvable, no sandbox, a replayed approval), and
+    // in those cases nothing was dispatched. The row is left `pending`, which for a
+    // non-idempotent task means recovery will settle the task into
+    // `needs-verification` rather than risk repeating a dispatch whose reach we
+    // cannot establish. Erring that way is the one that cannot duplicate an effect.
     let o = match outcome {
         Ok(o) => o,
         Err(e) => return Err(dispatch_failure(&e)),
     };
+    // V-93's window: the effect is reserved and its outcome is not yet recorded.
+    // A crash here leaves exactly the state `recover` has to recognise, so the
+    // point is what makes that path testable through a real process rather than a
+    // constructed row. `maybe_crash` is a no-op unless `ORXNUD_FAULT` names it.
+    orxnud_store::faults::maybe_crash(
+        orxnud_store::faults::FaultPoint::ExecutionReservedBeforeOutcome,
+    );
+    {
+        let settled_at = g.2.clock_now_ms();
+        let effect_status = match certainty_of(&o.verification) {
+            Certainty::Established => EffectStatus::Observed,
+            Certainty::Disproved => EffectStatus::NotPerformed,
+            Certainty::Unknown => EffectStatus::Unknown,
+        };
+        if let Err(e) =
+            g.2.resolve_effect(&effect_key, effect_status, None, settled_at)
+        {
+            // The row stays `pending`, which is the fail-closed reading: recovery
+            // will refuse to re-run a non-idempotent task whose effect it cannot
+            // account for. Losing the fine-grained verdict costs a retry or a
+            // human; inventing one would cost correctness.
+            tracing::error!(
+                error = ?e,
+                task = %proposal.task_id.as_str(),
+                effect = %effect_key,
+                "the side-effect ledger could not record this outcome; the effect stays unresolved"
+            );
+        }
+    }
     // Set only on the unverified path; `None` on the verified one.
     let mut outcome_uncertainty: Option<UnverifiedSettlement> = None;
 
@@ -2680,16 +2811,9 @@ async fn execute_proposal<S: SecretsContract>(
     // The step number is read from the durable counter rather than carried in memory, and
     // checked against the proposal this execution came from, so an approval minted for one
     // step cannot advance another.
-    // Whether repeating this action is safe comes from the capability's own declaration.
-    // Read from the registry rather than the proposal or the task row, and defaulted to
-    // `false` when the capability is unknown -- an unrecognised action is treated as one
-    // that must not be repeated, which is the direction that cannot duplicate an effect.
-    let capability_id = orxnud_domain::ids::CapabilityId::new(proposal.capability.as_str());
-    let idempotent =
-        g.0.registry()
-            .get(&capability_id)
-            .is_some_and(|d| d.idempotent);
-
+    // `idempotent` is read above, before the reservation, and reused here so the
+    // ledger row and the task state cannot disagree about whether repeating this
+    // action is safe.
     let advance = if o.is_verified() {
         let complete_at = g.2.clock_now_ms();
         let step_no = g.2.next_step_no(&began.task_id).map_err(task_fault)?;
