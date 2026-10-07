@@ -1,0 +1,11 @@
+error[E0433]: cannot find `PolicySeal` in `orxnud_domain`
+  --> tests/compile_fail/the_seal_is_gone.rs:16:32
+   |
+16 |     let _seal = orxnud_domain::PolicySeal::attest("anything");
+   |                                ^^^^^^^^^^ could not find `PolicySeal` in `orxnud_domain`
+
+error[E0425]: cannot find function `seal` in crate `orxnud_policy`
+  --> tests/compile_fail/the_seal_is_gone.rs:15:32
+   |
+15 |     let _seal = orxnud_policy::seal();
+   |                                ^^^^ not found in `orxnud_policy`

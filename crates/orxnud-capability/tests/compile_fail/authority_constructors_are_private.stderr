@@ -1,0 +1,60 @@
+error[E0624]: associated function `issue` is private
+  --> tests/compile_fail/authority_constructors_are_private.rs:28:38
+   |
+28 |       let _proof = AuthorisationProof::issue("v1", None, RiskClass::Low);
+   |                                        ^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/orxnud-policy/src/authority.rs
+   |
+   | /     pub(crate) fn issue(
+   | |         policy_version: impl Into<String>,
+   | |         approval: Option<ApprovalDigest>,
+   | |         assessed_risk: RiskClass,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0624]: associated function `issue` is private
+  --> tests/compile_fail/authority_constructors_are_private.rs:31:38
+   |
+31 |       let _proof = AuthorisationProof::issue(
+   |                                        ^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/orxnud-policy/src/authority.rs
+   |
+   | /     pub(crate) fn issue(
+   | |         policy_version: impl Into<String>,
+   | |         approval: Option<ApprovalDigest>,
+   | |         assessed_risk: RiskClass,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0624]: associated function `authorise` is private
+  --> tests/compile_fail/authority_constructors_are_private.rs:46:45
+   |
+46 |       let _invocation = CapabilityInvocation::authorise(
+   |                                               ^^^^^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/orxnud-policy/src/authority.rs
+   |
+   | /     pub(crate) fn authorise(
+   | |         request: ActionRequest,
+   | |         actor: Actor,
+   | |         context: InvocationContext,
+   | |         proof: AuthorisationProof,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0624]: associated function `issue` is private
+  --> tests/compile_fail/authority_constructors_are_private.rs:50:29
+   |
+50 |           AuthorisationProof::issue("v1", None, RiskClass::Low),
+   |                               ^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/orxnud-policy/src/authority.rs
+   |
+   | /     pub(crate) fn issue(
+   | |         policy_version: impl Into<String>,
+   | |         approval: Option<ApprovalDigest>,
+   | |         assessed_risk: RiskClass,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here

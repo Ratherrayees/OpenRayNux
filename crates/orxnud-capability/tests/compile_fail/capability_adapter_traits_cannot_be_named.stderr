@@ -1,0 +1,7 @@
+error[E0432]: unresolved imports `orxnud_capability::AdapterBundle`, `orxnud_capability::CapabilityAdapter`
+  --> tests/compile_fail/capability_adapter_traits_cannot_be_named.rs:15:25
+   |
+15 | use orxnud_capability::{AdapterBundle, CapabilityAdapter};
+   |                         ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^ no `CapabilityAdapter` in the root
+   |                         |
+   |                         no `AdapterBundle` in the root
