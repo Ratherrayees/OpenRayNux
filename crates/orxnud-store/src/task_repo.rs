@@ -1008,17 +1008,18 @@ impl<'a> TaskRepository<'a> {
 
     /// Begins an immediate transaction.
     ///
-    /// `IMMEDIATE`, never `DEFERRED`: with a deferred transaction the write lock
-    /// is taken at the first *read*, so a second writer can change the table
-    /// between our read and our write and the statement is retried — which for a
-    /// state transition means deciding again whether it is legal.
+    /// Delegates to [`crate::tx::authority_transaction`], which is where the reasoning
+    /// lives. In short: a task transition reads before it writes, so the write lock has
+    /// to be held across the read, and `IMMEDIATE` is the only `BEGIN` that takes it
+    /// there. `DEFERRED` takes it at the first write instead, which is one statement too
+    /// late -- the decision has already been made.
     fn tx(&mut self) -> Result<Transaction<'_>, TaskRepoError> {
-        // `unchecked_transaction` is required, not chosen: a transaction needs a
-        // `&mut` borrow of the connection, and this repository deliberately holds a
-        // shared one so that reads do not require write access. The single-writer
-        // discipline (ADR-0006) is what makes this safe: exactly one `&mut
+        // `authority_transaction` takes `&Connection`, not `&mut`, and that is required
+        // rather than chosen: this repository holds a shared borrow so that reads do not
+        // require write access, and `Transaction::new` would need `&mut`. The single-writer
+        // discipline (ADR-0006) is what keeps that safe -- exactly one `&mut
         // TaskRepository` exists at a time, so exactly one transaction can be open.
-        Ok(self.conn.unchecked_transaction()?)
+        Ok(crate::tx::authority_transaction(self.conn)?)
     }
 
     // ---------------------------------------------------------------- enqueue
