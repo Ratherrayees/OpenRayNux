@@ -218,7 +218,7 @@ impl DispatchOutcome {
 /// field on the declaration because the adapter is the thing that knows how it runs:
 /// a declaration claiming Tier 0 while the implementation spawns a subprocess would
 /// be exactly the bypass Phase 4b exists to close.
-pub trait CapabilityAdapter: Send + Sync {
+pub(crate) trait CapabilityAdapter: Send + Sync {
     /// The id this adapter implements.
     fn capability_id(&self) -> &CapabilityId;
 
@@ -888,8 +888,132 @@ pub struct SandboxPlan {
     pub resources: ResourcePolicy,
 }
 
+/// The adapter implementations a [`Dispatcher`] can resolve against.
+///
+/// # Why this type exists
+///
+/// It exists so that `Dispatcher::new` can stay `pub` while the things it stores are
+/// not. [`AdapterBundle`] is `pub(crate)` — the boundary that makes an adapter
+/// uncallable and unimplementable from another crate — so a `pub fn new(…,
+/// BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>)` would leak a crate-private type
+/// into a public signature. This is a `pub` wrapper with a private field and
+/// crate-private construction, which gives the same reachability with none of the
+/// leak.
+///
+/// It is deliberately *not* a general registration API: `insert` is `pub(crate)`, so
+/// the only bundles a caller can ever obtain are the ones this crate builds. A public
+/// `register` would be a way to add execution machinery from outside, which is exactly
+/// what the sealed trait prevents.
+///
+/// Not to be confused with [`crate::CapabilityRegistry`], which holds capability
+/// *declarations* (risk, class, enabled) rather than implementations. Both are real;
+/// this one holds the code.
+#[derive(Clone, Default)]
+pub struct AdapterRegistry {
+    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
+}
+
+impl std::fmt::Debug for AdapterRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Counted rather than listed: an `Arc<dyn AdapterBundle>` cannot be
+        // formatted, and the ids alone would be an inventory of what this
+        // installation can execute.
+        f.debug_struct("AdapterRegistry")
+            .field("adapters", &self.bundles.len())
+            .finish()
+    }
+}
+
+impl AdapterRegistry {
+    /// A registry with no adapters in it.
+    ///
+    /// Every dispatch against this is refused with [`DispatchError::NoImplementation`],
+    /// which is the fail-closed result and not a gap.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// How many adapters are registered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bundles.len()
+    }
+
+    /// Whether no adapter is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bundles.is_empty()
+    }
+
+    /// Whether `id` has an implementation here.
+    #[must_use]
+    pub fn contains(&self, id: &CapabilityId) -> bool {
+        self.bundles.contains_key(id)
+    }
+
+    /// Registers an adapter under the id **the adapter itself reports**.
+    ///
+    /// Crate-private because that is the whole boundary: the only way an adapter
+    /// enters the world is code in this crate.
+    ///
+    /// The id is read from the adapter rather than passed in. That makes it
+    /// impossible to file a bundle under a different id than the one it answers to,
+    /// which was a latent composition bug when the caller supplied both and the
+    /// dispatcher later compared them.
+    pub(crate) fn insert(
+        &mut self,
+        bundle: Arc<dyn AdapterBundle + Send + Sync>,
+    ) -> Option<Arc<dyn AdapterBundle + Send + Sync>> {
+        let id = bundle.adapter().capability_id().clone();
+        self.bundles.insert(id, bundle)
+    }
+
+    /// The map the dispatcher holds.
+    pub(crate) fn into_bundles(self) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
+        self.bundles
+    }
+
+    /// Adopts an already-built bundle map.
+    ///
+    /// Crate-private for the same reason `insert` is: it is a construction path, and
+    /// every construction path for a registry is inside this crate.
+    #[cfg(test)]
+    pub(crate) fn from_bundles(
+        bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
+    ) -> Self {
+        Self { bundles }
+    }
+
+    /// The adapters this crate ships.
+    ///
+    /// The single supported way for a caller to obtain a non-empty registry, and the
+    /// reason composition of adapter code lives here rather than in the daemon: an
+    /// adapter is capability code, so the set of them is the crate's business.
+    ///
+    /// `write-text` and `read-text` are included only when their helper binary can be
+    /// located, which keeps the Tier-1 refusal (`NoImplementation`) at composition
+    /// rather than turning it into a runtime failure further from the cause.
+    #[must_use]
+    pub fn shipped(workspace: &std::path::Path) -> Self {
+        let mut registry = Self::empty();
+        registry.insert(Arc::new(crate::text::WordCountBundle::default()));
+        if let Some(helper) = crate::write_text::resolve_helper() {
+            registry.insert(Arc::new(crate::write_text::WriteTextBundle::new(
+                workspace, helper,
+            )));
+        }
+        if let Some(helper) = crate::read_text::resolve_helper() {
+            registry.insert(Arc::new(crate::read_text::ReadTextBundle::new(
+                workspace, helper,
+            )));
+        }
+        registry
+    }
+}
+
 /// Verification strategy, looked up alongside the adapter.
-pub trait AdapterBundle {
+pub(crate) trait AdapterBundle {
     /// The adapter.
     fn adapter(&self) -> &dyn CapabilityAdapter;
 
@@ -1048,17 +1172,20 @@ pub struct Dispatcher<'p, S: SecretsContract> {
 }
 
 impl<'p, S: SecretsContract> Dispatcher<'p, S> {
-    /// Builds a dispatcher over `bundles`.
+    /// Builds a dispatcher over `registry`.
+    ///
+    /// Takes an [`AdapterRegistry`] rather than a raw bundle map because the bundle
+    /// type is crate-private; see that type for why that is the boundary.
     #[must_use]
     pub fn new(
         policy: &'p mut PolicyEngine,
         secrets: &'p S,
-        bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
+        registry: AdapterRegistry,
     ) -> Self {
         Self {
             policy,
             secrets,
-            bundles,
+            bundles: registry.into_bundles(),
             reentrancy: ReentrancyGuard::default(),
             execution: None,
         }
@@ -1135,26 +1262,6 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             output_cap_bytes: sandboxed.output_cap_bytes,
             resources: sandboxed.resources.clone(),
         })
-    }
-
-    /// Registers an implementation. Duplicate ids are refused, because two
-    /// implementations of one capability is a version-conflict bug that would
-    /// otherwise be resolved by iteration order.
-    ///
-    /// # Errors
-    ///
-    /// [`DispatchError::NoImplementation`] is not the right error here; a duplicate
-    /// is reported as [`RegisterError::Duplicate`].
-    pub fn register(
-        &mut self,
-        bundle: Arc<dyn AdapterBundle + Send + Sync>,
-    ) -> Result<(), RegisterError> {
-        let id = bundle.adapter().capability_id().clone();
-        if self.bundles.contains_key(&id) {
-            return Err(RegisterError::Duplicate(id));
-        }
-        self.bundles.insert(id, bundle);
-        Ok(())
     }
 
     /// Whether a dispatch is currently in flight on this thread of control.
