@@ -909,7 +909,7 @@ fn the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs()
     assert_eq!(
         idempotent, &0,
         "`filesystem/write-text` declares itself non-idempotent, so the effect must be \
-         recorded as unsafe to repeat: {rows:?}"
+         recorded as one that must not be repeated: {rows:?}"
     );
 
     // And the task finished, so nothing is left claiming otherwise.
