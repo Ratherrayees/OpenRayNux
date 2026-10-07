@@ -199,6 +199,12 @@ G2D_CASES: list[tuple[str, str, str, bool]] = [
         False,
     ),
     (
+        "a violation AFTER a nested block inside a test module is still test-only",
+        "G2d",
+        "crates/orxnud-capability/src/a.rs",
+        False,
+    ),
+    (
         "#[cfg(all(test, unix))] is test-only",
         "G2d",
         "crates/orxnud-capability/src/a.rs",
@@ -406,6 +412,24 @@ mod tests {
     #[test]
     fn it_builds() {
         assert!(deeper::fixture().issued_by().len() > 0);
+    }
+}
+""",
+        "a violation AFTER a nested block inside a test module is still test-only": """
+#[cfg(test)]
+mod tests {
+    // A nested block, so that a region matcher which ends at the first closing
+    // brace would stop here -- before the violation below, and therefore expose it.
+    mod deeper {
+        pub fn helper() -> u32 {
+            7
+        }
+    }
+
+    use orxnud_domain::PolicySeal;
+
+    pub fn fixture() -> PolicySeal {
+        PolicySeal::attest("test")
     }
 }
 """,
