@@ -15,9 +15,12 @@
 //!
 //! # Ordering and atomicity come from SQLite, not from a mutex
 //!
-//! `BEGIN IMMEDIATE` takes the write lock before the sequence number is read, so
-//! two writers cannot both read the same head. `audit_log.seq` is the primary key,
-//! so a stale head fails at insert rather than forking the journal.
+//! `audit_log.seq` is the primary key, so a writer whose idea of the chain head
+//! went stale fails at insert rather than forking the journal -- and it fails with
+//! [`JournalError::PositionTaken`], which names the reason and tells the caller to
+//! reload instead of retrying blindly. Two writers *can* both read the same head;
+//! what they cannot both do is record it.
+//!
 //! `spent_approvals.digest` is the primary key, so single-use approval is one
 //! `INSERT` — not a `SELECT` followed by an `INSERT`, which is race-prone by
 //! construction and would let two dispatches both succeed.
@@ -125,8 +128,24 @@ impl SqliteAuditJournal {
 impl AuditJournal for SqliteAuditJournal {
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
         let unavailable = |e: rusqlite::Error| JournalError::Unavailable(e.to_string());
-        // `IMMEDIATE` before the read: taking the write lock first is what stops
-        // two writers both computing the same successor. See the module docs.
+        // DEFERRED, and it does not need to be anything else. V-95.
+        //
+        // This comment previously said "`IMMEDIATE` before the read: taking the write
+        // lock first is what stops two writers both computing the same successor",
+        // over a `DEFERRED` transaction -- and the claim was wrong twice over. There is
+        // no read in this transaction: its only statement is the `INSERT`, so the write
+        // lock is taken on the first statement either way. And the read that decides the
+        // successor is not here at all -- it belongs to the caller, which must load the
+        // chain head, hash it, and then call `append`.
+        //
+        // That caller's race is real, and the primary key is what resolves it: two
+        // writers that both computed `seq = N` collide, and the loser gets
+        // `JournalError::PositionTaken`, which says its idea of the head was stale and
+        // that it must reload rather than retry blindly. That is a classified refusal
+        // naming the reason -- the same shape `TaskRepository` now produces for a lost
+        // authority race, arrived at by a different mechanism. Fixing it properly would
+        // mean moving the head read inside this transaction, which is a change to the
+        // journal's interface and out of scope for V-95; it is recorded as a follow-up.
         let tx = self.conn.unchecked_transaction().map_err(unavailable)?;
         tx.execute(
             "INSERT INTO audit_log (seq, prev_hash, record_hash, record)
@@ -225,8 +244,8 @@ impl SqliteApprovalLedger {
     /// # Concurrency
     ///
     /// Same as [`SqliteAuditJournal::open`]: concurrent opens of one database are
-    /// supported, and concurrent writes are serialised by the write lock plus
-    /// `BEGIN IMMEDIATE`.
+    /// supported. Concurrent writes are serialised by the write lock and the primary key,
+    /// not by a transaction mode -- this type opens no transaction at all.
     ///
     /// # Errors
     ///

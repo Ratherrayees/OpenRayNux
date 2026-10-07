@@ -48,13 +48,25 @@
 //!
 //! # The transaction discipline
 //!
-//! Every state transition is one `BEGIN IMMEDIATE` transaction. `IMMEDIATE`
-//! rather than the default `DEFERRED` because `sqlite.org/lang_transaction.html`
-//! says: *"If the BEGIN IMMEDIATE operation succeeds, then no subsequent
-//! operations in that transaction will ever fail with a SQLITE_BUSY error."*
-//! With `DEFERRED`, the lock is taken at the first read and a concurrent writer
-//! can invalidate the plan, so the transition is retried — which for a state
-//! transition means re-evaluating whether it is still legal.
+//! Every state transition is one `BEGIN IMMEDIATE` transaction, opened through
+//! [`tx::authority_transaction`]. `IMMEDIATE` rather than the default `DEFERRED`
+//! because `sqlite.org/lang_transaction.html` says: *"If the BEGIN IMMEDIATE
+//! operation succeeds, then no subsequent operations in that transaction will
+//! ever fail with a SQLITE_BUSY error."*
+//!
+//! The clause that matters is the first half of that sentence. `DEFERRED` takes
+//! the write lock at the transaction's first **write**, not its first read — and a
+//! task transition reads before it writes, because the read is what answers "is
+//! this still legal?". So the lock arrives one statement too late: a competing
+//! writer can commit in between, and the write is then refused outright with
+//! `SQLITE_BUSY_SNAPSHOT`, which SQLite never passes to the busy handler because
+//! waiting cannot make a stale snapshot current. `busy_timeout` does not rescue it.
+//!
+//! That was not a theoretical gap. `TaskRepository::tx` was documented here as
+//! taking the lock before the read while calling `unchecked_transaction()`, which
+//! is `DEFERRED` — so the crate asserted a property it did not have. See
+//! [`tx`] for the measurement and `crates/orxnud-task/tests/v95_concurrency.rs`
+//! for the reproduction.
 //!
 //! Every mutation here takes `&mut Connection`, so the compiler enforces that a
 //! caller cannot hold a shared borrow across a transaction.
