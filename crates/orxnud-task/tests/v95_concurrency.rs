@@ -309,6 +309,24 @@ impl Outcome {
             Self::Succeeded => panic!("{who}: won the race it was supposed to lose"),
         }
     }
+
+    /// For an operation whose correct outcome on losing may legitimately be `Ok` — an
+    /// idempotent no-op on a terminal state. The assertion is narrower and just as
+    /// sharp: whatever the answer, it must not be an unclassified busy error, because a
+    /// busy error means the operation never got to look at current state at all.
+    fn assert_no_busy_error(self, who: &str) {
+        match self {
+            Self::Busy => panic!(
+                "{who}: was told 'database is locked', so it never reached a decision at \
+                 all. See `assert_loser_was_told_why` for why that is the wrong answer."
+            ),
+            Self::Storage(msg) => {
+                panic!("{who}: expected a decision, got a storage error: {msg}")
+            }
+            Self::Refused(why) => eprintln!("{who}: refused with a reason: {why}"),
+            Self::Succeeded => eprintln!("{who}: succeeded, having read current state"),
+        }
+    }
 }
 
 fn is_busy(e: &rusqlite::Error) -> bool {
@@ -515,9 +533,20 @@ fn a_competing_state_change_is_a_classified_refusal_on_the_proposal_path() {
 }
 
 /// A'''. `request_cancel`, which reads the task, updates it, and reads it again — the one
-/// transition whose refusal is *derived from a read* rather than from a row count.
+/// transition whose outcome is *derived from a read* rather than from a row count.
+///
+/// The correct outcome here is `Ok`, and the test says why that is a hard-won assertion
+/// rather than a weak one. Cancelling an already-`cancelled` task is an idempotent no-op
+/// by design (`TaskState::is_terminal`), so the contender *should* succeed — but only if
+/// it saw the rival's committed state. Under `DEFERRED` it never got that far: the
+/// refusal came from `SQLITE_BUSY_SNAPSHOT` before any of this was decided.
+///
+/// So the assertion is that the contender waited for the lock, and then took the
+/// read-derived no-op path: it must not have written anything. If it had decided from a
+/// pre-commit snapshot it would have seen `running`, and `cancel_requested_at_ms` would
+/// carry its timestamp.
 #[test]
-fn a_competing_cancellation_is_a_classified_refusal_not_a_busy_error() {
+fn a_competing_cancellation_makes_the_contender_wait_and_then_see_the_new_state() {
     let d = dir("A4-cancel");
     let db = db_in(&d);
     {
@@ -540,7 +569,21 @@ fn a_competing_cancellation_is_a_classified_refusal_not_a_busy_error() {
     );
 
     assert_contended(blocked, "A'''");
-    out.assert_loser_was_told_why("A''': contender on the cancel path");
+    out.assert_no_busy_error("A''': contender on the cancel path");
+
+    let check = open_engine(&db);
+    let row = check.task(&tid("t")).expect("read").expect("present");
+    assert_eq!(
+        row.state,
+        TaskState::Cancelled,
+        "the rival's cancellation stands"
+    );
+    assert_eq!(
+        row.cancel_requested_at_ms, None,
+        "the contender must have observed the terminal state and written nothing. A \
+         timestamp here means it decided from a snapshot taken before the rival \
+         committed: {row:?}"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -962,7 +1005,7 @@ fn deferred_and_immediate_differ_in_whether_the_write_can_be_committed() {
         (TransactionBehavior::Deferred, "deferred"),
         (TransactionBehavior::Immediate, "immediate"),
     ] {
-        let d = dir(&format!("mechanism-{tag}"));
+        let d = dir(&format!("mechanism-comparison-{tag}"));
         let db = db_in(&d);
         {
             let mut e = open_engine(&db);
@@ -1013,7 +1056,7 @@ fn deferred_and_immediate_differ_in_whether_the_write_can_be_committed() {
 /// decision is made on current state. There is no window to lose.
 #[test]
 fn immediate_reads_current_state_because_the_lock_is_taken_before_the_read() {
-    let d = dir("mechanism-immediate");
+    let d = dir("mechanism-immediate-alone");
     let db = db_in(&d);
     {
         let mut e = open_engine(&db);
@@ -1051,7 +1094,7 @@ fn immediate_reads_current_state_because_the_lock_is_taken_before_the_read() {
 /// undecidable, and that no busy handler or `busy_timeout` can absorb.
 #[test]
 fn deferred_never_waits_and_reports_an_unclassifiable_conflict() {
-    let d = dir("mechanism-deferred");
+    let d = dir("mechanism-deferred-alone");
     let db = db_in(&d);
     {
         let mut e = open_engine(&db);

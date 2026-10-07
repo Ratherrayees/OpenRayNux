@@ -73,6 +73,7 @@ pub mod schema;
 pub mod security_state;
 pub mod sqlite;
 pub mod task_repo;
+pub mod tx;
 
 pub use migration::{MIGRATIONS, Migration, MigrationError, MigrationRunner};
 pub use pragma::{Pragma, PragmaError};
