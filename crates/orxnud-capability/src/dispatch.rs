@@ -218,6 +218,19 @@ impl DispatchOutcome {
 /// field on the declaration because the adapter is the thing that knows how it runs:
 /// a declaration claiming Tier 0 while the implementation spawns a subprocess would
 /// be exactly the bypass Phase 4b exists to close.
+///
+/// # Why this trait is `pub(crate)`
+///
+/// Because a trait object of it is a capability execution primitive. Anyone who can
+/// name this trait can do two things they must not be able to do: call `invoke`, and
+/// implement the trait to supply their own adapter to a `Dispatcher`. Both are the
+/// execution boundary, and both are now decided by `rustc` rather than by a reviewer
+/// reading source.
+///
+/// A `pub trait` with a `pub(crate)` method would *also* have worked — an
+/// unimplementable method makes the trait unimplementable — but a private method
+/// inside a public trait reads as an oversight, and the whole trait being
+/// unreachable is the statement that is actually true.
 pub(crate) trait CapabilityAdapter: Send + Sync {
     /// The id this adapter implements.
     fn capability_id(&self) -> &CapabilityId;
@@ -747,7 +760,6 @@ mod redact_tests {
     #[test]
     fn control_characters_are_still_replaced_and_the_budget_still_applies() {
         // The original two responsibilities, unchanged: scrub framing characters,
-        // then bound the result.
         let mut s = "x".repeat(MAX - 4);
         s.push_str("\n\r\u{0} ");
         let out = redact(&s);
@@ -1013,6 +1025,11 @@ impl AdapterRegistry {
 }
 
 /// Verification strategy, looked up alongside the adapter.
+///
+/// Crate-private for the same reason as [`CapabilityAdapter`]: implementing it is
+/// supplying an adapter, and `sandbox_plan` is how a Tier-1 capability's parameters
+/// reach its child, so it is part of the execution surface rather than a description
+/// of one.
 pub(crate) trait AdapterBundle {
     /// The adapter.
     fn adapter(&self) -> &dyn CapabilityAdapter;
