@@ -210,10 +210,31 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "task_effect_step_scope",
         sql: crate::schema::MIGRATION_EFFECT_STEP_SCOPE,
     },
+    Migration {
+        // V-97. `task_proposals` had no uniqueness on `(task_id, step_no, attempt_no)` --
+        // only the surrogate `proposal_id` primary key, and the non-unique lookup index
+        // migration 8 deliberately created. The constraint is *stated* in `schema.rs` and
+        // *assumed* by the approval path, and it was never enforced, so a second proposal
+        // for one execution identity could exist and could be approved in its own right.
+        //
+        // Forward rather than an edit to migration 7 or 8, for the reason migration 8
+        // gives: a database that already applied those versions holds the shape they
+        // created, and rewriting them would leave it in place while claiming it never
+        // existed.
+        //
+        // Duplicates are reconciled rather than assumed absent, because they are
+        // reachable: `propose_action` only refused a second proposal through the task's
+        // state, and `begin_execution_spending_approval` re-enters `running` without
+        // advancing `attempts` or `steps_completed`, so a worker whose dispatch failed
+        // could propose again for the same identity. See `MIGRATION_PROPOSAL_IDENTITY`.
+        version: 14,
+        name: "task_proposal_identity",
+        sql: crate::schema::MIGRATION_PROPOSAL_IDENTITY,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Applies pending migrations.
 #[derive(Debug)]
@@ -1177,5 +1198,316 @@ mod tests {
             .expect("an empty snapshot of an empty database is faithful");
         // Absolute: refused, because nothing about the file says it is safe.
         Backup::verify(backup.path()).expect_err("the strict API still refuses emptiness");
+    }
+    // ---------------------------------------------------------------- V-97: migration 12
+    //
+    // Migration 12 rebuilds `task_approvals` to add `CHECK (length(digest) = 32)`. Two
+    // things about that rebuild were wrong and are asserted here.
+    //
+    // The first: the copy wrote `NULL` into `consumed_at_ms`, justified by a claim that a
+    // consumed row "cannot be re-inserted under this primary key". It can — the row *is*
+    // re-inserted, under a key identical to the one it came from — so the consumption
+    // record of every already-executed approval was erased, and
+    // `record_approval_replacing_expired` reads that column to decide whether a
+    // replacement is allowed.
+    //
+    // The second: the filter was `length(digest) = 32` alone, which is not a type check.
+    // SQLite is dynamically typed, so a 32-character TEXT value satisfies it and was
+    // carried into the new table as a digest.
+
+    /// An approval, inserted at schema 10 with a caller-chosen digest and consumption.
+    ///
+    /// `digest_sql` is interpolated into the statement rather than bound, because that is
+    /// the only way to produce a value of a chosen *storage class*. A bound `"x'ff..'"`
+    /// is the 68-character TEXT spelling of a blob, not a blob — which is precisely the
+    /// distinction migration 12's filter exists to draw, and binding it would have made
+    /// every fixture a malformed row.
+    fn seed_approval(
+        conn: &Connection,
+        task: &str,
+        attempt: i64,
+        digest_sql: &str,
+        issued: i64,
+        expires: i64,
+        consumed: Option<i64>,
+    ) {
+        let consumed = consumed.map_or_else(|| "NULL".to_owned(), |v| v.to_string());
+        conn.execute_batch(&format!(
+            "INSERT INTO task_approvals
+               (task_id,attempt_no,step_no,digest,capability,target,params,
+                issued_at_ms,expires_at_ms,consumed_at_ms)
+             VALUES ('{task}',{attempt},1,{digest_sql},'filesystem/write-text','out.txt',
+                     '{{}}',{issued},{expires},{consumed});"
+        ))
+        .expect("seed an approval");
+    }
+
+    fn approvals(conn: &Connection) -> Vec<(i64, Option<i64>, String, i64)> {
+        let mut st = conn
+            .prepare(
+                "SELECT attempt_no, consumed_at_ms, hex(digest), expires_at_ms
+                   FROM task_approvals ORDER BY attempt_no;",
+            )
+            .expect("prepare");
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect()
+    }
+
+    /// Requirement: `consumed_at_ms` is preserved, for every valid row, consumed or not.
+    #[test]
+    fn migration_12_preserves_which_approvals_had_been_consumed() {
+        let conn = mem();
+        migrate_to(&conn, 10);
+        conn.execute(
+            "INSERT INTO tasks (id,kind,state,idempotent,attempts,max_attempts,
+                               created_at_ms,updated_at_ms)
+             VALUES ('t','query','completed',0,1,9,1,1);",
+            [],
+        )
+        .expect("task");
+
+        seed_approval(
+            &conn,
+            "t",
+            1,
+            &format!("x'{}'", "11".repeat(32)),
+            10,
+            9_000,
+            None,
+        );
+        seed_approval(
+            &conn,
+            "t",
+            2,
+            &format!("x'{}'", "22".repeat(32)),
+            20,
+            9_000,
+            Some(1_700_000_000_123_i64),
+        );
+        // Consumed *and* expired: the combination that must survive most faithfully,
+        // because both are facts an operator reads.
+        seed_approval(
+            &conn,
+            "t",
+            3,
+            &format!("x'{}'", "33".repeat(32)),
+            30,
+            40,
+            Some(1_700_000_000_456_i64),
+        );
+        seed_approval(
+            &conn,
+            "t",
+            4,
+            &format!("x'{}'", "44".repeat(32)),
+            40,
+            50,
+            Some(1_700_000_000_789_i64),
+        );
+
+        let before = approvals(&conn);
+        assert_eq!(before.len(), 4, "four rows seeded");
+
+        migrate_to(&conn, CURRENT_VERSION);
+        let after = approvals(&conn);
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "every valid row must survive: {before:?} -> {after:?}"
+        );
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert_eq!(
+                a.0, b.0,
+                "attempt order must be unchanged: {before:?} -> {after:?}"
+            );
+            assert_eq!(
+                a.1, b.1,
+                "consumed_at_ms(attempt {}) must be identical across the migration: \
+                 {:?} -> {:?}",
+                b.0, b.1, a.1
+            );
+            assert_eq!(a.2, b.2, "the digest must be carried verbatim");
+            assert_eq!(a.3, b.3, "expires_at_ms must be carried verbatim");
+        }
+        assert_eq!(
+            after.iter().filter(|r| r.1.is_some()).count(),
+            3,
+            "three of the four were consumed, and all three must still read as consumed"
+        );
+    }
+
+    /// The inverse: an *unconsumed* approval must not come out looking consumed. A blanket
+    /// copy of a sentinel would satisfy the test above and break this one.
+    #[test]
+    fn migration_12_does_not_invent_a_consumption_that_did_not_happen() {
+        let conn = mem();
+        migrate_to(&conn, 10);
+        conn.execute(
+            "INSERT INTO tasks (id,kind,state,idempotent,attempts,max_attempts,
+                               created_at_ms,updated_at_ms)
+             VALUES ('t','query','waiting-for-user',0,1,9,1,1);",
+            [],
+        )
+        .expect("task");
+        seed_approval(
+            &conn,
+            "t",
+            1,
+            &format!("x'{}'", "aa".repeat(32)),
+            10,
+            9_000,
+            None,
+        );
+
+        migrate_to(&conn, CURRENT_VERSION);
+        let after = approvals(&conn);
+        assert_eq!(
+            after[0].1, None,
+            "an approval nobody spent must not come out spent"
+        );
+    }
+
+    /// Requirement: a malformed digest is still discarded. Preserving consumption state
+    /// must not mean preserving rows the CHECK refuses.
+    #[test]
+    fn migration_12_still_discards_a_malformed_digest() {
+        let conn = mem();
+        migrate_to(&conn, 10);
+        conn.execute(
+            "INSERT INTO tasks (id,kind,state,idempotent,attempts,max_attempts,
+                               created_at_ms,updated_at_ms)
+             VALUES ('t','query','completed',0,1,9,1,1);",
+            [],
+        )
+        .expect("task");
+
+        seed_approval(
+            &conn,
+            "t",
+            1,
+            &format!("x'{}'", "ff".repeat(32)),
+            10,
+            9_000,
+            None,
+        );
+        // 31 bytes.
+        seed_approval(
+            &conn,
+            "t",
+            2,
+            &format!("x'{}'", "ee".repeat(31)),
+            10,
+            9_000,
+            None,
+        );
+        // 33 bytes.
+        seed_approval(
+            &conn,
+            "t",
+            3,
+            &format!("x'{}'", "dd".repeat(33)),
+            10,
+            9_000,
+            None,
+        );
+        // Zero bytes.
+        seed_approval(&conn, "t", 4, "zeroblob(0)", 10, 9_000, None);
+        // 32 characters, and not one of them a hex digit: `length()` alone would accept it.
+        seed_approval(
+            &conn,
+            "t",
+            5,
+            &format!("'{}'", "zz".repeat(16)),
+            10,
+            9_000,
+            None,
+        );
+        // 32 characters that *are* hex, stored as TEXT rather than BLOB.
+        seed_approval(
+            &conn,
+            "t",
+            6,
+            &format!("'{}'", "ab".repeat(16)),
+            10,
+            9_000,
+            None,
+        );
+        // An INTEGER cannot be 32 bytes long.
+        seed_approval(&conn, "t", 7, "32", 10, 9_000, None);
+        // And one that must survive, to prove the filter is not simply "drop everything".
+        seed_approval(
+            &conn,
+            "t",
+            8,
+            &format!("x'{}'", "01".repeat(32)),
+            10,
+            9_000,
+            None,
+        );
+
+        assert_eq!(
+            approvals(&conn).len(),
+            8,
+            "all eight are insertable at schema 10"
+        );
+
+        migrate_to(&conn, CURRENT_VERSION);
+        let after = approvals(&conn);
+        // Attempts 1 and 8 are the two well-formed 32-byte blobs; every other attempt is a
+        // value whose length or storage class makes it unusable as a digest.
+        let survivors: Vec<i64> = after.iter().map(|r| r.0).collect();
+        assert_eq!(
+            survivors,
+            vec![1, 8],
+            "only the well-formed 32-byte blobs may survive, and a TEXT value of length 32 \
+             is not one of them; got {after:?}"
+        );
+    }
+
+    /// Requirement: post-migration consumption still works — a database that survives the
+    /// rebuild must still enforce single use.
+    #[test]
+    fn a_migrated_approval_can_still_be_consumed_exactly_once() {
+        let conn = mem();
+        migrate_to(&conn, 10);
+        conn.execute(
+            "INSERT INTO tasks (id,kind,state,idempotent,attempts,max_attempts,
+                               created_at_ms,updated_at_ms)
+             VALUES ('t','query','waiting-for-user',0,1,9,1,1);",
+            [],
+        )
+        .expect("task");
+        seed_approval(
+            &conn,
+            "t",
+            1,
+            &format!("x'{}'", "7f".repeat(32)),
+            10,
+            9_000,
+            None,
+        );
+
+        migrate_to(&conn, CURRENT_VERSION);
+        let spent = conn
+            .execute(
+                "UPDATE task_approvals SET consumed_at_ms = 555 WHERE task_id = 't';",
+                [],
+            )
+            .expect("consume");
+        assert_eq!(spent, 1, "the first consumption lands");
+        let again = conn
+            .execute(
+                "UPDATE task_approvals SET consumed_at_ms = 556 WHERE task_id = 't'
+                   AND consumed_at_ms IS NULL;",
+                [],
+            )
+            .expect("second consumption");
+        assert_eq!(
+            again, 0,
+            "and the conditional form still reports 'no row', so single use holds"
+        );
     }
 }

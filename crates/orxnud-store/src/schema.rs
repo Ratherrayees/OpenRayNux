@@ -226,8 +226,21 @@ CREATE INDEX IF NOT EXISTS idx_task_effects_task
 -- here: the worker. The lease holder is execution ownership, and storing it beside the
 -- proposer is how a task lease would quietly become an authority token (V-71).
 --
--- One proposal per attempt (`UNIQUE (task_id, attempt_no)`), because a human wait is
--- not a retry: the same attempt that asked is the attempt that may execute.
+-- One proposal per execution identity — `UNIQUE (task_id, step_no, attempt_no)`. Because a
+-- human wait is not a retry, the attempt that asked is the attempt that may execute.
+--
+-- **That UNIQUE does not exist in this `CREATE TABLE`, and did not for seven versions.**
+-- It arrives as a separate index in migration 14 (V-97). The reason it is not here is
+-- worth stating, because this comment used to claim the constraint was part of this
+-- table's definition and it was not: `step_no` itself is not a column here either — it is
+-- added by `ALTER TABLE` in migration 7 — so the identity did not exist to be constrained
+-- when this table was created. Migration 8 then dropped the `UNIQUE (task_id, step_no)`
+-- that migration 7 had created, correctly, because a per-step key cannot represent a
+-- retry; and its replacement was left non-unique, which is where the invariant was left
+-- unenforced until V-97.
+--
+-- Kept in step with `task_attempts` (migration 9) and `task_approvals` (migration 10),
+-- which both carry exactly this key as their `PRIMARY KEY`.
 CREATE TABLE IF NOT EXISTS task_proposals (
     proposal_id    TEXT    NOT NULL PRIMARY KEY,
     task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -706,9 +719,41 @@ CREATE INDEX IF NOT EXISTS idx_task_effects_scope
 /// unparseable input. A range check would have accepted it.
 ///
 /// The other columns, their types, the primary key and the foreign key are carried over
-/// verbatim, so nothing else about the table changes. `consumed_at_ms` is copied as NULL
-/// for every row: a row can only reach here having never been consumed, because a
-/// consumed row cannot be re-inserted under this primary key.
+/// verbatim, so nothing else about the table changes.
+///
+/// # Every column is copied, including `consumed_at_ms`
+///
+/// The copy below selects `consumed_at_ms` rather than a literal `NULL`, and that is the
+/// whole content of one claim this migration used to make in the other direction: that
+/// *"a row can only reach here having never been consumed, because a consumed row cannot
+/// be re-inserted under this primary key."* Both halves are wrong. The row **is**
+/// re-inserted — that is what the `INSERT ... SELECT` does — under a primary key
+/// identical to the one it came from, so nothing about the copy refuses a consumed row.
+///
+/// The consequence was not cosmetic. `record_approval_replacing_expired` decides whether
+/// an approval may be replaced by consulting `consumed_at_ms.is_some()`, and it says
+/// explicitly that it checks `steps_completed` too so the decision "does not rest on a
+/// single write that some future path might skip". Writing `NULL` removed one of the two.
+/// A database that had executed even one approved attempt — the normal case, since
+/// `begin_execution_spending_approval` is what takes the execution lease — came out of
+/// this migration with its consumption records erased and its approvals looking unspent.
+///
+/// # What the digest filter actually rejects
+///
+/// `WHERE typeof(digest) = 'blob' AND length(digest) = 32`, and both halves are
+/// load-bearing. `length()` alone is not a type check: SQLite is dynamically typed, so a
+/// 32-character **TEXT** value satisfies `length(digest) = 32` and would have been
+/// carried into the new table as a digest. A 32-character string containing no hex digit
+/// at all is not an authority digest and must not become one, so the filter names the
+/// storage class the CHECK is about.
+///
+/// Discarding such a row is still correct, for the same reason it was correct before:
+/// `digest BLOB NOT NULL` under a `length(digest) = 32` CHECK is the binding between an
+/// approval and the operation it authorises, and a row that cannot satisfy it was never
+/// authority. The `CHECK` itself cannot be tightened to `typeof(digest) = 'blob'` without
+/// also changing the value written by `record_approval`, so the type requirement lives in
+/// the copy's `WHERE` and in `parse_approval_digest`, which refuses a non-hex value with
+/// a typed error rather than a slice.
 pub const MIGRATION_APPROVAL_DIGEST_LENGTH: &str = r#"
 CREATE TABLE task_approvals_length_checked (
     task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -731,13 +776,143 @@ INSERT INTO task_approvals_length_checked
     (task_id, step_no, attempt_no, digest, capability, target, params,
      issued_at_ms, expires_at_ms, consumed_at_ms)
 SELECT task_id, step_no, attempt_no, digest, capability, target, params,
-       issued_at_ms, expires_at_ms, NULL
+       issued_at_ms, expires_at_ms, consumed_at_ms
   FROM task_approvals
- WHERE length(digest) = 32;
+ WHERE typeof(digest) = 'blob'
+   AND length(digest) = 32;
 
 DROP TABLE task_approvals;
 
 ALTER TABLE task_approvals_length_checked RENAME TO task_approvals;
+"#;
+
+/// Migration 14 — one proposal per execution identity. V-97.
+///
+/// # What is being enforced
+///
+/// `(task_id, step_no, attempt_no)` is the identity a proposal occupies. `task_attempts`
+/// (migration 9) and `task_approvals` (migration 10) both already carry exactly this as
+/// their `PRIMARY KEY`. `task_proposals` carried only `proposal_id`, a surrogate minted as
+/// `p-{task_id}-{milliseconds}`, so the invariant was enforced nowhere: a second proposal
+/// for one identity coexisted with the first, and `record_approval` -- which is keyed on
+/// the identity, not on `proposal_id` -- could not tell which proposal its row belonged
+/// to.
+///
+/// `proposal_id` stays the primary key. It is the row's own name, every caller addresses a
+/// proposal by it (`proposal_by_id`, `decide_proposal`, `begin_execution_spending_approval`),
+/// and replacing it would be a larger change than the defect. The identity gets its own
+/// unique index beside it.
+///
+/// # Why migration 8's index was not enough
+///
+/// Migration 7 created `UNIQUE (task_id, step_no)`. Migration 8 dropped it, and that
+/// reasoning was correct: a retried step produces two proposals on the *same* step, so a
+/// per-step uniqueness cannot represent a retry. The replacement was a plain lookup index
+/// over the triple, and the conclusion drawn from it -- that "no new uniqueness is
+/// introduced" -- is where the design went wrong. The triple was the key that was wanted.
+///
+/// # Existing duplicates are classified, never assumed absent
+///
+/// They are reachable, so this migration does not begin by creating the index and hoping.
+/// It first asks whether any identity holds **more than one distinct action**.
+///
+/// * **Distinguishable only by `proposal_id`** -- same `capability`, same `target`, same
+///   `params`. Two requests for the same action; one of them is redundant. Reconciled
+///   deterministically (earliest `created_at_ms`, then lowest `proposal_id`, a total order
+///   so every host picks the same survivor), and the discarded rows are written to
+///   `task_events` first. Not silent: the trail is where an operator finds out.
+/// * **Two different actions** -- same identity, different `capability`, `target` or
+///   `params`. Choosing one is an *authority* decision, and a schema migration has no
+///   business making it: the two rows disagree about what was going to happen, and both
+///   may have been approved. This migration **refuses to run** instead, with a message
+///   naming the offending identities, and the runner rolls it back. An operator resolves
+///   the ambiguity and re-runs.
+///
+/// # Ordering
+///
+/// The guard runs *before* the delete and *before* the index, so a database that cannot be
+/// reconciled is left exactly as it was.
+pub const MIGRATION_PROPOSAL_IDENTITY: &str = r#"
+-- Step 1: refuse to proceed if any execution identity holds two DIFFERENT actions.
+--
+-- A temp table rather than a permanent one: this is migration scratch, and it must not
+-- outlive the statement. `RAISE(ABORT, ...)` is only legal inside a trigger, which is what
+-- makes this an abort *with a reason* rather than a bare CHECK failure an operator has to
+-- interpret.
+CREATE TEMP TABLE v97_proposal_conflict_guard (
+    conflicting_identities INTEGER NOT NULL
+);
+
+CREATE TEMP TRIGGER v97_abort_on_conflicting_proposals
+AFTER INSERT ON v97_proposal_conflict_guard
+WHEN NEW.conflicting_identities > 0
+BEGIN
+    SELECT RAISE(ABORT, 'task_proposals holds two different actions for one (task_id, step_no, attempt_no); \
+resolve them by hand before migrating, because choosing between them is an authority decision');
+END;
+
+INSERT INTO v97_proposal_conflict_guard (conflicting_identities)
+SELECT COUNT(*)
+  FROM (SELECT task_id, step_no, attempt_no
+          FROM task_proposals
+         GROUP BY task_id, step_no, attempt_no
+        HAVING COUNT(*) > 1
+           AND COUNT(DISTINCT capability
+                     || char(31) || COALESCE(target, char(30))
+                     || char(31) || params) > 1) AS conflicting;
+
+-- Step 2: record every redundant row in the audit trail BEFORE deleting it.
+--
+-- `task_events` is append-only and the only durable place this can be written, and
+-- recording it first means a crash between the two statements leaves a row that is
+-- both still present and already documented -- the recoverable direction. The detail
+-- names the survivor, so the trail says which of the two won and why it was not
+-- arbitrary.
+INSERT INTO task_events (task_id, at_ms, kind, from_state, to_state, worker, attempt_no, detail)
+SELECT p.task_id, 0, 'proposal-identity-reconciled', NULL, NULL, p.proposer, p.attempt_no,
+       'redundant proposal ' || p.proposal_id || ' duplicates '
+       || (SELECT k.proposal_id
+             FROM task_proposals k
+            WHERE k.task_id = p.task_id AND k.step_no = p.step_no AND k.attempt_no = p.attempt_no
+            ORDER BY k.created_at_ms ASC, k.proposal_id ASC
+            LIMIT 1)
+       || ' on the same execution identity'
+  FROM task_proposals p
+ WHERE EXISTS (SELECT 1
+                 FROM task_proposals k
+                WHERE k.task_id = p.task_id AND k.step_no = p.step_no
+                  AND k.attempt_no = p.attempt_no)
+   AND p.proposal_id <> (SELECT k.proposal_id
+                           FROM task_proposals k
+                          WHERE k.task_id = p.task_id AND k.step_no = p.step_no
+                            AND k.attempt_no = p.attempt_no
+                          ORDER BY k.created_at_ms ASC, k.proposal_id ASC
+                          LIMIT 1);
+
+-- Step 3: delete exactly the rows step 2 documented.
+DELETE FROM task_proposals
+ WHERE EXISTS (SELECT 1
+                 FROM task_proposals k
+                WHERE k.task_id = task_proposals.task_id
+                  AND k.step_no = task_proposals.step_no
+                  AND k.attempt_no = task_proposals.attempt_no)
+   AND proposal_id <> (SELECT k.proposal_id
+                         FROM task_proposals k
+                        WHERE k.task_id = task_proposals.task_id
+                          AND k.step_no = task_proposals.step_no
+                          AND k.attempt_no = task_proposals.attempt_no
+                        ORDER BY k.created_at_ms ASC, k.proposal_id ASC
+                        LIMIT 1);
+
+-- Step 4: the constraint, and the lookup index that migration 8 left behind.
+--
+-- `idx_task_proposals_step_attempt` has exactly these three columns, so it is dropped and
+-- recreated as unique rather than adding a second index over the same columns. The name is
+-- kept, so nothing that references it breaks, and the planner still gets one index.
+DROP INDEX IF EXISTS idx_task_proposals_step_attempt;
+
+CREATE UNIQUE INDEX idx_task_proposals_step_attempt
+    ON task_proposals (task_id, step_no, attempt_no);
 "#;
 
 #[cfg(test)]
