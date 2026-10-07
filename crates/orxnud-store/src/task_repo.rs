@@ -2937,6 +2937,22 @@ impl<'a> TaskRepository<'a> {
     ///   resolved `not-performed` is retryable by design, and a stale row from an earlier
     ///   attempt of the *same* step must not block it.
     ///
+    /// ## `effect_observed` is not evidence here
+    ///
+    /// `tasks.effect_observed` is a task-level boolean, so it has the same shape of
+    /// problem as the effect predicate this function used to run: one bit standing for a
+    /// task that may have many steps and many effects. It is deliberately **not**
+    /// consulted.
+    ///
+    /// Traced and cleared rather than assumed. Its only readers are the conformance
+    /// suite, which asserts that a task completed with an observed effect recorded that
+    /// fact; the read model, which projects it onto a row; and the daemon's JSON report,
+    /// which surfaces it to a caller. None of them is a recovery decision.
+    ///
+    /// The constraint on any future reader is that a task-level bit cannot say *which*
+    /// effect was observed or *which step* it belonged to, so it cannot stand in for
+    /// this predicate without acquiring the same `(step, attempt)` scope.
+    ///
     /// ### Rows whose step was never recorded
     ///
     /// `task_effects.step_no` is nullable because a row written before version 13 has no
