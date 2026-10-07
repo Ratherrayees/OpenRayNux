@@ -482,17 +482,21 @@ impl DurableEngine {
     /// # Errors
     ///
     /// [`EngineError`] of kind `Storage` if the write fails.
+    /// The identity is spelled out rather than bundled; see the note on
+    /// [`orxnud_store::task_repo::TaskRepository::reserve_effect`].
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_effect(
         &mut self,
         key: &str,
         id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         step_key: &str,
         idempotent: bool,
         now_ms: i64,
     ) -> Result<bool, EngineError> {
         self.repo()
-            .reserve_effect(key, id, attempt_no, step_key, idempotent, now_ms)
+            .reserve_effect(key, id, step_no, attempt_no, step_key, idempotent, now_ms)
             .map(|o| o.is_some())
             .map_err(EngineError::from)
     }
@@ -1195,11 +1199,11 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         let key = DurableEngine::idempotency_key(&tid("t"), "send", "initial");
         assert!(
-            e.reserve_effect(&key, &tid("t"), 1, "send", false, NOW)
+            e.reserve_effect(&key, &tid("t"), 1, 1, "send", false, NOW)
                 .expect("reserve")
         );
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 2, "send", false, NOW)
+            !e.reserve_effect(&key, &tid("t"), 1, 2, "send", false, NOW)
                 .expect("reserve"),
             "a retry must not be able to dispatch the same effect again"
         );
@@ -1214,7 +1218,7 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         let key = DurableEngine::idempotency_key(&tid("t"), "s", "initial");
         let _ = e
-            .reserve_effect(&key, &tid("t"), 1, "s", false, NOW)
+            .reserve_effect(&key, &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(!e.all_effects_resolved(&tid("t")).expect("unresolved"));
         assert!(

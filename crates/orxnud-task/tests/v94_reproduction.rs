@@ -431,18 +431,18 @@ fn p1_17_reserve_effect_distinguishes_a_duplicate_from_an_invalid_insert() {
     claimed_task(&mut e, "t");
 
     assert!(
-        e.reserve_effect("k", &tid("t"), 1, "step", false, NOW)
+        e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW)
             .expect("first"),
         "the first reservation must succeed"
     );
     assert!(
-        !e.reserve_effect("k", &tid("t"), 1, "step", false, NOW)
+        !e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW)
             .expect("duplicate"),
         "a genuine duplicate is `false`, and that is the documented meaning"
     );
 
     // An effect for a task that does not exist: an invalid insert, not a duplicate.
-    let ghost = e.reserve_effect("other", &tid("ghost"), 1, "step", false, NOW);
+    let ghost = e.reserve_effect("other", &tid("ghost"), 1, 1, "step", false, NOW);
     assert!(
         ghost.is_err(),
         "an effect for a non-existent task is invalid, not a duplicate: {ghost:?}"
@@ -786,8 +786,8 @@ fn the_reservation_outcomes_are_exactly_two_and_neither_is_an_error() {
     // `DurableEngine::reserve_effect` collapses the row to a bool; this asserts the two
     // answers it is allowed to give are "reserved" and "already reserved", and that the
     // second is not an error.
-    let first = e.reserve_effect("k", &tid("t"), 1, "step", false, NOW);
-    let second = e.reserve_effect("k", &tid("t"), 1, "step", false, NOW);
+    let first = e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW);
+    let second = e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW);
     assert!(first.expect("the first reservation is not an error"));
     assert!(
         !second.expect("a duplicate is an answer, not an error"),

@@ -148,7 +148,7 @@ fn child_main() -> ! {
     // An external effect is reserved *before* it is dispatched, so a crash here
     // leaves an unresolved ledger row -- TP-12's "outcome unknown".
     let key = DurableEngine::idempotency_key(&t, "external-call", "initial");
-    let reserved = e.reserve_effect(&key, &t, claimed.attempts, "external-call", false, NOW);
+    let reserved = e.reserve_effect(&key, &t, 1, claimed.attempts, "external-call", false, NOW);
     assert!(
         reserved.expect("reserve"),
         "the first reservation must succeed"
@@ -510,7 +510,7 @@ fn a_crash_never_produces_a_duplicate_side_effect() {
     {
         let mut e = open_engine(&db);
         assert!(
-            !e.reserve_effect(&key, &tid("fault-task"), 2, "external-call", false, NOW)
+            !e.reserve_effect(&key, &tid("fault-task"), 1, 2, "external-call", false, NOW)
                 .expect("reserve"),
             "the reservation from the killed process must still block a re-dispatch"
         );
