@@ -86,7 +86,7 @@ SKIPPED=()
 declare -A NAMES=(
   [G1]="format"
   [G2]="dependency graph"
-  [G2d]="policy seal"
+  [G2d]="authority boundary"
   [G3]="platform boundary"
   [G4]="unsafe"
   [G5]="portable core (wasm)"
@@ -152,24 +152,31 @@ gate_root() {
   printf '%s' "${ORXNUD_GATE_ROOT:-$REPO_ROOT}"
 }
 
-# G2d -- the policy seal is reachable only from orxnud-policy.
+# G2d -- authority is minted only by orxnud-policy, and only where rustc can see it.
 #
-# ADR-0013 makes `AuthorisationProof` unconstructible except through `PolicySeal::attest`,
-# which only `orxnud-policy` may name. That is the whole capability boundary: a
-# capability crate cannot *become* authorised, it can only ask.
+# The boundary is now a compiler fact rather than a convention. `AuthorisationProof`,
+# `CapabilityInvocation` and `DispatchView` live in orxnud-policy beside the
+# `pub(crate)` constructors that produce them, and `CapabilityAdapter`/`AdapterBundle`
+# are whole `pub(crate)` traits. Rust has no friend crates, so "exactly one crate may
+# construct this" is only expressible as `pub(crate)` on a type its owner can see.
 #
 # The invariant is about *minting*, not naming. A capability crate legitimately takes a
 # `CapabilityInvocation` as an argument -- that is the whole point of it -- and cannot
-# construct one, because the only constructor requires a `PolicySeal`. So the gate
-# forbids the root of the authority chain and the minting verbs, and
-# `gate_policy.py` re-derives the authority surface from the domain's own source so the
-# forbidden set cannot go stale unnoticed.
+# construct one. So the gate forbids the minting verbs outside orxnud-policy, asserts the
+# constructors are still `pub(crate)` and the sealed traits still `pub(crate)`, and
+# refuses a re-export from orxnud-domain, which everything depends on.
+#
+# Why keep a lexical scan when rustc already refuses the obvious attempts: because this
+# gate's own history is the argument. It reported `ok` on a tree that forged authority
+# three separate ways from a standalone crate, two of which named none of the symbols it
+# looked for. A gate that cannot fail is worse than no gate, so this one is asserted
+# against drift by its own self-tests (G13) as well as by `gate_policy.py`.
 gate_G2d() {
   banner G2d
   if python3 scripts/gate_policy.py g2d --root "$(gate_root)"; then
-    ok "the policy seal is reachable only from orxnud-policy (production code)"
+    ok "authority is minted only by orxnud-policy, and only through pub(crate)"
   else
-    fail_gate "a policy-seal symbol is reachable outside orxnud-policy in production code"
+    fail_gate "authority is reachable outside orxnud-policy, or its constructors widened"
   fi
 }
 

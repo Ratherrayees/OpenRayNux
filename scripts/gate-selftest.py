@@ -32,30 +32,19 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(REPO, "scripts", "ci-gates.sh")
 
-# A minimal but *faithful* domain, so the G2d drift check has something real to verify.
-# `PolicySeal::attest` is the ungated root; the other two take `&PolicySeal`, exactly as
-# the real domain does. A fixture whose domain differed from the real shape would be
-# testing a different invariant.
-DOMAIN_SRC = """\
-pub struct PolicySeal {
-    issued_by: &'static str,
-}
-
-impl PolicySeal {
-    pub fn attest(issued_by: &'static str) -> Self {
-        Self { issued_by }
-    }
-    pub fn issued_by(&self) -> &'static str {
-        self.issued_by
-    }
-}
-
+# Minimal but *faithful* copies of the two crates G2d now reads.
+#
+# Authority lives in orxnud-policy, beside the `pub(crate)` constructors that mint it,
+# and the sealed capability traits live in orxnud-capability. A fixture whose shapes
+# differed from the real ones would be testing a different invariant -- which is how a
+# gate passes while meaning something else.
+POLICY_SRC = """\
 pub struct AuthorisationProof {
     policy_version: String,
 }
 
 impl AuthorisationProof {
-    pub fn issue(_seal: &PolicySeal, policy_version: impl Into<String>) -> Self {
+    pub(crate) fn issue(policy_version: impl Into<String>) -> Self {
         Self { policy_version: policy_version.into() }
     }
     pub fn policy_version(&self) -> &str {
@@ -68,11 +57,49 @@ pub struct CapabilityInvocation {
 }
 
 impl CapabilityInvocation {
-    pub fn authorise(_seal: &PolicySeal, step: u32) -> Self {
+    pub(crate) fn authorise(_request: &(), step: u32) -> Self {
         Self { step }
     }
     pub fn step(&self) -> u32 {
         self.step
+    }
+}
+
+pub struct DispatchView<'a> {
+    step: u32,
+    _p: &'a u32,
+}
+"""
+
+CAPABILITY_SRC = """\
+use orxnud_policy::CapabilityInvocation;
+
+pub(crate) trait CapabilityAdapter {
+    fn invoke(&self, view: &u32) -> Result<(), String>;
+}
+
+pub(crate) trait AdapterBundle {
+    fn adapter(&self) -> &dyn CapabilityAdapter;
+}
+
+// Naming an authority type is legitimate: a capability crate receives an invocation
+// and cannot construct one. The fixture needs one, or the must-pass cases would not
+// show that the gate tells "names" apart from "mints".
+pub fn execute(invocation: &CapabilityInvocation) -> u32 {
+    invocation.step()
+}
+"""
+
+# orxnud-domain must re-export nothing: everything depends on it, so a re-export there
+# would put the minting constructor in reach of the whole workspace.
+DOMAIN_SRC = """\
+pub struct ActionRequest {
+    pub step: u32,
+}
+
+impl ActionRequest {
+    pub fn new(step: u32) -> Self {
+        Self { step }
     }
 }
 """
@@ -85,9 +112,10 @@ class Fixture:
         self.root = root
         for crate in ("orxnud-domain", "orxnud-policy", "orxnud-capability", "orxnud-task"):
             os.makedirs(os.path.join(root, "crates", crate, "src"), exist_ok=True)
-        self.write("crates/orxnud-domain/src/invocation.rs", DOMAIN_SRC)
-        for crate in ("orxnud-policy", "orxnud-capability", "orxnud-task"):
-            self.write(f"crates/{crate}/src/lib.rs", "")
+        self.write("crates/orxnud-domain/src/lib.rs", DOMAIN_SRC)
+        self.write("crates/orxnud-policy/src/authority.rs", POLICY_SRC)
+        self.write("crates/orxnud-capability/src/dispatch.rs", CAPABILITY_SRC)
+        self.write("crates/orxnud-task/src/lib.rs", "")
 
     def write(self, rel: str, text: str) -> None:
         path = os.path.join(self.root, rel)
@@ -129,7 +157,7 @@ G2D_CASES: list[tuple[str, str, str, bool]] = [
         True,
     ),
     (
-        "bypass 3: the seal in examples/, which cargo compiles but the old find skipped",
+        "bypass 3: minting in examples/, which cargo compiles but the old find skipped",
         "G2d",
         "crates/orxnud-capability/examples/a.rs",
         True,
@@ -137,20 +165,20 @@ G2D_CASES: list[tuple[str, str, str, bool]] = [
     # ---- equivalent spellings of minting -----------------------------------------
     ("a bare `authorise(..)` call", "G2d", "crates/orxnud-capability/src/a.rs", True),
     (
-        "an imported associated function: use PolicySeal::attest;",
+        "an imported associated function: use CapabilityInvocation::authorise;",
         "G2d",
         "crates/orxnud-capability/src/a.rs",
         True,
     ),
     (
-        "a fully qualified path: orxnud_domain::PolicySeal::attest(..)",
+        "a fully qualified path: orxnud_policy::CapabilityInvocation::authorise(..)",
         "G2d",
         "crates/orxnud-capability/src/a.rs",
         True,
     ),
-    ("a type alias for the seal", "G2d", "crates/orxnud-capability/src/a.rs", True),
+    ("a type alias for the authority type", "G2d", "crates/orxnud-capability/src/a.rs", True),
     (
-        "AuthorisationProof::issue without a seal-derived value",
+        "AuthorisationProof::issue from another crate",
         "G2d",
         "crates/orxnud-capability/src/a.rs",
         True,
@@ -163,7 +191,7 @@ G2D_CASES: list[tuple[str, str, str, bool]] = [
     ),
     # ---- legitimate code that must keep working -----------------------------------
     (
-        "a real #[cfg(test)] module may mint a seal to build a fixture",
+        "a real #[cfg(test)] module may mint authority to build a fixture",
         "G2d",
         "crates/orxnud-capability/src/a.rs",
         False,
@@ -193,7 +221,7 @@ G2D_CASES: list[tuple[str, str, str, bool]] = [
         False,
     ),
     (
-        "a nested module inside a test module may mint a seal",
+        "a nested module inside a test module may mint authority",
         "G2d",
         "crates/orxnud-capability/src/a.rs",
         False,
@@ -305,24 +333,24 @@ def source_for(name: str) -> str:
         # --- G2d must-fail ---
         "bypass 1: a comment mentioning #[cfg(test)] must not switch the gate off": """
 // The test module uses #[cfg(test)] later.
-use orxnud_domain::PolicySeal;
-
-fn production() {
-    let _ = PolicySeal::attest("attacker");
-}
-""",
-        "bypass 2: CapabilityInvocation::authorise in production code": """
-use orxnud_domain::CapabilityInvocation;
+use orxnud_policy::CapabilityInvocation;
 
 fn production() {
     let _ = CapabilityInvocation::authorise(&(), 1);
 }
 """,
-        "bypass 3: the seal in examples/, which cargo compiles but the old find skipped": """
-use orxnud_domain::PolicySeal;
+        "bypass 2: CapabilityInvocation::authorise in production code": """
+use orxnud_policy::CapabilityInvocation;
+
+fn production() {
+    let _ = CapabilityInvocation::authorise(&(), 1);
+}
+""",
+        "bypass 3: minting in examples/, which cargo compiles but the old find skipped": """
+use orxnud_policy::CapabilityInvocation;
 
 fn main() {
-    let _ = PolicySeal::attest("attacker");
+    let _ = CapabilityInvocation::authorise(&(), 1);
 }
 """,
         "a bare `authorise(..)` call": """
@@ -330,49 +358,49 @@ fn production() {
     let _ = authorise(&(), 1);
 }
 """,
-        "an imported associated function: use PolicySeal::attest;": """
-use orxnud_domain::PolicySeal::attest;
+        "an imported associated function: use CapabilityInvocation::authorise;": """
+use orxnud_policy::CapabilityInvocation::authorise;
 
 fn production() {
-    let _ = attest("attacker");
+    let _ = authorise(&(), 1);
 }
 """,
-        "a fully qualified path: orxnud_domain::PolicySeal::attest(..)": """
+        "a fully qualified path: orxnud_policy::CapabilityInvocation::authorise(..)": """
 fn production() {
-    let _ = orxnud_domain::PolicySeal::attest("attacker");
+    let _ = orxnud_policy::CapabilityInvocation::authorise(&(), 1);
 }
 """,
-        "a type alias for the seal": """
-use orxnud_domain::PolicySeal as Seal;
+        "a type alias for the authority type": """
+use orxnud_policy::CapabilityInvocation as Invocation;
 
 fn production() {
-    let _ = Seal::attest("attacker");
+    let _ = Invocation::authorise(&(), 1);
 }
 """,
-        "AuthorisationProof::issue without a seal-derived value": """
+        "AuthorisationProof::issue from another crate": """
 fn production() {
-    let _ = orxnud_domain::AuthorisationProof::issue(&(), "v1");
+    let _ = orxnud_policy::AuthorisationProof::issue("v1");
 }
 """,
         "benches/ is production-reachable code too": """
 fn bench() {
-    let _ = orxnud_domain::PolicySeal::attest("attacker");
+    let _ = orxnud_policy::CapabilityInvocation::authorise(&(), 1);
 }
 """,
         "#[cfg(any(test, unix))] is production code and must NOT be exempt": """
 #[cfg(any(test, unix))]
 fn production() {
-    let _ = orxnud_domain::PolicySeal::attest("attacker");
+    let _ = orxnud_policy::CapabilityInvocation::authorise(&(), 1);
 }
 """,
         # --- G2d must-pass ---
-        "a real #[cfg(test)] module may mint a seal to build a fixture": """
+        "a real #[cfg(test)] module may mint authority to build a fixture": """
 #[cfg(test)]
 mod tests {
-    use orxnud_domain::PolicySeal;
+    use orxnud_policy::CapabilityInvocation;
 
-    fn fixture() -> PolicySeal {
-        PolicySeal::attest("test")
+    fn fixture() -> CapabilityInvocation {
+        CapabilityInvocation::authorise(&(), 1)
     }
 }
 """,
@@ -391,27 +419,27 @@ pub fn production() {}
 pub fn production() {}
 """,
         "a capability crate may take a CapabilityInvocation as an argument": """
-use orxnud_domain::CapabilityInvocation;
+use orxnud_policy::CapabilityInvocation;
 
 /// Execute an invocation that policy has already authorised.
 pub fn execute(invocation: &CapabilityInvocation) -> u32 {
     invocation.step()
 }
 """,
-        "a nested module inside a test module may mint a seal": """
+        "a nested module inside a test module may mint authority": """
 #[cfg(test)]
 mod tests {
     mod deeper {
-        use orxnud_domain::PolicySeal;
+        use orxnud_policy::CapabilityInvocation;
 
-        pub fn fixture() -> PolicySeal {
-            PolicySeal::attest("test")
+        pub fn fixture() -> CapabilityInvocation {
+            CapabilityInvocation::authorise(&(), 1)
         }
     }
 
     #[test]
     fn it_builds() {
-        assert!(deeper::fixture().issued_by().len() > 0);
+        assert_eq!(deeper::fixture().step(), 1);
     }
 }
 """,
@@ -426,20 +454,20 @@ mod tests {
         }
     }
 
-    use orxnud_domain::PolicySeal;
+    use orxnud_policy::CapabilityInvocation;
 
-    pub fn fixture() -> PolicySeal {
-        PolicySeal::attest("test")
+    pub fn fixture() -> CapabilityInvocation {
+        CapabilityInvocation::authorise(&(), 1)
     }
 }
 """,
         "#[cfg(all(test, unix))] is test-only": """
 #[cfg(all(test, unix))]
 mod unix_only_tests {
-    use orxnud_domain::PolicySeal;
+    use orxnud_policy::CapabilityInvocation;
 
-    pub fn fixture() -> PolicySeal {
-        PolicySeal::attest("test")
+    pub fn fixture() -> CapabilityInvocation {
+        CapabilityInvocation::authorise(&(), 1)
     }
 }
 """,
@@ -504,71 +532,51 @@ pub fn f() {}
     return table[name]
 
 
-DRIFT_CASES: list[tuple[str, bool]] = [
-    # Must be rejected: the chain changed shape underneath the gate.
-    ("the seal gains a second public constructor", True),
-    ("the domain gains a third seal-gated type", True),
-    ("a type becomes gated transitively through an authority type", True),
-    ("the seal type is renamed", True),
-    # Must be accepted, and this one matters as much as the others: a *new ordinary*
-    # domain type with a public constructor is not a finding. A check that flagged it
-    # would flag every constructor in the crate, and nobody reads a gate that always
-    # shouts.
-    ("an ordinary new domain type with a public constructor", False),
-    ("the domain is unchanged", False),
+# Each case mutates the authority surface in exactly one way and says whether the gate
+# must reject it. The must-accept cases matter as much as the must-reject ones: a check
+# that flagged an ordinary new public type would flag every constructor in the crate,
+# and nobody reads a gate that always shouts.
+DRIFT_CASES: list[tuple[str, str, bool]] = [
+    # ---- must be rejected: the boundary has weakened --------------------------
+    ("policy", "CapabilityInvocation::authorise is widened to `pub`", True),
+    ("policy", "AuthorisationProof::issue is widened to `pub`", True),
+    ("policy", "the minting constructor is renamed", True),
+    ("policy", "the minting constructor is deleted", True),
+    ("policy", "an authority type is renamed", True),
+    ("policy", "an authority type is re-exported from orxnud-domain", True),
+    ("capability", "CapabilityAdapter is widened to `pub`", True),
+    ("capability", "AdapterBundle is widened to `pub`", True),
+    ("capability", "a sealed trait is deleted", True),
+    # ---- must be accepted ---------------------------------------------------
+    ("policy", "an ordinary new public type with a public constructor", False),
+    ("policy", "the authority surface is unchanged", False),
 ]
 
 
-def mutated_domain(case: str) -> str:
-    """A domain whose authority chain has been changed in one specific way."""
-    if case.startswith("the seal gains a second public constructor"):
-        return DOMAIN_SRC.replace(
-            "    pub fn issued_by(&self) -> &'static str {",
-            """    pub fn forge() -> Self {
-        Self { issued_by: "forged" }
+def drift_policy(case: str) -> str:
+    """`orxnud-policy`'s source with its authority surface changed in one way."""
+    if case.startswith("CapabilityInvocation::authorise is widened"):
+        return POLICY_SRC.replace("pub(crate) fn authorise", "pub fn authorise")
+    if case.startswith("AuthorisationProof::issue is widened"):
+        return POLICY_SRC.replace("pub(crate) fn issue", "pub fn issue")
+    if case.startswith("the minting constructor is renamed"):
+        return POLICY_SRC.replace("fn authorise", "fn authorise_for_good_measure")
+    if case.startswith("the minting constructor is deleted"):
+        return POLICY_SRC.replace(
+            """    pub(crate) fn authorise(_request: &(), step: u32) -> Self {
+        Self { step }
     }
-    pub fn issued_by(&self) -> &'static str {""",
+""",
+            "",
         )
-    if case.startswith("the domain gains a third seal-gated type"):
+    if case.startswith("an authority type is renamed"):
+        return POLICY_SRC.replace("CapabilityInvocation", "InvocationOfRecord")
+    if case.startswith("an ordinary new public type"):
         return (
-            DOMAIN_SRC
+            POLICY_SRC
             + """
-/// A new authority type, gated by the seal like the existing two.
-pub struct Escalation {
-    approved: bool,
-}
-
-impl Escalation {
-    pub fn approve(_seal: &PolicySeal, approved: bool) -> Self {
-        Self { approved }
-    }
-}
-"""
-        )
-    if case.startswith("a type becomes gated transitively"):
-        return (
-            DOMAIN_SRC
-            + """
-/// Gated through an authority type rather than through the seal directly, so it is only
-/// findable by following the closure.
-pub struct ExecutionGrant {
-    granted: bool,
-}
-
-impl ExecutionGrant {
-    pub fn grant(_proof: &AuthorisationProof, granted: bool) -> Self {
-        Self { granted }
-    }
-}
-"""
-        )
-    if case.startswith("the seal type is renamed"):
-        return DOMAIN_SRC.replace("PolicySeal", "PolicySealV2")
-    if case.startswith("an ordinary new domain type"):
-        return (
-            DOMAIN_SRC
-            + """
-/// Not authority: no seal, no relationship to one. Constructible, as any domain value is.
+/// Not authority: it takes no authority type and returns none. Constructible, as any
+/// ordinary public value in this crate is.
 pub struct Cursor(pub u32);
 
 impl Cursor {
@@ -576,6 +584,36 @@ impl Cursor {
         Self(offset)
     }
 }
+"""
+        )
+    return POLICY_SRC
+
+
+def drift_capability(case: str) -> str:
+    """`orxnud-capability`'s source with its sealed traits changed in one way."""
+    if case.startswith("CapabilityAdapter is widened"):
+        return CAPABILITY_SRC.replace("pub(crate) trait CapabilityAdapter", "pub trait CapabilityAdapter")
+    if case.startswith("AdapterBundle is widened"):
+        return CAPABILITY_SRC.replace("pub(crate) trait AdapterBundle", "pub trait AdapterBundle")
+    if case.startswith("a sealed trait is deleted"):
+        return CAPABILITY_SRC.replace(
+            """pub(crate) trait AdapterBundle {
+    fn adapter(&self) -> &dyn CapabilityAdapter;
+}
+""",
+            "",
+        )
+    return CAPABILITY_SRC
+
+
+def mutated_domain(case: str) -> str:
+    """`orxnud-domain` with authority leaking back into it."""
+    if case.startswith("an authority type is re-exported"):
+        return DOMAIN_SRC + (
+            """
+// Everything depends on orxnud-domain. A re-export here would put the minting
+// constructor in reach of the whole workspace.
+pub use orxnud_policy::{AuthorisationProof, CapabilityInvocation, DispatchView};
 """
         )
     return DOMAIN_SRC
@@ -622,20 +660,20 @@ G2D_TRANSFORMS: list[tuple[str, str]] = [
         "the comment that disables the gate, moved to the top of the file",
         """
 // This crate deliberately mentions #[cfg(test)] in its documentation.
-use orxnud_domain::PolicySeal;
+use orxnud_policy::CapabilityInvocation;
 
 fn production() {
-    let _ = PolicySeal::attest("attacker");
+    let _ = CapabilityInvocation::authorise(&(), 1);
 }
 """,
     ),
     (
         "the comment moved to the bottom, after the violation",
         """
-use orxnud_domain::PolicySeal;
+use orxnud_policy::CapabilityInvocation;
 
 fn production() {
-    let _ = PolicySeal::attest("attacker");
+    let _ = CapabilityInvocation::authorise(&(), 1);
 }
 
 // see also #[cfg(test)] below
@@ -649,14 +687,14 @@ mod tests {}
 // The test module uses #[cfg(test)] later.
 #[cfg(test)]
 mod check_all_the_things {
-    use orxnud_domain::PolicySeal;
-    fn fixture() -> PolicySeal {
-        PolicySeal::attest("t")
+    use orxnud_policy::CapabilityInvocation;
+    fn fixture() -> CapabilityInvocation {
+        CapabilityInvocation::authorise(&(), 1)
     }
 }
 
 fn production() {
-    let _ = PolicySeal::attest("attacker");
+    let _ = CapabilityInvocation::authorise(&(), 1);
 }
 """,
     ),
@@ -671,7 +709,7 @@ mod tests {
 }
 
 fn production() {
-    let _ = orxnud_domain::PolicySeal::attest("attacker");
+    let _ = orxnud_policy::CapabilityInvocation::authorise(&(), 1);
 }
 """,
     ),
@@ -679,27 +717,27 @@ fn production() {
         "a fully qualified path, and the import removed",
         """
 fn production() {
-    let _ = ::orxnud_domain::invocation::PolicySeal::attest("attacker");
+    let _ = ::orxnud_policy::authority::CapabilityInvocation::authorise(&(), 1);
 }
 """,
     ),
     (
         "a re-exported alias",
         """
-use orxnud_domain::PolicySeal as Gate;
+use orxnud_policy::CapabilityInvocation as Gate;
 
 fn production() {
-    let _ = Gate::attest("attacker");
+    let _ = Gate::authorise(&(), 1);
 }
 """,
     ),
     (
         "an associated-function import used bare",
         """
-use orxnud_domain::PolicySeal::{self as S, attest};
+use orxnud_policy::CapabilityInvocation::{self as S, authorise};
 
 fn production() {
-    let _ = attest("attacker");
+    let _ = authorise(&(), 1);
 }
 """,
     ),
@@ -708,9 +746,9 @@ fn production() {
         """
 mod inner {
     pub mod deeper {
-        use orxnud_domain::PolicySeal;
-        pub fn forge() -> PolicySeal {
-            PolicySeal::attest("attacker")
+        use orxnud_policy::CapabilityInvocation;
+        pub fn forge() -> CapabilityInvocation {
+            CapabilityInvocation::authorise(&(), 1)
         }
     }
 }
@@ -862,23 +900,28 @@ def main() -> int:
                 print(f"  FAIL  {name}")
                 failures.append(detail)
 
-        # The authority-surface drift check: the gate must notice the domain changing,
-        # because a forbidden list that silently goes stale is how the original bypasses
-        # existed.
-        for name, expect_fail in DRIFT_CASES:
+        # The authority-surface drift check. A forbidden list that silently goes stale is
+        # how the original bypasses existed: G2d reported `ok` on a tree that forged
+        # authority three ways, because the symbols it looked for were not the ones the
+        # exploits used.
+        for where, name, expect_fail in DRIFT_CASES:
             total += 1
             root = os.path.join(tmp, "drift")
             shutil.rmtree(root, ignore_errors=True)
             fx = Fixture(root)
-            fx.write("crates/orxnud-domain/src/invocation.rs", mutated_domain(name))
+            if where == "policy":
+                fx.write("crates/orxnud-policy/src/authority.rs", drift_policy(name))
+            elif where == "capability":
+                fx.write("crates/orxnud-capability/src/dispatch.rs", drift_capability(name))
+            fx.write("crates/orxnud-domain/src/lib.rs", mutated_domain(name))
             result = fx.gate("G2d")
             rejected = result.returncode != 0
             if rejected == expect_fail:
-                print(f"  ok    {name}")
+                print(f"  ok    {where}: {name}")
             else:
-                print(f"  FAIL  {name}")
+                print(f"  FAIL  {where}: {name}")
                 failures.append(
-                    f"{name}\n     expected the gate to "
+                    f"{where}: {name}\n     expected the gate to "
                     f"{'REJECT' if expect_fail else 'ACCEPT'}\n{result.stdout}\n{result.stderr}"
                 )
 
