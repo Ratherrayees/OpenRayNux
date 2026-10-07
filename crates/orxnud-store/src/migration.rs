@@ -163,10 +163,24 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "task_approval_step_scope",
         sql: crate::schema::MIGRATION_APPROVAL_STEP_SCOPE,
     },
+    Migration {
+        // V-93. Records, per side effect, whether repeating *that effect* is safe.
+        // `tasks.idempotent` cannot answer it: a task is created before the capability
+        // that will run on it is chosen, and the daemon's default task kind is `query`,
+        // so most tasks are flagged idempotent at the task level regardless of what
+        // they are about to do. Recovery needs the capability's own declaration, and
+        // the dispatcher is the only place that knows it -- so it is written into the
+        // ledger where recovery can read it. Forward, for the same reason as 9 and 10:
+        // a database already at version 10 holds effects with no repeat-safety recorded,
+        // and the column defaults those to `0`, which is the fail-closed reading.
+        version: 11,
+        name: "task_effect_idempotency",
+        sql: crate::schema::MIGRATION_EFFECT_IDEMPOTENCY,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 10;
+pub const CURRENT_VERSION: u32 = 11;
 
 /// Applies pending migrations.
 #[derive(Debug)]

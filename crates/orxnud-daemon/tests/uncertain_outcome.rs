@@ -804,3 +804,215 @@ fn a_worker_whose_lease_ended_cannot_settle_the_outcome() {
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---------------------------------------------------------------------------
+// V-93: the production dispatch path writes the evidence recovery needs
+// ---------------------------------------------------------------------------
+//
+// # Why these are ledger assertions and not crash assertions
+//
+// The crash evidence for V-93 is `orxnud-task/tests/crash_recovery_uncertainty.rs`,
+// where real `SIGKILL`s are delivered to real child processes running the production
+// engine against a real file, and `recover()` is then run for real. That is the only
+// honest way to produce a crash in the dangerous window, and it is where the recovery
+// *decision* is proven.
+//
+// It cannot be done from the daemon binary, and the reason is worth recording:
+// `orxnud_store::faults::maybe_crash` is gated on `#[cfg(any(test,
+// feature = "fault-injection"))]`, the daemon declares no such feature, and a binary is
+// never built with `cfg(test)`. So every fault point is compiled out of `orxnud`.
+// `Daemon::start_with_fault` therefore does not arm anything, and the pre-existing
+// `a_crash_inside_the_uncertainty_transition_leaves_no_retryable_task` above cannot
+// distinguish a crash from a clean run -- its assertion passes either way, because a
+// clean run also leaves the task non-retryable. Filed as a follow-up finding; not fixed
+// here, because enabling the feature in a shipped manifest is outside V-93.
+//
+// What *is* provable from the daemon is the other half of the chain: that the production
+// dispatch path reserves the effect before dispatch and resolves it on every outcome,
+// with the capability's own repeat-safety. That is what makes the store-level crash
+// tests meaningful, because it is the only producer of the rows they read.
+
+/// Reads the side-effect ledger the daemon wrote, out of its own database.
+///
+/// Through `orxnud_store::Store` rather than a direct `rusqlite` handle, so the test
+/// needs no dependency the daemon does not already have, and so it reads the rows the
+/// way every other reader does. Values are read as the stored `i64` for
+/// `idempotent` rather than a bool, so a value outside `0`/`1` is visible here instead
+/// of being silently folded into a `false`.
+fn effects(root: &std::path::Path) -> Vec<(String, String, i64)> {
+    let store =
+        orxnud_store::Store::open(&root.join("state.db"), false).expect("open the daemon database");
+    let conn = store.conn();
+    let mut stmt = conn
+        .prepare("SELECT step_key, status, idempotent FROM task_effects ORDER BY reserved_at_ms;")
+        .expect("prepare");
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query");
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.expect("row"));
+    }
+    out
+}
+
+/// A successful governed `write-text` records an effect that must not be repeated.
+///
+/// This is the row `recover()` reads. Without it, a crash in the execution window
+/// leaves a task `running` under a dead owner's lease and nothing to distinguish it
+/// from an ordinary abandoned one -- which is the V-93 defect.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires a real Tier-1 sandbox: the write must actually run (V-87)"
+)]
+#[test]
+fn the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs() {
+    if !ready_on(true) {
+        println!(
+            "  NOT_PROVEN: this host cannot isolate, so the dispatch cannot be made to run; \
+             the ledger evidence is NOT demonstrated here (V-87)"
+        );
+        return;
+    }
+    let d = dir("v93-ledger");
+    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    let s = Daemon::start(&d);
+    let pid = s.approved_proposal("v93l");
+
+    let x = send(
+        s.ep(),
+        "x",
+        "task/execute",
+        json!({"proposal": pid, "worker": "w1"}),
+    );
+    assert!(
+        x.get("result").is_some(),
+        "the execution was refused rather than attempted: {x}"
+    );
+    assert_eq!(
+        x["result"]["verified"], true,
+        "the write should verify: {x}"
+    );
+
+    let rows = effects(&d);
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one effect must be recorded for one dispatch, got {rows:?}"
+    );
+    let (step, status, idempotent) = &rows[0];
+    assert_eq!(step, "filesystem/write-text", "{rows:?}");
+    assert_eq!(
+        status, "observed",
+        "a verified write must resolve its effect to `observed`, not leave it pending: {rows:?}"
+    );
+    assert_eq!(
+        idempotent, &0,
+        "`filesystem/write-text` declares itself non-idempotent, so the effect must be \
+         recorded as unsafe to repeat: {rows:?}"
+    );
+
+    // And the task finished, so nothing is left claiming otherwise.
+    assert_eq!(s.task("v93l")["state"], "completed");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The mirror: an idempotent capability records an effect that *is* safe to repeat, so a
+/// crash in the same window leaves its task recoverable.
+///
+/// This is the half that stops the V-93 fix from turning every crashed read into a
+/// terminal task.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires a real Tier-1 sandbox (V-87)"
+)]
+#[test]
+fn the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_capability() {
+    if !ready_on(true) {
+        println!("  NOT_PROVEN: this host cannot isolate (V-87)");
+        return;
+    }
+    let d = dir("v93-ledger-idempotent");
+    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    let s = Daemon::start(&d);
+    send(
+        s.ep(),
+        "c",
+        "task/create",
+        json!({"id": "v93li", "content": "count"}),
+    );
+    let claimed = send(
+        s.ep(),
+        "cl",
+        "task/claim",
+        json!({"id": "v93li", "worker": "w1"}),
+    );
+    assert!(claimed.get("result").is_some(), "claim failed: {claimed}");
+    let p = send(
+        s.ep(),
+        "p",
+        "task/propose",
+        json!({
+            "task": "v93li", "worker": "w1", "capability": "text/word-count",
+            "params": {"text": "one two three"}}),
+    );
+    let pid = p["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned();
+    let a = send(
+        s.ep(),
+        "a",
+        "capability/approve",
+        json!({"proposal": pid, "ttl_ms": 60_000}),
+    );
+    assert!(a.get("result").is_some(), "approval failed: {a}");
+    let x = send(
+        s.ep(),
+        "x",
+        "task/execute",
+        json!({"proposal": pid, "worker": "w1"}),
+    );
+    assert!(x.get("result").is_some(), "execute refused: {x}");
+
+    let rows = effects(&d);
+    assert_eq!(rows.len(), 1, "got {rows:?}");
+    assert_eq!(rows[0].0, "text/word-count", "{rows:?}");
+    assert_eq!(rows[0].1, "observed", "{rows:?}");
+    assert_eq!(
+        rows[0].2, 1,
+        "`text/word-count` is a pure function and declares itself idempotent, so a crash \
+         after it ran must leave the task recoverable: {rows:?}"
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The task's own `idempotent` flag is not what the ledger records, and must not be.
+///
+/// The daemon's `task/create` defaults to a `query` kind, so this task row says
+/// `idempotent = 1` while the capability about to run is a non-idempotent write. If
+/// recovery consulted the task row, a crash in the execution window would auto-retry
+/// the write -- the exact defect. Asserted here as a live fact about the shipped
+/// default, not as a hypothetical.
+#[test]
+fn the_daemons_default_task_kind_is_idempotent_and_that_is_not_what_is_recorded() {
+    let d = dir("v93-kind-default");
+    let s = Daemon::start(&d);
+    send(
+        s.ep(),
+        "c",
+        "task/create",
+        json!({"id": "v93k", "content": "write"}),
+    );
+    let t = s.task("v93k");
+    assert_eq!(
+        t["kind"], "query",
+        "the daemon's default task kind is `query`; if this ever changes, recovery's \
+         input needs re-examining"
+    );
+    assert_eq!(t["idempotent"], true, "{t}");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}

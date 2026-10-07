@@ -934,6 +934,48 @@ impl TaskService {
             })
     }
 
+    /// Reserves the idempotency key for a side effect about to be dispatched.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if the write fails.
+    pub fn reserve_effect(
+        &mut self,
+        key: &str,
+        id: &TaskId,
+        attempt_no: u32,
+        step_key: &str,
+        idempotent: bool,
+        now_ms: i64,
+    ) -> Result<bool, TaskFault> {
+        self.engine
+            .reserve_effect(key, id, attempt_no, step_key, idempotent, now_ms)
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
+    }
+
+    /// Records how a reserved side effect turned out.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if the write fails.
+    pub fn resolve_effect(
+        &mut self,
+        key: &str,
+        status: orxnud_store::task_repo::EffectStatus,
+        detail: Option<&str>,
+        now_ms: i64,
+    ) -> Result<bool, TaskFault> {
+        self.engine
+            .resolve_effect(key, status, detail, now_ms)
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
+    }
+
     /// Records an approval for a step, replacing one that expired without being used.
     ///
     /// # Errors

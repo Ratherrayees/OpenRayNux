@@ -243,7 +243,7 @@ fn an_idempotency_reservation_survives_a_restart() {
         let _ = e.claim_task("w", NOW).expect("claim");
         let k = DurableEngine::idempotency_key(&tid("t"), "send", "initial");
         assert!(
-            e.reserve_effect(&k, &tid("t"), 1, "send", NOW)
+            e.reserve_effect(&k, &tid("t"), 1, "send", false, NOW)
                 .expect("reserve")
         );
         k
@@ -251,7 +251,7 @@ fn an_idempotency_reservation_survives_a_restart() {
     {
         let mut e = engine(&path);
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 2, "send", NOW)
+            !e.reserve_effect(&key, &tid("t"), 2, "send", false, NOW)
                 .expect("reserve"),
             "the reservation must survive the restart"
         );
