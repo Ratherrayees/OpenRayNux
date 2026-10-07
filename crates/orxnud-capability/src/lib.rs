@@ -191,70 +191,6 @@ impl CapabilityDeclaration {
     }
 }
 
-/// What a capability implementation provides.
-///
-/// The contract is deliberately narrow: it receives a [`DispatchView`], which
-/// **does not carry the actor**. A capability that learns who is calling it
-/// becomes a confused deputy able to reuse one caller's authority for another's
-/// request (ADR-0027, control S8).
-///
-/// # Errors
-///
-/// Any failure the capability reports, including one it invents. The dispatcher
-/// does not interpret adapter failures as permission failures; a capability that
-/// cannot do the work fails the *work*, not the *policy*.
-pub trait CapabilityContract {
-    /// Runs the capability.
-    fn invoke(&self, view: &DispatchView<'_>) -> Result<CapabilityOutcome, CapabilityError>;
-}
-
-/// What a capability returns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CapabilityOutcome {
-    /// The value produced. `None` for a capability with no result.
-    pub value: Option<serde_json::Value>,
-    /// Whether the caller should treat the effect as having happened.
-    ///
-    /// `false` means *unknown*, which is not the same as "did not happen". This
-    /// distinction is what TP-12 exists to preserve: an unknown outcome must be
-    /// recorded as unknown, never silently reported as success.
-    pub effect_observed: bool,
-    /// A short, redacted description for the audit trail. Never a secret.
-    pub detail: Option<String>,
-}
-
-impl CapabilityOutcome {
-    /// An outcome whose effect is known to have occurred.
-    #[must_use]
-    pub fn observed(value: serde_json::Value) -> Self {
-        Self {
-            value: Some(value),
-            effect_observed: true,
-            detail: None,
-        }
-    }
-
-    /// An outcome whose effect is **unknown**.
-    #[must_use]
-    pub fn uncertain() -> Self {
-        Self {
-            value: None,
-            effect_observed: false,
-            detail: None,
-        }
-    }
-
-    /// An outcome known *not* to have occurred.
-    #[must_use]
-    pub fn not_performed(detail: impl Into<String>) -> Self {
-        Self {
-            value: None,
-            effect_observed: false,
-            detail: Some(detail.into()),
-        }
-    }
-}
-
 /// Why a dispatch was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchError {
@@ -438,11 +374,6 @@ impl Dispatcher {
         })
     }
 
-    /// The invocation projection an adapter would receive.
-    #[must_use]
-    pub fn view_for<'i>(&self, invocation: &'i CapabilityInvocation) -> DispatchView<'i> {
-        invocation.dispatch_view()
-    }
 }
 
 /// An invocation that passed every admissibility check.
@@ -453,11 +384,42 @@ impl Dispatcher {
 #[derive(Debug, Clone)]
 pub struct ResolvedDispatch<'a> {
     /// Which capability to run.
-    pub capability: CapabilityId,
+    capability: CapabilityId,
     /// Who is acting. For audit only.
-    pub actor: Actor,
+    actor: Actor,
     /// What the adapter receives. Contains no actor.
-    pub view: DispatchView<'a>,
+    ///
+    /// Private because a `DispatchView` is the argument to adapter execution, and
+    /// adapter execution is now crate-private. A public field here would hand every
+    /// caller the one value `CapabilityAdapter::invoke` takes — which is the
+    /// capability execution boundary this crate enforces by privacy rather than by
+    /// asking callers not to.
+    ///
+    /// `dead_code` is accurate and load-bearing rather than suppressed: the
+    /// Phase-1 admissibility check this type belongs to is exercised only by this
+    /// module's own test, and the governed path builds the same projection itself in
+    /// `dispatch::Dispatcher::dispatch`. The field is kept because the type is
+    /// documented surface (`orxnud-capability::Dispatcher` is named in the daemon's
+    /// architecture notes), and it is kept *unreadable from outside* because that is
+    /// the invariant. Deleting it would be a separate decision about a Phase-1
+    /// leftover, not part of sealing execution.
+    #[allow(dead_code)]
+    view: DispatchView<'a>,
+}
+
+impl<'a> ResolvedDispatch<'a> {
+    /// Which capability this dispatch will run.
+    #[must_use]
+    pub fn capability(&self) -> &CapabilityId {
+        &self.capability
+    }
+
+    /// Who is acting. For the audit record; never for an adapter.
+    #[must_use]
+    pub fn actor(&self) -> &Actor {
+        &self.actor
+    }
+
 }
 
 impl ResolvedDispatch<'_> {
@@ -628,18 +590,6 @@ mod tests {
         assert!(!d.enabled);
         assert_eq!(d.effective_class(), DataClass::Public);
         assert_eq!(d.risk, RiskClass::Medium);
-    }
-
-    #[test]
-    fn an_uncertain_outcome_is_not_a_success() {
-        let u = CapabilityOutcome::uncertain();
-        assert!(!u.effect_observed);
-        assert!(u.value.is_none());
-        let n = CapabilityOutcome::not_performed("no such file");
-        assert!(!n.effect_observed);
-        assert!(n.detail.is_some(), "a non-effect should say why");
-        let o = CapabilityOutcome::observed(serde_json::json!({"ok": true}));
-        assert!(o.effect_observed);
     }
 
     #[test]
