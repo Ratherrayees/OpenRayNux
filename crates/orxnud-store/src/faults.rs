@@ -249,6 +249,10 @@ mod tests {
 /// kill-from-the-outside suite cannot check: the window is microseconds wide and
 /// inside someone else's function, so the only way in is to be called from there.
 #[cfg(test)]
+// Several tests here deliberately use the deprecated lease-without-spending
+// operation: it is the only way to construct "lease held, approval unspent"
+// without hand-written SQL, and the recovery tests need exactly that.
+#[allow(deprecated)]
 mod atomicity {
     use super::*;
     use crate::migration::MigrationRunner;

@@ -628,6 +628,53 @@ pub const MIGRATION_EFFECT_IDEMPOTENCY: &str = r#"
 ALTER TABLE task_effects ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Migration 12 — the approval digest's length is enforced by the database. V-94.
+///
+/// Recreates `task_approvals` rather than using `ALTER TABLE`, because SQLite cannot add
+/// a CHECK to an existing table. That is the same trade migration 10 already made, and
+/// it is the right one here: the digest is the binding between an approval and the
+/// operation it authorises, and a durable layer that will store a blob of any length
+/// under that column has no invariant left to lose.
+///
+/// The CHECK is `length(digest) = 32` and not `length(digest) BETWEEN 1 AND 32`, because
+/// an empty digest is exactly the value the previous parser manufactured from
+/// unparseable input. A range check would have accepted it.
+///
+/// The other columns, their types, the primary key and the foreign key are carried over
+/// verbatim, so nothing else about the table changes. `consumed_at_ms` is copied as NULL
+/// for every row: a row can only reach here having never been consumed, because a
+/// consumed row cannot be re-inserted under this primary key.
+pub const MIGRATION_APPROVAL_DIGEST_LENGTH: &str = r#"
+CREATE TABLE task_approvals_length_checked (
+    task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    step_no        INTEGER NOT NULL DEFAULT 1,
+    attempt_no     INTEGER NOT NULL,
+    digest         BLOB    NOT NULL,
+    capability     TEXT    NOT NULL,
+    target         TEXT,
+    params         TEXT    NOT NULL,
+    issued_at_ms   INTEGER NOT NULL,
+    expires_at_ms  INTEGER NOT NULL,
+    consumed_at_ms INTEGER,
+    PRIMARY KEY (task_id, step_no, attempt_no),
+    CHECK (step_no >= 1),
+    -- The authority digest is exactly 32 bytes, always. V-94.
+    CHECK (length(digest) = 32)
+);
+
+INSERT INTO task_approvals_length_checked
+    (task_id, step_no, attempt_no, digest, capability, target, params,
+     issued_at_ms, expires_at_ms, consumed_at_ms)
+SELECT task_id, step_no, attempt_no, digest, capability, target, params,
+       issued_at_ms, expires_at_ms, NULL
+  FROM task_approvals
+ WHERE length(digest) = 32;
+
+DROP TABLE task_approvals;
+
+ALTER TABLE task_approvals_length_checked RENAME TO task_approvals;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

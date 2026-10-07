@@ -71,7 +71,7 @@ impl CapabilityDeclaration {
 /// Attaching them is a builder rather than a constructor parameter so the fifteen
 /// existing `PolicyEngine::new` sites are untouched. There is still exactly one
 /// code path: `evaluate` asks [`ApprovalLedger::is_consumed`] and `authorise`
-/// calls [`ApprovalLedger::consume`] whichever implementation is attached, so
+/// calls [`ApprovalLedger::consume_at`] whichever implementation is attached, so
 /// there is no second set of rules to drift.
 pub struct PolicyEngine {
     policy: PolicySet,
@@ -201,14 +201,22 @@ impl PolicyEngine {
     ///
     /// # Errors
     ///
+    /// `now_ms` is recorded as the consumption time, and is the *same* reading
+    /// [`Self::authorise`] uses for every other decision about this action, so the
+    /// ledger's timestamp is the time the decision was made rather than a second clock
+    /// read taken a moment later.
+    ///
+    /// # Errors
+    ///
     /// [`PolicyError::ApprovalLedgerUnavailable`] if the digest was already spent
     /// or the ledger could not be written. Both mean "not consumed".
     pub fn consume_approval(
         &mut self,
         digest: orxnud_domain::approval::ApprovalDigest,
+        now_ms: i64,
     ) -> Result<(), PolicyError> {
         self.ledger
-            .consume(&digest)
+            .consume_at(&digest, now_ms)
             .map_err(|e| PolicyError::ApprovalLedgerUnavailable(e.to_string()))
     }
 
@@ -551,7 +559,10 @@ impl PolicyEngine {
         // wins while the semantics are unspecified. V-43 records this for Phase 4/5,
         // where a reservation distinct from a consumption may be the better model.
         if let Some(record) = approval
-            && let Err(e) = self.ledger.consume(&record.digest)
+            // The same `now_ms` every other decision in this call used. V-94: the
+            // ledger's timestamp is now the time of the decision rather than a sentinel,
+            // and taking it from here is what keeps the two from disagreeing.
+            && let Err(e) = self.ledger.consume_at(&record.digest, now_ms)
         {
             // Lost the race, or the ledger is down. Either way this is not a permit,
             // and the answer is a refusal carrying the reason it exists for.

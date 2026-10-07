@@ -639,7 +639,9 @@ fn a_spent_approval_is_still_spent_after_a_restart() {
     {
         let mut engine = durable_engine_from(&db, gated_policy());
         assert!(!engine.approval_is_consumed(&record.digest).expect("read"));
-        engine.consume_approval(record.digest).expect("consume");
+        engine
+            .consume_approval(record.digest, 1_000)
+            .expect("consume");
         assert!(engine.approval_is_consumed(&record.digest).expect("read"));
     }
 
@@ -659,7 +661,7 @@ fn distinct_approvals_are_independent_across_a_restart() {
     let b = approval("bob", NOW, NOW + 60_000);
     {
         let mut engine = durable_engine_from(&db, gated_policy());
-        engine.consume_approval(a.digest).expect("a");
+        engine.consume_approval(a.digest, 1_000).expect("a");
     }
     let mut engine = durable_engine_from(&db, gated_policy());
     assert!(engine.approval_is_consumed(&a.digest).expect("read"));
@@ -667,7 +669,7 @@ fn distinct_approvals_are_independent_across_a_restart() {
         !engine.approval_is_consumed(&b.digest).expect("read"),
         "a different approval must be unaffected"
     );
-    engine.consume_approval(b.digest).expect("b");
+    engine.consume_approval(b.digest, 1_000).expect("b");
     cleanup(&dir);
 }
 
@@ -692,7 +694,7 @@ fn two_processes_racing_for_one_digest_produce_exactly_one_success() {
                 // transition and the migrations on a fresh file.
                 let mut ledger = SqliteApprovalLedger::open(&db).expect("open");
                 barrier.wait();
-                ledger.consume(&digest)
+                ledger.consume_at(&digest, 1_000)
             })
         })
         .collect();

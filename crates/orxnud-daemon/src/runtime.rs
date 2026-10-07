@@ -2568,38 +2568,39 @@ async fn execute_proposal<S: SecretsContract>(
         });
     }
 
-    // 4. Take the fresh execution lease and resume the task, atomically.
+    // 4. Take the fresh execution lease **and** spend the approval, in one transaction.
+    //
+    // V-94. These were two calls, and a failure of the second was logged while execution
+    // proceeded -- so a capability could run with no durable record that its approval had
+    // been spent. Reproduced over a real daemon with a real `write-text`: the reply came
+    // back `verified: true`, `state: completed`, `steps_completed: 1`, with the
+    // consumption refused.
+    //
+    // One transaction means the two cannot disagree. Every refusal below -- a missing
+    // proposal, a task not waiting, an attempt whose approval is already spent -- rolls the
+    // whole thing back, so no lease is granted and the task stays exactly where it was
+    // with its approval still retryable.
+    //
+    // # Which ledger is authoritative
+    //
+    // Neither one mirrors the other, and it is worth being precise because the old comment
+    // claimed otherwise:
+    //
+    // * `spent_approvals`, written by `PolicyEngine::authorise` *inside* `dispatch` below,
+    //   is the replay gate. It is read by `evaluate` before the decision and burned before
+    //   the capability runs, so it stops one approval being presented twice across the
+    //   whole installation and across restarts.
+    // * `task_approvals.consumed_at_ms` is the task domain's record of which approval
+    //   authorised which attempt of which step. `record_approval_replacing_expired` reads
+    //   it when deciding whether a step's approval may be replaced.
+    //
+    // So at this point the authoritative ledger has *not* committed -- that happens four
+    // steps down -- and the "the ledger is authoritative, so a failure here is only a
+    // reporting fault" argument this call site used to make was not available. It is a
+    // precondition now.
     let began =
-        g.2.begin_approved_execution(&proposal_id, &worker, now)
+        g.2.begin_execution_spending_approval(&proposal_id, &worker, now)
             .map_err(task_fault)?;
-
-    // 5. Mark the task-domain approval spent, mirroring the policy ledger.
-    //
-    // `PolicyEngine::authorise` spends the digest in its own ledger when it authorises, so
-    // single-use is already enforced -- but `task_approvals.consumed_at_ms` was never written
-    // by anything in the daemon. That column is the task domain's own record of its approvals,
-    // and leaving it permanently NULL while a *security* decision came to depend on it (this
-    // slice's replacement rule) is precisely the arrangement where a lookup reads as "not
-    // used" and means "nobody ever wrote it down".
-    //
-    // Written here, at the point the lease is taken and the dispatch is about to happen, so
-    // it means the same thing the ledger's spend means: this approval authorised one attempt.
-    // Best-effort by design, and deliberately so: the ledger is authoritative for single-use,
-    // so a failure to update the row is a reporting fault and not a reason to refuse an
-    // otherwise-authorised execution. It is logged rather than swallowed.
-    if let Err(e) = g.2.consume_approval(
-        &proposal.task_id,
-        proposal.step_no,
-        proposal.attempt_no,
-        now,
-    ) {
-        tracing::error!(
-            error = ?e,
-            task = %proposal.task_id.as_str(),
-            step_no = proposal.step_no,
-            "an approval was spent but its task-domain row could not be marked consumed"
-        );
-    }
 
     // 5b. Reserve the side effect, *before* it is dispatched.
     //

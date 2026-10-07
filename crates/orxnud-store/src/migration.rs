@@ -177,10 +177,27 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "task_effect_idempotency",
         sql: crate::schema::MIGRATION_EFFECT_IDEMPOTENCY,
     },
+    Migration {
+        // V-94. `task_approvals.digest` had no length CHECK, so the durable layer would
+        // store a blob of any length under the column that binds an approval to the
+        // operation it authorises -- including the zero-length blob the previous parser
+        // produced from unparseable input. Requires recreating the table, because SQLite
+        // cannot add a CHECK to an existing one.
+        //
+        // Forward, and deliberately lossy: the copy below keeps only rows whose digest is
+        // already 32 bytes. A database carrying a malformed approval has an authority
+        // record that never was one; discarding it is the fail-closed reading, and the
+        // alternative -- keeping it -- would preserve exactly the state this migration
+        // exists to remove. Such a row is un-recoverable authority, and an operator who
+        // needs it can re-approve.
+        version: 12,
+        name: "task_approval_digest_length",
+        sql: crate::schema::MIGRATION_APPROVAL_DIGEST_LENGTH,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 11;
+pub const CURRENT_VERSION: u32 = 12;
 
 /// Applies pending migrations.
 #[derive(Debug)]
@@ -605,7 +622,9 @@ mod tests {
                     "INSERT INTO task_approvals (task_id,attempt_no,digest,capability,target,
                                                  params,issued_at_ms,expires_at_ms)
                      VALUES (?1,?2,?3,'filesystem/write-text','t','{}',1,2);",
-                    rusqlite::params![id, attempt, vec![attempt as u8; 8]],
+                    // A real digest is 32 bytes. Migration 12 refuses anything else, so a
+                    // shorter seed would be discarded rather than migrated -- which is the point.
+                    rusqlite::params![id, attempt, vec![attempt as u8; 32]],
                 )
                 .expect("approval");
             }

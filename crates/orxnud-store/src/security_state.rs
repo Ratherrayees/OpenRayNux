@@ -202,7 +202,7 @@ impl AuditJournal for SqliteAuditJournal {
 ///
 /// # Atomicity
 ///
-/// [`consume`](ApprovalLedger::consume) is one `INSERT`. The primary key does the
+/// [`consume_at`](ApprovalLedger::consume_at) is one `INSERT`. The primary key does the
 /// work: a second insert of the same digest raises a uniqueness violation, which
 /// becomes [`LedgerError::AlreadyConsumed`]. There is no window between "have I
 /// used this?" and "mark it used", which is the window a `SELECT`-then-`INSERT`
@@ -275,20 +275,40 @@ impl SqliteApprovalLedger {
 }
 
 impl ApprovalLedger for SqliteApprovalLedger {
-    fn consume(&mut self, digest: &ApprovalDigest) -> Result<(), LedgerError> {
+    fn consume_at(&mut self, digest: &ApprovalDigest, now_ms: i64) -> Result<(), LedgerError> {
         let unavailable = |e: rusqlite::Error| LedgerError::Unavailable(e.to_string());
-        // One statement. The uniqueness violation *is* the single-use mechanism.
+        // One statement. The uniqueness violation *is* the single-use mechanism, and the
+        // timestamp is written by that same statement -- so there is no window in which a
+        // digest is recorded as spent with no time, or timed with no spend. V-94.
+        //
+        // The violation is classified by *extended* code, not by "is it a constraint
+        // violation". `spent_approvals` has a CHECK on the digest's length, so a
+        // malformed digest would otherwise arrive here as `AlreadyConsumed` -- telling
+        // the caller this approval was already spent, when in fact it was never a
+        // digest. Single-use is a primary-key property and is reported as one.
         self.conn
             .execute(
                 "INSERT INTO spent_approvals (digest, consumed_at_ms) VALUES (?1, ?2);",
-                params![digest.as_bytes().as_slice(), 0_i64],
+                params![digest.as_bytes().as_slice(), now_ms],
             )
             .map(|_| ())
             .map_err(|e| match e {
                 rusqlite::Error::SqliteFailure(f, _)
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation
+                        && f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
                 {
                     LedgerError::AlreadyConsumed
+                }
+                rusqlite::Error::SqliteFailure(f, m)
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    // A constraint that is not the primary key: the row was refused for
+                    // a reason that has nothing to do with a replay, and reporting it as
+                    // one would tell the caller to stop retrying when retrying cannot help.
+                    LedgerError::Unavailable(format!(
+                        "the spent-approval ledger refused the row: {}",
+                        m.unwrap_or_else(|| format!("code {}", f.extended_code))
+                    ))
                 }
                 other => unavailable(other),
             })
@@ -400,13 +420,13 @@ mod tests {
     fn the_ledger_refuses_a_replay_and_accepts_a_distinct_digest() {
         let path = db_path("ledger");
         let mut l = SqliteApprovalLedger::open(&path).expect("open");
-        l.consume(&digest(1)).expect("first");
+        l.consume_at(&digest(1), 0).expect("first");
         assert!(l.is_consumed(&digest(1)).expect("read"));
         assert!(matches!(
-            l.consume(&digest(1)),
+            l.consume_at(&digest(1), 0),
             Err(LedgerError::AlreadyConsumed)
         ));
-        l.consume(&digest(2)).expect("distinct");
+        l.consume_at(&digest(2), 0).expect("distinct");
         assert!(!l.is_consumed(&digest(3)).expect("read"));
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -416,7 +436,7 @@ mod tests {
         let path = db_path("restart");
         {
             let mut l = SqliteApprovalLedger::open(&path).expect("open");
-            l.consume(&digest(9)).expect("consume");
+            l.consume_at(&digest(9), 0).expect("consume");
         }
         let l = SqliteApprovalLedger::open(&path).expect("reopen");
         assert!(
@@ -448,7 +468,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let d = digest(42);
-                    ledger.consume(&d)
+                    ledger.consume_at(&d, 0)
                 })
             })
             .collect();
@@ -663,7 +683,7 @@ mod tests {
             .expect("append afterwards");
         SqliteApprovalLedger::open(&db)
             .expect("ledger afterwards")
-            .consume(&digest(1))
+            .consume_at(&digest(1), 0)
             .expect("consume afterwards");
         let _ = std::fs::remove_dir_all(&dir);
     }
