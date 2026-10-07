@@ -554,7 +554,8 @@ actually ship?*
    `bundled` feature. Every platform gets a *known* SQLite, not a distro's.
 2. **Assert the version at build time.** A compile-time assertion (and a test)
    that the bundled `SQLITE_VERSION_NUMBER` ≥ 3.51.3. A release that fails this
-   does not build. This makes the requirement mechanically enforced rather than
+   does not build, and CI gate G3 reads `cfg` predicates structurally rather than as
+   text. This makes the requirement mechanically enforced rather than
    a comment.
 3. **Pin the exact amalgamation** in the lockfile, and record the pinned
    `SQLITE_SOURCE_ID` / SHA3 in the SBOM. SQLite releases are

@@ -140,7 +140,7 @@ TP-12 every side effect is accounted for.
 | NFR-02 | Resource efficient | Same budgets, per-capability, with a "disabled = zero cost" assertion in CI. |
 | NFR-03 | Reliable | Failure-injection suite; no silent data loss; every task recoverable. |
 | NFR-04 | Secure | Threat model in `04-…`; LLM is never an authority. |
-| NFR-05 | Portable | Portable core has **zero** `cfg(target_os)` branches outside `platform` crates. Enforced in CI by grep + review. |
+| NFR-05 | Portable | Portable core has **zero** `cfg(target_os)` branches outside `platform` crates. Enforced by CI gate G3 over source *code* (not comments), including every nested `cfg(not(..))`/`cfg(any(..))`/`cfg(all(..))` spelling; self-tested. |
 | NFR-06 | Observable | Structured logs + traces locally, OTLP-exportable optionally, no telemetry server required. |
 | NFR-07 | Extensible | A new capability implemented purely as an adapter crate + manifest. |
 | NFR-08 | Customizable | Second user customizes via config/data only, **zero** source forks. |

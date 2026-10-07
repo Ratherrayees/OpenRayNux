@@ -202,7 +202,8 @@ Enforcement, in order of strength:
    the `Cargo.toml` `[dependencies]` list is the enforcement point. A layer
    violation is a compile error, not a review comment.
 2. **`cargo deny` / `cargo vet`** for supply-chain and duplicate policy.
-3. **A CI grep gate:** `cfg(target_os)` / `cfg(windows)` / `std::env::consts::OS`
+3. **A CI gate (G3)** that reads `cfg` predicates as predicates: any platform key at
+   any nesting depth, plus `env::consts` and `std::os::{unix,windows}` paths --
    may appear **only** in `crates/platform-*`. Any occurrence elsewhere fails
    the build. This makes NFR-05 machine-checked rather than aspirational.
 4. **Code review** with the ADR list as the checklist.

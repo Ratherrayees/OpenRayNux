@@ -582,6 +582,248 @@ def run_case(
     )
 
 
+# --------------------------------------------------------------------------
+# Adversarial transformations
+# --------------------------------------------------------------------------
+#
+# Every fixture above is *authored*. These are the same violations, rewritten the way an
+# ordinary refactor or a well-meaning contributor would rewrite them, with no intent to
+# evade anything. Each must still be rejected: if a harmless edit can turn a violation
+# into a pass, the gate is enforcing a spelling rather than a rule.
+#
+# The first group is G2d; the second is G3.
+
+G2D_TRANSFORMS: list[tuple[str, str]] = [
+    (
+        "the comment that disables the gate, moved to the top of the file",
+        """
+// This crate deliberately mentions #[cfg(test)] in its documentation.
+use orxnud_domain::PolicySeal;
+
+fn production() {
+    let _ = PolicySeal::attest("attacker");
+}
+""",
+    ),
+    (
+        "the comment moved to the bottom, after the violation",
+        """
+use orxnud_domain::PolicySeal;
+
+fn production() {
+    let _ = PolicySeal::attest("attacker");
+}
+
+// see also #[cfg(test)] below
+#[cfg(test)]
+mod tests {}
+""",
+    ),
+    (
+        "the test module renamed, and the disabling comment kept",
+        """
+// The test module uses #[cfg(test)] later.
+#[cfg(test)]
+mod check_all_the_things {
+    use orxnud_domain::PolicySeal;
+    fn fixture() -> PolicySeal {
+        PolicySeal::attest("t")
+    }
+}
+
+fn production() {
+    let _ = PolicySeal::attest("attacker");
+}
+""",
+    ),
+    (
+        "the attribute reformatted across lines",
+        """
+#[cfg(
+    test
+)]
+mod tests {
+    fn f() {}
+}
+
+fn production() {
+    let _ = orxnud_domain::PolicySeal::attest("attacker");
+}
+""",
+    ),
+    (
+        "a fully qualified path, and the import removed",
+        """
+fn production() {
+    let _ = ::orxnud_domain::invocation::PolicySeal::attest("attacker");
+}
+""",
+    ),
+    (
+        "a re-exported alias",
+        """
+use orxnud_domain::PolicySeal as Gate;
+
+fn production() {
+    let _ = Gate::attest("attacker");
+}
+""",
+    ),
+    (
+        "an associated-function import used bare",
+        """
+use orxnud_domain::PolicySeal::{self as S, attest};
+
+fn production() {
+    let _ = attest("attacker");
+}
+""",
+    ),
+    (
+        "the minting call inside a nested production module",
+        """
+mod inner {
+    pub mod deeper {
+        use orxnud_domain::PolicySeal;
+        pub fn forge() -> PolicySeal {
+            PolicySeal::attest("attacker")
+        }
+    }
+}
+""",
+    ),
+]
+
+G3_TRANSFORMS: list[tuple[str, str]] = [
+    (
+        "a predicate split one key per line",
+        """
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "x"),
+    unix,
+))]
+pub fn f() {}
+""",
+    ),
+    (
+        "a predicate nested three deep",
+        """
+#[cfg(not(all(any(target_os = "linux", target_os = "macos"), unix, not(feature = "y"))))]
+pub fn f() {}
+""",
+    ),
+    (
+        "a predicate reformatted with extra spaces",
+        """
+#[cfg ( not ( target_os = \"windows\" ) )]
+pub fn f() {}
+""",
+    ),
+    (
+        "a cfg_attr whose predicate is the whole trick",
+        """
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    derive(Debug)
+)]
+pub struct S;
+""",
+    ),
+    (
+        "a fully qualified platform constant",
+        """
+pub fn f() -> &'static str {
+    std::env::consts::OS
+}
+""",
+    ),
+    (
+        "the predicate introduced inside an otherwise clean crate",
+        """
+// Portable core.
+pub fn f() {}
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub fn g() {}
+""",
+    ),
+]
+
+
+# Rewrites of *legitimate* code that must keep being accepted. Without these, the
+# adversarial group above is only half the story: a gate that flags a local variable
+# called `target_os` is a gate that gets disabled, and the fix for that is not to weaken
+# the gate but to notice it here.
+G3_LEGITIMATE_TRANSFORMS: list[tuple[str, str]] = [
+    (
+        "a local variable that merely looks like a platform key",
+        """
+pub fn f() {
+    let target_os = "linux";
+    let unix = true;
+    let _ = (target_os, unix);
+}
+""",
+    ),
+    (
+        "a function parameter named windows",
+        """
+pub fn f(windows: bool) -> bool {
+    windows
+}
+""",
+    ),
+    (
+        "a struct field named target_arch, serialised as JSON",
+        """
+pub struct Build {
+    pub target_arch: String,
+}
+
+pub fn render(b: &Build) -> String {
+    format!("{:?}", b.target_arch)
+}
+""",
+    ),
+    (
+        "prose in a block comment describing a platform predicate",
+        """
+/*
+ * This crate must not branch on the platform: no `cfg(target_os = "linux")`,
+ * no `cfg(not(unix))`, no read of `env::consts::OS`. Stating the rule is not
+ * breaking it.
+ */
+pub fn f() {}
+""",
+    ),
+]
+
+
+def run_transform(
+    tmp: str, gate: str, rel: str, name: str, source: str, expect_fail: bool = True
+) -> str | None:
+    """Return a failure description, or None when the gate reached the expected verdict."""
+    root = os.path.join(tmp, "xform")
+    shutil.rmtree(root, ignore_errors=True)
+    fx = Fixture(root)
+    fx.write(rel, source)
+    result = fx.gate(gate)
+    rejected = result.returncode != 0
+    if rejected == expect_fail:
+        return None
+    if expect_fail:
+        return (
+            f"{name}\n     an ordinary refactor of a real violation turned it into a "
+            f"PASS, so the gate enforces a spelling rather than a rule.\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+    return (
+        f"{name}\n     legitimate code was REJECTED. A gate that flags this is a gate "
+        f"people disable, which is how the original bypasses existed.\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+
+
 def main() -> int:
     failures: list[str] = []
     total = 0
@@ -615,6 +857,35 @@ def main() -> int:
                     f"{name}\n     expected the gate to "
                     f"{'REJECT' if expect_fail else 'ACCEPT'}\n{result.stdout}\n{result.stderr}"
                 )
+
+        for name, source in G2D_TRANSFORMS:
+            total += 1
+            detail = run_transform(tmp, "G2d", "crates/orxnud-capability/src/a.rs", name, source)
+            if detail is None:
+                print(f"  ok    G2d transform: {name}")
+            else:
+                print(f"  FAIL  G2d transform: {name}")
+                failures.append(detail)
+
+        for name, source in G3_TRANSFORMS:
+            total += 1
+            detail = run_transform(tmp, "G3", "crates/orxnud-task/src/a.rs", name, source)
+            if detail is None:
+                print(f"  ok    G3 transform: {name}")
+            else:
+                print(f"  FAIL  G3 transform: {name}")
+                failures.append(detail)
+
+        for name, source in G3_LEGITIMATE_TRANSFORMS:
+            total += 1
+            detail = run_transform(
+                tmp, "G3", "crates/orxnud-task/src/a.rs", name, source, expect_fail=False
+            )
+            if detail is None:
+                print(f"  ok    G3 legitimate: {name}")
+            else:
+                print(f"  FAIL  G3 legitimate: {name}")
+                failures.append(detail)
 
     print()
     if failures:
