@@ -2,9 +2,10 @@
 //!
 //! # One writer, one transaction per transition
 //!
-//! Every mutation runs inside `BEGIN IMMEDIATE` (ADR-0007 invariant 1), and every
-//! method that writes takes `&mut Connection`, so the compiler — not a review —
-//! prevents two callers interleaving inside a transaction.
+//! Every mutation runs inside `BEGIN IMMEDIATE` (ADR-0007 invariant 1), via
+//! [`crate::tx::authority_transaction`], and every method that writes takes
+//! `&mut Connection`, so the compiler — not a review — prevents two callers
+//! interleaving inside a transaction.
 //!
 //! # The three invariants ADR-0007 names
 //!
@@ -2806,10 +2807,13 @@ impl<'a> TaskRepository<'a> {
         // One conditional UPDATE, and its row count is the *only* evidence that the
         // transition happened. V-94.
         //
-        // The read above already established `state = waiting-for-user`, so a zero-row
-        // result means the row stopped matching between the two statements -- which is
-        // reachable, because this transaction is `BEGIN DEFERRED` (see `Self::tx`) and
-        // the write lock is not held until the first write. `complete_verified_step`
+        // The read above already established `state = waiting-for-user`, and the write
+        // lock is held across both statements (`BEGIN IMMEDIATE`, see `Self::tx`), so
+        // within this transaction a zero-row result can only mean the predicate itself
+        // did not hold -- the state the read observed is not the state the write
+        // requires. The check is kept anyway: `IMMEDIATE` is a claim about isolation,
+        // not an assertion about this statement's effect, and a row count is the only
+        // evidence that the expected mutation happened. `complete_verified_step`
         // already treats the zero-row case as a refusal rather than a success; this
         // function did not, and returned `Ok` while granting a lease it had not
         // written and logging a transition that had not occurred.
@@ -2938,10 +2942,12 @@ impl<'a> TaskRepository<'a> {
     ///
     /// **The decision is one statement.** The whole classification is a `CASE`
     /// expression inside the `UPDATE`, with no preceding read, so there is no
-    /// read-then-write window for another connection to slip through — which
-    /// matters because every transaction here is `BEGIN DEFERRED`
-    /// (`Self::tx`). The row is read back afterwards only to name the event, never
-    /// to choose the state.
+    /// read-then-write window for another connection to slip through — which is
+    /// what made this operation correct even while `Self::tx` was `BEGIN DEFERRED`.
+    /// It no longer depends on that: `authority_transaction` is `IMMEDIATE`, so the
+    /// lock is held across the statement regardless. The single-statement shape is
+    /// kept because it is what makes the classification reviewable. The row is read
+    /// back afterwards only to name the event, never to choose the state.
     ///
     /// **Failure to read the ledger is a failure to recover.** A status outside the
     /// vocabulary is not "probably fine"; it is a row whose meaning is unknown, and

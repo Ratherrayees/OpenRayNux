@@ -818,8 +818,7 @@ fn a_reservation_records_the_effects_repeat_safety() {
 /// holds the task open.
 ///
 /// It also pins the property the audit flagged as a dependency: every transaction
-/// here is `BEGIN DEFERRED` (the separate finding that this crate runs
-/// `BEGIN IMMEDIATE`), so the guarantee must come from the statement's shape, not
+/// here was `BEGIN DEFERRED` (V-95), so the guarantee came from the statement's shape, not
 /// from the isolation level. If the decision is ever rewritten as a read followed by
 /// a write, this test is what notices.
 #[test]
