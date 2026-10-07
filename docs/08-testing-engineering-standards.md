@@ -341,7 +341,7 @@ Property tests **do** run (`proptest` in `orxnud-policy` and `orxnuctl`).
 | Licence scan of model manifests | **No models ship**, so there is nothing to scan. |
 | Migrations up and down on a copy of a real previous DB | Partially true: `orxnud-store` tests migration and rollback, and the conformance suite runs `synchronous = FULL` durability cases. Not a gate in the form stated. |
 | Cross-compile check for the portable core | **True** — gate G5 plus the `portable-core` job. |
-| `cfg(target_os)` grep gate | **True** — gate G3. Known blind spot recorded in V-29: it greps for `cfg`, not for a platform *API*, so unguarded `std::os::unix` passed it and broke MSVC. That happened and is fixed. |
+| `cfg(target_os)` gate | **True** — gate G3. Two blind spots, both now closed. **V-29:** it grepped for `cfg` rather than a platform *API*, so unguarded `std::os::unix` passed it and broke MSVC; G3 now detects `std::os::{unix,windows}` paths directly. **V-96:** it matched raw text, so a comment could switch it off and seven of nine `cfg` spellings -- every nested one -- were invisible; G3 now classifies source lexically and reads predicates at any depth. Self-tested against fixtures by gate G13. |
 
 **Non-blocking / scheduled — what is actually configured:** the AI evaluation track and
 the nightly `windows-check`. **Not configured:** full soak, performance comparison reports,

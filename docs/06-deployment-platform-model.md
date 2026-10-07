@@ -211,7 +211,8 @@ Not theoretical — these are the ones that cause real bugs:
 ```
 
 **Rule:** the core defines the trait; adapters implement it; the core never names
-an OS. Enforced by (a) CI grep for `cfg(target_os)` / `cfg(windows)` /
+an OS. Enforced by (a) CI gate G3, which reads `cfg` predicates at any nesting
+depth, for `cfg(target_os)` / `cfg(windows)` /
 `env::consts::OS` outside `crates/platform-*`, and (b) a CI job that builds the
 core for a target with no platform adapter available (e.g. `wasm32-unknown-unknown`
 for the pure-logic subset) to prove the boundary is real.

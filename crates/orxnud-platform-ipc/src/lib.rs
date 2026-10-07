@@ -2,7 +2,7 @@
 //!
 //! # Why this is a separate crate
 //!
-//! Gate **G3** permits `cfg(target_os)` only inside `crates/orxnud-platform-*`, and
+//! Gate **G3** permits platform predicates only inside `crates/orxnud-platform-*`, and
 //! that rule is what forces the placement. A socket is an operating-system
 //! facility; a daemon that named one would be a daemon with an opinion about the
 //! host, which is what the trait boundary exists to prevent. So the *selection*

@@ -31,6 +31,10 @@ import re
 import sys
 from dataclasses import dataclass
 
+# No `__pycache__` in the repository: a CI script must not leave build artefacts
+# behind, and this one runs from a checkout that is expected to stay clean.
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rustscan  # noqa: E402
