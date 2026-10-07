@@ -302,9 +302,8 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 
 -- The TP-8 exactly-once mechanism, expressed as the primary key rather than as a
--- unique index added later: a duplicate fire is unrepresentable, so
--- `INSERT OR IGNORE` cannot succeed twice even across a crash, because SQLite
--- serialises writes.
+-- unique index added later: a duplicate fire is unrepresentable, so an insert cannot
+-- succeed twice even across a crash, because SQLite serialises writes.
 CREATE TABLE IF NOT EXISTS schedule_fires (
     schedule_id   TEXT    NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
     fire_time_ms  INTEGER NOT NULL,
@@ -554,8 +553,9 @@ ALTER TABLE task_attempts_scoped RENAME TO task_attempts;
 /// `(task_id, 1)`.
 ///
 /// The collision is silent rather than loud, which is what makes it worth a migration
-/// rather than a code guard: `record_approval` is an `INSERT OR IGNORE`, so step 2's
-/// approval is discarded and `approval_for` hands back step 1's row. A multi-step task
+/// rather than a code guard: the collision constraint was silently discarded at the
+/// insert, so step 2's approval was dropped and `approval_for` handed back step 1's
+/// row. A multi-step task
 /// could then never have its second step approved, and the only symptom was an
 /// `approval-step-mismatch` refusal naming a mismatch the caller had not caused.
 ///
