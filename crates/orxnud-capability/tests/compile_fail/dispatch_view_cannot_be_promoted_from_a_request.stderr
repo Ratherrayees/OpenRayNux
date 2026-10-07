@@ -1,0 +1,26 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/dispatch_view_cannot_be_promoted_from_a_request.rs:26:54
+   |
+26 |     let _view: DispatchView<'_> = DispatchView::from(request());
+   |                                   ------------------ ^^^^^^^^^ expected `DispatchView<'_>`, found `ActionRequest`
+   |                                   |
+   |                                   arguments to this function are incorrect
+   |
+note: associated function defined here
+  --> $RUST/core/src/convert/mod.rs
+
+error[E0277]: the trait bound `DispatchView<'_>: From<ActionRequest>` is not satisfied
+  --> tests/compile_fail/dispatch_view_cannot_be_promoted_from_a_request.rs:27:45
+   |
+27 |     let _view: DispatchView<'_> = request().into();
+   |                                             ^^^^ the trait `From<ActionRequest>` is not implemented for `DispatchView<'_>`
+   |
+   = note: required for `ActionRequest` to implement `Into<DispatchView<'_>>`
+
+error[E0277]: the trait bound `DispatchView<'_>: From<ActionRequest>` is not satisfied
+  --> tests/compile_fail/dispatch_view_cannot_be_promoted_from_a_request.rs:28:36
+   |
+28 |     let _view: DispatchView<'_> = <ActionRequest as Into<DispatchView<'_>>>::into(request());
+   |                                    ^^^^^^^^^^^^^ the trait `From<ActionRequest>` is not implemented for `DispatchView<'_>`
+   |
+   = note: required for `ActionRequest` to implement `Into<DispatchView<'_>>`

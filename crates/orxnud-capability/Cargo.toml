@@ -40,6 +40,12 @@ orxnud-task = { workspace = true }
 # cannot be observed from either crate's own tests.
 orxnud-store = { workspace = true }
 proptest = { workspace = true }
+# The authority boundary is asserted by compiler failures, not by tests that pass: a
+# positive test cannot prove an absence. This crate can host them because it already
+# depends on `orxnud-policy`, which is where the authority types and their
+# `pub(crate)` constructors now live -- and `orxnud-domain` cannot, because depending
+# on policy would invert the layer order gate G2 enforces.
+trybuild = { workspace = true }
 
 [[bin]]
 # The Tier-1 child for `filesystem/write-text`. A binary rather than an extra

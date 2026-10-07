@@ -1,0 +1,15 @@
+error[E0451]: fields `step`, `capability`, `params`, `data_class` and `context` of struct `DispatchView` are private
+  --> tests/compile_fail/dispatch_view_cannot_be_built_from_fields.rs:23:9
+   |
+22 |     let _view = DispatchView {
+   |                 ------------ in this type
+23 |         step: 0,
+   |         ^^^^ private field
+24 |         capability: &capability,
+   |         ^^^^^^^^^^ private field
+25 |         params: &params,
+   |         ^^^^^^ private field
+26 |         data_class: DataClass::Public,
+   |         ^^^^^^^^^^ private field
+27 |         context: &context,
+   |         ^^^^^^^ private field

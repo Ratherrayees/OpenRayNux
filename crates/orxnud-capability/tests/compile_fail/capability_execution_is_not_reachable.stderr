@@ -1,0 +1,36 @@
+error[E0624]: associated function `authorise` is private
+  --> tests/compile_fail/capability_execution_is_not_reachable.rs:57:44
+   |
+57 |       let invocation = CapabilityInvocation::authorise(
+   |                                              ^^^^^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/orxnud-policy/src/authority.rs
+   |
+   | /     pub(crate) fn authorise(
+   | |         request: ActionRequest,
+   | |         actor: Actor,
+   | |         context: InvocationContext,
+   | |         proof: AuthorisationProof,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0624]: associated function `issue` is private
+  --> tests/compile_fail/capability_execution_is_not_reachable.rs:61:29
+   |
+61 |           AuthorisationProof::issue("v1", None, RiskClass::Low),
+   |                               ^^^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/orxnud-policy/src/authority.rs
+   |
+   | /     pub(crate) fn issue(
+   | |         policy_version: impl Into<String>,
+   | |         approval: Option<ApprovalDigest>,
+   | |         assessed_risk: RiskClass,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0599]: no method named `adapter` found for struct `WordCountBundle` in the current scope
+  --> tests/compile_fail/capability_execution_is_not_reachable.rs:66:26
+   |
+66 |     let adapter = bundle.adapter();
+   |                          ^^^^^^^ private field, not a method
