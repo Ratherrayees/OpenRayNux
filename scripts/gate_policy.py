@@ -56,27 +56,52 @@ SOURCE_GLOBS = (
     ("build.rs", None),
 )
 
-# Crates allowed to reference the authority types at all.
+# Crates allowed to *mint* authority.
 #
-# orxnud-domain *defines* them. orxnud-policy is the only authoriser by definition.
-# Naming `CapabilityInvocation` as a parameter type is legitimate elsewhere -- a
-# capability crate receives an invocation and cannot construct one -- so the invariant is
-# about minting, which requires naming `PolicySeal`.
-EXEMPT_CRATES = frozenset({"orxnud-domain", "orxnud-policy"})
+# orxnud-policy *owns* the authority types now: `AuthorisationProof`, `CapabilityInvocation`
+# and `DispatchView` live in `crates/orxnud-policy/src/authority.rs`, beside the
+# `pub(crate)` constructors that produce them. Rust has no friend crates, so the only way
+# to make "exactly one crate may construct this" a compiler fact rather than a code-review
+# convention is to put the type where that crate can see it and everyone else cannot.
+#
+# Naming an authority type as a parameter type is legitimate elsewhere -- a capability
+# crate receives an invocation and cannot construct one -- so the invariant stays about
+# minting, not naming.
+EXEMPT_CRATES = frozenset({"orxnud-policy"})
 
 # The authority surface, asserted rather than trusted. `check_authority_surface` verifies
-# each of these against the domain source and fails if the domain has moved.
-EXPECTED_SEAL_TYPE = "PolicySeal"
-EXPECTED_SEAL_GATED = (
-    ("AuthorisationProof", "issue"),
-    ("CapabilityInvocation", "authorise"),
+# each of these against the owning crate's source and fails if authority has moved.
+#
+# Each entry is (type, minting constructor, expected visibility). Visibility is part of the
+# invariant, not decoration: a `pub(crate)` constructor is enforced by `rustc`, a `pub` one
+# is enforced by this scan and by nothing else. `rustc` is the stronger instrument, so the
+# assertion here exists to catch the day someone widens it.
+EXPECTED_AUTHORITY_TYPES = ("AuthorisationProof", "CapabilityInvocation", "DispatchView")
+EXPECTED_MINTING_CONSTRUCTORS = {
+    "AuthorisationProof": "issue",
+    "CapabilityInvocation": "authorise",
+}
+EXPECTED_CONSTRUCTOR_VISIBILITY = "pub(crate)"
+
+# The trait boundary in orxnud-capability. Both are whole `pub(crate)` traits, not `pub`
+# traits with `pub(crate)` methods: a `pub` trait could still be *implemented* from outside,
+# which would let an external bundle enter the registry. Asserting the trait's own
+# visibility catches that, and asserting the method's catches a re-widening inside the crate.
+EXPECTED_SEALED_ITEMS = (
+    ("orxnud-capability", "CapabilityAdapter", "trait"),
+    ("orxnud-capability", "AdapterBundle", "trait"),
 )
-# Every public constructor the seal is allowed to have. More than one would be a second
-# way to obtain authority from nothing.
-EXPECTED_SEAL_CONSTRUCTORS = frozenset({"attest"})
-# Identifiers that mint authority. `authorise` alone catches the method-call form,
-# `Type::fn` and `use Type::fn; fn(..)`.
-MINTING_VERBS = ("attest", "authorise", "issue")
+
+# Identifiers that *mint* authority. `authorise` alone catches the method-call form,
+# `Type::fn` and `use Type::fn; fn(..)`. `attest` is gone with the seal it belonged to.
+#
+# `dispatch_view` is deliberately absent. It is `pub` and legitimately called from
+# orxnud-capability, because producing the adapter's input from an authorised invocation
+# is the dispatcher's job and cannot happen inside the policy crate. It mints nothing:
+# it requires an invocation to call, so it is downstream of `authorise` rather than
+# another way past it. The distinction is that a minting verb creates authority from
+# parts, and this one can only re-derive a view of authority that already exists.
+MINTING_VERBS = ("authorise", "issue")
 
 
 @dataclass(frozen=True)
@@ -158,21 +183,14 @@ def authority_violations(root: str, sources: list[str]) -> list[Violation]:
         for m in _IDENT_RE.finditer(code):
             ident = m.group(0)
             line = rustscan.line_of(production, m.start())
-            if ident == EXPECTED_SEAL_TYPE:
+            if ident in MINTING_VERBS:
                 out.append(
                     Violation(
                         path,
                         line,
-                        f"references {EXPECTED_SEAL_TYPE}, the root of the authority "
-                        f"chain: anything holding one can authorise a capability",
-                    )
-                )
-            elif ident in MINTING_VERBS:
-                out.append(
-                    Violation(
-                        path,
-                        line,
-                        f"calls `{ident}`, which mints authority or its proof",
+                        f"calls `{ident}`, which mints authority or the proof behind it. "
+                        f"Only {sorted(EXEMPT_CRATES)[0]} may, and it does so through a "
+                        f"`pub(crate)` constructor that `rustc` keeps to that crate.",
                     )
                 )
     return out
@@ -181,98 +199,159 @@ def authority_violations(root: str, sources: list[str]) -> list[Violation]:
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _fn_visibility_in_impl(code: str, type_name: str, fn_name: str) -> str | None:
+    """The modifier in front of `Type::fn`, searching only inside `impl Type { .. }`.
+
+    Scoping to the impl block is the whole point. `PolicyEngine::authorise` and
+    `CapabilityInvocation::authorise` are different functions with the same name, and
+    only the second one is a constructor. A naive `fn authorise` search across the file
+    finds the first and reports the wrong visibility -- which here means reading a
+    `pub` and calling the boundary broken when it is not.
+    """
+    for m in re.finditer(rf"impl(?:<[^>]*>)?\s+(?:\w+::)*{type_name}\b", code):
+        start = code.find("{", m.end())
+        if start == -1:
+            continue
+        depth, i = 0, start
+        while i < len(code):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        block = code[start:i]
+        fm = re.search(rf"((?:pub\s*(?:\(\s*crate\s*\))?\s*)?)fn {fn_name}\s*[(<]", block)
+        if fm:
+            return fm.group(1).strip() or "(private)"
+    return None
+
+
 def check_authority_surface(root: str) -> list[str]:
-    """Re-derive the authority chain from the domain source; report any drift.
+    """Assert where authority lives and who can mint it; report any drift.
 
-    A gate whose forbidden list is a hand-maintained constant decays: someone adds a
-    constructor, nobody edits the gate, and the gate keeps passing. So this derives the
-    chain and asserts it.
+    A gate whose expectation is a hand-maintained constant decays: someone widens a
+    constructor, nobody edits the gate, and the gate keeps passing. So every claim is
+    checked against the source and fails loudly.
 
-    The derivation is the **closure of the seal**, not "anything that looks like
-    authority". Starting from ``PolicySeal``, follow every public constructor in
-    ``orxnud-domain`` that takes a type already in the set and returns a type; that type
-    joins the set. Today the closure is exactly ``{PolicySeal, AuthorisationProof,
-    CapabilityInvocation}``, which is the chain the gate forbids.
+    Five things this asserts, and each fails loudly:
 
-    Three things this asserts, and each fails loudly:
-
-    1. the seal type exists and is public;
-    2. every public constructor of the seal is an expected one -- so a second
-       constructor *on the seal itself* is caught, since that would be a new way to
-       obtain authority from nothing; and
-    3. the closure is exactly the expected set -- so a new seal-gated path, at any
-       depth, is caught.
+    1. each authority type is defined in the *owning* crate, not merely reachable from
+       it -- a `pub use` re-export would put the constructor back within reach of the
+       type's own visibility rules, and that is the mistake worth catching;
+    2. each minting constructor exists and is exactly the expected name;
+    3. each minting constructor is ``pub(crate)``, which is the assertion that makes the
+       boundary a compiler fact rather than a convention;
+    4. no authority type is re-exported from a crate *below* the owner, since
+       ``orxnud-domain`` is depended on by everything and a re-export there would give
+       the minting constructor a second, wider audience; and
+    5. each sealed capability item is a whole ``pub(crate)`` trait, not a ``pub`` trait
+       with ``pub(crate)`` methods.
 
     # What this deliberately cannot detect
 
-    A *brand-new, unrelated* public type in ``orxnud-domain`` with a public constructor
-    taking no seal at all. Nothing distinguishes that from an ordinary new domain type
-    such as ``TaskId`` -- guessing would mean flagging every constructor in the crate,
-    which is noise a reviewer learns to skip, and a gate that cries wolf is a gate that
-    gets disabled. Introducing a new authority type is a design decision and is required
-    to come through an ADR; this gate's job is to notice when the *existing* chain
-    changes shape underneath it.
+    A *brand-new, unrelated* public type with a public constructor that happens to grant
+    capability execution. Nothing marks it as authority -- guessing would mean flagging
+    every constructor in the crate, which is noise a reviewer learns to skip, and a gate
+    that cries wolf is a gate that gets disabled. Introducing a new authority type is a
+    design decision and comes through an ADR; this gate's job is to notice when the
+    *existing* surface changes shape underneath it.
     """
     problems: list[str] = []
-    domain = os.path.join(root, "crates", "orxnud-domain", "src")
-    if not os.path.isdir(domain):
-        return [f"orxnud-domain source not found at {domain}"]
+    owner_crate = "orxnud-policy"
+    owner = os.path.join(root, "crates", owner_crate, "src")
+    if not os.path.isdir(owner):
+        return [f"{owner_crate} source not found at {owner}"]
 
-    ctors: list[tuple[str, str, str, str]] = []  # (owner, fn, params, returns)
-    structs: set[str] = set()
+    defined: dict[str, str] = {}  # type -> path that defines it, with `pub struct`
+    visibility: dict[str, str] = {}  # (type, fn) -> the modifier in front of `fn`
+    for dirpath, _dirnames, filenames in os.walk(owner):
+        for name in sorted(filenames):
+            if not name.endswith(".rs"):
+                continue
+            path = os.path.join(dirpath, name)
+            code = _code_of(path)
+            for t in EXPECTED_AUTHORITY_TYPES:
+                if re.search(rf"^pub struct {t}\b", code, re.M):
+                    defined[t] = os.path.relpath(path, root)
+            # `pub(crate) fn issue`, `pub fn issue`, `fn issue` -- whichever applies.
+            for t, fn in EXPECTED_MINTING_CONSTRUCTORS.items():
+                found = _fn_visibility_in_impl(code, t, fn)
+                if found is not None:
+                    visibility[(t, fn)] = found
+
+    # (1) ownership.
+    for t in EXPECTED_AUTHORITY_TYPES:
+        if t not in defined:
+            problems.append(
+                f"{owner_crate}: `{t}` is missing or is no longer defined here. Authority "
+                f"moved, which means the `pub(crate)` constructors moved with it and the "
+                f"boundary this gate asserts is no longer where it was."
+            )
+
+    # (2) + (3) the minting constructors and their visibility.
+    for t, expected_fn in EXPECTED_MINTING_CONSTRUCTORS.items():
+        seen = visibility.get((t, expected_fn))
+        if seen is None:
+            problems.append(
+                f"{owner_crate}: `{t}::{expected_fn}` is missing. Without it the type "
+                f"cannot be minted even by policy, so either the boundary is gone or the "
+                f"constructor was renamed."
+            )
+            continue
+        if seen != EXPECTED_CONSTRUCTOR_VISIBILITY:
+            problems.append(
+                f"{owner_crate}: `{t}::{expected_fn}` is `{seen}`, not "
+                f"`{EXPECTED_CONSTRUCTOR_VISIBILITY}`. `rustc` only refuses other crates at "
+                f"`pub(crate)`; anything wider hands the minting constructor to every "
+                f"dependent, and the lexical scan below is the only thing left."
+            )
+
+    # (4) no re-export from a lower layer.
+    domain = os.path.join(root, "crates", "orxnud-domain", "src")
     for dirpath, _dirnames, filenames in os.walk(domain):
         for name in sorted(filenames):
             if not name.endswith(".rs"):
                 continue
             code = _code_of(os.path.join(dirpath, name))
-            structs |= set(re.findall(r"pub struct (\w+)", code))
-            ctors.extend(_public_constructors(code))
+            for t in EXPECTED_AUTHORITY_TYPES:
+                for m in re.finditer(rf"pub use [^;]*\b{t}\b", code):
+                    line = rustscan.line_of(open(os.path.join(dirpath, name), encoding="utf-8").read(), m.start())
+                    problems.append(
+                        f"{owner_crate}: `{t}` is re-exported from "
+                        f"{os.path.relpath(os.path.join(dirpath, name), root)}:{line}. "
+                        f"Everything depends on orxnud-domain, so a re-export there puts "
+                        f"the minting constructor in reach of the whole workspace."
+                    )
 
-    if EXPECTED_SEAL_TYPE not in structs:
-        problems.append(
-            f"orxnud-domain: `{EXPECTED_SEAL_TYPE}` is missing. The gate's entire "
-            f"invariant rests on it being the root of the authority chain."
-        )
-        return problems
-
-    # (2) The seal's own constructors.
-    seal_ctors = sorted(fn for owner, fn, _p, _r in ctors if owner == EXPECTED_SEAL_TYPE)
-    expected_seal_ctors = EXPECTED_SEAL_CONSTRUCTORS
-    unexpected = [fn for fn in seal_ctors if fn not in expected_seal_ctors]
-    if unexpected:
-        problems.append(
-            f"orxnud-domain: {EXPECTED_SEAL_TYPE} gained a public constructor "
-            f"{unexpected}. A second way to obtain the seal is a second root of "
-            f"authority, and the gate's whole model stops holding."
-        )
-
-    # (3) The closure.
-    closure = {EXPECTED_SEAL_TYPE}
-    changed = True
-    while changed:
-        changed = False
-        for owner, _fn, params, ret in ctors:
-            if owner in closure:
-                continue
-            takes_seal = any(f"&{t}" in params for t in closure)
-            if takes_seal and ret:
-                closure.add(ret)
-                changed = True
-
-    expected = {EXPECTED_SEAL_TYPE} | {t for t, _ in EXPECTED_SEAL_GATED}
-    for extra in sorted(closure - expected):
-        problems.append(
-            f"orxnud-domain: `{extra}` is reachable from the seal and so is authority, "
-            f"but the gate does not know about it. Either it is a new authority type and "
-            f"the invariant needs restating, or it is not and the closure was followed "
-            f"too far."
-        )
-    for missing in sorted(expected - closure):
-        problems.append(
-            f"orxnud-domain: `{missing}` was expected to be gated by "
-            f"{EXPECTED_SEAL_TYPE} but no public constructor takes one. The chain has "
-            f"been broken, which makes the type mintable from nothing."
-        )
+    # (5) the sealed capability traits.
+    for crate, item, kind in EXPECTED_SEALED_ITEMS:
+        base = os.path.join(root, "crates", crate, "src")
+        if not os.path.isdir(base):
+            problems.append(f"{crate} source not found at {base}")
+            continue
+        found_wide = False
+        for dirpath, _dirnames, filenames in os.walk(base):
+            for name in sorted(filenames):
+                if not name.endswith(".rs"):
+                    continue
+                code = _code_of(os.path.join(dirpath, name))
+                if re.search(rf"^pub {kind} {item}\b", code, re.M):
+                    found_wide = True
+                    problems.append(
+                        f"{crate}: `{item}` is `pub`. A `pub` trait cannot be sealed by "
+                        f"its methods' visibility, because another crate can still "
+                        f"*implement* it -- which would let an external adapter bundle "
+                        f"enter the registry."
+                    )
+        if not found_wide and not any(
+            re.search(rf"^pub\(crate\) {kind} {item}\b", _code_of(os.path.join(dp, n)), re.M)
+            for dp, _dn, fns in os.walk(base)
+            for n in fns
+            if n.endswith(".rs")
+        ):
+            problems.append(f"{crate}: `{item}` is not declared at all; the sealed surface moved.")
     return problems
 
 
@@ -381,7 +460,7 @@ def main(argv: list[str]) -> int:
             for d in drift:
                 print(f"   {d}")
             print(
-                "FAIL  G2d: the authority surface in orxnud-domain has changed. This is a "
+                "FAIL  G2d: the authority surface has changed. This is a "
                 "decision, not a formality: re-read the invariant and update the gate.",
                 file=sys.stderr,
             )
