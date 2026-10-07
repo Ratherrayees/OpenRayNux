@@ -16,9 +16,10 @@ use crate::dispatch::{AdapterBundle, SandboxPlan};
 use crate::read_text::{self, ReadTextBundle};
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, CapabilityInvocation, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel};
 use orxnud_policy::PolicyEngine;
+use orxnud_policy::authority::CapabilityInvocation;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::policy_set::{Grant, PolicySet};
 

@@ -93,11 +93,9 @@ fn secret_ref() -> SecretRef {
 ///
 /// Generic over the concrete adapter because every fixture is a different type; the
 /// `'static` bound is what lets it become an `Arc<dyn AdapterBundle + Send + Sync>`.
-fn bundles<A: crate::dispatch::CapabilityAdapter + 'static>(
-    b: Bundle<A>,
-) -> Registry {
-    use std::sync::Arc;
+fn bundles<A: crate::dispatch::CapabilityAdapter + 'static>(b: Bundle<A>) -> Registry {
     use crate::dispatch::AdapterBundle;
+    use std::sync::Arc;
     let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let id = b.adapter().capability_id().clone();
     m.insert(id, b.into_arc());
@@ -972,7 +970,7 @@ fn an_implementation_declaring_too_little_is_refused() {
         }
         fn invoke(
             &self,
-            _v: &orxnud_domain::invocation::DispatchView<'_>,
+            _v: &orxnud_policy::authority::DispatchView<'_>,
             _c: Option<&crate::credential::CredentialHandle>,
         ) -> Result<crate::verification::ExecutionOutcome, String> {
             Ok(crate::verification::ExecutionOutcome::Succeeded { output: None })

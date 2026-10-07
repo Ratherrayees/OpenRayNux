@@ -70,7 +70,7 @@ use serde_json::Value;
 
 use orxnud_domain::enums::{DataClass, IsolationTier, RiskClass};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::{CapabilityInvocation, DispatchView};
+use orxnud_policy::authority::{CapabilityInvocation, DispatchView};
 
 use crate::dispatch::{
     AdapterBundle, CapabilityAdapter, ExecutionTier, ResourceBudget, ResourcePolicy, SandboxPlan,
@@ -503,17 +503,13 @@ mod tests {
 
     #[test]
     fn the_adapter_refuses_to_run_in_process() {
-        let context = orxnud_domain::invocation::InvocationContext::new("k", 1_000, "c");
         let params = serde_json::json!({"path": "a.txt", "contents": "x"});
-        let id = WriteTextAdapter.capability_id();
-        let view = orxnud_domain::invocation::DispatchView {
-            step: 0,
-            capability: id,
-            params: &params,
-            data_class: DataClass::Public,
-            context: &context,
-        };
-        let outcome = WriteTextAdapter.invoke(&view, None);
+        // The view now comes from a real policy authorisation rather than a literal:
+        // `DispatchView`'s fields are private because they are the argument to
+        // capability execution, and a hand-built one would reopen that door.
+        let outcome = crate::suites::support::with_dispatch_view(WRITE_TEXT_ID, &params, |view| {
+            WriteTextAdapter.invoke(view, None)
+        });
         assert!(
             outcome.is_err(),
             "an in-process write would be the tier bypass; it must refuse"

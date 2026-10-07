@@ -32,8 +32,9 @@ use crate::verification::ExecutionOutcome;
 use orxnud_domain::approval::{ApprovalRecord, NormalizedParams};
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, DispatchView, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel, RequestId, SecretRef};
+use orxnud_policy::authority::DispatchView;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::digest::digest_for;
 use orxnud_policy::policy_set::{Grant, PolicySet};
@@ -126,7 +127,7 @@ impl CapabilityAdapter for RecordingAdapter {
         view: &DispatchView<'_>,
         _c: Option<&crate::credential::CredentialHandle>,
     ) -> Result<ExecutionOutcome, String> {
-        self.rec.invocations.lock().expect("lock").push(view.step);
+        self.rec.invocations.lock().expect("lock").push(view.step());
         Ok(ExecutionOutcome::Succeeded { output: None })
     }
 }
@@ -140,15 +141,10 @@ impl crate::verification::Verifier for Confirm {
         _e: &ExecutionOutcome,
         _params: &serde_json::Value,
         _at: i64,
-    ) -> Result<
-        crate::verification::VerificationOutcome,
-        crate::verification::VerifyError,
-    > {
-        Ok(
-            crate::verification::VerificationOutcome::Verified {
-                evidence: "confirmed".into(),
-            },
-        )
+    ) -> Result<crate::verification::VerificationOutcome, crate::verification::VerifyError> {
+        Ok(crate::verification::VerificationOutcome::Verified {
+            evidence: "confirmed".into(),
+        })
     }
 }
 
@@ -180,7 +176,6 @@ fn registry_for(rec: &Arc<Recorder>) -> Registry {
     );
     Registry::from_bundles(m)
 }
-
 
 // ---------------------------------------------------------------- concurrency
 

@@ -33,12 +33,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::credential::CredentialHandle;
 use crate::dispatch::{AdapterBundle, CapabilityAdapter};
-use crate::verification::{
-    ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
-};
+use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 use orxnud_domain::enums::DataClass;
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::DispatchView;
+use orxnud_policy::authority::DispatchView;
 
 // ---------------------------------------------------------------- the harness
 
@@ -315,7 +313,8 @@ fn a_contract_adapter_can_actually_be_dispatched() {
     let a = Arc::new(ConformingAdapter::new("dispatchable"));
     let bundle = ConformingBundle(Arc::clone(&a) as Arc<dyn CapabilityAdapter>);
     let id = bundle.adapter().capability_id().clone();
-    let mut registry: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
+    let mut registry: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> =
+        BTreeMap::new();
     registry.insert(id, Arc::new(bundle));
 
     let mut engine = orxnud_policy::PolicyEngine::new(
@@ -340,7 +339,8 @@ fn a_contract_adapter_can_actually_be_dispatched() {
     ));
 
     let secrets = support::FakeSecrets::new();
-    let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(registry));
+    let mut d =
+        crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(registry));
 
     let request = orxnud_domain::ActionRequest::new(
         orxnud_domain::TaskId::new("t-1"),
