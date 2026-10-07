@@ -42,6 +42,10 @@ pub mod text;
 pub mod verification;
 pub mod write_text;
 
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod suites;
+
 use std::collections::BTreeMap;
 
 use orxnud_domain::Actor;
