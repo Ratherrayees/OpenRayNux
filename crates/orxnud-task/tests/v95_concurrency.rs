@@ -628,7 +628,7 @@ fn two_workers_racing_one_approval_never_allow_both_to_execute() {
     for (who, r) in [("w-a", ra.as_ref()), ("w-b", rb.as_ref())] {
         if let Err(why) = r {
             assert!(
-                !is_busy_message(&why),
+                !is_busy_message(why),
                 "{who} lost the race and was told the database was busy instead of why it \
                  lost. A busy error is not a refusal.\n  {why}"
             );

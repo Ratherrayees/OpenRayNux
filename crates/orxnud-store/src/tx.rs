@@ -113,7 +113,7 @@ mod tests {
         let conn = open(&p);
         let tx = authority_transaction(&conn).expect("begin");
 
-        let mut other = peer(&p);
+        let other = peer(&p);
         assert!(
             other.execute_batch("BEGIN IMMEDIATE;").is_err(),
             "another connection took the write lock while `authority_transaction` was \
@@ -141,7 +141,7 @@ mod tests {
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)
             .expect("begin deferred");
 
-        let mut other = peer(&p);
+        let other = peer(&p);
         assert!(
             other.execute_batch("BEGIN IMMEDIATE;").is_ok(),
             "a DEFERRED transaction holds no write lock before its first write. This is \
