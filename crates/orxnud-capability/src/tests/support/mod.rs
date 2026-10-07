@@ -24,12 +24,10 @@ use std::time::Duration;
 
 use crate::credential::CredentialHandle;
 use crate::dispatch::{AdapterBundle, CapabilityAdapter};
-use crate::verification::{
-    ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
-};
+use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 use orxnud_domain::enums::DataClass;
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::DispatchView;
+use orxnud_policy::authority::DispatchView;
 
 /// Shared recorder, so a test can assert on how many times an adapter ran.
 #[derive(Debug, Default)]
@@ -249,7 +247,7 @@ impl CapabilityAdapter for SuccessfulAdapter {
         self.saw_credential
             .store(credential.is_some(), Ordering::SeqCst);
         Ok(ExecutionOutcome::Succeeded {
-            output: Some(format!("ran step {} of {}", view.step, view.capability)),
+            output: Some(format!("ran step {} of {}", view.step(), view.capability())),
         })
     }
 }
@@ -497,4 +495,88 @@ pub fn helper_path() -> PathBuf {
 #[must_use]
 pub fn sandbox_helpers_dir() -> PathBuf {
     helper_path().parent().expect("dir").to_path_buf()
+}
+
+/// A genuinely policy-authorised invocation for `capability`.
+///
+/// # Why this helper exists
+///
+/// `CapabilityInvocation::authorise` and `AuthorisationProof::issue` are now
+/// `pub(crate)` in `orxnud-policy`. This crate cannot build authority, which is the
+/// boundary — so a test here that needs a `DispatchView` must obtain one the only way
+/// any caller can: by asking policy to authorise an action.
+///
+/// That makes these tests *stronger* than the fixtures they replace. They used to
+/// hand-build a `DispatchView` with `pub` fields, which asserted only that an adapter
+/// behaved when handed whatever the test felt like. This asserts the adapter behaves
+/// when handed something policy actually authorised.
+pub fn authorised_invocation(
+    capability: &str,
+    params: &serde_json::Value,
+) -> orxnud_policy::authority::CapabilityInvocation {
+    use orxnud_domain::DataClass;
+    use orxnud_domain::ids::{CapabilityId, RunId, TaskId, UserId};
+
+    let id = CapabilityId::new(capability);
+    let grant = orxnud_policy::policy_set::Grant {
+        id: orxnud_domain::ids::GrantId::new("g-test"),
+        granted_by: UserId::new("u-1"),
+        capability: id.clone(),
+        max_data_class: DataClass::Personal,
+        may_grant: false,
+        expires_at_ms: i64::MAX,
+        revoked: false,
+    };
+    let mut engine = orxnud_policy::PolicyEngine::new(
+        orxnud_policy::PolicySet::deny_all("test-v1").with_grant(grant),
+        orxnud_policy::budget::BudgetLedger::empty().with_global(10_000),
+        "test-v1",
+    );
+    // Low risk and no egress, so no approval is required: these tests are about the
+    // adapter contract, not about the approval path.
+    engine.register(orxnud_policy::CapabilityDeclaration::new(
+        id.clone(),
+        orxnud_domain::enums::RiskClass::Low,
+        DataClass::Personal,
+        false,
+        1,
+    ));
+
+    let request = orxnud_domain::ActionRequest::new(
+        TaskId::new("t"),
+        RunId::new("r"),
+        0,
+        id,
+        params.clone(),
+        DataClass::Public,
+        DataClass::Public,
+    );
+    engine
+        .authorise_for_dispatch(
+            request,
+            orxnud_domain::Actor::Human {
+                user: UserId::new("u-1"),
+                via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+            },
+            orxnud_domain::InvocationContext::new("k", 30_000, "c"),
+            None,
+            orxnud_domain::NormalizedParams::canonical(params.to_string()),
+            None,
+            1,
+        )
+        .expect("a granted capability must be authorised")
+        .invocation
+}
+
+/// Runs `f` with a `DispatchView` the governed path produced.
+///
+/// The closure form is what makes the borrow work: the view borrows the invocation, so
+/// the invocation has to outlive it, and returning the view would not be possible.
+pub fn with_dispatch_view<R>(
+    capability: &str,
+    params: &serde_json::Value,
+    f: impl FnOnce(&orxnud_policy::authority::DispatchView<'_>) -> R,
+) -> R {
+    let invocation = authorised_invocation(capability, params);
+    f(&invocation.dispatch_view())
 }

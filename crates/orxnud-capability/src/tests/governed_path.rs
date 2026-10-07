@@ -28,15 +28,13 @@ use crate::dispatch::{
     ExecutionReport, ExecutionTier, SandboxPlan, SandboxRefusal,
 };
 use crate::subprocess::SandboxExecutionBackend;
-use crate::verification::{
-    ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
-};
+use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 use orxnud_domain::approval::NormalizedParams;
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::DispatchView;
 use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel, SecretRef};
+use orxnud_policy::authority::DispatchView;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::policy_set::{Grant, PolicySet};
 use orxnud_policy::{CapabilityDeclaration, PolicyEngine};
@@ -176,7 +174,7 @@ impl AdapterBundle for HelperBundle {
     }
     fn sandbox_plan(
         &self,
-        _invocation: &orxnud_domain::invocation::CapabilityInvocation,
+        _invocation: &orxnud_policy::authority::CapabilityInvocation,
     ) -> Option<SandboxPlan> {
         let (ro, rw) = self.grants.clone();
         Some(SandboxPlan {
@@ -325,6 +323,112 @@ fn a_governed_tier1_dispatch_runs_a_sandboxed_subprocess() {
         d.audit_records(),
         2,
         "the authorisation and its terminal outcome are both audited"
+    );
+}
+
+/// The invocation a policy decision produces carries the class **policy** assessed.
+///
+/// Before the authority types moved, the caller could write
+/// `DispatchView { .., data_class: DataClass::Public, .. }` about itself and hand that
+/// to `invoke`. So this asserts the direction of travel: the request asks for
+/// `Personal`, the grant permits `Personal`, and the invocation that comes out reports
+/// `Personal`. A boundary that only refuses obviously-wrong values would not notice a
+/// caller understating its own class, so the positive direction is the one worth pinning.
+#[test]
+fn the_invocation_carries_the_class_policy_assessed() {
+    let mut engine = policy(0, 1_000);
+    let authorised = engine
+        .authorise_for_dispatch(request(), human(), context(), None, params(), None, NOW)
+        .expect("the request is inside the grant");
+
+    let invocation = authorised.invocation;
+    assert_eq!(
+        invocation.data_class(),
+        DataClass::Personal,
+        "the class is the one the declaration and grant allow, not one the caller asserted"
+    );
+    assert_eq!(invocation.capability(), &cap());
+    assert_eq!(invocation.assessed_risk(), RiskClass::Low);
+    assert_eq!(invocation.policy_version(), "v1");
+
+    // And the view handed to an adapter is a projection of that same invocation, so the
+    // adapter cannot be shown a different class than the one that was authorised.
+    let view = invocation.dispatch_view();
+    assert_eq!(view.data_class(), invocation.data_class());
+    assert_eq!(view.capability(), invocation.capability());
+}
+
+/// `CapabilityInvocation` is `Clone`, and that is the one place a boundary like this can
+/// quietly leak: a value that can be duplicated is a value someone will duplicate and
+/// then re-submit, hoping the second copy skips a budget charge or an approval.
+///
+/// So this pins that a clone carries no authority of its own. The capability crate
+/// exposes no entry point that accepts an invocation -- `Dispatcher::dispatch` takes a
+/// request and authorises it itself -- so a clone has nowhere to go. The runtime
+/// consequence is visible in the budget: one authorisation buys one execution, and the
+/// second attempt is refused before any adapter is reached.
+#[test]
+fn a_cloned_invocation_carries_no_authority_of_its_own() {
+    // A separate engine for the shape assertions, so the budget below measures only
+    // what the test says it measures.
+    let mut shaping = policy(1, 1_000);
+    let authorised = shaping
+        .authorise_for_dispatch(request(), human(), context(), None, params(), None, NOW)
+        .expect("within budget");
+    let original = authorised.invocation;
+    let clones = vec![original.clone(), original.clone()];
+
+    // Three identical values, and none of them is a second authorisation: cloning is a
+    // field copy, so every clone carries the same single policy_version and the same
+    // single, already-consumed budget decision.
+    for clone in &clones {
+        assert_eq!(clone.policy_version(), original.policy_version());
+        assert_eq!(clone.assessed_risk(), original.assessed_risk());
+    }
+
+    // The only door re-authorises, so the budget is what stops the replay.
+    let mut engine = policy(1, 1);
+    let secrets = FakeSecrets::new();
+    let backend = Arc::new(CountingBackend::new());
+    let mut d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("env-dump")),
+    )
+    .with_execution(backend.clone());
+
+    d.dispatch(
+        request(),
+        human(),
+        context(),
+        None,
+        params(),
+        None,
+        None,
+        NOW,
+    )
+    .expect("the first execution is within budget");
+    assert_eq!(backend.calls(), 1);
+
+    let replay = d.dispatch(
+        request(),
+        human(),
+        context(),
+        None,
+        params(),
+        None,
+        None,
+        NOW,
+    );
+    assert!(
+        replay.is_err(),
+        "the second dispatch must be refused: budget 1 buys one execution, and a clone \
+         of the first invocation is not a second authorisation"
+    );
+    assert_eq!(
+        backend.calls(),
+        1,
+        "and the refused replay must not reach the sandbox at all"
     );
 }
 
@@ -660,9 +764,8 @@ fn a_governed_filesystem_probe_is_denied() {
 
     let mut engine = policy(0, 1_000);
     let secrets = FakeSecrets::new();
-    let mut d2 =
-        crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+    let mut d2 = crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -697,9 +800,8 @@ fn a_governed_network_probe_is_denied() {
 
     let mut engine = policy(0, 1_000);
     let secrets = FakeSecrets::new();
-    let mut d2 =
-        crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+    let mut d2 = crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -731,9 +833,8 @@ fn a_governed_environment_probe_sees_no_secret() {
     let adapter = Tier1HelperAdapter::running("cred-env-probe");
     let mut engine = policy(0, 1_000);
     let secrets = FakeSecrets::new();
-    let mut d2 =
-        crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+    let mut d2 = crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -828,9 +929,8 @@ fn a_governed_hang_is_stopped_at_the_deadline() {
     let adapter = Tier1HelperAdapter::running("hang");
     let mut engine = policy(0, 1_000);
     let secrets = FakeSecrets::new();
-    let mut d2 =
-        crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+    let mut d2 = crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let started = std::time::Instant::now();
     let outcome = d2
@@ -869,9 +969,8 @@ fn a_governed_flood_is_bounded() {
         .insert("ORXNUD_HOSTILE_HELPER".into(), "flood\u{1}20000000".into());
     let mut engine = policy(0, 1_000);
     let secrets = FakeSecrets::new();
-    let mut d2 =
-        crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+    let mut d2 = crate::dispatch::Dispatcher::new(&mut engine, &secrets, bundles(adapter))
+        .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
     let outcome = d2
         .dispatch(
@@ -961,9 +1060,7 @@ trait AuditAccess {
     fn audit_records(&self) -> usize;
 }
 
-impl<S: orxnud_domain::SecretsContract> AuditAccess
-    for crate::dispatch::Dispatcher<'_, S>
-{
+impl<S: orxnud_domain::SecretsContract> AuditAccess for crate::dispatch::Dispatcher<'_, S> {
     fn audit_records(&self) -> usize {
         self.audit_len()
     }
@@ -1156,7 +1253,7 @@ mod v46 {
         }
         fn sandbox_plan(
             &self,
-            _invocation: &orxnud_domain::invocation::CapabilityInvocation,
+            _invocation: &orxnud_policy::authority::CapabilityInvocation,
         ) -> Option<SandboxPlan> {
             Some(SandboxPlan {
                 program: helper_path().display().to_string(),
@@ -1205,8 +1302,9 @@ mod v46 {
         m.insert(id.clone(), bundle(required.clone()));
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
-        let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+        let mut d =
+            crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                .with_execution(Arc::new(SandboxExecutionBackend::new()));
         let (watcher, stop, _base) = watch(25, MY_CEILING);
         let outcome = d
             .dispatch(
@@ -1291,8 +1389,9 @@ mod v46 {
         m.insert(id.clone(), bundle(incomplete));
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
-        let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-            .with_execution(Arc::new(backend));
+        let mut d =
+            crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                .with_execution(Arc::new(backend));
 
         let err = d
             .dispatch(
@@ -1392,8 +1491,9 @@ mod v46 {
         m.insert(id.clone(), bundle(required.clone()));
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
-        let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-            .with_execution(Arc::new(backend));
+        let mut d =
+            crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                .with_execution(Arc::new(backend));
         let err = d
             .dispatch(
                 request(),
@@ -1496,8 +1596,9 @@ mod v46 {
         );
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
-        let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+        let mut d =
+            crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
         let (watcher, stop, base) = watch(30, "268435456");
         let outcome = d
@@ -1607,8 +1708,9 @@ mod v46 {
         );
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
-        let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+        let mut d =
+            crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
         let (watcher, stop, _base) = watch(25, mine);
         let outcome = d
@@ -1761,8 +1863,9 @@ mod v46 {
         );
         let mut engine = policy(0, 1_000);
         let secrets = FakeSecrets::new();
-        let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-            .with_execution(Arc::new(SandboxExecutionBackend::new()));
+        let mut d =
+            crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                .with_execution(Arc::new(SandboxExecutionBackend::new()));
 
         let (watcher, stop, _base) = watch(25, mine);
         let outcome = d
@@ -1835,8 +1938,9 @@ mod v46 {
 
             let mut engine = policy(0, 1_000);
             let secrets = FakeSecrets::new();
-            let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
-                .with_execution(backend);
+            let mut d =
+                crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+                    .with_execution(backend);
 
             match d.dispatch(
                 request(),

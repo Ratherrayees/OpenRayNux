@@ -24,9 +24,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::dispatch::{
-    AdapterBundle, DispatchOutcome, Dispatcher, ExecutionBackend, SandboxPlan,
-};
+use crate::dispatch::{AdapterBundle, DispatchOutcome, Dispatcher, ExecutionBackend, SandboxPlan};
 use crate::verification::VerificationOutcome;
 use crate::write_text::{self, WriteTextBundle};
 use orxnud_domain::approval::NormalizedParams;
@@ -68,7 +66,7 @@ fn contract(plan: SandboxPlan) -> crate::dispatch::ExecutionContract {
 /// that wants a genuine invocation has to ask the policy engine for one. Which is
 /// also the point -- an invocation assembled from parts would not be the thing the
 /// dispatcher passes to a bundle.
-fn invocation(params: &serde_json::Value) -> orxnud_domain::invocation::CapabilityInvocation {
+fn invocation(params: &serde_json::Value) -> orxnud_policy::authority::CapabilityInvocation {
     let mut engine = policy();
     engine
         .authorise_for_dispatch(
@@ -223,9 +221,8 @@ impl Fixture {
         now_ms: i64,
     ) -> Result<DispatchOutcome, crate::dispatch::DispatchError> {
         let secrets = FakeSecrets::new();
-        let mut d = Dispatcher::new(engine, &secrets, self.bundles()).with_execution(Arc::new(
-            crate::subprocess::SandboxExecutionBackend::new(),
-        ));
+        let mut d = Dispatcher::new(engine, &secrets, self.bundles())
+            .with_execution(Arc::new(crate::subprocess::SandboxExecutionBackend::new()));
         d.dispatch(
             request(path, contents),
             human(),
@@ -511,9 +508,8 @@ fn object_key_order_does_not_change_what_an_approval_authorises() {
     // one operation written two ways, not two operations.
     let secrets = FakeSecrets::new();
     let mut engine = policy();
-    let mut d = Dispatcher::new(&mut engine, &secrets, fixture.bundles()).with_execution(Arc::new(
-        crate::subprocess::SandboxExecutionBackend::new(),
-    ));
+    let mut d = Dispatcher::new(&mut engine, &secrets, fixture.bundles())
+        .with_execution(Arc::new(crate::subprocess::SandboxExecutionBackend::new()));
     let reversed: ActionRequest = ActionRequest::new(
         TaskId::new("t-1"),
         RunId::new("r-1"),
@@ -700,17 +696,15 @@ fn the_adapter_is_tier_1_and_refuses_to_execute_in_process() {
         fixture.bundle.adapter().tier(),
         crate::dispatch::ExecutionTier::Subprocess
     );
-    let context = InvocationContext::new("k", 1_000, "c");
     let json = serde_json::json!({"path": "a.txt", "contents": "x"});
-    let view = orxnud_domain::invocation::DispatchView {
-        step: 0,
-        capability: fixture.bundle.adapter().capability_id(),
-        params: &json,
-        data_class: DataClass::Public,
-        context: &context,
-    };
+    // `DispatchView`'s fields are private now — they are the argument to a
+    // crate-private `invoke`. A hand-built view would be exactly the bypass this
+    // crate's sealing removed, so the view is obtained from policy instead.
+    let refused = support::with_dispatch_view(crate::write_text::WRITE_TEXT_ID, &json, |view| {
+        fixture.bundle.adapter().invoke(view, None)
+    });
     assert!(
-        fixture.bundle.adapter().invoke(&view, None).is_err(),
+        refused.is_err(),
         "an in-process write would be the tier bypass"
     );
 }

@@ -60,7 +60,7 @@ use serde_json::{Value, json};
 
 use orxnud_domain::enums::{DataClass, IsolationTier, RiskClass};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::DispatchView;
+use orxnud_policy::authority::DispatchView;
 
 use crate::credential::CredentialHandle;
 use crate::dispatch::{AdapterBundle, CapabilityAdapter, ExecutionTier};
@@ -233,7 +233,7 @@ impl CapabilityAdapter for WordCountAdapter {
         view: &DispatchView<'_>,
         _credential: Option<&CredentialHandle>,
     ) -> Result<ExecutionOutcome, String> {
-        let text = text_param(view.params)?;
+        let text = text_param(view.params())?;
         Ok(ExecutionOutcome::Succeeded {
             output: Some(count_by_scan(&text).to_json().to_string()),
         })
@@ -410,7 +410,7 @@ impl AdapterBundle for WordCountBundle {
     /// `None` is the truthful answer for something that spawns no process.
     fn sandbox_plan(
         &self,
-        _invocation: &orxnud_domain::invocation::CapabilityInvocation,
+        _invocation: &orxnud_policy::authority::CapabilityInvocation,
     ) -> Option<crate::dispatch::SandboxPlan> {
         None
     }
@@ -422,31 +422,25 @@ impl AdapterBundle for WordCountBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orxnud_domain::invocation::InvocationContext;
 
-    /// A `DispatchView` for these tests, built through the real type.
+    /// Runs `f` with the actor-free projection, as the governed path produced it.
     ///
-    /// The actor-free projection is the point: an adapter receives this and nothing
-    /// else, so "the adapter learns who asked" is not a property these tests have to
-    /// take on trust.
-    fn view<'p>(params: &'p Value, context: &'p InvocationContext) -> DispatchView<'p> {
-        DispatchView {
-            step: 0,
-            capability: &WORD_COUNT,
-            params,
-            data_class: DataClass::Public,
-            context,
-        }
-    }
-
-    fn ctx() -> InvocationContext {
-        InvocationContext::new("test", 1_000, "test-request")
+    /// This used to construct a `DispatchView` by hand, because every field was
+    /// public. They are private now — they live in `orxnud-policy` and are the
+    /// argument to a crate-private `invoke`, so a public field would reopen exactly
+    /// the door the boundary closes.
+    ///
+    /// The replacement is stronger than what it replaced: the view now comes from a
+    /// real policy authorisation rather than from whatever this test decided to put in
+    /// it, so "the adapter learns what to do and not who asked" is asserted against a
+    /// value that was actually authorised.
+    fn with_view<R>(params: &Value, f: impl FnOnce(&DispatchView<'_>) -> R) -> R {
+        crate::suites::support::with_dispatch_view(WORD_COUNT_ID, params, f)
     }
 
     /// Runs the adapter and reads the counts back out of its claimed result.
     fn run(params: &Value) -> Result<Counts, String> {
-        let context = ctx();
-        match WordCountAdapter.invoke(&view(params, &context), None) {
+        match with_view(params, |view| WordCountAdapter.invoke(view, None)) {
             Ok(ExecutionOutcome::Succeeded { output: Some(raw) }) => {
                 let v: Value = serde_json::from_str(&raw).expect("the adapter emits JSON");
                 Ok(Counts::from_json(&v).expect("the adapter emits all four counts"))
@@ -730,10 +724,8 @@ mod tests {
     #[test]
     fn a_correct_result_verifies() {
         let params = json!({ "text": "hello world\nsecond line" });
-        let context = ctx();
-        let execution = WordCountAdapter
-            .invoke(&view(&params, &context), None)
-            .expect("ran");
+        let execution =
+            with_view(&params, |view| WordCountAdapter.invoke(view, None)).expect("ran");
         let v = WordCountVerifier
             .verify(&execution, &params, 0)
             .expect("verified");

@@ -49,34 +49,33 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod authority;
 pub mod budget;
 pub mod decision;
 pub mod digest;
 pub mod engine;
 pub mod policy_set;
 
+pub use authority::{AuthorisationProof, CapabilityInvocation, DispatchView};
 pub use budget::{BudgetError, BudgetLedger, Ceiling};
 pub use decision::{Decision, DenialReason, PolicyError};
 pub use digest::{DigestError, canonical_params, digest_for, issue_approval};
 pub use engine::{AuthorisedInvocation, CapabilityDeclaration, PolicyEngine};
 pub use policy_set::{Grant, PolicySet};
 
-/// This crate's authorisation seal.
-///
-/// Named here so the policy engine has one obvious way to obtain it. Gate G2 in
-/// `scripts/ci-gates.sh` fails the build if any crate other than
-/// `orxnud-policy` references `PolicySeal`, so this is the only place a proof
-/// can come from.
-pub fn seal() -> orxnud_domain::PolicySeal {
-    orxnud_domain::PolicySeal::attest("orxnud-policy")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_seal_names_this_crate() {
-        assert_eq!(seal().issued_by(), "orxnud-policy");
-    }
-}
+// `PolicySeal` and `seal()` used to live here. They are gone, and
+// `scripts/ci-gates.sh` G2d's token list has an entry for each that now matches
+// nothing.
+//
+// The seal was a `pub struct` in `orxnud-domain` whose only field was a `&'static str`
+// the *holder* wrote about itself. `AuthorisationProof::issue` and
+// `CapabilityInvocation::authorise` both took it and bound it to `_`; nothing
+// anywhere compared `issued_by` with `"orxnud-policy"`. So the "proof of policy"
+// was a value the caller supplied, and the only thing standing between a caller and
+// authority was gate G2d -- a lexical CI scan that the third audit showed reporting
+// `ok` on a tree that forges authority three separate ways.
+//
+// Now that the authority types live in this crate, their constructors can be
+// `pub(crate)` and `rustc` enforces the boundary. The seal existed to bridge two
+// crates; with no bridge left, it is not a weakened control but a deleted fiction.
+// See `authority.rs`.

@@ -26,8 +26,9 @@ use crate::verification::ExecutionOutcome;
 use orxnud_domain::approval::NormalizedParams;
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, DispatchView, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel, RequestId};
+use orxnud_policy::authority::DispatchView;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::policy_set::{Grant, PolicySet};
 use orxnud_policy::{CapabilityDeclaration, PolicyEngine};
@@ -97,8 +98,8 @@ fn params() -> NormalizedParams {
 }
 
 fn registry(b: Bundle<impl CapabilityAdapter + 'static>) -> Registry {
-    use std::sync::Arc;
     use crate::dispatch::AdapterBundle;
+    use std::sync::Arc;
     let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let id = b.adapter().capability_id().clone();
     m.insert(id, b.into_arc());

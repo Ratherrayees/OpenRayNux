@@ -4,15 +4,14 @@ use orxnud_audit::{AuditChain, AuditOutcome, OutcomeKind, RecordError};
 use orxnud_domain::ids::{CapabilityId, RequestId};
 use orxnud_domain::security_state::{ApprovalLedger, AuditJournal, InMemoryApprovals};
 use orxnud_domain::{
-    ActionRequest, Actor, ApprovalRecord, AuthorisationProof, CapabilityInvocation, DataClass,
-    InvocationContext, NormalizedParams, RiskClass,
+    ActionRequest, Actor, ApprovalRecord, DataClass, InvocationContext, NormalizedParams, RiskClass,
 };
 
+use crate::authority::{AuthorisationProof, CapabilityInvocation};
 use crate::budget::{BudgetLedger, scope_for_risk};
 use crate::decision::{Decision, DenialReason, PolicyError};
 use crate::digest::digest_for;
 use crate::policy_set::{GrantLookup, PolicySet};
-use crate::seal;
 use orxnud_domain::security_state::LedgerError;
 
 /// A capability's declared contract, as policy sees it.
@@ -596,7 +595,6 @@ impl PolicyEngine {
         }
 
         let proof = AuthorisationProof::issue(
-            &seal(),
             self.policy_version.clone(),
             match &decision {
                 Decision::Gate {
@@ -611,7 +609,7 @@ impl PolicyEngine {
         // the proof that policy is the only crate that can -- the constructor
         // demands this crate's seal, and gate G2 forbids any other crate from
         // naming it.
-        let _invocation = CapabilityInvocation::authorise(&seal(), request, actor, context, proof);
+        let _invocation = CapabilityInvocation::authorise(request, actor, context, proof);
         Ok(decision)
     }
 
@@ -679,7 +677,6 @@ impl PolicyEngine {
         // than asking policy to decide twice -- a second evaluation could charge the
         // budget again and append a second audit record for one caller action.
         let proof = AuthorisationProof::issue(
-            &seal(),
             self.policy_version.clone(),
             match &decision {
                 Decision::Gate {
@@ -689,7 +686,7 @@ impl PolicyEngine {
             },
             decision.risk(),
         );
-        let invocation = CapabilityInvocation::authorise(&seal(), request, actor, context, proof);
+        let invocation = CapabilityInvocation::authorise(request, actor, context, proof);
         Ok(AuthorisedInvocation {
             invocation,
             decision,

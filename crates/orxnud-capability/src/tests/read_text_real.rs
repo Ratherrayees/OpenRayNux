@@ -134,13 +134,10 @@ fn dispatch_read(
     ws: &Path,
     path: &str,
     approval: Option<&orxnud_domain::approval::ApprovalRecord>,
-) -> Result<crate::dispatch::DispatchOutcome, crate::dispatch::DispatchError>
-{
+) -> Result<crate::dispatch::DispatchOutcome, crate::dispatch::DispatchError> {
     let helper = read_text::resolve_helper().expect("helper built");
-    let mut bundles: BTreeMap<
-        CapabilityId,
-        Arc<dyn crate::dispatch::AdapterBundle + Send + Sync>,
-    > = BTreeMap::new();
+    let mut bundles: BTreeMap<CapabilityId, Arc<dyn crate::dispatch::AdapterBundle + Send + Sync>> =
+        BTreeMap::new();
     bundles.insert(cap(), Arc::new(ReadTextBundle::new(ws, helper)));
     let mut engine = policy();
     let secrets = FakeSecrets::new();
@@ -264,10 +261,8 @@ fn an_approved_read_is_single_use() {
     // the dispatcher borrows, so a second *dispatcher* would be a second ledger and would
     // prove nothing about single use.
     let helper = read_text::resolve_helper().expect("helper built");
-    let mut bundles: BTreeMap<
-        CapabilityId,
-        Arc<dyn crate::dispatch::AdapterBundle + Send + Sync>,
-    > = BTreeMap::new();
+    let mut bundles: BTreeMap<CapabilityId, Arc<dyn crate::dispatch::AdapterBundle + Send + Sync>> =
+        BTreeMap::new();
     bundles.insert(cap(), Arc::new(ReadTextBundle::new(&ws, helper)));
     let mut engine = policy();
     let secrets = FakeSecrets::new();

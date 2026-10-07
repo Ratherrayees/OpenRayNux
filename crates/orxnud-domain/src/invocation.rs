@@ -1,37 +1,33 @@
-//! Action requests and authorised capability invocations.
+//! Action requests: what a caller asks for, before anything has been authorised.
 //!
-//! # The choke point
+//! # There are no authorised invocations in this crate
 //!
-//! [`CapabilityInvocation`] is the *only* way to reach a capability adapter.
-//! Both its fields **and** those of [`AuthorisationProof`] are private, so
-//! neither type can be built with a struct literal from outside this crate.
+//! [`CapabilityInvocation`], [`AuthorisationProof`] and [`DispatchView`] used to
+//! live here, and this module documented a two-part enforcement story: private
+//! fields, plus gate G2's lexical scan to stop other crates naming the minting
+//! verbs. The second half is the part that was not true.
 //!
-//! # What actually enforces this, stated honestly
+//! Gate G2 reported `ok` on a tree that forged authority three separate ways
+//! from a standalone crate, because a lexical scan cannot see what a token
+//! *means* -- and a third of the escapes named none of the symbols it looked
+//! for. A checker that cannot fail is worse than no checker, because it reports
+//! `ok` on the trees it exists to catch.
 //!
-//! Rust has no friend crates: a `pub fn` in this crate is callable by every
-//! crate in the workspace, including ones that should not hold an
-//! authorisation. So the guarantee is **two mechanisms, neither of them the
-//! type system alone**:
+//! So the types moved to [`orxnud-policy`], next to the constructors that mint
+//! them, and those constructors are `pub(crate)`. Rust cannot say "callable by
+//! exactly one crate" about a `pub` item, which is the whole reason the seal was
+//! needed; it can say it about a `pub(crate)` one. The boundary is now decided
+//! by `rustc` rather than by a pattern match over source text.
 //!
-//! 1. **Opacity.** Neither type has public fields, so no caller can assemble one
-//!    from parts. [`AuthorisationProof::issue`] is the single path, and it takes
-//!    a [`PolicySeal`].
-//! 2. **The dependency-graph gate** (`scripts/ci-gates.sh`, gate G2): only
-//!    `orxnud-policy` is permitted to name `AuthorisationProof`,
-//!    `PolicySeal`, or [`CapabilityInvocation::authorise`]. Any other crate
-//!    referencing them fails the build.
-//!
-//! Claiming the type system alone guarantees "only the policy layer can
-//! authorise" would be false, and a false security claim is worse than a
-//! documented two-part mechanism. Gate G2 is what closes the gap; the
-//! compile-fail tests in `tests/compile_fail/` prove the opacity half.
+//! What is left here is deliberately untrusted: a caller must be able to
+//! describe the action it wants. [`CapabilityRequest`] and [`ActionRequest`]
+//! carry no authority to forge, and neither can be promoted into something that
+//! does -- there is no `From`/`Into` from a request to an invocation.
 //!
 //! See ADR-0012 and ADR-0027.
 
 use serde::{Deserialize, Serialize};
 
-use crate::actor::Actor;
-use crate::approval::ApprovalDigest;
 use crate::enums::{DataClass, RiskClass};
 use crate::ids::{CapabilityId, RequestId, RunId, TaskId};
 
@@ -134,92 +130,9 @@ impl InvocationContext {
     }
 }
 
-/// Proof that the policy layer evaluated and authorised an action.
-///
-/// Fields are private, so this cannot be assembled from parts outside
-/// `orxnud-domain`. It is the value that makes [`CapabilityInvocation`]
-/// unforgeable, which is the mechanism behind "the LLM must never be the
-/// authority that grants itself permission".
-///
-/// Obtain one from [`AuthorisationProof::issue`], which additionally requires a
-/// [`PolicySeal`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorisationProof {
-    policy_version: String,
-    approval: Option<ApprovalDigest>,
-    assessed_risk: RiskClass,
-}
+// ---- moved to `orxnud-policy::authority` (AuthorisationProof) ----
 
-impl AuthorisationProof {
-    /// Issues a proof. Requires a [`PolicySeal`], which gate G2 restricts to
-    /// `orxnud-policy`.
-    #[must_use]
-    pub fn issue(
-        _seal: &PolicySeal,
-        policy_version: impl Into<String>,
-        approval: Option<ApprovalDigest>,
-        assessed_risk: RiskClass,
-    ) -> Self {
-        Self {
-            policy_version: policy_version.into(),
-            approval,
-            assessed_risk,
-        }
-    }
-
-    /// The policy version that made the decision.
-    #[must_use]
-    pub fn policy_version(&self) -> &str {
-        &self.policy_version
-    }
-
-    /// The approval digest, when the risk class required one.
-    #[must_use]
-    pub fn approval(&self) -> Option<ApprovalDigest> {
-        self.approval
-    }
-
-    /// The risk the policy assigned, after escalation.
-    #[must_use]
-    pub fn assessed_risk(&self) -> RiskClass {
-        self.assessed_risk
-    }
-}
-
-/// The capability of issuing an [`AuthorisationProof`].
-///
-/// Deliberately **not** constructible in a useful way: its only constructor
-/// records the issuing crate name, and gate G2 permits that name to be
-/// `orxnud-policy` and nothing else. Rust offers no way to express "only this
-/// crate may call this", so the restriction is mechanical rather than nominal —
-/// which is why it lives in a script that fails the build rather than in a
-/// comment.
-///
-/// A caller that reached this type without a real policy evaluation has still
-/// gained nothing: `CapabilityInvocation::authorise` grants no capability by
-/// itself. The dispatcher resolves the capability against the registry, and
-/// Phase 1's registry is empty.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicySeal {
-    issued_by: &'static str,
-}
-
-impl PolicySeal {
-    /// The name recorded for a seal.
-    #[must_use]
-    pub fn issued_by(&self) -> &'static str {
-        self.issued_by
-    }
-
-    /// Creates a seal attributed to `issued_by`.
-    ///
-    /// Public because Rust cannot restrict it; the gate is the enforcement.
-    /// Callers outside `orxnud-policy` are a build failure, not a runtime one.
-    #[must_use]
-    pub fn attest(issued_by: &'static str) -> Self {
-        Self { issued_by }
-    }
-}
+// ---- moved to `orxnud-policy::authority` (PolicySeal, deleted) ----
 
 /// An **untrusted inbound request** to invoke a capability.
 ///
@@ -257,9 +170,9 @@ impl PolicySeal {
 /// any plan exists. Converting one into the other is a step of the authorisation
 /// pipeline, not a field copy.
 ///
-/// [`CapabilityInvocation::authorise`] is not a method on this type precisely because
-/// authorisation needs an actor, a policy evaluation and a proof, none of which exist
-/// at ingress.
+/// [`orxnud_policy::CapabilityInvocation::authorise`] is not a method on this
+/// type precisely because authorisation needs an actor, a policy evaluation and a
+/// proof, none of which exist at ingress.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityRequest {
     /// Which capability the caller wants.
@@ -281,176 +194,9 @@ pub struct CapabilityRequest {
     pub request_id: RequestId,
 }
 
-/// A **policy-authorised** request to invoke a capability.
-///
-/// Fields are private. The only constructor is [`Self::authorise`], which
-/// requires an [`AuthorisationProof`].
-///
-/// A capability adapter never sees this type's `actor` field: the dispatcher
-/// strips it. That is deliberate — a capability that learns its caller becomes
-/// a confused deputy (ADR-0027, control S8).
-///
-/// # This type is NOT `Deserialize`, and that is load-bearing
-///
-/// A derived `Deserialize` is a *second, unrestricted constructor*. It writes the
-/// private fields without going through [`Self::authorise`], so it bypasses
-/// [`PolicySeal`], [`AuthorisationProof`], and policy evaluation entirely — which is
-/// exactly what the private fields were there to prevent.
-///
-/// This was not theoretical. Before Phase 3, this type derived both `Serialize` and
-/// `Deserialize`, and a standalone crate could mint an authorised invocation from a
-/// JSON literal, asserting its own `assessed_risk: low` and `policy_version`:
-///
-/// ```text
-/// FORGED OK -> CapabilityId("send-email") risk=Low policy_version=forged
-///            params={"to":"attacker@evil.test"}
-/// ```
-///
-/// No policy. No proof. No seal. No human.
-///
-/// `serde` is a mechanism for constructing a value from external data, and private
-/// fields do not make a derived deserializer an authority boundary. The architectural
-/// claim in ADR-0012 — "it is not *possible* to do this without going through policy" —
-/// was false for this type until the derive was removed.
-///
-/// Inbound data uses [`CapabilityRequest`], which is a *request* and carries no
-/// authority to lose. See ADR-0034.
-///
-/// `Serialize` remains, for audit records and for hashing: serialising an
-/// authority-bearing value *out* is a disclosure risk the caller must own, whereas
-/// deserialising one *in* is an authorisation bypass. Those are not symmetric.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CapabilityInvocation {
-    task: TaskId,
-    step: u32,
-    actor: Actor,
-    capability: CapabilityId,
-    params: serde_json::Value,
-    data_class: DataClass,
-    context: InvocationContext,
-    assessed_risk: RiskClass,
-    policy_version: String,
-}
+// ---- moved to `orxnud-policy::authority` (CapabilityInvocation) ----
 
-impl CapabilityInvocation {
-    /// Authorises an action, producing an invocation.
-    ///
-    /// # Safety of this boundary
-    ///
-    /// The safety here is *type-level*, not documentary: `AuthorisationProof`
-    /// can only be obtained from `orxnud-policy` running a real policy
-    /// evaluation. A caller that has not evaluated policy cannot call this.
-    #[must_use]
-    pub fn authorise(
-        _seal: &PolicySeal,
-        request: ActionRequest,
-        actor: Actor,
-        context: InvocationContext,
-        proof: AuthorisationProof,
-    ) -> Self {
-        // Computed before the fields are moved out.
-        let data_class = request.effective_class();
-        Self {
-            task: request.task,
-            step: request.step,
-            actor,
-            capability: request.capability,
-            params: request.params,
-            data_class,
-            context,
-            assessed_risk: proof.assessed_risk,
-            policy_version: proof.policy_version,
-        }
-    }
-
-    /// The task this invocation belongs to.
-    #[must_use]
-    pub fn task(&self) -> &TaskId {
-        &self.task
-    }
-
-    /// The step index within the plan.
-    #[must_use]
-    pub fn step(&self) -> u32 {
-        self.step
-    }
-
-    /// Who is acting. Read by policy and audit; stripped before dispatch.
-    #[must_use]
-    pub fn actor(&self) -> &Actor {
-        &self.actor
-    }
-
-    /// The capability to invoke.
-    #[must_use]
-    pub fn capability(&self) -> &CapabilityId {
-        &self.capability
-    }
-
-    /// The validated parameters.
-    #[must_use]
-    pub fn params(&self) -> &serde_json::Value {
-        &self.params
-    }
-
-    /// The effective data class.
-    #[must_use]
-    pub fn data_class(&self) -> DataClass {
-        self.data_class
-    }
-
-    /// The execution context.
-    #[must_use]
-    pub fn context(&self) -> &InvocationContext {
-        &self.context
-    }
-
-    /// The risk the policy assigned.
-    #[must_use]
-    pub fn assessed_risk(&self) -> RiskClass {
-        self.assessed_risk
-    }
-
-    /// The policy version that authorised this.
-    #[must_use]
-    pub fn policy_version(&self) -> &str {
-        &self.policy_version
-    }
-
-    /// What the adapter actually receives: everything *except* the actor.
-    ///
-    /// This is the method the dispatcher uses. Making the strip explicit at one
-    /// place is what keeps "capabilities are caller-agnostic" true rather than
-    /// aspirational.
-    #[must_use]
-    pub fn dispatch_view(&self) -> DispatchView<'_> {
-        DispatchView {
-            step: self.step,
-            capability: &self.capability,
-            params: &self.params,
-            data_class: self.data_class,
-            context: &self.context,
-        }
-    }
-}
-
-/// The capability-facing projection of an invocation.
-///
-/// Contains no actor and no policy version: the capability learns *what* to do,
-/// never *who* asked. Authority was already settled.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DispatchView<'a> {
-    /// Step index, for correlation in adapter logs.
-    pub step: u32,
-    /// The capability id.
-    pub capability: &'a CapabilityId,
-    /// The validated parameters.
-    pub params: &'a serde_json::Value,
-    /// The effective data class.
-    pub data_class: DataClass,
-    /// Deadline, idempotency key, and cancellation handle.
-    pub context: &'a InvocationContext,
-}
+// ---- moved to `orxnud-policy::authority` (DispatchView) ----
 
 /// A correlation id for a single dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,9 +206,7 @@ pub struct DispatchId(pub RequestId);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::AuthChannel;
-    use crate::approval::ApprovalDigest;
-    use crate::ids::{RunId, UserId};
+    use crate::ids::RunId;
     use proptest::prelude::*;
 
     fn request(a: DataClass, b: DataClass) -> ActionRequest {
@@ -498,82 +242,15 @@ mod tests {
         let json = serde_json::to_string(&request_dto()).expect("serialise");
         let back: CapabilityRequest = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(back, request_dto());
-    }
-
-    /// A request cannot claim a risk assessment or a policy version.
-    ///
-    /// There is nowhere to put them, and that is the point: those are derived by
-    /// policy, not asserted by a caller. A request that *could* carry them would
-    /// be a request that could lie about them.
-    #[test]
-    fn an_untrusted_request_has_no_field_for_risk_or_policy_version() {
-        let v = serde_json::to_value(request_dto()).expect("to value");
-        for forbidden in [
-            "assessed_risk",
-            "policy_version",
-            "actor",
-            "approval",
-            "credential",
-            "seal",
-            "proof",
-        ] {
+        // The point is what it does NOT carry: no risk, no policy version, no digest,
+        // no actor. There is no field for any of them, so there is nothing to forge.
+        let rendered = serde_json::to_string(&back).expect("serialise again");
+        for forbidden in ["risk", "policy", "digest", "actor", "seal"] {
             assert!(
-                !v.as_object().is_some_and(|o| o.contains_key(forbidden)),
-                "CapabilityRequest must not carry {forbidden}: {v}"
+                !rendered.contains(forbidden),
+                "the inbound DTO grew a `{forbidden}` field: {rendered}"
             );
         }
-    }
-
-    /// The DTO is not convertible into an invocation by any route.
-    ///
-    /// Authorisation goes through validation and policy, which produce an
-    /// `ActionRequest` and an `AuthorisationProof` respectively. There is no
-    /// `From<CapabilityRequest>` and no `CapabilityRequest::authorise`, so the
-    /// compiler refuses the shortcut a future author would otherwise reach for.
-    #[test]
-    fn a_request_cannot_become_an_invocation() {
-        // Compiles only because `CapabilityRequest` and `CapabilityInvocation` are
-        // unrelated types. If someone adds `From<&CapabilityRequest>` for
-        // `CapabilityInvocation`, this stops compiling.
-        assert_unrelated(&request_dto(), &authorised());
-    }
-
-    /// Takes a reference to each of two types, to assert they are unrelated.
-    fn assert_unrelated<A, B>(_: &A, _: &B) {}
-
-    /// A real, policy-authorised invocation.
-    fn authorised() -> CapabilityInvocation {
-        CapabilityInvocation::authorise(
-            &PolicySeal::attest("test"),
-            request(DataClass::Public, DataClass::Public),
-            Actor::Human {
-                user: UserId::new("u"),
-                via: AuthChannel::LocalInteractive,
-            },
-            InvocationContext::new("k", 1_000, "c"),
-            proof(),
-        )
-    }
-
-    fn proof() -> AuthorisationProof {
-        AuthorisationProof::issue(&seal(), "v1", None, RiskClass::Low)
-    }
-
-    fn seal() -> PolicySeal {
-        // In-crate, so this is the honest spelling of what `orxnud-policy` does
-        // across the crate boundary.
-        PolicySeal::attest("orxnud-domain-test")
-    }
-
-    fn actor() -> Actor {
-        Actor::Human {
-            user: UserId::new("u"),
-            via: AuthChannel::LocalInteractive,
-        }
-    }
-
-    fn ctx() -> InvocationContext {
-        InvocationContext::new("k", 1000, "c")
     }
 
     #[test]
@@ -606,47 +283,6 @@ mod tests {
     fn public_data_leaves_risk_untouched() {
         let req = request(DataClass::Public, DataClass::Public);
         assert_eq!(req.effective_risk(RiskClass::Medium), RiskClass::Medium);
-    }
-
-    #[test]
-    fn dispatch_view_hides_the_actor() {
-        let inv = CapabilityInvocation::authorise(
-            &seal(),
-            request(DataClass::Public, DataClass::Public),
-            actor(),
-            ctx(),
-            proof(),
-        );
-        let view = inv.dispatch_view();
-        // The actor is reachable on the invocation for audit...
-        assert!(matches!(inv.actor(), Actor::Human { .. }));
-        // ...but the dispatch view has no field that could carry it. This is
-        // the type-level expression of "capabilities are caller-agnostic".
-        let debug = format!("{view:?}");
-        assert!(
-            !debug.contains("Human") && !debug.contains("u\""),
-            "dispatch view leaked actor identity: {debug}"
-        );
-    }
-
-    #[test]
-    fn authorise_records_policy_version_and_risk() {
-        let p = AuthorisationProof::issue(
-            &seal(),
-            "v1",
-            Some(ApprovalDigest::from_bytes([7u8; 32])),
-            RiskClass::Critical,
-        );
-        let inv = CapabilityInvocation::authorise(
-            &seal(),
-            request(DataClass::Sensitive, DataClass::Sensitive),
-            actor(),
-            ctx(),
-            p,
-        );
-        assert_eq!(inv.policy_version(), "v1");
-        assert_eq!(inv.assessed_risk(), RiskClass::Critical);
-        assert_eq!(inv.data_class(), DataClass::Sensitive);
     }
 
     proptest! {

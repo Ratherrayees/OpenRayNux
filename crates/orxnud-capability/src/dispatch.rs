@@ -50,8 +50,9 @@ use std::sync::{Arc, Mutex};
 use orxnud_domain::Actor;
 use orxnud_domain::approval::{ApprovalDigest, ApprovalRecord, NormalizedParams};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::{ActionRequest, CapabilityInvocation, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::platform::{SecretRef, SecretsContract};
+use orxnud_policy::authority::CapabilityInvocation;
 use orxnud_policy::{PolicyEngine, PolicyError};
 
 use crate::credential::{CredentialBroker, CredentialError};
@@ -262,7 +263,7 @@ pub(crate) trait CapabilityAdapter: Send + Sync {
     /// Any failure the adapter reports.
     fn invoke(
         &self,
-        view: &orxnud_domain::invocation::DispatchView<'_>,
+        view: &orxnud_policy::authority::DispatchView<'_>,
         credential: Option<&crate::credential::CredentialHandle>,
     ) -> Result<ExecutionOutcome, String>;
 }
@@ -982,7 +983,9 @@ impl AdapterRegistry {
     }
 
     /// The map the dispatcher holds.
-    pub(crate) fn into_bundles(self) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
+    pub(crate) fn into_bundles(
+        self,
+    ) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
         self.bundles
     }
 
@@ -1194,11 +1197,7 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
     /// Takes an [`AdapterRegistry`] rather than a raw bundle map because the bundle
     /// type is crate-private; see that type for why that is the boundary.
     #[must_use]
-    pub fn new(
-        policy: &'p mut PolicyEngine,
-        secrets: &'p S,
-        registry: AdapterRegistry,
-    ) -> Self {
+    pub fn new(policy: &'p mut PolicyEngine, secrets: &'p S, registry: AdapterRegistry) -> Self {
         Self {
             policy,
             secrets,

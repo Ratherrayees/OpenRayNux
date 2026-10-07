@@ -40,7 +40,7 @@ use serde_json::Value;
 
 use orxnud_domain::enums::{DataClass, IsolationTier, RiskClass};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::{CapabilityInvocation, DispatchView};
+use orxnud_policy::authority::{CapabilityInvocation, DispatchView};
 
 use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 
