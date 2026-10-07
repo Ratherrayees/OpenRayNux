@@ -133,6 +133,11 @@ fn child_main() -> ! {
         e.reserve_effect(
             &key,
             &tid("v93-task"),
+            // This harness drives a single-step task, so the step is 1. Written
+            // explicitly rather than left to a default, because the recovery predicate
+            // now matches on it and a wrong value here would make every crash test
+            // assert the wrong thing.
+            1,
             claimed.attempts,
             effect_step,
             effect_idempotent,
@@ -631,9 +636,25 @@ fn uncertainty_takes_precedence_over_the_retry_budget() {
     {
         let e = open_engine(&db);
         // Exhaust the budget: the pre-fix code dead-lettered here.
+        //
+        // By lowering `max_attempts` rather than raising `attempts`, and for a reason
+        // that is a property of the production system rather than of this test:
+        //
+        // `tasks.attempts` is the counter `take_lease` increments, and `take_lease` only
+        // ever claims a task in state `pending`. A task that is `running` under a lease
+        // therefore cannot be claimed again, so its counter cannot move past the attempt
+        // that was interrupted. Recovery relies on that to identify the interrupted
+        // execution as `(steps_completed + 1, attempts)`.
+        //
+        // Writing `attempts = max_attempts` directly would forge a counter value that no
+        // sequence of claims can produce, and recovery would correctly decline to match
+        // any effect against it. That is not a bug in the matching; it is this test
+        // asserting a state the system cannot reach. Lowering the budget to the attempt
+        // actually made arms the identical `attempts >= max_attempts` branch without
+        // inventing history.
         e.conn()
             .execute(
-                "UPDATE tasks SET attempts = max_attempts WHERE id = 'v93-task';",
+                "UPDATE tasks SET max_attempts = attempts WHERE id = 'v93-task';",
                 [],
             )
             .expect("exhaust the budget");
@@ -784,7 +805,7 @@ fn a_reservation_records_the_effects_repeat_safety() {
     for (step, idempotent) in [("count", true), ("external-call", false)] {
         let key = DurableEngine::idempotency_key(&tid("v93-task"), step, "initial");
         assert!(
-            e.reserve_effect(&key, &tid("v93-task"), 1, step, idempotent, NOW)
+            e.reserve_effect(&key, &tid("v93-task"), 1, 1, step, idempotent, NOW)
                 .expect("reserve"),
             "reserve {step}"
         );
@@ -1024,8 +1045,16 @@ fn an_approval_is_spent_once_and_a_crash_after_it_still_needs_verification() {
         // end first so the engine can be used again.
         let key = DurableEngine::idempotency_key(&tid("v93-task"), "external-call", "1/1");
         assert!(
-            e.reserve_effect(&key, &tid("v93-task"), attempt, "external-call", false, NOW)
-                .expect("reserve"),
+            e.reserve_effect(
+                &key,
+                &tid("v93-task"),
+                1,
+                attempt,
+                "external-call",
+                false,
+                NOW
+            )
+            .expect("reserve"),
             "reserve"
         );
         drop(e);

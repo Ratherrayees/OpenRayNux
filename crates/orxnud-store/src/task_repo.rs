@@ -2911,9 +2911,43 @@ impl<'a> TaskRepository<'a> {
     ///
     /// ## The rule
     ///
-    /// An orphaned task is settled into [`TaskState::NeedsVerification`] **iff** it
-    /// holds at least one effect row that is both **not** `not-performed` **and
-    /// flagged non-idempotent**. Everything else keeps the previous behaviour.
+    /// An orphaned task is settled into [`TaskState::NeedsVerification`] **iff** it holds
+    /// at least one effect row that is **for the execution being recovered** and is both
+    /// **not** `not-performed` **and flagged non-idempotent**. Everything else keeps the
+    /// previous behaviour.
+    ///
+    /// "The execution being recovered" is `(step_no = steps_completed + 1,
+    /// attempt_no = attempts)` — the step the task is on, and the attempt it reached. Both
+    /// are read from the task row inside the same statement, so the scope cannot drift
+    /// from the decision.
+    ///
+    /// This scope is the point, and it is why it is `task` + `step` + `attempt`:
+    ///
+    /// * **`task` alone is wrong.** A verified effect from a *completed earlier step*
+    ///   says nothing about whether the step that just crashed may be retried. Scoping
+    ///   only by task made that earlier evidence decisive, and because
+    ///   `NeedsVerification` is terminal and unclaimable, a single verified
+    ///   `filesystem/read-text` or `filesystem/write-text` in step 1 meant the task could
+    ///   never be recovered again.
+    /// * **`attempt` alone is wrong.** `tasks.attempts` is reset to `0` at every step
+    ///   boundary, so step 1's first attempt and step 2's first attempt are both
+    ///   `attempt_no = 1`. `task_effects` records `attempt_no` and, since version 13,
+    ///   `step_no`; without the step the two are indistinguishable.
+    /// * **`step` alone is wrong.** A step may take several attempts. An attempt that
+    ///   resolved `not-performed` is retryable by design, and a stale row from an earlier
+    ///   attempt of the *same* step must not block it.
+    ///
+    /// ### Rows whose step was never recorded
+    ///
+    /// `task_effects.step_no` is nullable because a row written before version 13 has no
+    /// recorded step, and `NULL` asserts nothing. Such a row is treated as **matching any
+    /// step**, so a task owning one is settled rather than retried.
+    ///
+    /// That is deliberately the expensive direction. The alternative — guessing `1`, as
+    /// migrations 8 and 9 do for tables that predate composition outright — would assert
+    /// a step nobody recorded, and on a multi-step task the guess is wrong often enough
+    /// to matter. Failing safe here costs one human decision per affected task; guessing
+    /// costs an unknown number of duplicated effects.
     ///
     /// Every clause is load-bearing, and the distinctions are the point:
     ///
@@ -2998,6 +3032,9 @@ impl<'a> TaskRepository<'a> {
                      SELECT t.id AS id,
                             CASE WHEN EXISTS (SELECT 1 FROM task_effects e
                                                WHERE e.task_id = t.id
+                                                 AND (e.step_no IS NULL
+                                                      OR e.step_no = t.steps_completed + 1)
+                                                 AND e.attempt_no = t.attempts
                                                  AND e.status <> 'not-performed'
                                                  AND e.idempotent = 0)
                                  THEN 1 ELSE 0 END AS uncertain
@@ -3040,10 +3077,23 @@ impl<'a> TaskRepository<'a> {
 
             // The attempt never finished; record that, so "we do not know whether
             // the work happened" is visible rather than assumed to have succeeded.
+            //
+            // Scoped to the same `(step_no, attempt_no)` the state decision above used,
+            // rather than to `task_id` alone. A task holds one lease, so today only one
+            // attempt can be unfinished -- but "today only one" is a property of the
+            // lease, not of the table, and this statement was relying on it to close
+            // rows it never named. Naming the identity removes the reliance.
+            //
+            // `steps_completed + 1` and `attempts` are read from the task row rather
+            // than passed in, so the scope cannot drift from the scope the decision used:
+            // both come out of the same `tasks` row inside this statement.
             tx.execute(
                 "UPDATE task_attempts
                     SET finished_at_ms = ?2, outcome = 'recovered', error = 'owner lost'
-                  WHERE task_id = ?1 AND finished_at_ms IS NULL;",
+                  WHERE task_id = ?1
+                    AND step_no = (SELECT steps_completed + 1 FROM tasks WHERE id = ?1)
+                    AND attempt_no = (SELECT attempts FROM tasks WHERE id = ?1)
+                    AND finished_at_ms IS NULL;",
                 rusqlite::params![id, now_ms],
             )?;
             log(
@@ -3112,6 +3162,26 @@ impl<'a> TaskRepository<'a> {
     /// transaction as the dispatch decision; this is that row, and `false` is the
     /// caller's signal not to dispatch.
     ///
+    /// # The step number is part of the effect's identity
+    ///
+    /// `step_no` is recorded because `attempt_no` does not identify an attempt on its
+    /// own: `tasks.attempts` counts attempts *within the current logical step* and is
+    /// reset at every step boundary, so step 1's first attempt and step 2's first
+    /// attempt are both `attempt_no = 1`. Without the step, `recover()` cannot tell which
+    /// execution an effect row belongs to, and is forced to reason about the whole task --
+    /// which lets a completed earlier step's effect decide whether a later step may ever
+    /// be retried.
+    ///
+    /// `step_key` is the capability, not a step number, and is kept for what it is: the
+    /// ledger's record of *what* was dispatched.
+    ///
+    /// The argument count is the identity, spelled out: a task, a step, an attempt, a
+    /// capability, and whether that capability may be repeated. Bundling the first three
+    /// into a struct would be tidier and would also make the argument order harder to read
+    /// at the call site, because the whole point of the change is that `step_no` and
+    /// `attempt_no` are both integers that must not be swapped. Every other site in this
+    /// workspace that takes a comparable tuple spells it the same way.
+    #[allow(clippy::too_many_arguments)]
     /// # Errors
     ///
     /// Any SQLite error.
@@ -3119,6 +3189,7 @@ impl<'a> TaskRepository<'a> {
         &mut self,
         idempotency_key: &str,
         task_id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         step_key: &str,
         idempotent: bool,
@@ -3137,11 +3208,13 @@ impl<'a> TaskRepository<'a> {
         // is identified by extended code rather than by substring-matching the message.
         let inserted = match tx.execute(
             "INSERT INTO task_effects
-                (idempotency_key, task_id, attempt_no, step_key, status, idempotent, reserved_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6);",
+                (idempotency_key, task_id, step_no, attempt_no, step_key, status, idempotent,
+                 reserved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7);",
             rusqlite::params![
                 idempotency_key,
                 task_id.as_str(),
+                step_no,
                 attempt_no,
                 step_key,
                 i64::from(idempotent),
@@ -4058,24 +4131,53 @@ pub const APPROVAL_DIGEST_BYTES: usize = 32;
 /// read path upper-cases (`hex()`) while every writer supplies lower-case, and a
 /// round-trip assertion that compares spellings rather than bytes would otherwise fail
 /// for a reason that has nothing to do with correctness.
+/// Decodes an approval digest, or refuses.
+///
+/// # Why the ASCII check comes first
+///
+/// This used to slice `hex` by **byte** index to name the offending character, which
+/// panics when the index lands inside a multi-byte character. The length gates are in
+/// bytes, so a string of 64 *bytes* containing one two-byte character passed them, and
+/// the error path — the only thing that slices — then panicked at a character boundary.
+///
+/// The panic was reachable: 61 ASCII characters followed by a two-byte character and one
+/// more ASCII character is exactly 64 bytes, passes both gates, and puts byte 62 inside
+/// the multi-byte character. It was not reachable from the daemon, whose only production
+/// digest is hex it encoded itself from trusted bytes, but
+/// [`TaskRepository::record_approval`] and [`crate::DurableEngine`] are public, and a
+/// `Result`-returning parser that panics on malformed input is a contract violation
+/// whatever its callers happen to do.
+///
+/// So: reject anything that is not ASCII hex **before** any indexing, and never slice a
+/// `&str` by a byte offset again. The error names a byte value rather than a substring,
+/// which is both safe and more precise about what was wrong.
 fn parse_approval_digest(hex: &str) -> Result<[u8; APPROVAL_DIGEST_BYTES], TaskRepoError> {
-    let bad = |reason: &str| TaskRepoError::InvalidDigest {
-        reason: reason.to_owned(),
-    };
+    let bad = |reason: String| TaskRepoError::InvalidDigest { reason };
 
     if hex.is_empty() {
-        return Err(bad("the digest is empty"));
+        return Err(bad("the digest is empty".to_owned()));
+    }
+    // Before every length check, because every length check below is in bytes and a
+    // multi-byte character would make the byte count disagree with the character count.
+    if !hex.is_ascii() {
+        let at = hex.bytes().position(|b| !b.is_ascii()).unwrap_or(0);
+        let code = u32::from(hex.as_bytes()[at]);
+        return Err(bad(format!(
+            "the digest contains a non-ASCII character; an approval digest is hex, and \
+             hex is ASCII (byte 0x{code:02x} at position {at})"
+        )));
     }
     // Checked before decoding, so the "wrong length" answer is specific rather than a
-    // trailing-nibble accident.
+    // trailing-nibble accident. `is_ascii` has established that byte length and character
+    // length are the same number, so these counts are counts of characters.
     if !hex.len().is_multiple_of(2) {
-        return Err(bad(&format!(
+        return Err(bad(format!(
             "the digest is {} characters, which is not a whole number of bytes",
             hex.len()
         )));
     }
     if hex.len() != APPROVAL_DIGEST_BYTES * 2 {
-        return Err(bad(&format!(
+        return Err(bad(format!(
             "the digest is {} characters; an approval digest is exactly {}",
             hex.len(),
             APPROVAL_DIGEST_BYTES * 2
@@ -4084,15 +4186,19 @@ fn parse_approval_digest(hex: &str) -> Result<[u8; APPROVAL_DIGEST_BYTES], TaskR
 
     let mut out = [0u8; APPROVAL_DIGEST_BYTES];
     for (i, slot) in out.iter_mut().enumerate() {
-        let hi = (hex.as_bytes()[i * 2] as char)
+        // Byte values, never `&str` slices: `hex` is ASCII now, so a byte is a character,
+        // and reading it as a byte cannot be out of bounds for any index this loop makes.
+        let pair = &hex.as_bytes()[i * 2..i * 2 + 2];
+        let hi = (pair[0] as char)
             .to_digit(16)
-            .ok_or_else(|| bad(&format!("{:?} is not a hex digit", &hex[i * 2..i * 2 + 1])))?;
-        let lo = (hex.as_bytes()[i * 2 + 1] as char)
+            .ok_or_else(|| bad(format!("{:#04x} is not a hex digit", pair[0])))?;
+        let lo = (pair[1] as char)
             .to_digit(16)
-            .ok_or_else(|| bad(&format!("{:?} is not a hex digit", &hex[i * 2..i * 2 + 2])))?;
+            .ok_or_else(|| bad(format!("{:#04x} is not a hex digit", pair[1])))?;
         // A nibble pair is at most 0xff, so this cannot overflow; `try_from` makes that
         // explicit rather than relying on the reader to check it.
-        *slot = u8::try_from(hi * 16 + lo).map_err(|_| bad("a hex pair is out of range"))?;
+        *slot =
+            u8::try_from(hi * 16 + lo).map_err(|_| bad("a hex pair is out of range".to_owned()))?;
     }
     Ok(out)
 }
@@ -5269,11 +5375,11 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let first = repo
-            .reserve_effect("key-1", &tid("t"), 1, "step-1", false, NOW)
+            .reserve_effect("key-1", &tid("t"), 1, 1, "step-1", false, NOW)
             .expect("reserve");
         assert!(first.is_some());
         let second = repo
-            .reserve_effect("key-1", &tid("t"), 2, "step-1", false, NOW)
+            .reserve_effect("key-1", &tid("t"), 1, 2, "step-1", false, NOW)
             .expect("reserve");
         assert!(
             second.is_none(),
@@ -5296,7 +5402,7 @@ mod tests {
         {
             let key = format!("k{i}");
             let _ = repo
-                .reserve_effect(&key, &tid("t"), 1, "s", false, NOW)
+                .reserve_effect(&key, &tid("t"), 1, 1, "s", false, NOW)
                 .expect("reserve");
             assert!(
                 repo.resolve_effect(&key, status, None, NOW + 1)
@@ -5315,7 +5421,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", false, NOW)
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Pending, None, NOW)
@@ -5329,7 +5435,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", false, NOW)
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Unknown, None, NOW)
@@ -5351,7 +5457,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", false, NOW)
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(!repo.all_effects_resolved(&tid("t")).expect("resolved?"));
         let _ = repo.resolve_effect("k", EffectStatus::Unknown, None, NOW);
@@ -5800,6 +5906,7 @@ mod tests {
                     &format!("k{i}"),
                     &tid("t"),
                     1,
+                    1,
                     &format!("s{i}"),
                     false,
                     NOW + i,
@@ -5826,6 +5933,194 @@ mod tests {
             .complete(&tid("t"), "w", NOW, TaskState::Pending, false, None)
             .expect_err("must refuse");
         assert!(matches!(err, TaskRepoError::Corrupt(_)), "{err}");
+    }
+
+    // ---------------------------------------------------------- digest parsing
+
+    /// **The panic this exists for.** 64 *bytes* whose 62nd byte is the second half of a
+    /// two-byte character.
+    ///
+    /// The previous parser checked length in bytes, then sliced the string by byte offset
+    /// to name the bad character. Byte 62 here is inside 'e-acute', so that slice panicked
+    /// with "byte index 62 is not a char boundary" instead of returning `InvalidDigest`.
+    ///
+    /// Built as a byte-length construction on purpose: 61 ASCII characters, one two-byte
+    /// character and one more ASCII character is 64 bytes but 63 characters, which is
+    /// exactly how it slipped past both length gates.
+    #[test]
+    fn a_64_byte_digest_with_a_multibyte_character_is_refused_and_does_not_panic() {
+        let mut hex = String::with_capacity(64);
+        hex.push_str(&"a".repeat(61));
+        hex.push('\u{00e9}'); // bytes 61..63, so byte 62 is this character's second half
+        hex.push('a');
+        assert_eq!(
+            hex.len(),
+            APPROVAL_DIGEST_BYTES * 2,
+            "the fixture must satisfy the length gate that used to be checked first"
+        );
+        assert_eq!(
+            hex.chars().count(),
+            63,
+            "and disagree with it -- that disagreement is the bug"
+        );
+
+        // Asserted on the *result*, not merely the absence of a panic: a version that
+        // returned some other error would pass a "did not panic" check.
+        let out = parse_approval_digest(&hex);
+        assert!(
+            matches!(out, Err(TaskRepoError::InvalidDigest { .. })),
+            "a malformed digest must be the documented typed error, got {out:?}"
+        );
+    }
+
+    /// Every shape of malformed input is a typed error, and none panics. A parser that
+    /// panics on caller-controlled bytes is a denial of service on an authority path.
+    #[test]
+    fn malformed_digests_are_always_a_typed_refusal() {
+        // A digest whose 62nd byte falls inside a multi-byte character.
+        let mut boundary_shifting = String::with_capacity(64);
+        boundary_shifting.push_str(&"ab".repeat(30));
+        boundary_shifting.push('a');
+        boundary_shifting.push('\u{00e9}');
+        boundary_shifting.push('a');
+
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("empty", String::new(), false),
+            ("valid lowercase", "ab".repeat(32), true),
+            ("valid uppercase", "AB".repeat(32), true),
+            ("valid mixed case", "aB".repeat(32), true),
+            ("valid all zeros", "0".repeat(64), true),
+            ("valid all fs", "f".repeat(64), true),
+            ("one short", "ab".repeat(16), false),
+            ("one long", "ab".repeat(64), false),
+            ("odd length", "a".repeat(63), false),
+            ("odd length, one over", "a".repeat(65), false),
+            (
+                "invalid ascii g",
+                format!("{}g{}", "ab".repeat(31), "a"),
+                false,
+            ),
+            ("invalid ascii z", "zz".repeat(32), false),
+            ("leading space", format!(" {}", "ab".repeat(32)), false),
+            ("trailing newline", format!("{}\n", "ab".repeat(32)), false),
+            (
+                "internal space",
+                format!("{} {}", "ab".repeat(31), "ab"),
+                false,
+            ),
+            ("trailing nul", format!("{}\0", "ab".repeat(31)), false),
+            (
+                "two-byte e-acute at the end",
+                format!("{}\u{00e9}", "ab".repeat(31)),
+                false,
+            ),
+            ("two-byte, boundary-shifting", boundary_shifting, false),
+            (
+                "three-byte cjk",
+                format!("{}\u{4e2d}", "ab".repeat(31)),
+                false,
+            ),
+            ("emoji", format!("{}\u{1f600}", "ab".repeat(31)), false),
+            (
+                "combining mark",
+                format!("{}\u{0301}", "ab".repeat(31)),
+                false,
+            ),
+            (
+                "latin-1 supplement",
+                format!("{}\u{00ff}", "ab".repeat(31)),
+                false,
+            ),
+            (
+                "mixed valid and multibyte",
+                format!("{}{}", "ab".repeat(31), "\u{00e9}"),
+                false,
+            ),
+            ("all multibyte", "\u{00e9}".repeat(32), false),
+            ("single high byte", "\u{00ff}".to_owned(), false),
+        ];
+
+        for (name, hex, expect_ok) in &cases {
+            let out = parse_approval_digest(hex);
+            if *expect_ok {
+                assert!(out.is_ok(), "{name} must be accepted, got {out:?}");
+            } else {
+                assert!(
+                    matches!(out, Err(TaskRepoError::InvalidDigest { .. })),
+                    "{name} must be InvalidDigest, got {out:?}"
+                );
+            }
+        }
+    }
+
+    /// Uppercase is accepted and decodes to the same bytes as lowercase. A digest is a
+    /// byte string with a hex rendering; treating the two spellings as different values
+    /// would make an approval that verifies in one place fail in another.
+    #[test]
+    fn hex_case_is_a_rendering_not_a_different_value() {
+        let lower = parse_approval_digest(&"ab".repeat(32)).expect("lower");
+        let upper = parse_approval_digest(&"AB".repeat(32)).expect("upper");
+        let mixed = parse_approval_digest(&"aB".repeat(32)).expect("mixed");
+        assert_eq!(lower, upper);
+        assert_eq!(lower, mixed);
+    }
+
+    /// The refusal says which byte and where, so an operator is not left guessing. The
+    /// position is a byte offset, which is where the offending byte lives.
+    #[test]
+    fn a_non_ascii_refusal_names_the_offending_byte() {
+        let mut hex = String::with_capacity(64);
+        hex.push_str(&"ab".repeat(20));
+        hex.push('\u{00e9}'); // byte 40
+        hex.push_str(&"ab".repeat(21));
+        let err = parse_approval_digest(&hex).expect_err("non-ASCII must be refused");
+        let TaskRepoError::InvalidDigest { reason } = err else {
+            panic!("expected InvalidDigest");
+        };
+        assert!(
+            reason.contains("non-ASCII") && reason.contains("40"),
+            "the reason must name the byte and its position, got {reason:?}"
+        );
+    }
+
+    /// The end-to-end shape, so the parser is not only correct in isolation: a refused
+    /// digest leaves **no** row, rather than a row holding a truncated or empty value.
+    #[test]
+    fn a_multibyte_digest_leaves_no_row_rather_than_a_truncated_one() {
+        let mut conn = mem();
+        let mut repo = TaskRepository::new(&mut conn);
+        insert(&mut repo, "t", TaskKind::Workflow);
+        let mut hex = String::with_capacity(64);
+        hex.push_str(&"ab".repeat(30));
+        hex.push('a');
+        hex.push('\u{00e9}');
+        hex.push('a');
+        let err = repo
+            .record_approval(&ApprovalRow {
+                task_id: tid("t"),
+                step_no: 1,
+                attempt_no: 1,
+                digest_hex: hex,
+                capability: "c".to_owned(),
+                target: None,
+                params: "{}".to_owned(),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 60_000,
+                consumed_at_ms: None,
+            })
+            .expect_err("must be refused");
+        assert!(
+            matches!(err, TaskRepoError::InvalidDigest { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            repo.approval_for_attempt(&tid("t"), 1, 1)
+                .expect("read")
+                .is_none(),
+            "a refused digest must leave no row at all: a truncated or empty blob under \
+             the column that binds an approval to the operation it authorises is exactly \
+             what V-94 existed to prevent"
+        );
     }
 
     /// The parser has exactly two answers: the 32 bytes, or a refusal.

@@ -194,10 +194,26 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "task_approval_digest_length",
         sql: crate::schema::MIGRATION_APPROVAL_DIGEST_LENGTH,
     },
+    Migration {
+        // V-93 follow-up. The effect ledger recorded `task_id` and `attempt_no` but not
+        // the logical step, and `attempt_no` restarts at every step boundary -- so two
+        // steps' effects were indistinguishable and `recover()` could only reason about
+        // the whole task. It therefore let a completed earlier step's effect decide
+        // whether a later step could ever be retried, which is permanent, because
+        // `needs-verification` is terminal.
+        //
+        // Nullable rather than defaulted: a row written before this migration has no
+        // recorded step, and `step_no = 1` would assert one. `NULL` says the evidence is
+        // absent, and `recover()` reads it as "might be the execution I am recovering",
+        // which fails safe.
+        version: 13,
+        name: "task_effect_step_scope",
+        sql: crate::schema::MIGRATION_EFFECT_STEP_SCOPE,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 12;
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Applies pending migrations.
 #[derive(Debug)]

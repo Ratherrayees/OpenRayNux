@@ -628,6 +628,71 @@ pub const MIGRATION_EFFECT_IDEMPOTENCY: &str = r#"
 ALTER TABLE task_effects ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Migration 13 — the effect ledger records the logical step it belongs to.
+///
+/// # The defect this corrects
+///
+/// `recover()` decided whether a task held uncertain work by asking whether *any* of
+/// its effect rows was both not `not-performed` and flagged non-idempotent. That is a
+/// question about the whole task, and the answer it needs is about one execution.
+///
+/// The two differ, because `tasks.attempts` counts attempts **within the current logical
+/// step** and is reset to `0` by `complete_verified_step` at every step boundary. So
+/// step 1's first attempt and step 2's first attempt are both `attempt_no = 1`, and
+/// nothing in `task_effects` distinguished them: the table had `task_id`, `attempt_no`
+/// and a `step_key` that holds the *capability id*, not a step number.
+///
+/// The consequence is that a verified, non-idempotent effect from a **completed earlier
+/// step** made the whole task unrecoverable. `filesystem/read-text` and
+/// `filesystem/write-text` both deliberately leave `idempotent` false, so any
+/// multi-step task that had completed a step with either of them could never be
+/// recovered again once a later step crashed. `NeedsVerification` is terminal and
+/// unclaimable, so that is permanent.
+///
+/// # Why the column is nullable rather than defaulted
+///
+/// `step_no INTEGER NOT NULL DEFAULT 1` would be a fabrication: it would assert that
+/// every pre-existing effect belongs to step 1, which is exactly the legacy mapping
+/// migrations 8 and 9 apply to `task_attempts` and `task_proposals` **only** because
+/// those tables were written by a build that predated composition entirely.
+///
+/// The evidence here is weaker. The column that records whether an effect may be
+/// repeated is `idempotent`, added in version 11; before that the ledger recorded only
+/// what the dispatcher had done. So a row can exist whose step was never recorded at
+/// all, and `NULL` says exactly that: *this row's step is not known*. It is a statement
+/// about the absence of evidence, not an invented step number.
+///
+/// `recover()` reads `NULL` as "this row might belong to the execution being recovered"
+/// and therefore fails safe. That is the direction that cannot duplicate an effect, and
+/// it costs at most one human decision per affected task.
+///
+/// # Why `idempotency_key` is not parsed instead
+///
+/// The key already contains the step — it is built as
+/// `{len}/{task}/{capability}/{step}/{attempt}`. Parsing it would avoid a migration and
+/// would be worse: a security decision would then depend on a `format!` in another
+/// crate, and a change to that format would silently change what recovery considers
+/// uncertain. The column is relational for the same reason `task_approvals` and
+/// `task_proposals` carry `step_no` as a column rather than inside a key.
+///
+/// # Why `ALTER TABLE` and not a rebuild
+///
+/// The column is nullable, so it needs no default, and SQLite's `ALTER TABLE ADD COLUMN`
+/// accepts a `CHECK` when every existing row satisfies it — which `NULL` does, via
+/// `step_no IS NULL`. Migrations 9, 10 and 12 had to rebuild their tables because they
+/// were changing a primary key or adding a `CHECK` that `ADD COLUMN` cannot express; this
+/// one can be expressed, so rebuilding would be churn.
+pub const MIGRATION_EFFECT_STEP_SCOPE: &str = r#"
+ALTER TABLE task_effects
+    ADD COLUMN step_no INTEGER CHECK (step_no IS NULL OR step_no >= 1);
+
+-- The identity recovery actually queries: one task, one step, one attempt. The existing
+-- `(task_id, attempt_no)` index cannot serve it, because `attempt_no` alone does not
+-- identify an attempt without the step.
+CREATE INDEX IF NOT EXISTS idx_task_effects_scope
+    ON task_effects (task_id, step_no, attempt_no);
+"#;
+
 /// Migration 12 — the approval digest's length is enforced by the database. V-94.
 ///
 /// Recreates `task_approvals` rather than using `ALTER TABLE`, because SQLite cannot add

@@ -914,17 +914,21 @@ impl TaskService {
     /// # Errors
     ///
     /// [`TaskFault`] if the write fails.
+    /// The identity is spelled out rather than bundled; see the note on
+    /// [`orxnud_store::task_repo::TaskRepository::reserve_effect`].
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_effect(
         &mut self,
         key: &str,
         id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         step_key: &str,
         idempotent: bool,
         now_ms: i64,
     ) -> Result<bool, TaskFault> {
         self.engine
-            .reserve_effect(key, id, attempt_no, step_key, idempotent, now_ms)
+            .reserve_effect(key, id, step_no, attempt_no, step_key, idempotent, now_ms)
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
                 detail: e.to_string(),

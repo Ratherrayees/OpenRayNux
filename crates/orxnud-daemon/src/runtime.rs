@@ -2659,6 +2659,10 @@ async fn execute_proposal<S: SecretsContract>(
         .reserve_effect(
             &effect_key,
             &proposal.task_id,
+            // From the proposal, not recomputed. The proposal is the durable record of
+            // which step and attempt this execution is, and the reservation has to
+            // describe the same execution `recover()` will later ask about.
+            proposal.step_no,
             proposal.attempt_no,
             &proposal.capability,
             idempotent,
