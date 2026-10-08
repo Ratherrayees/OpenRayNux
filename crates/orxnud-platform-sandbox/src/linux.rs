@@ -272,6 +272,33 @@ impl SandboxRunner for BwrapRunner {
         Ok(())
     }
 
+    /// # `Refused` means *before*, and that is checkable rather than promised
+    ///
+    /// This function has one spawn point. Five refusals sit above it — the availability
+    /// check, the limit translation, the "required but nothing named" rule, cgroup
+    /// creation under `Resource::Required`, and command construction — and each is
+    /// textually unreachable from anything below. Two failures sit *below* it, and
+    /// neither may report itself as a refusal:
+    ///
+    /// | below the spawn point | status | why not `Refused` |
+    /// |---|---|---|
+    /// | the supervisor never joins the dedicated cgroup | [`ExecutionStatus::Abandoned`] | a process existed, and up to two seconds of polling passed while it did whatever it did |
+    /// | `try_wait` fails while waiting for the supervisor | [`ExecutionStatus::Killed`] | a process existed and we lost track of it |
+    ///
+    /// This split is what makes the invariant enforceable rather than promised. Both used
+    /// to report [`ExecutionStatus::Refused`], which is a claim that nothing ran, and the
+    /// capability layer turns that claim into *"definitely did not happen, so retrying is
+    /// safe"* — while the membership check can fail *because* the payload joined, ran and
+    /// exited inside the poll interval. The comment that used to assert "every `Err` and
+    /// `Refused` path below is decided before `spawn_supervisor` is reached" was, by
+    /// inspection of this function, false.
+    ///
+    /// # The `unproven` field answers a different question
+    ///
+    /// A non-empty `unproven` means the caller *accepted* best-effort containment and this
+    /// host could not provide it. That is an agreed weakening, recorded so the audit record
+    /// can carry it — not a failure, and never a substitute for
+    /// [`ExecutionStatus::Abandoned`].
     fn run(&self, spec: &SandboxSpec) -> Result<ExecutionResult, SandboxUnavailable> {
         let available = Self::probe();
 
@@ -447,7 +474,23 @@ impl SandboxRunner for BwrapRunner {
             let _ = child.wait();
             drop(owned);
             return Ok(ExecutionResult {
-                status: ExecutionStatus::Refused(SandboxUnavailable::GuaranteeUnavailable {
+                // `Abandoned`, not `Refused`, and this is the site the distinction exists
+                // for. A supervisor was created: `spawn_supervisor` returned `Ok` above,
+                // and up to two seconds elapsed while this function polled for its
+                // membership.
+                //
+                // The poll can fail for reasons that have nothing to do with whether the
+                // payload ran — `contains` swallows every read error, and the loop also
+                // gives up when `try_wait` finds the supervisor *already reaped*, which is
+                // what happens when it joined, ran the payload and exited between two
+                // polls. The kill below is not evidence either: it is issued after the
+                // fact, and on an already-exited supervisor it does nothing.
+                //
+                // Reporting this as `Refused` claimed "nothing ran" for an execution that
+                // may have completed its side effect, and every consumer downstream reads
+                // that claim as permission to repeat the effect. `Abandoned` says what is
+                // actually known: a process existed, and its outcome is not established.
+                status: ExecutionStatus::Abandoned(SandboxUnavailable::GuaranteeUnavailable {
                     guarantee: "OS-enforced resource ceilings",
                     detail,
                 }),
@@ -476,9 +519,26 @@ impl SandboxRunner for BwrapRunner {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) => {}
-                Err(e) => {
+                Err(_errno) => {
+                    // `Killed`, not `SpawnFailed`. `spawn_supervisor` succeeded above, so
+                    // a process exists; `SpawnFailed` is documented as *nothing ran*, and
+                    // losing track of a live supervisor is exactly the case it must not be
+                    // used for. Both reach the capability layer as `Unknown`, so this
+                    // corrects the label rather than the behaviour.
+                    //
+                    // The errno is deliberately dropped. It is the second thing lost here,
+                    // after the process, and every channel this crate has for it is either
+                    // the payload's own stdout/stderr — which would corrupt the record of
+                    // what the payload said — or `unproven`, which means "the caller agreed
+                    // to run without this guarantee" and would turn a fault into an
+                    // agreed degradation. The status is the security-relevant part, and it
+                    // is reported exactly.
+                    //
+                    // The two reader threads are left running: they are bounded, they hold
+                    // no authority, and joining them here would mean blocking in the one
+                    // branch whose whole point is that we have already lost the thread.
                     return Ok(ExecutionResult {
-                        status: ExecutionStatus::SpawnFailed(e.to_string()),
+                        status: ExecutionStatus::Killed,
                         stdout: CapturedStream::empty(),
                         stderr: CapturedStream::empty(),
                         elapsed: started.elapsed(),
@@ -935,6 +995,8 @@ pub fn observed_only_limits() -> ResourceLimits {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // ------------------------------------------- `Refused` means "before", structurally
 
     #[test]
     fn a_relative_program_is_refused_rather_than_reinterpreted() {

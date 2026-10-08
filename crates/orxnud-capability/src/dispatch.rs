@@ -894,9 +894,11 @@ pub enum ExecutionTier {
 /// would let a caller retry a refusal as though retrying could help.
 ///
 /// **A refusal is not automatically a disproof.** This type exists partly to say "nothing
-/// ran", but a backend that panicked reaches the same error type with no such claim —
-/// `execute` may have spawned its child before unwinding — so [`Self::certainty`] is the
-/// field a consumer must read. Treating every `SandboxRefusal` as proof that nothing ran
+/// ran", but a failure the backend cannot place in time reaches the same error type with no
+/// such claim — `execute` is called inside a `catch_unwind`, so a backend that panicked may
+/// have spawned its child before unwinding, and a backend that gives up on a containment
+/// guarantee may have already run the payload before it noticed — so [`Self::certainty`] is
+/// the field a consumer must read. Treating every `SandboxRefusal` as proof that nothing ran
 /// is what previously let a non-idempotent side effect be re-dispatched after a backend
 /// failure nobody could characterise.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -910,12 +912,17 @@ pub struct SandboxRefusal {
     /// Whether this refusal establishes that nothing ran.
     ///
     /// A field rather than an assumption, because the two are not the same and the
-    /// difference decides whether a retry is safe. Every refusal below is decided
-    /// *before* a process exists -- no backend configured, no plan, incomplete
-    /// resource policy, guarantees the host cannot establish, or the backend declining
-    /// to build a spec. One is not: a backend that **panicked** may have spawned its
-    /// child before unwinding, so from the journal alone nothing ran and something ran
-    /// are indistinguishable.
+    /// difference decides whether a retry is safe. `NothingAttempted` is set only where the
+    /// refusal is decided before a process exists -- no backend configured, no plan,
+    /// incomplete resource policy, guarantees the host cannot establish, or the backend
+    /// declining to build a spec -- and the *status* the backend reports for a give-up
+    /// carries the phase as well, so a refusal cannot be built for a phase that has passed.
+    ///
+    /// Two situations are `Unknown` and they are different in cause and identical in
+    /// consequence. A backend that **panicked** may have spawned its child before
+    /// unwinding, and a backend that **gave up** on a guarantee it had promised may have
+    /// already run the payload. From the journal alone, "nothing ran" and "something ran"
+    /// are indistinguishable in both.
     ///
     /// The journal records that difference rather than flattening both to "refused",
     /// because `OutcomeKind::Denied` asserts the capability did not execute and
@@ -1889,7 +1896,8 @@ pub fn terminal_outcome_for_failure(
             ExecutionCertainty::Unknown => (
                 OutcomeKind::Uncertain,
                 Some(format!(
-                    "the execution backend did not report, and a child may have run: {}",
+                    "the execution backend could not establish what it had started, so a child \
+                     may have run and its outcome is not settled: {}",
                     refusal.reason
                 )),
             ),
