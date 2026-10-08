@@ -15,9 +15,12 @@
 //!
 //! # Ordering and atomicity come from SQLite, not from a mutex
 //!
-//! `BEGIN IMMEDIATE` takes the write lock before the sequence number is read, so
-//! two writers cannot both read the same head. `audit_log.seq` is the primary key,
-//! so a stale head fails at insert rather than forking the journal.
+//! `audit_log.seq` is the primary key, so a writer whose idea of the chain head
+//! went stale fails at insert rather than forking the journal -- and it fails with
+//! [`JournalError::PositionTaken`], which names the reason and tells the caller to
+//! reload instead of retrying blindly. Two writers *can* both read the same head;
+//! what they cannot both do is record it.
+//!
 //! `spent_approvals.digest` is the primary key, so single-use approval is one
 //! `INSERT` — not a `SELECT` followed by an `INSERT`, which is race-prone by
 //! construction and would let two dispatches both succeed.
@@ -125,8 +128,24 @@ impl SqliteAuditJournal {
 impl AuditJournal for SqliteAuditJournal {
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
         let unavailable = |e: rusqlite::Error| JournalError::Unavailable(e.to_string());
-        // `IMMEDIATE` before the read: taking the write lock first is what stops
-        // two writers both computing the same successor. See the module docs.
+        // DEFERRED, and it does not need to be anything else. V-95.
+        //
+        // This comment previously said "`IMMEDIATE` before the read: taking the write
+        // lock first is what stops two writers both computing the same successor",
+        // over a `DEFERRED` transaction -- and the claim was wrong twice over. There is
+        // no read in this transaction: its only statement is the `INSERT`, so the write
+        // lock is taken on the first statement either way. And the read that decides the
+        // successor is not here at all -- it belongs to the caller, which must load the
+        // chain head, hash it, and then call `append`.
+        //
+        // That caller's race is real, and the primary key is what resolves it: two
+        // writers that both computed `seq = N` collide, and the loser gets
+        // `JournalError::PositionTaken`, which says its idea of the head was stale and
+        // that it must reload rather than retry blindly. That is a classified refusal
+        // naming the reason -- the same shape `TaskRepository` now produces for a lost
+        // authority race, arrived at by a different mechanism. Fixing it properly would
+        // mean moving the head read inside this transaction, which is a change to the
+        // journal's interface and out of scope for V-95; it is recorded as a follow-up.
         let tx = self.conn.unchecked_transaction().map_err(unavailable)?;
         tx.execute(
             "INSERT INTO audit_log (seq, prev_hash, record_hash, record)
@@ -202,7 +221,7 @@ impl AuditJournal for SqliteAuditJournal {
 ///
 /// # Atomicity
 ///
-/// [`consume`](ApprovalLedger::consume) is one `INSERT`. The primary key does the
+/// [`consume_at`](ApprovalLedger::consume_at) is one `INSERT`. The primary key does the
 /// work: a second insert of the same digest raises a uniqueness violation, which
 /// becomes [`LedgerError::AlreadyConsumed`]. There is no window between "have I
 /// used this?" and "mark it used", which is the window a `SELECT`-then-`INSERT`
@@ -225,8 +244,8 @@ impl SqliteApprovalLedger {
     /// # Concurrency
     ///
     /// Same as [`SqliteAuditJournal::open`]: concurrent opens of one database are
-    /// supported, and concurrent writes are serialised by the write lock plus
-    /// `BEGIN IMMEDIATE`.
+    /// supported. Concurrent writes are serialised by the write lock and the primary key,
+    /// not by a transaction mode -- this type opens no transaction at all.
     ///
     /// # Errors
     ///
@@ -275,20 +294,40 @@ impl SqliteApprovalLedger {
 }
 
 impl ApprovalLedger for SqliteApprovalLedger {
-    fn consume(&mut self, digest: &ApprovalDigest) -> Result<(), LedgerError> {
+    fn consume_at(&mut self, digest: &ApprovalDigest, now_ms: i64) -> Result<(), LedgerError> {
         let unavailable = |e: rusqlite::Error| LedgerError::Unavailable(e.to_string());
-        // One statement. The uniqueness violation *is* the single-use mechanism.
+        // One statement. The uniqueness violation *is* the single-use mechanism, and the
+        // timestamp is written by that same statement -- so there is no window in which a
+        // digest is recorded as spent with no time, or timed with no spend. V-94.
+        //
+        // The violation is classified by *extended* code, not by "is it a constraint
+        // violation". `spent_approvals` has a CHECK on the digest's length, so a
+        // malformed digest would otherwise arrive here as `AlreadyConsumed` -- telling
+        // the caller this approval was already spent, when in fact it was never a
+        // digest. Single-use is a primary-key property and is reported as one.
         self.conn
             .execute(
                 "INSERT INTO spent_approvals (digest, consumed_at_ms) VALUES (?1, ?2);",
-                params![digest.as_bytes().as_slice(), 0_i64],
+                params![digest.as_bytes().as_slice(), now_ms],
             )
             .map(|_| ())
             .map_err(|e| match e {
                 rusqlite::Error::SqliteFailure(f, _)
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation
+                        && f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
                 {
                     LedgerError::AlreadyConsumed
+                }
+                rusqlite::Error::SqliteFailure(f, m)
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    // A constraint that is not the primary key: the row was refused for
+                    // a reason that has nothing to do with a replay, and reporting it as
+                    // one would tell the caller to stop retrying when retrying cannot help.
+                    LedgerError::Unavailable(format!(
+                        "the spent-approval ledger refused the row: {}",
+                        m.unwrap_or_else(|| format!("code {}", f.extended_code))
+                    ))
                 }
                 other => unavailable(other),
             })
@@ -400,13 +439,13 @@ mod tests {
     fn the_ledger_refuses_a_replay_and_accepts_a_distinct_digest() {
         let path = db_path("ledger");
         let mut l = SqliteApprovalLedger::open(&path).expect("open");
-        l.consume(&digest(1)).expect("first");
+        l.consume_at(&digest(1), 0).expect("first");
         assert!(l.is_consumed(&digest(1)).expect("read"));
         assert!(matches!(
-            l.consume(&digest(1)),
+            l.consume_at(&digest(1), 0),
             Err(LedgerError::AlreadyConsumed)
         ));
-        l.consume(&digest(2)).expect("distinct");
+        l.consume_at(&digest(2), 0).expect("distinct");
         assert!(!l.is_consumed(&digest(3)).expect("read"));
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -416,7 +455,7 @@ mod tests {
         let path = db_path("restart");
         {
             let mut l = SqliteApprovalLedger::open(&path).expect("open");
-            l.consume(&digest(9)).expect("consume");
+            l.consume_at(&digest(9), 0).expect("consume");
         }
         let l = SqliteApprovalLedger::open(&path).expect("reopen");
         assert!(
@@ -448,7 +487,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let d = digest(42);
-                    ledger.consume(&d)
+                    ledger.consume_at(&d, 0)
                 })
             })
             .collect();
@@ -663,7 +702,7 @@ mod tests {
             .expect("append afterwards");
         SqliteApprovalLedger::open(&db)
             .expect("ledger afterwards")
-            .consume(&digest(1))
+            .consume_at(&digest(1), 0)
             .expect("consume afterwards");
         let _ = std::fs::remove_dir_all(&dir);
     }

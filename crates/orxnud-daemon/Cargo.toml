@@ -52,6 +52,14 @@ rustls-pki-types = { workspace = true }
 # records it persisted, so it uses the real store rather than a re-implementation
 # of the query.
 orxnud-store = { workspace = true }
+# Dev-only, and for the same reason: the execution-certainty suite drives a dispatch
+# failure through the real reservation, resolution and recovery against a real file,
+# which is the only way to assert that a verdict reaches `needs-verification` rather
+# than only that a function returns a value. Opening the file is a `rusqlite`
+# operation and the store does not re-export the handle type. `orxnud-capability` and
+# `orxnud-task` already take the same dev-dependency for the same reason, and G2 reads
+# `[dependencies]` only, so this cannot widen the layer graph.
+rusqlite = { workspace = true }
 
 # The one canonical long-lived process. `orxnuctl` is the command-line client and
 # depends only on `orxnud-protocol`, so the two do not compete for the same role.

@@ -22,14 +22,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use orxnud_capability::credential::CredentialHandle;
-use orxnud_capability::dispatch::{AdapterBundle, CapabilityAdapter};
-use orxnud_capability::verification::{
-    ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
-};
+use crate::credential::CredentialHandle;
+use crate::dispatch::{AdapterBundle, CapabilityAdapter};
+use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 use orxnud_domain::enums::DataClass;
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::DispatchView;
+use orxnud_policy::authority::DispatchView;
 
 /// Shared recorder, so a test can assert on how many times an adapter ran.
 #[derive(Debug, Default)]
@@ -56,6 +54,22 @@ pub enum VerifyMode {
     Refutes,
     /// Cannot run.
     Unavailable,
+    /// Refutes **whatever the execution did**, including after the capability failed or
+    /// went silent. The inadmissible-finding case.
+    ///
+    /// # Why this is a separate mode and not a flag
+    ///
+    /// Every other mode here reads `execution`, because a verifier that ignored it could
+    /// confirm an effect that never happened. This one is the opposite mistake and the
+    /// more dangerous one: it produces a *true sentence about the world* — "the effect is
+    /// not there" — from an execution that may have produced the effect, and
+    /// `Refuted` is the single finding the effect ledger turns into `not-performed`,
+    /// which is the only status recovery reads as "a repeat cannot duplicate anything".
+    ///
+    /// It is the shape a real verifier takes when written as "the target must not hold
+    /// the old bytes": absent and never-written look identical to it. So it is a fixture
+    /// the dispatcher has to survive, not an error case.
+    RefutesRegardless,
 }
 
 /// Pairs an adapter with a verifier.
@@ -90,7 +104,15 @@ impl Verifier for ModeVerifier {
     ) -> Result<VerificationOutcome, VerifyError> {
         // A verifier that ignored the execution outcome could confirm an effect that
         // never happened. Every mode below reads it.
-        if let ExecutionOutcome::Failed { .. } | ExecutionOutcome::Unknown { .. } = execution {
+        //
+        // `RefutesRegardless` is the documented exception, and it is an exception to the
+        // *fixture's* discipline rather than to the dispatcher's: the point is to hand the
+        // dispatcher an inadmissible finding and require it to refuse one, so the mode has
+        // to be able to produce it. Nothing downstream of `verify` is expected to take
+        // this at face value.
+        if !matches!(self.0, VerifyMode::RefutesRegardless)
+            && let ExecutionOutcome::Failed { .. } | ExecutionOutcome::Unknown { .. } = execution
+        {
             return Ok(VerificationOutcome::Undetermined {
                 reason: "execution did not report success".into(),
             });
@@ -99,7 +121,7 @@ impl Verifier for ModeVerifier {
             VerifyMode::Confirms => VerificationOutcome::Verified {
                 evidence: "the fixture confirms".into(),
             },
-            VerifyMode::Refutes => VerificationOutcome::Refuted {
+            VerifyMode::Refutes | VerifyMode::RefutesRegardless => VerificationOutcome::Refuted {
                 evidence: "the fixture refutes: the effect did not occur".into(),
             },
             VerifyMode::Unavailable => {
@@ -133,8 +155,19 @@ impl<A: CapabilityAdapter + 'static> Bundle<A> {
     pub fn unverifiable(adapter: A) -> Self {
         Self::new(adapter, VerifyMode::Unavailable)
     }
+    /// A bundle whose verifier refutes whatever the execution did.
+    pub fn refuting_regardless(adapter: A) -> Self {
+        Self::new(adapter, VerifyMode::RefutesRegardless)
+    }
     pub fn into_arc(self) -> Arc<dyn AdapterBundle + Send + Sync> {
         Arc::new(self)
+    }
+    /// Which verdict this bundle's verifier will reach for.
+    ///
+    /// For a bundle that supplies its own plan (and so cannot be cloned by
+    /// construction), which needs to forward the mode to the plan-carrying half.
+    pub fn mode(&self) -> VerifyMode {
+        self.mode
     }
 }
 
@@ -249,7 +282,7 @@ impl CapabilityAdapter for SuccessfulAdapter {
         self.saw_credential
             .store(credential.is_some(), Ordering::SeqCst);
         Ok(ExecutionOutcome::Succeeded {
-            output: Some(format!("ran step {} of {}", view.step, view.capability)),
+            output: Some(format!("ran step {} of {}", view.step(), view.capability())),
         })
     }
 }
@@ -497,4 +530,211 @@ pub fn helper_path() -> PathBuf {
 #[must_use]
 pub fn sandbox_helpers_dir() -> PathBuf {
     helper_path().parent().expect("dir").to_path_buf()
+}
+
+/// A genuinely policy-authorised invocation for `capability`.
+///
+/// # Why this helper exists
+///
+/// `CapabilityInvocation::authorise` and `AuthorisationProof::issue` are now
+/// `pub(crate)` in `orxnud-policy`. This crate cannot build authority, which is the
+/// boundary — so a test here that needs a `DispatchView` must obtain one the only way
+/// any caller can: by asking policy to authorise an action.
+///
+/// That makes these tests *stronger* than the fixtures they replace. They used to
+/// hand-build a `DispatchView` with `pub` fields, which asserted only that an adapter
+/// behaved when handed whatever the test felt like. This asserts the adapter behaves
+/// when handed something policy actually authorised.
+pub fn authorised_invocation(
+    capability: &str,
+    params: &serde_json::Value,
+) -> orxnud_policy::authority::CapabilityInvocation {
+    use orxnud_domain::DataClass;
+    use orxnud_domain::ids::{CapabilityId, RunId, TaskId, UserId};
+
+    let id = CapabilityId::new(capability);
+    let grant = orxnud_policy::policy_set::Grant {
+        id: orxnud_domain::ids::GrantId::new("g-test"),
+        granted_by: UserId::new("u-1"),
+        capability: id.clone(),
+        max_data_class: DataClass::Personal,
+        may_grant: false,
+        expires_at_ms: i64::MAX,
+        revoked: false,
+    };
+    let mut engine = orxnud_policy::PolicyEngine::new(
+        orxnud_policy::PolicySet::deny_all("test-v1").with_grant(grant),
+        orxnud_policy::budget::BudgetLedger::empty().with_global(10_000),
+        "test-v1",
+    );
+    // Low risk and no egress, so no approval is required: these tests are about the
+    // adapter contract, not about the approval path.
+    engine.register(orxnud_policy::CapabilityDeclaration::new(
+        id.clone(),
+        orxnud_domain::enums::RiskClass::Low,
+        DataClass::Personal,
+        false,
+        1,
+    ));
+
+    let request = orxnud_domain::ActionRequest::new(
+        TaskId::new("t"),
+        RunId::new("r"),
+        0,
+        id,
+        params.clone(),
+        DataClass::Public,
+        DataClass::Public,
+    );
+    engine
+        .authorise_for_dispatch(
+            request,
+            orxnud_domain::Actor::Human {
+                user: UserId::new("u-1"),
+                via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+            },
+            orxnud_domain::InvocationContext::new("k", 30_000, "c"),
+            None,
+            orxnud_domain::NormalizedParams::canonical(params.to_string()),
+            None,
+            1,
+        )
+        .expect("a granted capability must be authorised")
+        .invocation
+}
+
+/// Runs `f` with a `DispatchView` the governed path produced.
+///
+/// The closure form is what makes the borrow work: the view borrows the invocation, so
+/// the invocation has to outlive it, and returning the view would not be possible.
+pub fn with_dispatch_view<R>(
+    capability: &str,
+    params: &serde_json::Value,
+    f: impl FnOnce(&orxnud_policy::authority::DispatchView<'_>) -> R,
+) -> R {
+    let invocation = authorised_invocation(capability, params);
+    f(&invocation.dispatch_view())
+}
+
+/// An execution backend that never runs anything.
+///
+/// For tests whose subject is what happens **before** execution — the classification of
+/// a refusal, the disposition recorded for it — and which would otherwise be blocked at
+/// "no execution backend is configured" before reaching the stage under test. `execute`
+/// panics rather than returning a report, so a test that accidentally gets past the
+/// check it meant to fail at fails loudly instead of quietly measuring a successful run.
+pub struct StubBackend;
+
+impl crate::dispatch::ExecutionBackend for StubBackend {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        panic!("StubBackend::execute must not be reached by a test that stops before execution")
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}
+
+/// A Tier-1 backend that performs a **real side effect** and then reports nothing.
+///
+/// # Why this exists
+///
+/// The defect this suite guards against was a *phase* error: a backend failure was
+/// recorded as "nothing ran", so a capability whose side effect may already be on disk
+/// became re-dispatchable. Proving that requires a backend that genuinely produces an
+/// effect, because a fixture that only returns an error proves nothing about the world.
+///
+/// So this writes a real file, then returns `SandboxRefusal` with
+/// `ExecutionCertainty::Unknown` — exactly the shape a `catch_unwind` around a panicking
+/// backend produces, and the one event that must never be recorded as a disproof.
+///
+/// `certainty: Unknown` is hardcoded rather than inferred. Nothing in this crate can know
+/// where a real backend panicked, and inferring it would be exactly the mistake under
+/// test.
+pub struct EffectThenUnknownBackend {
+    /// Where the side effect is written.
+    pub path: std::path::PathBuf,
+    /// What is written, so the test can prove the effect happened.
+    pub contents: &'static str,
+}
+
+impl crate::dispatch::ExecutionBackend for EffectThenUnknownBackend {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        std::fs::write(&self.path, self.contents).expect("the simulated side effect must land");
+        Err(crate::dispatch::SandboxRefusal {
+            capability: orxnud_domain::ids::CapabilityId::new("filesystem/write-text"),
+            reason: "the execution backend panicked after starting the capability".to_owned(),
+            missing: vec!["a functioning execution backend"],
+            certainty: crate::dispatch::ExecutionCertainty::Unknown,
+        })
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}
+
+/// A Tier-1 backend that refuses **before** doing anything, carrying the certainty that
+/// says so.
+///
+/// The counterpart to [`EffectThenUnknownBackend`], and the reason a test can tell the
+/// two `SandboxRefused` shapes apart by observation rather than by reading the type: this
+/// one leaves no file behind.
+pub struct RefuseBeforeEffectBackend {
+    /// Where a file would have been written, had the backend proceeded.
+    pub path: std::path::PathBuf,
+}
+
+impl crate::dispatch::ExecutionBackend for RefuseBeforeEffectBackend {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        Err(crate::dispatch::SandboxRefusal::nothing_attempted(
+            orxnud_domain::ids::CapabilityId::new("filesystem/write-text"),
+            "no execution backend is configured, so a Tier-1 capability cannot be sandboxed",
+            vec!["a sandbox execution backend"],
+        ))
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}
+
+/// A Tier-1 backend that returns a chosen [`crate::dispatch::ExecutionOutcomeKind`].
+///
+/// The only way to reach a *specific* execution outcome through the real dispatcher,
+/// because `outcome_from_report` collapses the sandbox's status vocabulary down to three
+/// `ExecutionOutcome` values and tests need all three -- including the two post-start ones
+/// (`TimedOut`, `Killed`, `Cancelled`, `OutputCapped` all arrive as `Unknown`) that a
+/// refusal-shaped backend cannot produce at all, since a refusal is an `Err` and never
+/// becomes a report.
+pub struct ReportsStatus(pub crate::dispatch::ExecutionOutcomeKind);
+
+impl crate::dispatch::ExecutionBackend for ReportsStatus {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        Ok(crate::dispatch::ExecutionReport {
+            exit_code: match self.0 {
+                crate::dispatch::ExecutionOutcomeKind::Exited(c) => Some(c),
+                _ => None,
+            },
+            stdout: String::new(),
+            stderr: String::new(),
+            status: self.0,
+        })
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
 }

@@ -52,10 +52,7 @@ pub use ids::{
     CapabilityId, ExternalSource, GrantId, RequestId, RunId, ScheduleId, TaskId, UserId, WorkflowId,
 };
 pub use intent::{IntentKind, Proposal, ProposedStep};
-pub use invocation::{
-    ActionRequest, AuthorisationProof, CapabilityInvocation, CapabilityRequest, DispatchView,
-    InvocationContext, PolicySeal,
-};
+pub use invocation::{ActionRequest, CapabilityRequest, InvocationContext};
 pub use platform::{FsContract, NotificationRequest, NotifyContract, SecretRef, SecretsContract};
 pub use schema::{ParamField, ParamKind, ParamSchema, ParamSpec, TargetSemantics};
 pub use security_state::{

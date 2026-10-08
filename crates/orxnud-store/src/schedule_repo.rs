@@ -102,6 +102,54 @@ pub struct ScheduleRepository<'a> {
     conn: &'a mut Connection,
 }
 
+/// Inserts a fire row, distinguishing the expected duplicate from every other failure.
+///
+/// V-94. `insert_fire` and `record_fire_with_task` used `INSERT OR IGNORE`, which
+/// resolves a primary-key collision, a NOT NULL failure and a CHECK failure identically:
+/// the row is skipped and the statement reports zero rows. The caller then read that
+/// zero as `AlreadyPresent`.
+///
+/// That is not a cosmetic mislabel here. The scheduler counts a duplicate and still
+/// advances `last_fired_ms` past that occurrence, so an occurrence whose insert was
+/// *rejected* rather than *deduplicated* would be lost permanently with no error
+/// anywhere -- the next catch-up pass would see the same rejected insert and report it
+/// as a duplicate again.
+///
+/// A plain `INSERT` separates the two. The primary key is `(schedule_id, fire_time_ms)`,
+/// so its violation is the documented duplicate, and anything else is an error the
+/// caller must see. A foreign-key failure was already *not* swallowed by `OR IGNORE` --
+/// SQLite does not resolve those -- so this closes the remaining families rather than
+/// introducing a new behaviour.
+fn insert_fire_row(
+    conn: &Connection,
+    fire: &ScheduleFire,
+    now_ms: i64,
+) -> Result<FireInsert, ScheduleRepoError> {
+    match conn.execute(
+        "INSERT INTO schedule_fires
+            (schedule_id, fire_time_ms, catch_up, task_id, created_at_ms)
+         VALUES (?1, ?2, ?3, NULL, ?4);",
+        rusqlite::params![
+            fire.schedule.as_str(),
+            fire.fire_time_ms,
+            fire.catch_up,
+            now_ms
+        ],
+    ) {
+        Ok(1) => Ok(FireInsert::Inserted),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+                && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
+        {
+            Ok(FireInsert::AlreadyPresent)
+        }
+        Err(e) => Err(ScheduleRepoError::Sqlite(e)),
+        // A single-row INSERT that reports anything else is a statement this build does
+        // not understand; reported rather than rounded to one of the two answers above.
+        Ok(_) => Err(ScheduleRepoError::Sqlite(rusqlite::Error::InvalidQuery)),
+    }
+}
+
 impl<'a> ScheduleRepository<'a> {
     /// Wraps a connection.
     #[must_use]
@@ -226,22 +274,7 @@ impl<'a> ScheduleRepository<'a> {
         fire: &ScheduleFire,
         now_ms: i64,
     ) -> Result<FireInsert, ScheduleRepoError> {
-        let changed = self.conn.execute(
-            "INSERT OR IGNORE INTO schedule_fires
-                (schedule_id, fire_time_ms, catch_up, task_id, created_at_ms)
-             VALUES (?1, ?2, ?3, NULL, ?4);",
-            rusqlite::params![
-                fire.schedule.as_str(),
-                fire.fire_time_ms,
-                fire.catch_up,
-                now_ms
-            ],
-        )?;
-        Ok(if changed == 0 {
-            FireInsert::AlreadyPresent
-        } else {
-            FireInsert::Inserted
-        })
+        insert_fire_row(self.conn, fire, now_ms)
     }
 
     /// Links a fire to the task that will run it.
@@ -319,7 +352,7 @@ impl<'a> ScheduleRepository<'a> {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let changed = tx.execute(
-            "INSERT OR IGNORE INTO schedule_fires
+            "INSERT INTO schedule_fires
                 (schedule_id, fire_time_ms, catch_up, task_id, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5);",
             rusqlite::params![
@@ -329,13 +362,23 @@ impl<'a> ScheduleRepository<'a> {
                 task.as_str(),
                 now_ms
             ],
-        )?;
+        );
+        // Same classification as `insert_fire`, and for the same reason: a zero row count
+        // here used to be read as "this occurrence was already recorded", which the
+        // scheduler acts on by advancing past it. V-94.
+        let outcome = match changed {
+            Ok(1) => FireInsert::Inserted,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation
+                    && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
+            {
+                FireInsert::AlreadyPresent
+            }
+            Err(e) => return Err(ScheduleRepoError::Sqlite(e)),
+            Ok(_) => return Err(ScheduleRepoError::Sqlite(rusqlite::Error::InvalidQuery)),
+        };
         tx.commit()?;
-        Ok(if changed == 0 {
-            FireInsert::AlreadyPresent
-        } else {
-            FireInsert::Inserted
-        })
+        Ok(outcome)
     }
 
     /// The highest fire time already recorded for a schedule, if any.

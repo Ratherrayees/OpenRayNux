@@ -281,7 +281,7 @@ fn an_idempotency_key_survives_a_restart_and_still_deduplicates() {
         let _ = e.claim_task("w", NOW).expect("claim");
         let k = DurableEngine::idempotency_key(&tid("t"), "charge-card", "initial");
         assert!(
-            e.reserve_effect(&k, &tid("t"), 1, "charge-card", NOW)
+            e.reserve_effect(&k, &tid("t"), 1, 1, "charge-card", false, NOW)
                 .expect("reserve")
         );
         k
@@ -289,7 +289,7 @@ fn an_idempotency_key_survives_a_restart_and_still_deduplicates() {
     for _ in 0..2 {
         let mut e = open_engine(&db);
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 1, "charge-card", NOW)
+            !e.reserve_effect(&key, &tid("t"), 1, 1, "charge-card", false, NOW)
                 .expect("reserve"),
             "a reservation must survive any number of restarts"
         );
@@ -313,7 +313,9 @@ fn a_different_step_gets_a_different_key_across_a_restart() {
             &DurableEngine::idempotency_key(&tid("t"), "a", "initial"),
             &tid("t"),
             1,
+            1,
             "a",
+            false,
             NOW
         )
         .expect("a")
@@ -325,7 +327,9 @@ fn a_different_step_gets_a_different_key_across_a_restart() {
             &DurableEngine::idempotency_key(&tid("t"), "b", "initial"),
             &tid("t"),
             1,
+            1,
             "b",
+            false,
             NOW
         )
         .expect("b"),
@@ -348,8 +352,16 @@ fn an_effect_recorded_as_unknown_is_not_reported_as_a_success() {
     let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
     let key = DurableEngine::idempotency_key(&tid("t"), "remote-call", "initial");
     assert!(
-        e.reserve_effect(&key, &tid("t"), claimed.attempts, "remote-call", NOW)
-            .expect("reserve")
+        e.reserve_effect(
+            &key,
+            &tid("t"),
+            1,
+            claimed.attempts,
+            "remote-call",
+            false,
+            NOW
+        )
+        .expect("reserve")
     );
     assert!(
         e.resolve_effect(&key, EffectStatus::Unknown, Some("timeout"), NOW + 1)
@@ -387,7 +399,7 @@ fn an_uncertain_effect_is_recorded_before_the_verification_state() {
     let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
     let key = DurableEngine::idempotency_key(&tid("t"), "remote", "initial");
     assert!(
-        e.reserve_effect(&key, &tid("t"), claimed.attempts, "remote", NOW)
+        e.reserve_effect(&key, &tid("t"), 1, claimed.attempts, "remote", false, NOW)
             .expect("reserve")
     );
     assert!(

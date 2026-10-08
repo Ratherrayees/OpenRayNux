@@ -96,7 +96,7 @@ command must reach the platform store directly rather than have a credential cro
 socket. The live rule is `CLI_ALLOWED_INTERNAL` in `scripts/ci-gates.sh`. The amendment
 note above is preserved because the Phase 1 record should show what was agreed then;
 ADR-0040 records the change and its reasoning. The purpose is unchanged — a CLI cannot reimplement a rule it cannot see — and opening the approved socket is not such a rule |
-| `cfg(target_os)` / `cfg(windows)` / `env::consts::OS` appear **only** in `orxnud-platform-*` | **CI grep gate** (see §5) |
+| `cfg(target_os)` / `cfg(windows)` / `env::consts::OS` appear **only** in `orxnud-platform-*` | **CI gate G3** (see §5), self-tested |
 | The portable core builds with no platform crate available | **CI check:** `cargo check -p orxnud-domain -p orxnud-protocol --target wasm32-unknown-unknown` (or equivalent), proving the boundary is real rather than asserted |
 
 ---
@@ -153,7 +153,7 @@ Phase 1's job is to make violations **fail the build**, not to document them.
 | Supply chain | `cargo deny check` | advisories, unapproved licences, duplicates, bans |
 | Vulns | `cargo audit` | any known advisory |
 | Semver | `cargo semver-checks` | breaking change without a major bump |
-| **Platform boundary** | **CI grep:** `cfg(target_os)` / `cfg(windows)` / `std::env::consts::OS` outside `orxnud-platform-*` | a platform branch in the portable core |
+| **Platform boundary** | **CI gate G3:** any `cfg`/`cfg_attr` predicate naming a platform key at any nesting depth, `env::consts`, or a `std::os::{unix,windows}` path, outside `orxnud-platform-*` | a platform branch in the portable core |
 | **Copyleft** | `cargo deny` licence allowlist — **no GPL/AGPL/NC in any crate** | a licence regression (ADR-0006, ADR-0019) |
 | **Portable core** | `cargo check` of domain+protocol for a target with no platform crates | an accidental platform dependency |
 | **No `unsafe`** | Phase 1 target: **zero** `unsafe` blocks outside `platform-*` | any `unsafe` in the core (ADR: `08-…` §14) |

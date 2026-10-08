@@ -42,12 +42,16 @@ pub mod text;
 pub mod verification;
 pub mod write_text;
 
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+pub(crate) mod suites;
+
 use std::collections::BTreeMap;
 
 use orxnud_domain::Actor;
 use orxnud_domain::enums::{DataClass, IsolationTier, RiskClass};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::{CapabilityInvocation, DispatchView};
+use orxnud_policy::authority::{CapabilityInvocation, DispatchView};
 use serde::{Deserialize, Serialize};
 
 /// What a capability declares about itself.
@@ -184,70 +188,6 @@ impl CapabilityDeclaration {
     #[must_use]
     pub fn effective_class(&self) -> DataClass {
         self.reads.combine(self.writes)
-    }
-}
-
-/// What a capability implementation provides.
-///
-/// The contract is deliberately narrow: it receives a [`DispatchView`], which
-/// **does not carry the actor**. A capability that learns who is calling it
-/// becomes a confused deputy able to reuse one caller's authority for another's
-/// request (ADR-0027, control S8).
-///
-/// # Errors
-///
-/// Any failure the capability reports, including one it invents. The dispatcher
-/// does not interpret adapter failures as permission failures; a capability that
-/// cannot do the work fails the *work*, not the *policy*.
-pub trait CapabilityContract {
-    /// Runs the capability.
-    fn invoke(&self, view: &DispatchView<'_>) -> Result<CapabilityOutcome, CapabilityError>;
-}
-
-/// What a capability returns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CapabilityOutcome {
-    /// The value produced. `None` for a capability with no result.
-    pub value: Option<serde_json::Value>,
-    /// Whether the caller should treat the effect as having happened.
-    ///
-    /// `false` means *unknown*, which is not the same as "did not happen". This
-    /// distinction is what TP-12 exists to preserve: an unknown outcome must be
-    /// recorded as unknown, never silently reported as success.
-    pub effect_observed: bool,
-    /// A short, redacted description for the audit trail. Never a secret.
-    pub detail: Option<String>,
-}
-
-impl CapabilityOutcome {
-    /// An outcome whose effect is known to have occurred.
-    #[must_use]
-    pub fn observed(value: serde_json::Value) -> Self {
-        Self {
-            value: Some(value),
-            effect_observed: true,
-            detail: None,
-        }
-    }
-
-    /// An outcome whose effect is **unknown**.
-    #[must_use]
-    pub fn uncertain() -> Self {
-        Self {
-            value: None,
-            effect_observed: false,
-            detail: None,
-        }
-    }
-
-    /// An outcome known *not* to have occurred.
-    #[must_use]
-    pub fn not_performed(detail: impl Into<String>) -> Self {
-        Self {
-            value: None,
-            effect_observed: false,
-            detail: Some(detail.into()),
-        }
     }
 }
 
@@ -433,12 +373,6 @@ impl Dispatcher {
             view: invocation.dispatch_view(),
         })
     }
-
-    /// The invocation projection an adapter would receive.
-    #[must_use]
-    pub fn view_for<'i>(&self, invocation: &'i CapabilityInvocation) -> DispatchView<'i> {
-        invocation.dispatch_view()
-    }
 }
 
 /// An invocation that passed every admissibility check.
@@ -449,11 +383,41 @@ impl Dispatcher {
 #[derive(Debug, Clone)]
 pub struct ResolvedDispatch<'a> {
     /// Which capability to run.
-    pub capability: CapabilityId,
+    capability: CapabilityId,
     /// Who is acting. For audit only.
-    pub actor: Actor,
+    actor: Actor,
     /// What the adapter receives. Contains no actor.
-    pub view: DispatchView<'a>,
+    ///
+    /// Private because a `DispatchView` is the argument to adapter execution, and
+    /// adapter execution is now crate-private. A public field here would hand every
+    /// caller the one value `CapabilityAdapter::invoke` takes — which is the
+    /// capability execution boundary this crate enforces by privacy rather than by
+    /// asking callers not to.
+    ///
+    /// `dead_code` is accurate and load-bearing rather than suppressed: the
+    /// Phase-1 admissibility check this type belongs to is exercised only by this
+    /// module's own test, and the governed path builds the same projection itself in
+    /// `dispatch::Dispatcher::dispatch`. The field is kept because the type is
+    /// documented surface (`orxnud-capability::Dispatcher` is named in the daemon's
+    /// architecture notes), and it is kept *unreadable from outside* because that is
+    /// the invariant. Deleting it would be a separate decision about a Phase-1
+    /// leftover, not part of sealing execution.
+    #[allow(dead_code)]
+    view: DispatchView<'a>,
+}
+
+impl<'a> ResolvedDispatch<'a> {
+    /// Which capability this dispatch will run.
+    #[must_use]
+    pub fn capability(&self) -> &CapabilityId {
+        &self.capability
+    }
+
+    /// Who is acting. For the audit record; never for an adapter.
+    #[must_use]
+    pub fn actor(&self) -> &Actor {
+        &self.actor
+    }
 }
 
 impl ResolvedDispatch<'_> {
@@ -471,9 +435,7 @@ impl ResolvedDispatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orxnud_domain::PolicySeal;
     use orxnud_domain::actor::{Actor, AuthChannel};
-    use orxnud_domain::approval::ApprovalDigest;
     use orxnud_domain::ids::{RunId, TaskId, UserId};
     use orxnud_domain::invocation::{ActionRequest, InvocationContext};
     use proptest::prelude::*;
@@ -501,25 +463,74 @@ mod tests {
         )
     }
 
-    /// Builds an invocation the way `orxnud-policy` does. This is test-only
-    /// scaffolding: gate G2 forbids this spelling outside the policy crate.
+    /// A genuinely policy-authorised invocation, obtained the only way one can be.
+    ///
+    /// This helper used to mint one directly, via `PolicySeal::attest` plus the
+    /// `pub` `AuthorisationProof::issue` and `CapabilityInvocation::authorise`. Both
+    /// constructors are now `pub(crate)` in `orxnud-policy`, so this crate cannot
+    /// build authority at all — which is the boundary this change exists to establish.
+    ///
+    /// Obtaining one therefore means asking policy, which is both the only route and a
+    /// better test: it exercises the real grant check rather than asserting that a
+    /// hand-built token looks like an authorised one.
     fn authorised(capability: &str, class: DataClass) -> CapabilityInvocation {
         let mut req = request(class);
         req.capability = cap(capability);
-        let seal = PolicySeal::attest("orxnud-capability-test");
-        let proof = orxnud_domain::AuthorisationProof::issue(
-            &seal,
+        let grant = orxnud_policy::policy_set::Grant {
+            id: orxnud_domain::ids::GrantId::new("g-1"),
+            granted_by: orxnud_domain::ids::UserId::new("u-1"),
+            capability: req.capability.clone(),
+            max_data_class: DataClass::Regulated,
+            may_grant: false,
+            expires_at_ms: i64::MAX,
+            revoked: false,
+        };
+        let mut engine = orxnud_policy::PolicyEngine::new(
+            orxnud_policy::PolicySet::deny_all("v1").with_grant(grant),
+            orxnud_policy::budget::BudgetLedger::empty().with_global(1_000),
             "v1",
-            Some(ApprovalDigest::from_bytes([1u8; 32])),
-            RiskClass::Medium,
         );
-        CapabilityInvocation::authorise(
-            &seal,
-            req,
-            actor(),
-            InvocationContext::new("k", 1_000, "c"),
-            proof,
-        )
+        // Policy refuses a capability it has no declaration for (`UnknownCapability`),
+        // so the grant alone is not enough. Low risk and no egress, so no approval is
+        // needed: these tests are about the registry, not the approval path.
+        engine.register(orxnud_policy::CapabilityDeclaration::new(
+            req.capability.clone(),
+            orxnud_domain::enums::RiskClass::Low,
+            class,
+            false,
+            1,
+        ));
+        let actor = actor();
+        let params = orxnud_domain::NormalizedParams::canonical("{}".to_owned());
+        // A grant alone is not sufficient at the class these tests use: regulated data
+        // escalates the effective risk to High, and High requires an approval. So the
+        // helper mints one the way the daemon does, through `issue_approval` with a
+        // grant-capable approver. That is more of the real pipeline than the fixture it
+        // replaces, and it is the only way to obtain an invocation at this class now
+        // that `authorise` is `pub(crate)`.
+        let approval = orxnud_policy::issue_approval(
+            &actor,
+            &actor,
+            &req.capability,
+            None,
+            &params,
+            0,
+            i64::MAX,
+            orxnud_domain::enums::RiskClass::High,
+            1,
+        );
+        engine
+            .authorise_for_dispatch(
+                req,
+                actor,
+                InvocationContext::new("k", 1_000, "c"),
+                None,
+                params,
+                Some(&approval),
+                1,
+            )
+            .expect("a granted capability must be authorised")
+            .invocation
     }
 
     #[test]
@@ -624,18 +635,6 @@ mod tests {
         assert!(!d.enabled);
         assert_eq!(d.effective_class(), DataClass::Public);
         assert_eq!(d.risk, RiskClass::Medium);
-    }
-
-    #[test]
-    fn an_uncertain_outcome_is_not_a_success() {
-        let u = CapabilityOutcome::uncertain();
-        assert!(!u.effect_observed);
-        assert!(u.value.is_none());
-        let n = CapabilityOutcome::not_performed("no such file");
-        assert!(!n.effect_observed);
-        assert!(n.detail.is_some(), "a non-effect should say why");
-        let o = CapabilityOutcome::observed(serde_json::json!({"ok": true}));
-        assert!(o.effect_observed);
     }
 
     #[test]

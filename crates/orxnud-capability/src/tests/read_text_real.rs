@@ -11,16 +11,18 @@
 //! rather than quietly falling back, because a fallback would be exactly the substitution
 //! this file exists to prevent.
 
-mod support;
+// Declared once in `tests/mod.rs`, since a module path inside
+// `tests/` would otherwise resolve per-file.
+use super::{Registry, support};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use orxnud_capability::dispatch::Dispatcher;
-use orxnud_capability::read_text::{self, ReadTextBundle};
-use orxnud_capability::subprocess::SandboxExecutionBackend;
-use orxnud_capability::verification::ExecutionOutcome;
+use crate::dispatch::Dispatcher;
+use crate::read_text::{self, ReadTextBundle};
+use crate::subprocess::SandboxExecutionBackend;
+use crate::verification::ExecutionOutcome;
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
 use orxnud_domain::invocation::{ActionRequest, InvocationContext};
@@ -132,17 +134,14 @@ fn dispatch_read(
     ws: &Path,
     path: &str,
     approval: Option<&orxnud_domain::approval::ApprovalRecord>,
-) -> Result<orxnud_capability::dispatch::DispatchOutcome, orxnud_capability::dispatch::DispatchError>
-{
+) -> Result<crate::dispatch::DispatchOutcome, crate::dispatch::DispatchError> {
     let helper = read_text::resolve_helper().expect("helper built");
-    let mut bundles: BTreeMap<
-        CapabilityId,
-        Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
-    > = BTreeMap::new();
+    let mut bundles: BTreeMap<CapabilityId, Arc<dyn crate::dispatch::AdapterBundle + Send + Sync>> =
+        BTreeMap::new();
     bundles.insert(cap(), Arc::new(ReadTextBundle::new(ws, helper)));
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = Dispatcher::new(&mut engine, &secrets, bundles)
+    let mut d = Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(bundles))
         .with_execution(Arc::new(SandboxExecutionBackend::new()));
     let params = serde_json::json!({ "path": path });
     d.dispatch(
@@ -262,14 +261,12 @@ fn an_approved_read_is_single_use() {
     // the dispatcher borrows, so a second *dispatcher* would be a second ledger and would
     // prove nothing about single use.
     let helper = read_text::resolve_helper().expect("helper built");
-    let mut bundles: BTreeMap<
-        CapabilityId,
-        Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
-    > = BTreeMap::new();
+    let mut bundles: BTreeMap<CapabilityId, Arc<dyn crate::dispatch::AdapterBundle + Send + Sync>> =
+        BTreeMap::new();
     bundles.insert(cap(), Arc::new(ReadTextBundle::new(&ws, helper)));
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = Dispatcher::new(&mut engine, &secrets, bundles)
+    let mut d = Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(bundles))
         .with_execution(Arc::new(SandboxExecutionBackend::new()));
     let params = orxnud_policy::canonical_params(&serde_json::json!({ "path": "a.txt" }));
 

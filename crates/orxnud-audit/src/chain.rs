@@ -286,34 +286,85 @@ impl AuditChain {
     /// Returns the sequence numbers of `Authorised` records that have no
     /// matching terminal record.
     ///
-    /// # Why the match is by correlation id, not by position
+    /// # Why the match is by authorisation identity, not by position or by label
     ///
     /// An append-only hash chain cannot update a record after writing it, so a
-    /// terminal outcome is a **separate record** correlated by
-    /// [`RequestId`](orxnud_domain::ids::RequestId). Matching by sequence number
-    /// would be wrong: the outcome record has its own, later sequence number.
+    /// terminal outcome is a **separate record**. It identifies *which authorisation
+    /// it settles* by carrying that authorisation's own `seq` in
+    /// [`AuditRecord::settles`] — a value the single-writer chain assigned, so it is
+    /// unique, durable, restart-stable, and immune to the order operations finish in.
+    ///
+    /// This used to match on the request id and resolve the remainder by popping the
+    /// *earliest* open authorisation with a matching key. Both halves were wrong, and
+    /// observably so: the request id of an ad-hoc socket dispatch is derived from its
+    /// task and step, which for such a dispatch is the constant `ipc#0`. A FIFO pop
+    /// over a non-unique key resolves authorisation A with the completion of
+    /// unrelated authorisation B. There is no ordering of arrivals that fixes this,
+    /// because the key itself is not unique — no amount of care in the pairing makes
+    /// the answer right.
     ///
     /// This is the **"outcome unknown"** detector. A process that died between
-    /// the pre-call and post-call audit writes leaves exactly this pattern, and
+    /// the authorisation write and the terminal write leaves exactly this pattern, and
     /// it is how TP-12's "no effect without a record" becomes *auditable*
     /// rather than merely intended.
+    ///
+    /// # Legacy records
+    ///
+    /// A terminal record written before `settles` existed has no identity to compare.
+    /// It is **not** silently ignored: an authorisation that a legacy terminal record
+    /// might once have settled is reported as unresolved, because this function cannot
+    /// prove otherwise. That is a false positive on a journal written by an older
+    /// build, and it is the safe direction to be wrong in — an audit trail that claims
+    /// an outcome it cannot identify is worse than one that asks a human to look.
     #[must_use]
     pub fn unresolved_authorisations(&self) -> Vec<u64> {
-        let mut open: Vec<(u64, String)> = Vec::new();
+        // Exact set membership, not a FIFO. `settled` holds the `seq` of every
+        // authorisation some terminal record claims to settle.
+        let mut settled: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for (record, _) in &self.entries {
-            let Some(corr) = record.correlation_key() else {
-                continue;
-            };
-            match &record.outcome {
-                AuditOutcome::Authorised { .. } => open.push((record.seq, corr)),
-                AuditOutcome::Finished { .. } => {
-                    if let Some(pos) = open.iter().position(|(_, c)| *c == corr) {
-                        open.remove(pos);
-                    }
-                }
+            // A settlement cannot precede the authorisation it settles. The chain is
+            // append-only and monotonic, so `claimed >= record.seq` is a writer bug;
+            // honouring it would let a terminal record mark an authorisation resolved
+            // before that authorisation existed. Ignored here and reported by
+            // `dangling_settlements`.
+            if let Some(claimed) = record.settles_authorisation()
+                && claimed < record.seq
+            {
+                settled.insert(claimed);
             }
         }
-        open.into_iter().map(|(seq, _)| seq).collect()
+
+        self.entries
+            .iter()
+            .map(|(r, _)| r)
+            .filter(|r| matches!(r.outcome, AuditOutcome::Authorised { .. }))
+            .filter(|r| !settled.contains(&r.seq))
+            .map(|r| r.seq)
+            .collect()
+    }
+
+    /// Terminal records that settle an authorisation which does not exist.
+    ///
+    /// A `settles` pointing at a `seq` that is not an `Authorised` record is a
+    /// journal that cannot be reconciled: either a record was removed (which the hash
+    /// chain forbids) or one was fabricated with a bad reference. `verify` already
+    /// proves no record was removed, so this is a writer bug, and it is reported
+    /// rather than tolerated because it means the journal is lying about coverage.
+    #[must_use]
+    pub fn dangling_settlements(&self) -> Vec<(u64, u64)> {
+        let authorised: std::collections::BTreeSet<u64> = self
+            .entries
+            .iter()
+            .map(|(r, _)| r)
+            .filter(|r| matches!(r.outcome, AuditOutcome::Authorised { .. }))
+            .map(|r| r.seq)
+            .collect();
+        self.entries
+            .iter()
+            .map(|(r, _)| r)
+            .filter_map(|r| r.settles_authorisation().map(|seq| (r.seq, seq)))
+            .filter(|&(terminal, claimed)| claimed >= terminal || !authorised.contains(&claimed))
+            .collect()
     }
 }
 
@@ -414,77 +465,241 @@ mod tests {
         assert_eq!(c.len(), 1, "the refused append must not have been stored");
     }
 
-    /// An `Authorised` record and its terminal record share a correlation id.
+    // ---------------------------------------------------------------- identity
+    //
+    // These replace the tests that encoded the old FIFO pairing. Every one of them
+    // asserted that a shared *label* was enough to pair records, which is what made
+    // the misreporting possible: the label of an ad-hoc socket dispatch is the constant
+    // `ipc#0` for all of them.
+
+    /// An authorisation record. Every one of these is deliberately built with the
+    /// **same** request label, because that is the situation that broke: distinct
+    /// operations that look identical to any label-based pairing.
     fn corr(id: &str) -> AuditRecord {
         let mut r = rec();
         r.request = Some(RequestId::new(id));
         r
     }
 
-    #[test]
-    fn unresolved_authorisations_are_found() {
-        // The "outcome unknown" detector, which is what makes TP-12 auditable.
-        let mut c = AuditChain::new();
-        c.append(corr("A")).expect("a"); // seq 0: authorised, never terminated
-        c.append(corr("B")).expect("b"); // seq 1: authorised
-        c.append(corr("B").finished(OutcomeKind::Completed, 2, None))
-            .expect("c"); // closes B
-        let unresolved = c.unresolved_authorisations();
-        assert!(
-            unresolved.contains(&0),
-            "seq 0 was never resolved: {unresolved:?}"
-        );
-        assert!(
-            !unresolved.contains(&1),
-            "seq 1 was resolved by the correlated record"
-        );
+    /// The terminal record settling authorisation `seq`.
+    fn settled(by: &str, seq: u64, kind: OutcomeKind) -> AuditRecord {
+        corr(by).finished(kind, 2, None).settling(seq)
     }
 
+    /// Every ad-hoc socket dispatch looks exactly like this to a label-based pairing.
+    const IPC_LABEL: &str = "ipc#0";
+
     #[test]
-    fn a_complete_lifecycle_leaves_nothing_unresolved() {
+    fn one_authorisation_and_its_terminal_record_settle_each_other() {
         let mut c = AuditChain::new();
-        c.append(corr("A")).expect("a");
-        c.append(corr("A").finished(OutcomeKind::Completed, 2, None))
+        c.append(corr(IPC_LABEL)).expect("a");
+        let seq = 0;
+        c.append(settled(IPC_LABEL, seq, OutcomeKind::Completed))
             .expect("b");
         assert!(c.unresolved_authorisations().is_empty());
-    }
-
-    #[test]
-    fn the_denial_path_is_auditable() {
-        // A policy that logs its allows and not its denies cannot be reviewed.
-        let mut c = AuditChain::new();
-        c.append(corr("A")).expect("a");
-        c.append(corr("A").finished(OutcomeKind::Denied, 2, Some("no grant".into())))
-            .expect("b");
         assert!(c.verify().is_ok());
-        assert!(c.unresolved_authorisations().is_empty());
     }
 
     #[test]
-    fn an_uncertain_outcome_closes_the_correlation_explicitly() {
-        // `Uncertain` is a *terminal* recorded outcome: we said we do not know.
-        // It closes the correlation because the uncertainty was recorded, and the
-        // human adjudication happens in the task engine, not the journal.
+    fn interleaved_completion_in_either_order_settles_the_right_one() {
+        // A authorises, B authorises, B finishes, A finishes. B's completion arrives
+        // first. A FIFO pop over a shared label would have credited B's record to A.
         let mut c = AuditChain::new();
-        c.append(corr("A")).expect("a");
-        c.append(corr("A").finished(OutcomeKind::Uncertain, 2, None))
+        c.append(corr(IPC_LABEL)).expect("a authorises"); // seq 0
+        c.append(corr(IPC_LABEL)).expect("b authorises"); // seq 1
+        c.append(settled(IPC_LABEL, 1, OutcomeKind::Completed))
+            .expect("b finishes");
+        c.append(settled(IPC_LABEL, 0, OutcomeKind::Completed))
+            .expect("a finishes");
+        assert!(
+            c.unresolved_authorisations().is_empty(),
+            "both authorisations were settled, in an order a FIFO would mispair"
+        );
+        assert!(
+            c.dangling_settlements().is_empty(),
+            "each terminal named an authorisation that exists"
+        );
+    }
+
+    /// The finding, reproduced as a test.
+    ///
+    /// Two authorisations never reach a terminal record — a capability whose parameters
+    /// its own plan builder rejects, in a build where the dispatcher returned before the
+    /// audit write. Two *unrelated* operations then complete. A label-based FIFO
+    /// resolves the two dangling authorisations against those two completions, so the
+    /// journal reports the real failures as settled, and reports the two successful
+    /// operations' own authorisations as unresolved. Both halves are wrong, and neither
+    /// is a false positive or false negative in isolation: together they are a confident,
+    /// entirely incorrect answer about whether effects occurred.
+    #[test]
+    fn unrelated_completions_cannot_settle_someone_elses_authorisation() {
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("write-text authorises"); // 0: never resolved
+        c.append(corr(IPC_LABEL)).expect("write-text authorises"); // 1: never resolved
+        c.append(corr(IPC_LABEL)).expect("read-text authorises"); // 2
+        c.append(settled(IPC_LABEL, 2, OutcomeKind::Completed))
+            .expect("read-text completes");
+        c.append(corr(IPC_LABEL)).expect("read-text authorises"); // 4
+        c.append(settled(IPC_LABEL, 4, OutcomeKind::Completed))
+            .expect("read-text completes");
+
+        assert_eq!(
+            c.unresolved_authorisations(),
+            vec![0, 1],
+            "exactly the two that never reached a terminal record, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_refused_before_execution_is_a_distinct_disposition_from_a_completed_one() {
+        // Refused-before-execution and ran-and-succeeded must not be indistinguishable,
+        // because only one of them may be retried.
+        let mut denied = AuditChain::new();
+        denied.append(corr(IPC_LABEL)).expect("a");
+        denied
+            .append(settled(IPC_LABEL, 0, OutcomeKind::Denied))
+            .expect("denied");
+
+        let mut completed = AuditChain::new();
+        completed.append(corr(IPC_LABEL)).expect("a");
+        completed
+            .append(settled(IPC_LABEL, 0, OutcomeKind::Completed))
+            .expect("completed");
+
+        assert!(denied.verify().is_ok());
+        assert!(denied.unresolved_authorisations().is_empty());
+        assert!(completed.unresolved_authorisations().is_empty());
+
+        let kinds: Vec<_> = denied
+            .records()
+            .filter_map(|r| match r.outcome {
+                AuditOutcome::Finished { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec![OutcomeKind::Denied]);
+    }
+
+    #[test]
+    fn a_genuinely_unknown_outcome_is_recorded_as_such_and_still_settles() {
+        // `Uncertain` is a *terminal recorded outcome*: we said we do not know. It closes
+        // the authorisation because the uncertainty itself was recorded, and the human
+        // adjudication happens in the task engine rather than in the journal.
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("a");
+        c.append(settled(IPC_LABEL, 0, OutcomeKind::Uncertain))
             .expect("b");
         assert!(c.unresolved_authorisations().is_empty());
     }
 
     #[test]
-    fn records_without_any_correlation_id_are_ignored_by_the_detector() {
-        // Better to ignore them than to match them arbitrarily: guessing a
-        // correlation would produce a *wrong* "resolved" verdict, which is worse
-        // than no verdict.
-        let mut uncorrelatable = rec();
-        uncorrelatable.request = None;
-        uncorrelatable.task = None;
-        assert_eq!(uncorrelatable.correlation_key(), None);
-
+    fn many_identical_requests_each_settle_exactly_once() {
+        // Twelve identical capability requests. Identical in every labelled field, so a
+        // label-based pairing sees twelve interchangeable items.
+        const N: u64 = 12;
         let mut c = AuditChain::new();
-        c.append(uncorrelatable).expect("a");
-        assert!(c.unresolved_authorisations().is_empty());
+        for _ in 0..N {
+            c.append(corr(IPC_LABEL)).expect("authorises");
+        }
+        // Finish them in reverse, which is the order a FIFO would get most wrong.
+        for seq in (0..N).rev() {
+            c.append(settled(IPC_LABEL, seq, OutcomeKind::Completed))
+                .expect("finishes");
+        }
+        assert!(
+            c.unresolved_authorisations().is_empty(),
+            "every one of {N} identical authorisations settled"
+        );
+    }
+
+    #[test]
+    fn interleaved_authorise_and_settle_never_cross_pairs() {
+        // Authorise, authorise, settle, authorise, settle, settle... The detector must
+        // report exactly the authorisations nobody settled, at any interleaving.
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("a"); // 0 -> unresolved
+        c.append(corr(IPC_LABEL)).expect("b"); // 1 -> settled
+        c.append(settled(IPC_LABEL, 1, OutcomeKind::Completed))
+            .expect("b done");
+        c.append(corr(IPC_LABEL)).expect("c"); // 3 -> unresolved
+        c.append(corr(IPC_LABEL)).expect("d"); // 4 -> settled
+        c.append(corr(IPC_LABEL)).expect("e"); // 5 -> settled
+        c.append(settled(IPC_LABEL, 5, OutcomeKind::Failed))
+            .expect("e done");
+        c.append(settled(IPC_LABEL, 4, OutcomeKind::Completed))
+            .expect("d done");
+
+        assert_eq!(c.unresolved_authorisations(), vec![0, 3]);
+    }
+
+    #[test]
+    fn a_terminal_record_cannot_settle_an_authorisation_that_does_not_exist() {
+        // Either a record was removed — which `verify` already forbids — or one names
+        // an authorisation it never had. Either way the journal overstates its coverage
+        // and must say so rather than quietly count.
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("a"); // seq 0
+        c.append(settled(IPC_LABEL, 9, OutcomeKind::Completed))
+            .expect("claims seq 9");
+        assert_eq!(c.dangling_settlements(), vec![(1, 9)]);
+        assert!(
+            c.unresolved_authorisations().contains(&0),
+            "the real authorisation is still unresolved"
+        );
+    }
+
+    #[test]
+    fn a_settlement_cannot_precede_its_own_authorisation() {
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("a"); // seq 0
+        c.append(settled(IPC_LABEL, 0, OutcomeKind::Completed))
+            .expect("b"); // 1 -> ok
+        c.append(settled(IPC_LABEL, 1, OutcomeKind::Completed))
+            .expect("claims seq 1, which is itself a terminal record"); // 2
+        // seq 1 is not an authorisation at all, so this is dangling.
+        assert_eq!(c.dangling_settlements(), vec![(2, 1)]);
+    }
+
+    #[test]
+    fn an_authorisation_record_settles_nothing() {
+        let a = corr(IPC_LABEL);
+        assert_eq!(a.settles_authorisation(), None);
+        assert_eq!(a.settles, None);
+    }
+
+    #[test]
+    fn a_finished_record_with_no_identity_settles_nothing() {
+        // A disclosure is a recorded fact about the world, not the terminal disposition
+        // of an authorisation. It must not silently close one.
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("a"); // seq 0
+        c.append(corr("orxnud.policy/disclose").finished(
+            OutcomeKind::Completed,
+            2,
+            Some("bytes left".into()),
+        ))
+        .expect("a disclosure");
+        assert_eq!(
+            c.unresolved_authorisations(),
+            vec![0],
+            "an identity-less terminal record settles nothing"
+        );
+    }
+
+    #[test]
+    fn an_authorisation_survives_a_restart_and_is_still_unresolved() {
+        // What a process that died between authorising and recording leaves behind. The
+        // chain is rebuilt from the journal exactly as a new daemon would, and the
+        // finding is still there — which is the point of making it durable.
+        let mut c = AuditChain::new();
+        c.append(corr(IPC_LABEL)).expect("a"); // seq 0, never settled
+        c.append(corr(IPC_LABEL)).expect("b");
+        c.append(settled(IPC_LABEL, 1, OutcomeKind::Completed))
+            .expect("b done");
+
+        // A restart does not reconcile anything; it re-reads.
+        assert_eq!(c.unresolved_authorisations(), vec![0]);
+        assert!(c.verify().is_ok(), "the chain itself is intact");
     }
 
     #[test]

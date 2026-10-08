@@ -190,7 +190,21 @@ impl From<&TaskRepoError> for TaskCause {
             // "Not in the state you need": already decided, already terminal, or the caller
             // does not hold the lease. All three are conflicts, not bad input.
             TaskRepoError::ProposalNotInState { .. } => Self::Conflict,
-            TaskRepoError::InvalidComposition(_) => Self::InvalidInput,
+            // The same shape of refusal for a different reason: the request is
+            // well-formed and the *task* is not in a state that accepts it, because the
+            // previous execution's side effect has no established outcome. The client's
+            // remedy is to let recovery settle it, not to edit the request, which is what
+            // makes this a conflict rather than bad input.
+            TaskRepoError::EffectOutcomeUnresolved { .. } => Self::Conflict,
+            // The execution identity is taken: someone already asked for this step's
+            // attempt. Same conflict class as a state refusal, and distinct from
+            // `AlreadyExists` above, which means the caller's chosen *identifier* collided
+            // while the identity itself was still free. A caller can recover from that one
+            // by naming the proposal differently; it cannot recover from this one.
+            TaskRepoError::ExecutionIdentityTaken { .. } => Self::AlreadyExists,
+            TaskRepoError::InvalidComposition(_) | TaskRepoError::InvalidDigest { .. } => {
+                Self::InvalidInput
+            }
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => Self::Corrupt,
             // Busy and locked are another writer winning, which is a race outcome.
             TaskRepoError::Sqlite(inner)
@@ -329,7 +343,30 @@ impl From<TaskRepoError> for EngineError {
             | TaskRepoError::ProposalNotInState { .. }
             // A composition field outside the range its task allows is likewise bad input,
             // not a storage failure: the caller named a step the task does not have.
-            | TaskRepoError::InvalidComposition(_) => EngineErrorKind::InvalidInput,
+            //
+            // A malformed approval digest joins them for the same reason, and the mapping
+            // matters more than usual here: a digest that is not a canonical 32-byte
+            // value is not a *storage* problem, so reporting it as one would tell the
+            // caller its database is broken when what it did was send an approval that
+            // could never be honoured. V-94.
+            | TaskRepoError::InvalidComposition(_)
+            | TaskRepoError::InvalidDigest { .. }
+            // A duplicate execution identity is a duplicate, so it joins `AlreadyExists`:
+            // the request asked for something that already exists, and re-sending it
+            // unchanged cannot succeed.
+            | TaskRepoError::ExecutionIdentityTaken { .. } => EngineErrorKind::InvalidInput,
+            // An unresolved side effect on the current execution, and *only* that one.
+            // Nothing about the request is wrong; the task is in a state the client must
+            // resolve first. Reported as a conflict so the wire code says that, instead of
+            // "you sent something malformed", and the stored reason names the step and
+            // attempt.
+            //
+            // Kept as its own arm rather than folded into the group above: appending a
+            // `|` variant to an existing arm's pattern changes every variant already in
+            // it, which is how four unrelated refusals once became conflicts at once.
+            | TaskRepoError::EffectOutcomeUnresolved { .. } => {
+                EngineErrorKind::ConcurrencyConflict
+            }
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => {
                 EngineErrorKind::Invariant
             }
@@ -452,6 +489,64 @@ mod tests {
     fn a_repository_duplicate_maps_to_invalid_input_not_storage() {
         let e = EngineError::from(TaskRepoError::AlreadyExists("t".into()));
         assert_eq!(e.kind, EngineErrorKind::InvalidInput);
+    }
+
+    /// The two refusals this pass added must be *distinguishable* from the four they sit
+    /// beside.
+    ///
+    /// Written because the mistake is silent: adding a `|` variant to an existing arm's
+    /// pattern changes every variant already in it. Adding `EffectOutcomeUnresolved` that
+    /// way once reclassified `AlreadyExists`, `NotFound`, `NoSuchProposal` and
+    /// `ProposalNotInState` as concurrency conflicts, and two pre-existing tests caught it.
+    /// They are asserted individually here so the shape of the mistake cannot recur.
+    #[test]
+    fn adding_a_refusal_does_not_reclassify_the_ones_beside_it() {
+        // The group that must keep saying InvalidInput.
+        for e in [
+            TaskRepoError::AlreadyExists("t".into()),
+            TaskRepoError::NotFound("t".into()),
+            TaskRepoError::NoSuchProposal("p".into()),
+        ] {
+            let kind = EngineError::from(e).kind;
+            assert_eq!(
+                kind,
+                EngineErrorKind::InvalidInput,
+                "an existing refusal changed meaning; a new arm was appended to an \
+                 existing pattern instead of added beside it"
+            );
+        }
+        assert_eq!(
+            EngineError::from(TaskRepoError::ProposalNotInState {
+                id: "p".into(),
+                status: "running".into(),
+                expected: "waiting-for-user",
+            })
+            .kind,
+            EngineErrorKind::InvalidInput
+        );
+
+        // And the two that are *meant* to differ from each other.
+        assert_eq!(
+            EngineError::from(TaskRepoError::EffectOutcomeUnresolved {
+                id: "t".into(),
+                step_no: 1,
+                attempt_no: 1,
+            })
+            .kind,
+            EngineErrorKind::ConcurrencyConflict,
+            "an unestablished effect outcome is a state the client must resolve, not bad input"
+        );
+        assert_eq!(
+            EngineError::from(TaskRepoError::ExecutionIdentityTaken {
+                id: "t".into(),
+                step_no: 1,
+                attempt_no: 1,
+                existing_id: "p1".into(),
+            })
+            .kind,
+            EngineErrorKind::InvalidInput,
+            "a taken execution identity is a duplicate, which is what `AlreadyExists` means"
+        );
     }
 
     #[test]

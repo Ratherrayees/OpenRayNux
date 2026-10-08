@@ -40,7 +40,7 @@ use serde_json::Value;
 
 use orxnud_domain::enums::{DataClass, IsolationTier, RiskClass};
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::{CapabilityInvocation, DispatchView};
+use orxnud_policy::authority::{CapabilityInvocation, DispatchView};
 
 use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 
@@ -278,11 +278,21 @@ impl crate::dispatch::AdapterBundle for ReadTextBundle {
     fn sandbox_plan(
         &self,
         invocation: &CapabilityInvocation,
-    ) -> Option<crate::dispatch::SandboxPlan> {
-        let parsed = parse(invocation.params()).ok()?;
-        let absolute = resolve(&self.workspace, &parsed.path).ok()?;
+    ) -> Result<Option<crate::dispatch::SandboxPlan>, crate::dispatch::PlanError> {
+        // Both refusals are the caller's parameters and both are reported as such.
+        //
+        // These were `.ok()?`, which turned a precise reason the parse had already
+        // written -- whether a path is absolute, escapes the workspace, names a
+        // directory -- into a bare `None`. The dispatcher's only reading of `None` was
+        // "this adapter declares no plan", so a malformed request surfaced to the
+        // caller as a sandbox outage on a host whose sandbox was working, and the
+        // reason that would have told them what to fix was thrown away here.
+        let parsed =
+            parse(invocation.params()).map_err(crate::dispatch::PlanError::InvalidParams)?;
+        let absolute = resolve(&self.workspace, &parsed.path)
+            .map_err(crate::dispatch::PlanError::InvalidParams)?;
 
-        Some(crate::dispatch::SandboxPlan {
+        Ok(Some(crate::dispatch::SandboxPlan {
             program: self.helper.display().to_string(),
             // The path travels in argv because `SandboxSpec` has no stdin channel, recorded
             // as a known limitation of the existing contract rather than worked around by
@@ -318,7 +328,7 @@ impl crate::dispatch::AdapterBundle for ReadTextBundle {
                     cpu_cores: Some(1.0),
                 },
             },
-        })
+        }))
     }
 
     fn verifier(&self) -> &dyn Verifier {

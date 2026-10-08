@@ -58,3 +58,10 @@ desktop.ini
 /build/
 node_modules/
 *.tsbuildinfo
+
+# Python bytecode: `scripts/gate_policy.py` sets `sys.dont_write_bytecode`, but the
+# modules it imports are compiled before that runs, so the ignore is what actually keeps
+# the tree clean. Committed `.pyc` files are CPython-version-specific build artefacts and
+# two of them were tracked here before the rule existed.
+__pycache__/
+*.pyc
