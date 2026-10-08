@@ -170,7 +170,7 @@ impl HostCapability {
             "sandbox backend: {}\n\
              sandbox mechanism: {}\n\
              guarantees: visibility={} tree_lifetime={} resources={}\n\
-             tier1_executable: {verdict}",
+             tier1_executable: {verdict}\n",
             self.backend,
             self.mechanism,
             self.guarantees.visibility,
