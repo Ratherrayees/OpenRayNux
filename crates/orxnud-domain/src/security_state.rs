@@ -139,21 +139,40 @@ pub enum LedgerError {
 ///
 /// # The operation that matters
 ///
-/// [`consume`](Self::consume) is the whole point: it must be a *single atomic
+/// [`consume_at`](Self::consume_at) is the whole point: it must be a *single atomic
 /// step*. Two dispatches presenting the same approval must produce one success
 /// and one [`LedgerError::AlreadyConsumed`], never two successes and never two
 /// refusals. A `SELECT` followed by an `INSERT` is race-prone by construction and
 /// is not an acceptable implementation of this trait.
 #[allow(clippy::module_name_repetitions)]
 pub trait ApprovalLedger {
-    /// Atomically marks `digest` spent, or reports that it already was.
+    /// Atomically marks `digest` spent at `now_ms`, or reports that it already was.
+    ///
+    /// # Why the time is a parameter, and not the ledger's business
+    ///
+    /// V-94. The durable implementation previously wrote `0` — the epoch — into
+    /// `spent_approvals.consumed_at_ms`, so the ledger could answer *whether* a digest
+    /// had been spent and never *when*. A sentinel is not a weaker timestamp, it is a
+    /// missing one: zero is indistinguishable from "never recorded", and an incident
+    /// review, a retention decision or a replay-window question has no answer at all.
+    ///
+    /// The clock stays with the caller, for two reasons that are the same reason. The
+    /// domain has no clock by design (testability: no hidden time source), and a ledger
+    /// that read one would make its own output untestable without a seam. The caller
+    /// already has one — the same single reading `authorise` takes and hands down — so
+    /// passing it in means the recorded time is the time the decision was made, not a
+    /// second reading taken a moment later.
+    ///
+    /// The timestamp is written by the same single statement that records the spend, so
+    /// there is no window in which a digest is marked spent with no time, or timed with
+    /// no spend.
     ///
     /// # Errors
     ///
     /// [`LedgerError::AlreadyConsumed`] if the digest was already spent — which
     /// is a *succeed-or-refuse* answer, not a storage failure — or
     /// [`LedgerError::Unavailable`] if the ledger could not be consulted.
-    fn consume(&mut self, digest: &ApprovalDigest) -> Result<(), LedgerError>;
+    fn consume_at(&mut self, digest: &ApprovalDigest, now_ms: i64) -> Result<(), LedgerError>;
 
     /// Whether `digest` has been spent.
     ///
@@ -177,7 +196,7 @@ pub trait ApprovalLedger {
 ///
 /// So that policy has exactly one code path. `evaluate` asks
 /// [`ApprovalLedger::is_consumed`] and `authorise` calls
-/// [`ApprovalLedger::consume`] regardless of which implementation is attached;
+/// [`ApprovalLedger::consume_at`] regardless of which implementation is attached;
 /// there is no second set of rules to drift out of step.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryApprovals {
@@ -193,7 +212,7 @@ impl InMemoryApprovals {
 }
 
 impl ApprovalLedger for InMemoryApprovals {
-    fn consume(&mut self, digest: &ApprovalDigest) -> Result<(), LedgerError> {
+    fn consume_at(&mut self, digest: &ApprovalDigest, _now_ms: i64) -> Result<(), LedgerError> {
         if self.spent.contains(digest) {
             return Err(LedgerError::AlreadyConsumed);
         }
@@ -218,10 +237,10 @@ mod tests {
     fn the_in_memory_ledger_is_single_use() {
         let mut l = InMemoryApprovals::new();
         assert!(!l.is_consumed(&digest(1)).expect("read"));
-        l.consume(&digest(1)).expect("first consume");
+        l.consume_at(&digest(1), 0).expect("first consume");
         assert!(l.is_consumed(&digest(1)).expect("read"));
         assert!(matches!(
-            l.consume(&digest(1)),
+            l.consume_at(&digest(1), 0),
             Err(LedgerError::AlreadyConsumed)
         ));
     }
@@ -229,8 +248,8 @@ mod tests {
     #[test]
     fn distinct_digests_are_independent() {
         let mut l = InMemoryApprovals::new();
-        l.consume(&digest(1)).expect("one");
-        l.consume(&digest(2)).expect("two");
+        l.consume_at(&digest(1), 0).expect("one");
+        l.consume_at(&digest(2), 0).expect("two");
         assert!(l.is_consumed(&digest(1)).expect("read"));
         assert!(l.is_consumed(&digest(2)).expect("read"));
         assert!(!l.is_consumed(&digest(3)).expect("read"));
@@ -241,8 +260,8 @@ mod tests {
         // A caller must be able to tell "you may not reuse this" from "the ledger
         // is down". Collapsing them would turn an outage into a policy denial.
         let mut l = InMemoryApprovals::new();
-        l.consume(&digest(7)).expect("consume");
-        let replay = l.consume(&digest(7)).expect_err("replay");
+        l.consume_at(&digest(7), 0).expect("consume");
+        let replay = l.consume_at(&digest(7), 0).expect_err("replay");
         let text = replay.to_string();
         assert!(text.contains("already been used"), "{text}");
         assert!(!text.contains("unavailable"), "{text}");

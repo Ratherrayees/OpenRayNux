@@ -20,22 +20,20 @@
 //! Restarts are a real `drop` plus a real re-open. Concurrency uses a `Barrier` and
 //! SQLite's own write lock. Nothing here sleeps or polls.
 
+use super::Registry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use orxnud_capability::dispatch::{
-    AdapterBundle, CapabilityAdapter, DispatchError, Dispatcher, ExecutionTier,
-};
-use orxnud_capability::verification::{
-    ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
-};
+use crate::dispatch::{AdapterBundle, CapabilityAdapter, DispatchError, Dispatcher, ExecutionTier};
+use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, DispatchView, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_domain::security_state::{ApprovalLedger, AuditJournal};
 use orxnud_domain::{Actor, AuthChannel, DataClass, NormalizedParams, RiskClass};
+use orxnud_policy::authority::DispatchView;
 use orxnud_policy::policy_set::{Grant, PolicySet};
 use orxnud_policy::{BudgetLedger, PolicyEngine};
 use orxnud_store::security_state::{SqliteApprovalLedger, SqliteAuditJournal};
@@ -166,7 +164,7 @@ impl CapabilityAdapter for Successful {
     fn invoke(
         &self,
         _view: &DispatchView<'_>,
-        _credential: Option<&orxnud_capability::credential::CredentialHandle>,
+        _credential: Option<&crate::credential::CredentialHandle>,
     ) -> Result<ExecutionOutcome, String> {
         Ok(ExecutionOutcome::Succeeded {
             output: Some("ok".to_owned()),
@@ -208,8 +206,8 @@ impl AdapterBundle for Bundle {
     }
 }
 
-fn bundles() -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
-    let mut m = BTreeMap::new();
+fn bundles() -> Registry {
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     m.insert(
         cap(),
         Arc::new(Bundle {
@@ -217,7 +215,7 @@ fn bundles() -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
             verifier: Confirming,
         }) as Arc<dyn AdapterBundle + Send + Sync>,
     );
-    m
+    Registry::from_bundles(m)
 }
 
 /// A secret store with nothing in it. Present because the governed dispatcher is
@@ -639,7 +637,9 @@ fn a_spent_approval_is_still_spent_after_a_restart() {
     {
         let mut engine = durable_engine_from(&db, gated_policy());
         assert!(!engine.approval_is_consumed(&record.digest).expect("read"));
-        engine.consume_approval(record.digest).expect("consume");
+        engine
+            .consume_approval(record.digest, 1_000)
+            .expect("consume");
         assert!(engine.approval_is_consumed(&record.digest).expect("read"));
     }
 
@@ -659,7 +659,7 @@ fn distinct_approvals_are_independent_across_a_restart() {
     let b = approval("bob", NOW, NOW + 60_000);
     {
         let mut engine = durable_engine_from(&db, gated_policy());
-        engine.consume_approval(a.digest).expect("a");
+        engine.consume_approval(a.digest, 1_000).expect("a");
     }
     let mut engine = durable_engine_from(&db, gated_policy());
     assert!(engine.approval_is_consumed(&a.digest).expect("read"));
@@ -667,7 +667,7 @@ fn distinct_approvals_are_independent_across_a_restart() {
         !engine.approval_is_consumed(&b.digest).expect("read"),
         "a different approval must be unaffected"
     );
-    engine.consume_approval(b.digest).expect("b");
+    engine.consume_approval(b.digest, 1_000).expect("b");
     cleanup(&dir);
 }
 
@@ -692,7 +692,7 @@ fn two_processes_racing_for_one_digest_produce_exactly_one_success() {
                 // transition and the migrations on a fresh file.
                 let mut ledger = SqliteApprovalLedger::open(&db).expect("open");
                 barrier.wait();
-                ledger.consume(&digest)
+                ledger.consume_at(&digest, 1_000)
             })
         })
         .collect();

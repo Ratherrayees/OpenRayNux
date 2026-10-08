@@ -1,0 +1,9 @@
+error[E0432]: unresolved imports `orxnud_domain::AuthorisationProof`, `orxnud_domain::CapabilityInvocation`, `orxnud_domain::DispatchView`, `orxnud_domain::PolicySeal`
+  --> tests/compile_fail/domain_exposes_no_authority_type.rs:24:20
+   |
+24 |     ActionRequest, AuthorisationProof, CapabilityInvocation, DispatchView, PolicySeal,
+   |                    ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^ no `PolicySeal` in the root
+   |                    |                   |                     |
+   |                    |                   |                     no `DispatchView` in the root
+   |                    |                   no `CapabilityInvocation` in the root
+   |                    no `AuthorisationProof` in the root

@@ -469,19 +469,34 @@ impl DurableEngine {
     /// [`EffectStatus::Unknown`] and why an unresolved effect blocks a
     /// non-idempotent retry.
     ///
+    /// # `idempotent` is the effect's, not the task's
+    ///
+    /// Whether *this capability* may be repeated, taken from its declaration rather
+    /// than from `tasks.idempotent`. The task's flag answers "may this task be re-run
+    /// as a unit", which is a different question: a task is created before the
+    /// capability that will run on it is chosen, so most tasks are flagged idempotent
+    /// at the task level whatever they are about to do. Recovery reads this column
+    /// (see `TaskRepository::recover`), so passing the task's flag here would let a
+    /// crashed non-idempotent dispatch be re-run — the exact hole this records.
+    ///
     /// # Errors
     ///
     /// [`EngineError`] of kind `Storage` if the write fails.
+    /// The identity is spelled out rather than bundled; see the note on
+    /// [`orxnud_store::task_repo::TaskRepository::reserve_effect`].
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_effect(
         &mut self,
         key: &str,
         id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         step_key: &str,
+        idempotent: bool,
         now_ms: i64,
     ) -> Result<bool, EngineError> {
         self.repo()
-            .reserve_effect(key, id, attempt_no, step_key, now_ms)
+            .reserve_effect(key, id, step_no, attempt_no, step_key, idempotent, now_ms)
             .map(|o| o.is_some())
             .map_err(EngineError::from)
     }
@@ -733,16 +748,26 @@ impl DurableEngine {
     /// # Errors
     ///
     /// [`EngineError`] of kind `Storage`.
-    pub fn begin_approved_execution(
+    /// Takes the execution lease and spends the approval for that attempt, atomically.
+    ///
+    /// The daemon's only way to begin a governed execution. See
+    /// [`orxnud_store::task_repo::TaskRepository::begin_execution_spending_approval`]
+    /// for why the two are one operation.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of the cause the repository reports: the proposal is missing or
+    /// not approved, the task is not waiting, or the attempt has no unconsumed approval.
+    pub fn begin_execution_spending_approval(
         &mut self,
         proposal_id: &str,
         worker: &str,
         now_ms: i64,
     ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
-        let lease = self.limits.lease_duration_ms;
-        Ok(self
-            .repo()
-            .begin_approved_execution(proposal_id, worker, now_ms, lease)?)
+        let lease_ms = self.limits.lease_duration_ms;
+        self.repo()
+            .begin_execution_spending_approval(proposal_id, worker, now_ms, lease_ms)
+            .map_err(EngineError::from)
     }
 
     // ------------------------------------------------------------ schedules
@@ -1174,11 +1199,11 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         let key = DurableEngine::idempotency_key(&tid("t"), "send", "initial");
         assert!(
-            e.reserve_effect(&key, &tid("t"), 1, "send", NOW)
+            e.reserve_effect(&key, &tid("t"), 1, 1, "send", false, NOW)
                 .expect("reserve")
         );
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 2, "send", NOW)
+            !e.reserve_effect(&key, &tid("t"), 1, 2, "send", false, NOW)
                 .expect("reserve"),
             "a retry must not be able to dispatch the same effect again"
         );
@@ -1193,7 +1218,7 @@ mod tests {
         let _ = e.claim_task("w", NOW).expect("claim");
         let key = DurableEngine::idempotency_key(&tid("t"), "s", "initial");
         let _ = e
-            .reserve_effect(&key, &tid("t"), 1, "s", NOW)
+            .reserve_effect(&key, &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(!e.all_effects_resolved(&tid("t")).expect("unresolved"));
         assert!(

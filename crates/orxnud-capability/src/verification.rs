@@ -130,6 +130,64 @@ pub trait Verifier {
     /// it: if nothing ran, there is nothing to confirm, and a verifier that returns
     /// `Verified` for a `Failed` execution is itself broken.
     ///
+    /// # Admissibility: what a verifier is allowed to claim
+    ///
+    /// A verifier is asked for a *finding*. The dispatcher owns what that finding is
+    /// allowed to **mean**, and the two are different acts. The rule is one line:
+    ///
+    /// ```text
+    /// Verified and Refuted are admissible only against a Succeeded execution.
+    /// ```
+    ///
+    /// `Succeeded` is the only execution outcome that establishes a capability ran *and*
+    /// finished, which is the precondition for having a world to look at. Against
+    /// `Failed` or `Unknown` there is nothing to confirm and nothing to disprove: a
+    /// subprocess can write its file and *then* be killed by a deadline, a signal or a
+    /// resource ceiling, so "I looked and it is not there" and "I never got to look" are
+    /// the same statement.
+    ///
+    /// This matters because the two answers are not symmetric in consequence.
+    /// `Undetermined` withholds a decision. `Refuted` is the one finding the effect
+    /// ledger turns into `not-performed`, which is the *only* status recovery reads as
+    /// "a repeat cannot duplicate anything" — so a refutation is a retry permission, and
+    /// a refutation the verifier had no standing to issue is a duplicate side effect with
+    /// no human involved. `WriteTextVerifier` answered `Undetermined` for an unknown
+    /// execution correctly, and nothing checked; a verifier written as "the target must
+    /// not hold the old bytes" answers *absent* whenever it cannot confirm the write,
+    /// which is the natural mistake and a one-line one.
+    ///
+    /// [`crate::dispatch::admit_verification`] enforces this centrally, immediately after
+    /// this call and before the answer can reach an effect status, a task state or an
+    /// audit record — so a verifier that gets it wrong is made conservative rather than
+    /// trusted. Every verifier is subject to it, and no verifier needs to know it exists.
+    ///
+    /// # What this does *not* do, stated plainly
+    ///
+    /// The rule above constrains **which claims are admissible given what the execution
+    /// did**. It does not establish that an admissible claim is *true*. So after it runs,
+    /// these are two different things with two different owners:
+    ///
+    /// ```text
+    /// execution standing      = mechanically constrained, exhaustively, by admit_verification
+    /// the verifier's finding  = the capability author's responsibility
+    /// ```
+    ///
+    /// Concretely: for a `Succeeded` execution a `Refuted` is admitted, and the system's
+    /// safety then rests on that verifier having actually disproved the effect. That is a
+    /// deliberate delegation and it is the one V-92 already recorded when it made `Refuted`
+    /// retryable regardless of idempotency — *"the verifier already decided which findings
+    /// make a retry safe, and the task layer has strictly less information"*. Nothing in
+    /// this rule weakens that delegation, and nothing in it should be read as evidence
+    /// that a verifier's observation has been independently confirmed. A verifier that
+    /// refutes soundly is trusted; a verifier that refutes wrongly is trusted too, and the
+    /// only thing this rule removes is the ability to do that from a frame where nothing
+    /// ran to look at.
+    ///
+    /// The distinction is worth keeping visible because the two failure modes are not
+    /// symmetric to fix. A claim in an inadmissible frame is a *mechanical* error, and it
+    /// is now impossible. A wrong claim in an admissible frame is a *semantic* error in a
+    /// capability, and it is caught by reviewing that capability, not by this layer.
+    ///
     /// Receives the invocation's **validated parameters** as well, and that is not a
     /// convenience. A verifier is independent only if it can reach an expected answer
     /// by a route the adapter did not take; for a capability whose entire effect is a

@@ -3,11 +3,13 @@
 //! No real external system is contacted. The claim under test is that the *stages*
 //! run in order and that each refusal is fail-closed — not that any adapter works.
 
-mod support;
+// Declared once in `tests/mod.rs`, since a module path inside
+// `tests/` would otherwise resolve per-file.
+use super::{Registry, support};
 
 use std::collections::BTreeMap;
 
-use orxnud_capability::dispatch::{DispatchError, Dispatcher};
+use crate::dispatch::{DispatchError, Dispatcher};
 use orxnud_domain::approval::{ApprovalRecord, NormalizedParams};
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, RunId, TaskId, UserId};
@@ -91,26 +93,19 @@ fn secret_ref() -> SecretRef {
 ///
 /// Generic over the concrete adapter because every fixture is a different type; the
 /// `'static` bound is what lets it become an `Arc<dyn AdapterBundle + Send + Sync>`.
-fn bundles<A: orxnud_capability::dispatch::CapabilityAdapter + 'static>(
-    b: Bundle<A>,
-) -> BTreeMap<
-    CapabilityId,
-    std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
-> {
-    use orxnud_capability::dispatch::AdapterBundle as _;
-    let mut m = BTreeMap::new();
+fn bundles<A: crate::dispatch::CapabilityAdapter + 'static>(b: Bundle<A>) -> Registry {
+    use crate::dispatch::AdapterBundle;
+    use std::sync::Arc;
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let id = b.adapter().capability_id().clone();
     m.insert(id, b.into_arc());
-    m
+    Registry::from_bundles(m)
 }
 
 fn dispatcher<'a>(
     engine: &'a mut PolicyEngine,
     secrets: &'a FakeSecrets,
-    bundles: BTreeMap<
-        CapabilityId,
-        std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
-    >,
+    bundles: Registry,
 ) -> Dispatcher<'a, FakeSecrets> {
     Dispatcher::new(engine, secrets, bundles)
 }
@@ -332,7 +327,7 @@ fn a_capability_with_no_implementation_is_refused_at_stage_five() {
     // unknown capability, because the user's remedy differs.
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = dispatcher(&mut engine, &secrets, BTreeMap::new());
+    let mut d = dispatcher(&mut engine, &secrets, Registry::empty());
 
     let err = d
         .dispatch(
@@ -946,7 +941,7 @@ fn a_failing_adapter_is_reported_as_an_execution_failure_not_a_permission_failur
     assert!(
         matches!(
             outcome.execution,
-            orxnud_capability::verification::ExecutionOutcome::Failed { .. }
+            crate::verification::ExecutionOutcome::Failed { .. }
         ),
         "got {:?}",
         outcome.execution
@@ -964,7 +959,7 @@ fn an_implementation_declaring_too_little_is_refused() {
     // Policy grants Personal; the *implementation* only handles Public. Dispatching
     // Personal to it would be an escalation the declaration hides.
     struct NarrowAdapter;
-    impl orxnud_capability::dispatch::CapabilityAdapter for NarrowAdapter {
+    impl crate::dispatch::CapabilityAdapter for NarrowAdapter {
         fn capability_id(&self) -> &CapabilityId {
             // Leaked deliberately: a static id, so the test can build the key.
             static ID: std::sync::OnceLock<CapabilityId> = std::sync::OnceLock::new();
@@ -975,10 +970,10 @@ fn an_implementation_declaring_too_little_is_refused() {
         }
         fn invoke(
             &self,
-            _v: &orxnud_domain::invocation::DispatchView<'_>,
-            _c: Option<&orxnud_capability::credential::CredentialHandle>,
-        ) -> Result<orxnud_capability::verification::ExecutionOutcome, String> {
-            Ok(orxnud_capability::verification::ExecutionOutcome::Succeeded { output: None })
+            _v: &orxnud_policy::authority::DispatchView<'_>,
+            _c: Option<&crate::credential::CredentialHandle>,
+        ) -> Result<crate::verification::ExecutionOutcome, String> {
+            Ok(crate::verification::ExecutionOutcome::Succeeded { output: None })
         }
     }
 

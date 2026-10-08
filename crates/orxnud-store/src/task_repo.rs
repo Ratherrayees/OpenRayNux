@@ -2,9 +2,10 @@
 //!
 //! # One writer, one transaction per transition
 //!
-//! Every mutation runs inside `BEGIN IMMEDIATE` (ADR-0007 invariant 1), and every
-//! method that writes takes `&mut Connection`, so the compiler — not a review —
-//! prevents two callers interleaving inside a transaction.
+//! Every mutation runs inside `BEGIN IMMEDIATE` (ADR-0007 invariant 1), via
+//! [`crate::tx::authority_transaction`], and every method that writes takes
+//! `&mut Connection`, so the compiler — not a review — prevents two callers
+//! interleaving inside a transaction.
 //!
 //! # The three invariants ADR-0007 names
 //!
@@ -88,16 +89,34 @@ pub enum TaskRepoError {
     #[error(transparent)]
     UnknownState(Box<UnknownStateDetail>),
 
-    /// A row could not be decoded into its domain type.
+    /// A task with this id, or an attempt with this approval, already exists.
     ///
-    /// Boxed: the two `String`s make the variant far larger than its neighbours,
-    /// and an unboxed fat variant makes *every* `Result` in the crate large.
-    /// A task with this id already exists.
-    ///
-    /// A distinct variant because the caller may legitimately want to treat it as
-    /// idempotent — and must then *say so*, rather than have the store decide.
-    #[error("task {0} already exists")]
+    /// A distinct variant because the caller may legitimately want to treat a
+    /// duplicate as idempotent — and must then *say so*, rather than have the store
+    /// decide. It is also the variant the daemon maps to a specific wire code, which
+    /// is why a *different* constraint failure must never be reported as this one.
+    #[error("{0}")]
     AlreadyExists(String),
+
+    /// An approval digest that is not a canonical 32-byte value.
+    ///
+    /// Its own variant rather than [`Self::Corrupt`] because the reader wants the
+    /// opposite advice: a corrupt row needs repair, while a malformed digest means
+    /// *this caller supplied something that cannot be an authority* and the remedy is
+    /// to send a real one. Collapsing the two would point an operator at the database
+    /// for what is a request error.
+    ///
+    /// V-94. The digest is the binding between an approval and the operation it
+    /// authorises, so it has exactly one valid representation. A helper that returned
+    /// an empty vector for unparseable input made every malformed digest collapse onto
+    /// the same value, and made an odd-length one collapse onto a *different, valid*
+    /// digest -- so the stored authority stopped matching what the caller issued
+    /// without anything saying so.
+    #[error("invalid approval digest: {reason}")]
+    InvalidDigest {
+        /// Why it was refused.
+        reason: String,
+    },
 
     /// No task with this id.
     #[error("no task {0}")]
@@ -127,6 +146,82 @@ pub enum TaskRepoError {
         status: String,
         /// What the caller needed.
         expected: &'static str,
+    },
+
+    /// The task's current execution still has an unresolved side effect, so it cannot
+    /// be handed back to a human for a fresh approval.
+    ///
+    /// # Why this refusal exists
+    ///
+    /// Releasing the execution lease is what makes an unresolved effect invisible to
+    /// recovery: [`TaskRepository::recover`] selects `state = 'running' AND lease_holder
+    /// IS NOT NULL`, and `waiting-for-user` is neither. A task could reach that state
+    /// holding a `pending` effect row, and the row would then never be examined by
+    /// anything — while the task itself was also unclaimable, unapprovable (its approval
+    /// was spent to take the lease) and un-re-executable (its idempotency key was
+    /// reserved). Permanently stuck, silently.
+    ///
+    /// So the invariant is enforced at the transition rather than assumed:
+    ///
+    /// ```text
+    /// reserved unresolved effect
+    ///     =>  a recoverable running execution
+    ///     or  an explicitly resolved effect
+    /// ```
+    ///
+    /// The scope is the *current* execution -- `(steps_completed + 1, attempts)` -- which
+    /// is exactly what `recover` reads. That matters: a stale row from an earlier attempt
+    /// of the same step must not block a legitimate retry, and a task interrupted while
+    /// its effect was idempotent is deliberately returned to `pending` by recovery so it
+    /// can be retried. Scoping the whole task, or scoping to `attempt_no` alone, would
+    /// break both.
+    #[error(
+        "task {id} step {step_no} attempt {attempt_no} has an unresolved side effect, \
+         so its outcome must be established before another proposal is accepted"
+    )]
+    EffectOutcomeUnresolved {
+        /// The task.
+        id: String,
+        /// The logical step the unresolved effect belongs to.
+        step_no: u32,
+        /// The attempt the unresolved effect belongs to.
+        attempt_no: u32,
+    },
+
+    /// A proposal already occupies this execution identity.
+    ///
+    /// # Why this is not [`Self::AlreadyExists`]
+    ///
+    /// The old mapping reported every `UNIQUE` violation as *"a proposal already exists
+    /// for {task} attempt {n}"*, chosen by substring-matching the error message. Migration
+    /// 14 gave the table a second unique constraint — `(task_id, step_no, attempt_no)` —
+    /// so one statement can now fail on either of two genuinely different keys, and the
+    /// single message was wrong for both:
+    ///
+    /// | violated | meaning |
+    /// |---|---|
+    /// | `task_proposals.task_id, .step_no, .attempt_no` | this execution identity is taken — [`Self::ExecutionIdentityTaken`] |
+    /// | `task_proposals.proposal_id` | the caller's chosen *name* collided — [`Self::AlreadyExists`] |
+    ///
+    /// They are not interchangeable. One says "someone already asked for this execution";
+    /// the other says "your identifier collided with an unrelated row", which is a client
+    /// naming bug and is fixed by choosing another identifier. Reporting the second as the
+    /// first tells a caller its attempt already asked, when what actually happened is that
+    /// its `proposal_id` — derived from `p-{task_id}-{milliseconds}` — was minted inside one
+    /// millisecond of another.
+    #[error(
+        "task {id} step {step_no} attempt {attempt_no} already has proposal {existing_id}, \
+         so this execution cannot be proposed for twice"
+    )]
+    ExecutionIdentityTaken {
+        /// The task.
+        id: String,
+        /// The logical step.
+        step_no: u32,
+        /// The attempt.
+        attempt_no: u32,
+        /// The proposal that already holds the identity.
+        existing_id: String,
     },
 }
 
@@ -506,6 +601,13 @@ pub struct ReservedEffect {
     pub step_key: String,
     /// `observed`, `unknown`, or `not-performed`.
     pub status: String,
+    /// Whether repeating **this effect** is safe.
+    ///
+    /// Not the task's own `idempotent` flag: that answers "may this task be re-run
+    /// as a unit", which is a different question. This one answers "would running
+    /// this capability again duplicate something", and it is the capability's
+    /// declaration, recorded where [`TaskRepository::recover`] can read it.
+    pub idempotent: bool,
     /// Detail. Never a secret.
     pub detail: Option<String>,
 }
@@ -815,6 +917,88 @@ fn unknown_state(id: String, raw: String) -> TaskRepoError {
     TaskRepoError::UnknownState(Box::new(UnknownStateDetail { id, raw }))
 }
 
+/// Turns a failed `INSERT INTO task_proposals` into the right refusal.
+///
+/// # Why classification rather than substring matching
+///
+/// This used to read `if e.to_string().contains("UNIQUE")`, which collapses every
+/// constraint family into one answer and, since migration 14, two *different* unique keys
+/// as well. The extended code and the column list are the evidence, and both are read here.
+///
+/// `SQLITE_CONSTRAINT_UNIQUE` covers a unique index and `SQLITE_CONSTRAINT_PRIMARYKEY`
+/// covers the table's own key, so the two are already distinguished by code before the
+/// message is consulted. The message is then used only to say *which* columns — which is
+/// the part SQLite does not put in a code — and if it cannot be read, the caller is told
+/// the identity was taken rather than being handed a raw SQLite error it cannot act on.
+///
+/// # The two cases, and why the caller must be able to tell them
+///
+/// * **`(task_id, step_no, attempt_no)` taken** — `ExecutionIdentityTaken`. Someone already
+///   asked for this execution. Retrying with a different `proposal_id` cannot help.
+/// * **`proposal_id` taken** — `AlreadyExists`. A naming collision, usually two proposals
+///   minted from `p-{task_id}-{now}` inside one millisecond. Retrying with a fresh
+///   identifier *will* succeed.
+///
+/// An `AlreadyExists` that was really an identity collision would send a caller round a
+/// loop; an identity collision reported as `AlreadyExists` would tell it the wrong thing
+/// about *why*.
+fn classify_proposal_insert(
+    e: rusqlite::Error,
+    tx: &Transaction<'_>,
+    proposal_id: &str,
+    task_id: &TaskId,
+    attempt_no: u32,
+    step_no: u32,
+) -> TaskRepoError {
+    let rusqlite::Error::SqliteFailure(f, msg) = &e else {
+        return TaskRepoError::Sqlite(Box::new(e));
+    };
+    if f.code != rusqlite::ErrorCode::ConstraintViolation
+        || !matches!(
+            f.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+        )
+    {
+        return TaskRepoError::Sqlite(Box::new(e));
+    }
+
+    // `task_proposals.task_id, task_proposals.step_no, task_proposals.attempt_no`
+    let identity_key = msg.as_deref().is_some_and(|m| {
+        m.contains("task_proposals.task_id")
+            && m.contains("task_proposals.step_no")
+            && m.contains("task_proposals.attempt_no")
+    });
+
+    if identity_key {
+        // The winning row is read rather than reported from the insert's own parameters, so
+        // the refusal names the proposal that is *actually* holding the identity. The read
+        // runs inside the transaction that is about to roll back, which is fine: this only
+        // builds a message, and an answer we cannot read degrades to the name we were
+        // given rather than to a wrong claim that no row holds it.
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT proposal_id FROM task_proposals
+                  WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3;",
+                rusqlite::params![task_id.as_str(), step_no, attempt_no],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        return TaskRepoError::ExecutionIdentityTaken {
+            id: task_id.to_string(),
+            step_no,
+            attempt_no,
+            existing_id: existing.unwrap_or_else(|| proposal_id.to_owned()),
+        };
+    }
+
+    TaskRepoError::AlreadyExists(format!(
+        "action proposal {proposal_id} already exists, so its identifier is already in use; \
+         the execution identity itself is free"
+    ))
+}
+
 impl From<rusqlite::Error> for TaskRepoError {
     fn from(e: rusqlite::Error) -> Self {
         Self::Sqlite(Box::new(e))
@@ -983,17 +1167,18 @@ impl<'a> TaskRepository<'a> {
 
     /// Begins an immediate transaction.
     ///
-    /// `IMMEDIATE`, never `DEFERRED`: with a deferred transaction the write lock
-    /// is taken at the first *read*, so a second writer can change the table
-    /// between our read and our write and the statement is retried — which for a
-    /// state transition means deciding again whether it is legal.
+    /// Delegates to [`crate::tx::authority_transaction`], which is where the reasoning
+    /// lives. In short: a task transition reads before it writes, so the write lock has
+    /// to be held across the read, and `IMMEDIATE` is the only `BEGIN` that takes it
+    /// there. `DEFERRED` takes it at the first write instead, which is one statement too
+    /// late -- the decision has already been made.
     fn tx(&mut self) -> Result<Transaction<'_>, TaskRepoError> {
-        // `unchecked_transaction` is required, not chosen: a transaction needs a
-        // `&mut` borrow of the connection, and this repository deliberately holds a
-        // shared one so that reads do not require write access. The single-writer
-        // discipline (ADR-0006) is what makes this safe: exactly one `&mut
+        // `authority_transaction` takes `&Connection`, not `&mut`, and that is required
+        // rather than chosen: this repository holds a shared borrow so that reads do not
+        // require write access, and `Transaction::new` would need `&mut`. The single-writer
+        // discipline (ADR-0006) is what keeps that safe -- exactly one `&mut
         // TaskRepository` exists at a time, so exactly one transaction can be open.
-        Ok(self.conn.unchecked_transaction()?)
+        Ok(crate::tx::authority_transaction(self.conn)?)
     }
 
     // ---------------------------------------------------------------- enqueue
@@ -2275,6 +2460,18 @@ impl<'a> TaskRepository<'a> {
     /// never complete. Execution takes a fresh lease in
     /// [`Self::begin_approved_execution`].
     ///
+    /// **…unless the current execution still has an unresolved effect.** Releasing the
+    /// lease is what makes an unresolved `pending` row invisible to [`Self::recover`],
+    /// which selects `running`-and-leased and nothing else. So this refuses with
+    /// [`TaskRepoError::EffectOutcomeUnresolved`] while the current execution holds one.
+    /// The contract that preserves:
+    ///
+    /// ```text
+    /// reserved unresolved effect
+    ///     =>  a recoverable running execution
+    ///     or  an explicitly resolved effect
+    /// ```
+    ///
     /// The worker is verified to hold the live lease *before* the proposal is accepted,
     /// so only the task's current owner may propose on its behalf. That is a check that
     /// the caller owns the task — it grants nothing, and it is deliberately not how the
@@ -2365,6 +2562,37 @@ impl<'a> TaskRepository<'a> {
             )));
         }
 
+        // The task's *current* execution must not still be holding an unresolved effect
+        // when the lease is about to be released. See `EffectOutcomeUnresolved` for why
+        // releasing it is what hides the row from recovery, and why the scope is the
+        // current execution rather than the whole task.
+        //
+        // Read through the same `(steps_completed + 1, attempts)` pair that `recover`
+        // reads, from the task row this transaction already opened, so the two cannot
+        // disagree about which execution they mean.
+        //
+        // Deliberately *not* the whole task: an interrupted execution whose effect was
+        // idempotent is deliberately returned to `pending` by recovery so it can be
+        // retried, and its own stale row must not block that retry. That row is at an
+        // earlier `attempt_no`, so it does not match.
+        let current_attempt: u32 = row.3;
+        let unresolved: i64 = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM task_effects e
+               WHERE e.task_id = ?1
+                 AND (e.step_no IS NULL OR e.step_no = ?2)
+                 AND e.attempt_no = ?3
+                 AND e.status = 'pending');",
+            rusqlite::params![task_id.as_str(), step_no, current_attempt],
+            |r| r.get(0),
+        )?;
+        if unresolved != 0 {
+            return Err(TaskRepoError::EffectOutcomeUnresolved {
+                id: task_id.to_string(),
+                step_no,
+                attempt_no: current_attempt,
+            });
+        }
+
         tx.execute(
             "INSERT INTO task_proposals
                (proposal_id, task_id, attempt_no, step_no, capability, target, params,
@@ -2383,20 +2611,20 @@ impl<'a> TaskRepository<'a> {
                 now_ms,
             ],
         )
-        .map_err(|e| {
-            if String::from_utf8_lossy(e.to_string().as_bytes()).contains("UNIQUE") {
-                TaskRepoError::AlreadyExists(format!(
-                    "a proposal already exists for {task_id} attempt {}",
-                    row.3
-                ))
-            } else {
-                TaskRepoError::Sqlite(Box::new(e))
-            }
-        })?;
+        .map_err(|e| classify_proposal_insert(e, &tx, proposal_id, task_id, row.3, step_no))?;
 
         // `WaitingForUser` and the lease release in one statement, so there is no
         // interleaving in which the task is waiting while still holding a lease.
-        tx.execute(
+        // One conditional UPDATE, and its row count is the only evidence the transition
+        // happened. V-94.
+        //
+        // The comment above the statement claims the single-statement form makes an
+        // interleaving in which the task is waiting while still holding a lease
+        // impossible. That claim holds for the *statement*; it did not hold for the
+        // *caller*, because a zero-row result was not inspected, so the proposal row and
+        // the `running -> waiting-for-user` event could commit while the task stayed
+        // `running` and kept its lease -- the exact state the comment says cannot occur.
+        let changed = tx.execute(
             "UPDATE tasks
                 SET state = 'waiting-for-user',
                     lease_holder = NULL,
@@ -2405,6 +2633,17 @@ impl<'a> TaskRepository<'a> {
               WHERE id = ?1 AND state = 'running';",
             rusqlite::params![task_id.as_str(), now_ms],
         )?;
+        if changed == 0 {
+            // Refused before the event. Rolling back also takes the proposal row with
+            // it, which is the point of doing this inside the same transaction: a
+            // durable proposal for a task that never became waitable is unexplainable
+            // state, and it is what a client would be told to act on.
+            return Err(TaskRepoError::ProposalNotInState {
+                id: proposal_id.to_owned(),
+                status: "the task stopped matching before the proposal was recorded".to_owned(),
+                expected: "running",
+            });
+        }
 
         log(
             &tx,
@@ -2540,6 +2779,179 @@ impl<'a> TaskRepository<'a> {
     /// [`TaskRepoError::NoSuchProposal`], [`TaskRepoError::ProposalNotInState`] if the
     /// proposal is not `approved` or the task is not `waiting-for-user`, or any SQLite
     /// error.
+    /// Takes the execution lease **and** spends the approval, in one transaction.
+    ///
+    /// # Why these two must be one operation (V-94)
+    ///
+    /// They were separate: the daemon took the lease, then spent the approval, and
+    /// treated a failure of the second as a reporting fault it could log and proceed
+    /// past. That left two states a reader has to reason about:
+    ///
+    /// ```text
+    /// lease taken, approval NOT spent   ->  the caller holds a lease and a reusable
+    ///                                       approval, and nothing says so
+    /// ```
+    ///
+    /// and one the audit reproduced over a real daemon: with the spend forced to fail,
+    /// the capability still executed and the reply came back `verified: true`,
+    /// `state: completed`, `steps_completed: 1`.
+    ///
+    /// So the approval is now a **precondition** of the lease rather than a mirror of it.
+    /// One transaction means the two cannot disagree: either both happened or neither
+    /// did, and a failure leaves the task exactly as it was -- `waiting-for-user`, with
+    /// its approval still unspent and therefore retryable, and no lease granted.
+    ///
+    /// # Which ledger is authoritative
+    ///
+    /// Neither one is a mirror of the other, and it is worth being exact:
+    ///
+    /// * `spent_approvals` (written by `orxnud-policy`) is the **replay gate**. It is
+    ///   read by `evaluate` before a decision and burned by `authorise` before the
+    ///   capability runs, so it prevents one approval from being presented twice across
+    ///   the whole installation and across restarts.
+    /// * `task_approvals.consumed_at_ms` is the **task domain's record of which
+    ///   approval authorised which attempt of which step**. It is what
+    ///   `record_approval_replacing_expired` reads when deciding whether a step's
+    ///   approval may be replaced, and what a restart consults about a task's history.
+    ///
+    /// So neither failure is excusable by the other having succeeded, and in this
+    /// function neither has happened yet: `spent_approvals` is only written further down,
+    /// inside `dispatch`. That is exactly why this one is a precondition rather than a
+    /// best-effort mirror.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskRepoError::NoSuchProposal`], [`TaskRepoError::ProposalNotInState`] when the
+    /// proposal or the task is not where it must be, or [`TaskRepoError::NotFound`]
+    /// when the attempt has no unconsumed approval. All three are refusals, and all
+    /// three roll the transaction back, so no lease is granted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_execution_spending_approval(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> Result<ProposalRow, TaskRepoError> {
+        let tx = self.tx()?;
+
+        let proposal: Option<(String, String, u32, u32)> = tx
+            .query_row(
+                "SELECT task_id, status, attempt_no, step_no
+                   FROM task_proposals WHERE proposal_id = ?1;",
+                rusqlite::params![proposal_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? as u32,
+                        r.get::<_, i64>(3)? as u32,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, status, attempt, step_no)) = proposal else {
+            return Err(TaskRepoError::NoSuchProposal(proposal_id.to_owned()));
+        };
+        if status != "approved" {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: proposal_id.to_owned(),
+                status,
+                expected: "approved",
+            });
+        }
+
+        let task = TaskId::new(task_id.as_str());
+        let from: String = tx.query_row(
+            "SELECT state FROM tasks WHERE id = ?1;",
+            rusqlite::params![task_id.as_str()],
+            |r| r.get(0),
+        )?;
+        let state = TaskState::from_wire_str(&from)
+            .ok_or_else(|| unknown_state(task_id.clone(), from.clone()))?;
+        if state != TaskState::WaitingForUser {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: proposal_id.to_owned(),
+                status: format!("task is {}", state.as_wire_str()),
+                expected: "waiting-for-user",
+            });
+        }
+
+        // The approval must exist, and must be unconsumed. Its row count is checked like
+        // every other conditional mutation in this file, so "no row" cannot read as
+        // "spent successfully" -- which is the failure this whole operation exists to
+        // prevent.
+        let consumed = tx.execute(
+            "UPDATE task_approvals SET consumed_at_ms = ?4
+              WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3
+                AND consumed_at_ms IS NULL;",
+            rusqlite::params![task_id.as_str(), step_no, attempt, now_ms],
+        )?;
+        if consumed == 0 {
+            return Err(TaskRepoError::NotFound(format!(
+                "{task_id} step {step_no} attempt {attempt} has no unconsumed approval"
+            )));
+        }
+
+        let changed = tx.execute(
+            "UPDATE tasks
+                SET state = 'running',
+                    lease_holder = ?2,
+                    lease_expires_at_ms = ?3,
+                    updated_at_ms = ?4
+              WHERE id = ?1 AND state = 'waiting-for-user';",
+            rusqlite::params![
+                task_id.as_str(),
+                worker,
+                now_ms.saturating_add(lease_ms),
+                now_ms
+            ],
+        )?;
+        if changed == 0 {
+            return Err(TaskRepoError::ProposalNotInState {
+                id: proposal_id.to_owned(),
+                status: "the task stopped matching before the execution lease was taken".to_owned(),
+                expected: "waiting-for-user",
+            });
+        }
+
+        log(
+            &tx,
+            Some(&task),
+            now_ms,
+            "approved-execution-begun",
+            Some(state),
+            Some(TaskState::Running),
+            Some(worker),
+            Some(attempt),
+            Some(proposal_id),
+        )?;
+        tx.commit()?;
+        self.proposal_by_id(proposal_id)?
+            .ok_or_else(|| TaskRepoError::NoSuchProposal(proposal_id.to_owned()))
+    }
+
+    /// Takes the execution lease for an approved proposal, **without** spending an
+    /// approval.
+    ///
+    /// # Prefer [`Self::begin_execution_spending_approval`]
+    ///
+    /// This method exists because it did, and keeping it means a caller can still take
+    /// a lease while leaving the approval unspent -- which is the exact state V-94 found
+    /// reachable over a real daemon. The daemon uses the combined operation; this one has
+    /// no production caller and is reachable only from tests.
+    ///
+    /// It is kept rather than deleted for one reason: it is the only way to construct
+    /// "lease held, approval unspent" for a test that needs to prove the recovery path
+    /// handles it. Removing it would push that test towards hand-written SQL.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::begin_execution_spending_approval`], minus the approval precondition.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `begin_execution_spending_approval`: taking a lease without spending the                 approval leaves the two able to disagree"
+    )]
     pub fn begin_approved_execution(
         &mut self,
         id: &str,
@@ -2584,7 +2996,20 @@ impl<'a> TaskRepository<'a> {
                 expected: "waiting-for-user",
             });
         }
-        tx.execute(
+        // One conditional UPDATE, and its row count is the *only* evidence that the
+        // transition happened. V-94.
+        //
+        // The read above already established `state = waiting-for-user`, and the write
+        // lock is held across both statements (`BEGIN IMMEDIATE`, see `Self::tx`), so
+        // within this transaction a zero-row result can only mean the predicate itself
+        // did not hold -- the state the read observed is not the state the write
+        // requires. The check is kept anyway: `IMMEDIATE` is a claim about isolation,
+        // not an assertion about this statement's effect, and a row count is the only
+        // evidence that the expected mutation happened. `complete_verified_step`
+        // already treats the zero-row case as a refusal rather than a success; this
+        // function did not, and returned `Ok` while granting a lease it had not
+        // written and logging a transition that had not occurred.
+        let changed = tx.execute(
             "UPDATE tasks
                 SET state = 'running',
                     lease_holder = ?2,
@@ -2598,6 +3023,15 @@ impl<'a> TaskRepository<'a> {
                 now_ms
             ],
         )?;
+        if changed == 0 {
+            // Refused before the event, so the log cannot claim a transition that did
+            // not happen, and the transaction rolls the whole operation back.
+            return Err(TaskRepoError::ProposalNotInState {
+                id: id.to_owned(),
+                status: "the task stopped matching before the execution lease was taken".to_owned(),
+                expected: "waiting-for-user",
+            });
+        }
         log(
             &tx,
             Some(&task),
@@ -2616,6 +3050,18 @@ impl<'a> TaskRepository<'a> {
 
     // ---------------------------------------------------------------- recover
 
+    /// The `last_error` and event `detail` written when recovery settles an
+    /// orphaned task into [`TaskState::NeedsVerification`].
+    ///
+    /// A constant rather than a composed string so the reason a task stopped can be
+    /// matched exactly by a reader, and so it cannot drift between the `UPDATE`,
+    /// the event and the documentation. It names the *cause* and nothing else: no
+    /// capability, no target, no parameter, no payload. The content that may or may
+    /// not have been written is exactly what must not be copied into an audit
+    /// surface.
+    const UNCERTAIN_RECOVERY_REASON: &'static str =
+        "the process died with this task's side effect unresolved";
+
     /// Reclaims work abandoned by a restart, and returns how many rows changed.
     ///
     /// "Restart", not "expired lease": a restart means the previous process is
@@ -2626,6 +3072,206 @@ impl<'a> TaskRepository<'a> {
     /// A task past its retry budget goes to `dead-lettered` rather than back to
     /// `pending`, because re-queueing it would start a retry loop that no amount of
     /// waiting ends.
+    ///
+    /// # Why an effect row can stop a task becoming claimable (TP-2)
+    ///
+    /// V-92 made an uncertain side effect durable, but only on the path where the
+    /// dispatcher **returns**: the caller reads the verification outcome and writes
+    /// [`TaskState::NeedsVerification`]. There is a window on either side of that —
+    /// between the execution lease being taken and the outcome being settled — in
+    /// which the process can die and nothing has recorded the uncertainty. What
+    /// survives the crash is a task that is `running` under a dead owner's lease,
+    /// which this function used to return to `pending` and thereby make claimable.
+    ///
+    /// The durable evidence that distinguishes that case from an ordinary abandoned
+    /// task is the effect ledger, and this function now reads it.
+    ///
+    /// ## What an effect row means here
+    ///
+    /// `task_effects` rows are written by [`Self::reserve_effect`] *before* a
+    /// dispatch (ADR-0007 invariant 3 — the dedupe row is written in the same
+    /// transaction as the dispatch decision), and resolved afterwards by
+    /// [`Self::resolve_effect`], which refuses to write `pending`. So:
+    ///
+    /// | status | meaning | may a repeat duplicate an effect? |
+    /// |---|---|---|
+    /// | `pending` | a dispatch was authorised and its outcome was never established | **yes** — nobody knows whether it fired |
+    /// | `unknown` | TP-12's explicit verdict: it may or may not have happened | **yes** |
+    /// | `observed` | it happened, and the verifier said so | **yes** — it happened, so repeating duplicates it |
+    /// | `not-performed` | it definitely did not happen | no |
+    /// | anything else | a row this build cannot read | treated as `pending` |
+    ///
+    /// ### `not-performed` is a claim, and a claim needs a warrant
+    ///
+    /// Because this is the one status the predicate below *excludes*, `not-performed` is
+    /// not a neutral record — it is a **retry permission**. Two producers were able to
+    /// issue it without a warrant, and both are now closed at their source rather than
+    /// here, because compensating in recovery would mean recovery had to second-guess a
+    /// verdict it cannot re-derive:
+    ///
+    /// * A sandbox runner that gave up on a containment guarantee *after* starting the
+    ///   capability reported the same status as one that refused before starting. The
+    ///   sandbox vocabulary now distinguishes them (`ExecutionStatus::Abandoned`).
+    /// * A capability verifier could return `Refuted` for an execution that did not report
+    ///   success, and `Refuted` is the only verification finding that becomes
+    ///   `not-performed`. The dispatcher now refuses that finding unless the execution
+    ///   succeeded (`admit_verification`).
+    ///
+    /// So the rule in this function is unchanged and still correct, and it is now correct
+    /// for a reason that is checked rather than trusted.
+    ///
+    /// ### Rows written before those two fixes
+    ///
+    /// **No migration, and the decision is deliberate.** A pre-fix `not-performed` row may
+    /// be a fabricated disproof, and a fabricated disproof is a duplicate side effect for
+    /// any task still in that shape. Three things were weighed:
+    ///
+    /// 1. *Can it be told apart?* No, not structurally. A genuine pre-start refusal and a
+    ///    post-start give-up were both journaled `Denied` with effect `not-performed` and
+    ///    the same `missing` list; they differ only in the prose inside
+    ///    `task_effects.detail`. A free-text matcher would therefore be the *only*
+    ///    discriminator available, and a prose matcher is not a correctness mechanism.
+    /// 2. *How much was exposed?* The verifier half of the exposure is zero: no verifier
+    ///    in this workspace's history has ever had a `Refuted` arm reachable outside its
+    ///    `Succeeded` arm, so no shipped build could have written such a row. That leaves
+    ///    the sandbox half, which needs a host that delegates a cgroup base *and* a
+    ///    supervisor that fails to appear in it.
+    /// 3. *What would a blanket downgrade cost?* Every legitimately disproved
+    ///    non-idempotent effect — a traversing path, a refused approval, a write that
+    ///    landed with the wrong bytes — would become `unknown` and therefore
+    ///    `needs-verification`, manufacturing a queue of human adjudications for ordinary
+    ///    mistakes. That is a permanent, growing cost paid for a narrow and bounded
+    ///    exposure, and it would penalise all future history for one bug's window.
+    ///
+    /// So: **no schema change, no data rewrite, no prose matcher.** Historical evidence
+    /// is not rewritten into a more certain state, and it is not rewritten into a less
+    /// certain one either on the strength of a guess. The exposure that remains is
+    /// visible rather than silent — a task in that shape is `pending` and claimable, and
+    /// the claim is an audited event — so an operator who wants to enumerate candidates
+    /// can, and an installation that never delegated a cgroup base never had any.
+    ///
+    /// The durable mitigation is the invariant above, not a migration: the class is
+    /// unreachable from this build forward, which is what bounds the exposure to the
+    /// window in which it existed.
+    ///
+    /// ## The rule
+    ///
+    /// An orphaned task is settled into [`TaskState::NeedsVerification`] **iff** it holds
+    /// at least one effect row that is **for the execution being recovered** and is both
+    /// **not** `not-performed` **and flagged non-idempotent**. Everything else keeps the
+    /// previous behaviour.
+    ///
+    /// "The execution being recovered" is `(step_no = steps_completed + 1,
+    /// attempt_no = attempts)` — the step the task is on, and the attempt it reached. Both
+    /// are read from the task row inside the same statement, so the scope cannot drift
+    /// from the decision.
+    ///
+    /// This scope is the point, and it is why it is `task` + `step` + `attempt`:
+    ///
+    /// * **`task` alone is wrong.** A verified effect from a *completed earlier step*
+    ///   says nothing about whether the step that just crashed may be retried. Scoping
+    ///   only by task made that earlier evidence decisive, and because
+    ///   `NeedsVerification` is terminal and unclaimable, a single verified
+    ///   `filesystem/read-text` or `filesystem/write-text` in step 1 meant the task could
+    ///   never be recovered again.
+    /// * **`attempt` alone is wrong.** `tasks.attempts` is reset to `0` at every step
+    ///   boundary, so step 1's first attempt and step 2's first attempt are both
+    ///   `attempt_no = 1`. `task_effects` records `attempt_no` and, since version 13,
+    ///   `step_no`; without the step the two are indistinguishable.
+    /// * **`step` alone is wrong.** A step may take several attempts. An attempt that
+    ///   resolved `not-performed` is retryable by design, and a stale row from an earlier
+    ///   attempt of the *same* step must not block it.
+    ///
+    /// ## `effect_observed` is not evidence here
+    ///
+    /// `tasks.effect_observed` is a task-level boolean, so it has the same shape of
+    /// problem as the effect predicate this function used to run: one bit standing for a
+    /// task that may have many steps and many effects. It is deliberately **not**
+    /// consulted.
+    ///
+    /// Traced and cleared rather than assumed. Its only readers are the conformance
+    /// suite, which asserts that a task completed with an observed effect recorded that
+    /// fact; the read model, which projects it onto a row; and the daemon's JSON report,
+    /// which surfaces it to a caller. None of them is a recovery decision.
+    ///
+    /// The constraint on any future reader is that a task-level bit cannot say *which*
+    /// effect was observed or *which step* it belonged to, so it cannot stand in for
+    /// this predicate without acquiring the same `(step, attempt)` scope.
+    ///
+    /// ### Rows whose step was never recorded
+    ///
+    /// `task_effects.step_no` is nullable because a row written before version 13 has no
+    /// recorded step, and `NULL` asserts nothing. The predicate below reads `NULL` as
+    /// *"this row's step is unknown, so it is not excluded by the step test"* — and that is
+    /// the whole of its meaning.
+    ///
+    /// **It does not make a row match every execution.** The scope is three conditions
+    /// conjoined, and `NULL` satisfies only the step one:
+    ///
+    /// ```sql
+    /// e.task_id    = t.id
+    /// AND (e.step_no IS NULL OR e.step_no = t.steps_completed + 1)
+    /// AND e.attempt_no = t.attempts          <-- NULL does not reach this
+    /// AND e.status <> 'not-performed'
+    /// AND e.idempotent = 0
+    /// ```
+    ///
+    /// So a `NULL`-step row matches **only while `tasks.attempts` still equals that row's
+    /// `attempt_no`**. Once the task has advanced to a later attempt, the row no longer
+    /// matches and the task is returned to `pending` — a repeatable outcome for a row whose
+    /// step nobody recorded and whose attempt has been superseded. `recovery_scope_is_not_a
+    /// _wildcard` asserts exactly that, so the behaviour is pinned rather than implied.
+    ///
+    /// Is that safe enough? It is a real gap and it is deliberate. `origin/main`'s
+    /// `recover()` consulted no ledger at all and returned every interrupted task to
+    /// `pending`, so the only way to produce this shape is a database that was written by a
+    /// build older than this one *and* whose task has since been retried. Broadening `NULL`
+    /// to match every attempt would close it, at the cost of making one abandoned effect
+    /// row on an old task permanently unrecoverable — and it would do so by making the
+    /// predicate say something false: "this row might be any attempt of this task" is not
+    /// what "this row's step is unknown" means. The narrower reading is stated here, tested
+    /// below, and recorded as a known limit rather than papered over.
+    ///
+    /// Every clause is load-bearing, and the distinctions are the point:
+    ///
+    /// * A task with **no** effect rows crashed before dispatching anything, so the
+    ///   world is unchanged and re-running is safe. Conflating "non-idempotent" with
+    ///   "uncertain" would park every such task forever.
+    /// * An effect recorded `not-performed` was disproved, which is the one finding a
+    ///   retry cannot duplicate — the same reasoning V-92 applies when it maps a
+    ///   refuted outcome to `Failed`.
+    /// * An effect whose capability declares itself **idempotent** stays recoverable
+    ///   whatever its status, because repeating it cannot duplicate anything by its own
+    ///   declaration. Without this the fix would fill the queue with terminal tasks.
+    /// * A status outside the vocabulary counts as not-`not-performed`, so it fails
+    ///   closed rather than reading as benign.
+    ///
+    /// The flag consulted is the **effect's** repeat-safety, not `tasks.idempotent`.
+    /// See the comment on the `EXISTS` below for why that substitution would be wrong
+    /// and would leave this hole open.
+    ///
+    /// Uncertainty also takes precedence over the retry budget. An exhausted budget
+    /// is not a licence to repeat work whose outcome is unknown, and `dead-lettered`
+    /// would report "retries exhausted" as the reason when the truth is that a
+    /// person has to decide.
+    ///
+    /// ## Two properties of the implementation
+    ///
+    /// **The decision is one statement.** The whole classification is a `CASE`
+    /// expression inside the `UPDATE`, with no preceding read, so there is no
+    /// read-then-write window for another connection to slip through — which is
+    /// what made this operation correct even while `Self::tx` was `BEGIN DEFERRED`.
+    /// It no longer depends on that: `authority_transaction` is `IMMEDIATE`, so the
+    /// lock is held across the statement regardless. The single-statement shape is
+    /// kept because it is what makes the classification reviewable. The row is read
+    /// back afterwards only to name the event, never to choose the state.
+    ///
+    /// **Failure to read the ledger is a failure to recover.** A status outside the
+    /// vocabulary is not "probably fine"; it is a row whose meaning is unknown, and
+    /// the safe reading of an unknown row for a non-idempotent task is "do not
+    /// repeat this". A SQLite error while reading it propagates, which
+    /// `TaskService::open` turns into a refusal to start — a daemon that cannot
+    /// establish what happened does not serve requests.
     ///
     /// # Errors
     ///
@@ -2644,36 +3290,118 @@ impl<'a> TaskRepository<'a> {
                 .collect()
         };
         for id in &orphaned {
+            // The `EXISTS` sub-select is what makes this TP-2 rather than a
+            // blanket "any effect means stuck". See the table above for why
+            // `not-performed` is excluded and every other status is not.
+            //
+            // `e.idempotent` is the *effect's* repeat-safety, not `tasks.idempotent`.
+            // That is deliberate and load-bearing: the task's own flag answers "may this
+            // task be re-run as a unit", which is not the question. A task is created
+            // before the capability that will run on it is chosen -- and the daemon's
+            // `task/create` defaults to a `query` kind -- so most tasks are flagged
+            // idempotent at the task level no matter what they are about to do. Reading
+            // it here would leave this hole wide open. V-92 already reached the same
+            // conclusion for the same reason, reading the capability's declaration
+            // rather than the task row; the dispatcher is the only place that knows it,
+            // so it is written into the ledger at reservation time.
+            //
+            // It is evaluated once, in the `uncertainty` CTE, and referenced
+            // afterwards. Writing the sub-select out per column would be three
+            // copies of the load-bearing predicate, and two of them have to agree
+            // with the first or the row ends up internally contradictory -- a task
+            // settled into `needs-verification` with a `dead_lettered_at_ms`, say.
             tx.execute(
-                "UPDATE tasks
-                    SET state = CASE WHEN attempts >= max_attempts THEN 'dead-lettered'
-                                     ELSE 'pending' END,
+                "WITH uncertainty AS (
+                     SELECT t.id AS id,
+                            CASE WHEN EXISTS (SELECT 1 FROM task_effects e
+                                               WHERE e.task_id = t.id
+                                                 AND (e.step_no IS NULL
+                                                      OR e.step_no = t.steps_completed + 1)
+                                                 AND e.attempt_no = t.attempts
+                                                 AND e.status <> 'not-performed'
+                                                 AND e.idempotent = 0)
+                                 THEN 1 ELSE 0 END AS uncertain
+                       FROM tasks t
+                      WHERE t.id = ?1
+                 )
+                 UPDATE tasks
+                    SET state = CASE
+                                  WHEN (SELECT uncertain FROM uncertainty) = 1
+                                    THEN 'needs-verification'
+                                  WHEN attempts >= max_attempts THEN 'dead-lettered'
+                                  ELSE 'pending'
+                                END,
                         lease_holder = NULL,
                         lease_expires_at_ms = NULL,
                         updated_at_ms = ?2,
-                        dead_lettered_at_ms = CASE WHEN attempts >= max_attempts THEN ?2
-                                                  ELSE dead_lettered_at_ms END
+                        dead_lettered_at_ms = CASE
+                                  WHEN (SELECT uncertain FROM uncertainty) = 1
+                                    THEN dead_lettered_at_ms
+                                  WHEN attempts >= max_attempts THEN ?2
+                                  ELSE dead_lettered_at_ms END,
+                        last_error = CASE
+                                  WHEN (SELECT uncertain FROM uncertainty) = 1
+                                    THEN COALESCE(last_error, ?3)
+                                  ELSE last_error END
                   WHERE id = ?1;",
-                rusqlite::params![id, now_ms],
+                rusqlite::params![id, now_ms, Self::UNCERTAIN_RECOVERY_REASON],
             )?;
+
+            // Read back to name the event. The state was already decided by the
+            // statement above; this is bookkeeping, and it happens inside the same
+            // transaction so the two cannot disagree.
+            let settled: String = tx.query_row(
+                "SELECT state FROM tasks WHERE id = ?1;",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )?;
+            let to = TaskState::from_wire_str(&settled)
+                .ok_or_else(|| unknown_state(id.to_owned(), settled.clone()))?;
+
             // The attempt never finished; record that, so "we do not know whether
             // the work happened" is visible rather than assumed to have succeeded.
+            //
+            // Scoped to the same `(step_no, attempt_no)` the state decision above used,
+            // rather than to `task_id` alone. A task holds one lease, so today only one
+            // attempt can be unfinished -- but "today only one" is a property of the
+            // lease, not of the table, and this statement was relying on it to close
+            // rows it never named. Naming the identity removes the reliance.
+            //
+            // `steps_completed + 1` and `attempts` are read from the task row rather
+            // than passed in, so the scope cannot drift from the scope the decision used:
+            // both come out of the same `tasks` row inside this statement.
             tx.execute(
                 "UPDATE task_attempts
                     SET finished_at_ms = ?2, outcome = 'recovered', error = 'owner lost'
-                  WHERE task_id = ?1 AND finished_at_ms IS NULL;",
+                  WHERE task_id = ?1
+                    AND step_no = (SELECT steps_completed + 1 FROM tasks WHERE id = ?1)
+                    AND attempt_no = (SELECT attempts FROM tasks WHERE id = ?1)
+                    AND finished_at_ms IS NULL;",
                 rusqlite::params![id, now_ms],
             )?;
             log(
                 &tx,
                 Some(&TaskId::new(id)),
                 now_ms,
-                "recovered",
+                // Three distinct events rather than one, because `recovered` alone
+                // cannot answer the question that matters afterwards: may this be
+                // run again? `needs-verification-recovered` is the one that says a
+                // person has to decide, and it is the only one that may ever name
+                // `needs-verification`.
+                if to == TaskState::NeedsVerification {
+                    "needs-verification-recovered"
+                } else {
+                    "recovered"
+                },
                 Some(TaskState::Running),
+                Some(to),
                 None,
                 None,
-                None,
-                Some("lease orphaned by restart"),
+                Some(if to == TaskState::NeedsVerification {
+                    Self::UNCERTAIN_RECOVERY_REASON
+                } else {
+                    "lease orphaned by restart"
+                }),
             )?;
         }
 
@@ -2717,6 +3445,26 @@ impl<'a> TaskRepository<'a> {
     /// transaction as the dispatch decision; this is that row, and `false` is the
     /// caller's signal not to dispatch.
     ///
+    /// # The step number is part of the effect's identity
+    ///
+    /// `step_no` is recorded because `attempt_no` does not identify an attempt on its
+    /// own: `tasks.attempts` counts attempts *within the current logical step* and is
+    /// reset at every step boundary, so step 1's first attempt and step 2's first
+    /// attempt are both `attempt_no = 1`. Without the step, `recover()` cannot tell which
+    /// execution an effect row belongs to, and is forced to reason about the whole task --
+    /// which lets a completed earlier step's effect decide whether a later step may ever
+    /// be retried.
+    ///
+    /// `step_key` is the capability, not a step number, and is kept for what it is: the
+    /// ledger's record of *what* was dispatched.
+    ///
+    /// The argument count is the identity, spelled out: a task, a step, an attempt, a
+    /// capability, and whether that capability may be repeated. Bundling the first three
+    /// into a struct would be tidier and would also make the argument order harder to read
+    /// at the call site, because the whole point of the change is that `step_no` and
+    /// `attempt_no` are both integers that must not be swapped. Every other site in this
+    /// workspace that takes a comparable tuple spells it the same way.
+    #[allow(clippy::too_many_arguments)]
     /// # Errors
     ///
     /// Any SQLite error.
@@ -2724,23 +3472,47 @@ impl<'a> TaskRepository<'a> {
         &mut self,
         idempotency_key: &str,
         task_id: &TaskId,
+        step_no: u32,
         attempt_no: u32,
         step_key: &str,
+        idempotent: bool,
         now_ms: i64,
     ) -> Result<Option<ReservedEffect>, TaskRepoError> {
         let tx = self.tx()?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO task_effects
-                (idempotency_key, task_id, attempt_no, step_key, status, reserved_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5);",
+        // A plain `INSERT`, not `INSERT OR IGNORE` (V-94). `OR IGNORE` resolves a
+        // primary-key collision, a NOT NULL failure and a CHECK failure the same way --
+        // the row is skipped and the statement reports zero rows -- so `Ok(None)` used to
+        // mean "something was wrong with this reservation" as well as "this key is
+        // already reserved". That distinction is the whole contract: `None` is the
+        // caller's signal not to dispatch, and an *invalid* reservation reported as a
+        // duplicate would look like work already done.
+        //
+        // The primary key is `idempotency_key`, so its violation is the duplicate, and it
+        // is identified by extended code rather than by substring-matching the message.
+        let inserted = match tx.execute(
+            "INSERT INTO task_effects
+                (idempotency_key, task_id, step_no, attempt_no, step_key, status, idempotent,
+                 reserved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7);",
             rusqlite::params![
                 idempotency_key,
                 task_id.as_str(),
+                step_no,
                 attempt_no,
                 step_key,
+                i64::from(idempotent),
                 now_ms
             ],
-        )?;
+        ) {
+            Ok(n) => n,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation
+                    && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
+            {
+                0
+            }
+            Err(e) => return Err(TaskRepoError::from(e)),
+        };
         tx.commit()?;
         if inserted == 0 {
             return Ok(None);
@@ -2751,6 +3523,7 @@ impl<'a> TaskRepository<'a> {
             attempt_no,
             step_key: step_key.to_owned(),
             status: "pending".to_owned(),
+            idempotent,
             detail: None,
         }))
     }
@@ -2762,10 +3535,20 @@ impl<'a> TaskRepository<'a> {
     /// nothing knows, and that is a legitimate recorded state — whereas leaving the
     /// row `pending` forever would mean the same thing invisibly.
     ///
+    /// A row left at `pending` is not inert. It is the durable evidence that a
+    /// dispatch was authorised and its outcome never established, which is what
+    /// [`Self::recover`] reads to decide whether a crashed non-idempotent task may
+    /// be run again. This is the other reason the refusal above exists: if
+    /// `pending` were writable as a resolution, "never resolved" and "explicitly
+    /// recorded as unresolved" would become the same row, and only one of them is
+    /// evidence about a crash.
+    ///
     /// # Errors
     ///
-    /// `TaskRepoError::CorruptRow` for a status outside the vocabulary. There is no
-    /// `CorruptRow` variant; the error is reported as `TaskRepoError::Corrupt`.
+    /// [`TaskRepoError::Corrupt`] for a status inside `pending`. The doc comment in
+    /// the repository previously referred to a `CorruptRow` variant that does not
+    /// exist; the error has always been reported as
+    /// [`TaskRepoError::Corrupt`].
     pub fn resolve_effect(
         &mut self,
         idempotency_key: &str,
@@ -2796,7 +3579,7 @@ impl<'a> TaskRepository<'a> {
         Ok(self
             .conn
             .query_row(
-                "SELECT idempotency_key, task_id, attempt_no, step_key, status, detail
+                "SELECT idempotency_key, task_id, attempt_no, step_key, status, idempotent, detail
                    FROM task_effects WHERE idempotency_key = ?1;",
                 [idempotency_key],
                 |r| {
@@ -2806,7 +3589,12 @@ impl<'a> TaskRepository<'a> {
                         attempt_no: r.get(2)?,
                         step_key: r.get(3)?,
                         status: r.get(4)?,
-                        detail: r.get(5)?,
+                        // The column carries no CHECK of its own (`ALTER TABLE` cannot add
+                        // one), so the 0/1 restriction is enforced here instead. A value
+                        // outside it is corruption, and the only safe reading of a
+                        // corrupted repeat-safety flag is "not safe to repeat".
+                        idempotent: matches!(r.get::<_, i64>(5)?, 1),
+                        detail: r.get(6)?,
                     })
                 },
             )
@@ -2820,7 +3608,7 @@ impl<'a> TaskRepository<'a> {
     /// Any SQLite error.
     pub fn effects_for(&self, task_id: &TaskId) -> Result<Vec<ReservedEffect>, TaskRepoError> {
         let mut stmt = self.conn.prepare(
-            "SELECT idempotency_key, task_id, attempt_no, step_key, status, detail
+            "SELECT idempotency_key, task_id, attempt_no, step_key, status, idempotent, detail
                FROM task_effects WHERE task_id = ?1 ORDER BY reserved_at_ms, idempotency_key;",
         )?;
         let rows = stmt.query_map([task_id.as_str()], |r| {
@@ -2830,7 +3618,8 @@ impl<'a> TaskRepository<'a> {
                 attempt_no: r.get(2)?,
                 step_key: r.get(3)?,
                 status: r.get(4)?,
-                detail: r.get(5)?,
+                idempotent: matches!(r.get::<_, i64>(5)?, 1),
+                detail: r.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2884,30 +3673,16 @@ impl<'a> TaskRepository<'a> {
         validate_step_no(max_steps as u32, approval.step_no)
             .map_err(|e| TaskRepoError::InvalidComposition(Box::new(e)))?;
 
-        let changed = tx.execute(
-            "INSERT OR IGNORE INTO task_approvals
-                (task_id, attempt_no, step_no, digest, capability, target, params,
-                 issued_at_ms, expires_at_ms, consumed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL);",
-            rusqlite::params![
-                approval.task_id.as_str(),
-                approval.attempt_no,
-                approval.step_no,
-                hex_to_bytes(&approval.digest_hex),
-                approval.capability,
-                approval.target,
-                approval.params,
-                approval.issued_at_ms,
-                approval.expires_at_ms,
-            ],
-        )?;
+        // Parsed before the insert, so a malformed digest never reaches a column. V-94.
+        let digest = parse_approval_digest(&approval.digest_hex)?;
+
+        // A plain `INSERT`, not `INSERT OR IGNORE` (V-94). `OR IGNORE` covers NOT NULL
+        // and CHECK as well as UNIQUE, so its zero-row result meant "something was
+        // wrong with this row" -- and every one of those was reported as
+        // `AlreadyExists`, which is a *caller* error the daemon maps to a specific wire
+        // code. A constraint violation now surfaces as itself.
+        insert_approval(&tx, approval, digest)?;
         tx.commit()?;
-        if changed == 0 {
-            return Err(TaskRepoError::AlreadyExists(format!(
-                "{} attempt {} already has an approval",
-                approval.task_id, approval.attempt_no
-            )));
-        }
         Ok(())
     }
 
@@ -2996,7 +3771,7 @@ impl<'a> TaskRepository<'a> {
                     approval.task_id.as_str(),
                     approval.attempt_no,
                     approval.step_no,
-                    hex_to_bytes(&approval.digest_hex),
+                    parse_approval_digest(&approval.digest_hex)?,
                     approval.capability,
                     approval.target,
                     approval.params,
@@ -3068,7 +3843,7 @@ impl<'a> TaskRepository<'a> {
                 approval.task_id.as_str(),
                 approval.step_no,
                 approval.attempt_no,
-                hex_to_bytes(&approval.digest_hex),
+                parse_approval_digest(&approval.digest_hex)?,
                 approval.capability,
                 approval.target,
                 approval.params,
@@ -3527,20 +4302,188 @@ fn is_unique_violation(n: &usize) -> bool {
     *n == 0
 }
 
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    let bytes: Vec<u8> = hex.as_bytes().to_vec();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16);
-        let lo = (bytes[i + 1] as char).to_digit(16);
-        match (hi, lo) {
-            (Some(h), Some(l)) => out.push(u8::try_from(h * 16 + l).unwrap_or(0)),
-            _ => return Vec::new(),
+/// Inserts an approval row, distinguishing a duplicate from every other failure.
+///
+/// V-94. `record_approval` used `INSERT OR IGNORE`, and `OR IGNORE` resolves NOT NULL,
+/// CHECK, UNIQUE and PRIMARY KEY the same way: the row is silently skipped and the
+/// statement reports zero rows affected. The caller then read zero as "this attempt
+/// already has an approval" and returned `AlreadyExists` -- which is a *caller* error
+/// the daemon maps to a specific wire code, so a malformed or constraint-violating
+/// insert was reported to the reader as "you already approved this".
+///
+/// A plain `INSERT` separates them without relying on a message string to tell
+/// constraint families apart:
+///
+/// | outcome | meaning | reported as |
+/// |---|---|---|
+/// | one row | stored | `Ok(1)` |
+/// | primary-key violation | this attempt already holds one | `AlreadyExists` |
+/// | any other constraint violation | the row was invalid | `Corrupt`, naming it |
+/// | any other SQLite error | storage | `Sqlite` |
+///
+/// The primary key is distinguished by *which* constraint failed rather than by
+/// substring-matching the table's columns, because the message for a NOT NULL or CHECK
+/// failure also says "constraint failed" and the two must not collapse.
+fn insert_approval(
+    tx: &Transaction<'_>,
+    approval: &ApprovalRow,
+    digest: [u8; APPROVAL_DIGEST_BYTES],
+) -> Result<(), TaskRepoError> {
+    let result = tx.execute(
+        "INSERT INTO task_approvals
+            (task_id, attempt_no, step_no, digest, capability, target, params,
+             issued_at_ms, expires_at_ms, consumed_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL);",
+        rusqlite::params![
+            approval.task_id.as_str(),
+            approval.attempt_no,
+            approval.step_no,
+            digest.as_slice(),
+            approval.capability,
+            approval.target,
+            approval.params,
+            approval.issued_at_ms,
+            approval.expires_at_ms,
+        ],
+    );
+    match result {
+        // A plain `INSERT` of one row either lands or fails, so a success count of
+        // anything but one would mean the statement did not do what it says.
+        Ok(1) => Ok(()),
+        Ok(n) => Err(TaskRepoError::Corrupt(Box::new(CorruptRowDetail {
+            id: approval.task_id.to_string(),
+            reason: format!("one INSERT reported {n} rows affected"),
+        }))),
+        Err(rusqlite::Error::SqliteFailure(e, _msg))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+                && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
+        {
+            Err(TaskRepoError::AlreadyExists(format!(
+                "attempt {} of task {} already holds an approval",
+                approval.attempt_no, approval.task_id
+            )))
         }
-        i += 2;
+        Err(rusqlite::Error::SqliteFailure(e, msg))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            // Every other constraint family. Reported as corruption rather than as a
+            // duplicate, because the reader's remedy is different: this row is not
+            // something the caller sent twice.
+            Err(TaskRepoError::Corrupt(Box::new(CorruptRowDetail {
+                id: approval.task_id.to_string(),
+                reason: format!(
+                    "the approval for attempt {} violates a constraint and was not \
+                     stored: {}",
+                    approval.attempt_no,
+                    msg.unwrap_or_else(|| format!("code {}", e.extended_code))
+                ),
+            })))
+        }
+        Err(e) => Err(TaskRepoError::from(e)),
     }
-    out
+}
+
+/// The length in bytes of an approval digest.
+///
+/// Not a magic number at the call sites: the digest *is* this value (ADR-0037,
+/// `ApprovalDigest([u8; 32])`), so a place that needs the length and writes a different
+/// one is a place where the two have drifted.
+pub const APPROVAL_DIGEST_BYTES: usize = 32;
+
+/// Parses an approval digest from its hex spelling, or refuses it.
+///
+/// # Why this returns a `Result` rather than a value (V-94)
+///
+/// The previous version returned an empty `Vec` for unparseable input and dropped a
+/// trailing nibble for odd-length input. Both are worse than a refusal, and for
+/// different reasons:
+///
+/// * An **empty** result is a *value*. `digest BLOB NOT NULL` accepts a zero-length
+///   blob, so every malformed digest was persisted, and every one of them collapsed
+///   onto the same empty blob -- so distinct broken approvals became
+///   indistinguishable and nothing downstream could tell one from another.
+/// * A **truncated** result is worse still: 63 hex characters silently produced a
+///   perfectly valid-looking 32-byte digest that is *not* the digest the caller
+///   supplied. The stored authority no longer matched what was issued, which is the
+///   authority-substitution failure this whole mechanism exists to prevent.
+///
+/// So the only two possible answers are "these 32 bytes" and "this is not a digest".
+///
+/// Case-insensitive on input, and the stored bytes are canonical, so the hex read back
+/// is lower-case regardless of how the caller spelled it. That matters because the
+/// read path upper-cases (`hex()`) while every writer supplies lower-case, and a
+/// round-trip assertion that compares spellings rather than bytes would otherwise fail
+/// for a reason that has nothing to do with correctness.
+/// Decodes an approval digest, or refuses.
+///
+/// # Why the ASCII check comes first
+///
+/// This used to slice `hex` by **byte** index to name the offending character, which
+/// panics when the index lands inside a multi-byte character. The length gates are in
+/// bytes, so a string of 64 *bytes* containing one two-byte character passed them, and
+/// the error path — the only thing that slices — then panicked at a character boundary.
+///
+/// The panic was reachable: 61 ASCII characters followed by a two-byte character and one
+/// more ASCII character is exactly 64 bytes, passes both gates, and puts byte 62 inside
+/// the multi-byte character. It was not reachable from the daemon, whose only production
+/// digest is hex it encoded itself from trusted bytes, but
+/// [`TaskRepository::record_approval`] and [`crate::DurableEngine`] are public, and a
+/// `Result`-returning parser that panics on malformed input is a contract violation
+/// whatever its callers happen to do.
+///
+/// So: reject anything that is not ASCII hex **before** any indexing, and never slice a
+/// `&str` by a byte offset again. The error names a byte value rather than a substring,
+/// which is both safe and more precise about what was wrong.
+fn parse_approval_digest(hex: &str) -> Result<[u8; APPROVAL_DIGEST_BYTES], TaskRepoError> {
+    let bad = |reason: String| TaskRepoError::InvalidDigest { reason };
+
+    if hex.is_empty() {
+        return Err(bad("the digest is empty".to_owned()));
+    }
+    // Before every length check, because every length check below is in bytes and a
+    // multi-byte character would make the byte count disagree with the character count.
+    if !hex.is_ascii() {
+        let at = hex.bytes().position(|b| !b.is_ascii()).unwrap_or(0);
+        let code = u32::from(hex.as_bytes()[at]);
+        return Err(bad(format!(
+            "the digest contains a non-ASCII character; an approval digest is hex, and \
+             hex is ASCII (byte 0x{code:02x} at position {at})"
+        )));
+    }
+    // Checked before decoding, so the "wrong length" answer is specific rather than a
+    // trailing-nibble accident. `is_ascii` has established that byte length and character
+    // length are the same number, so these counts are counts of characters.
+    if !hex.len().is_multiple_of(2) {
+        return Err(bad(format!(
+            "the digest is {} characters, which is not a whole number of bytes",
+            hex.len()
+        )));
+    }
+    if hex.len() != APPROVAL_DIGEST_BYTES * 2 {
+        return Err(bad(format!(
+            "the digest is {} characters; an approval digest is exactly {}",
+            hex.len(),
+            APPROVAL_DIGEST_BYTES * 2
+        )));
+    }
+
+    let mut out = [0u8; APPROVAL_DIGEST_BYTES];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // Byte values, never `&str` slices: `hex` is ASCII now, so a byte is a character,
+        // and reading it as a byte cannot be out of bounds for any index this loop makes.
+        let pair = &hex.as_bytes()[i * 2..i * 2 + 2];
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| bad(format!("{:#04x} is not a hex digit", pair[0])))?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| bad(format!("{:#04x} is not a hex digit", pair[1])))?;
+        // A nibble pair is at most 0xff, so this cannot overflow; `try_from` makes that
+        // explicit rather than relying on the reader to check it.
+        *slot =
+            u8::try_from(hi * 16 + lo).map_err(|_| bad("a hex pair is out of range".to_owned()))?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -3548,6 +4491,175 @@ mod tests {
     use super::*;
     use crate::migration::MigrationRunner;
     use crate::pragma::Pragma;
+
+    /// A database written before the effect's repeat-safety existed upgrades to the
+    /// fail-closed reading.
+    ///
+    /// V-93. The column is added `NOT NULL DEFAULT 0`, so a row written by an older
+    /// build -- whose effect's repeat-safety nobody recorded -- becomes one that must
+    /// not be repeated. That is the only safe direction for a row whose meaning is
+    /// unknown, and it is what makes recovery conservative rather than permissive for
+    /// every database already on disk.
+    #[test]
+    fn a_legacy_effect_row_upgrades_to_the_fail_closed_repeat_safety() {
+        use crate::migration::{CURRENT_VERSION, MIGRATIONS};
+
+        let c = rusqlite::Connection::open_in_memory().expect("open");
+        // Stand up a version-10 database: everything except the effect's flag.
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 10) {
+            c.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("{}: {e}", m.name));
+            c.execute(
+                "INSERT OR REPLACE INTO schema_meta (version, name, applied_at) VALUES (?1, ?2, 0);",
+                rusqlite::params![i64::from(m.version), m.name],
+            )
+            .expect("record");
+        }
+        c.execute(
+            "INSERT INTO tasks (id, kind, state, idempotent, max_attempts, run_after_ms,
+                                 created_at_ms, updated_at_ms)
+             VALUES ('t','workflow','pending',0,3,0,0,0);",
+            [],
+        )
+        .expect("task");
+        c.execute(
+            "INSERT INTO task_effects (idempotency_key, task_id, attempt_no, step_key, status, reserved_at_ms)
+             VALUES ('k','t',1,'write','pending',0);",
+            [],
+        )
+        .expect("a pre-V-93 effect row");
+        let before: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('task_effects') WHERE name = 'idempotent';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("probe");
+        assert_eq!(before, 0, "precondition: version 10 has no such column");
+
+        MigrationRunner::new(&c)
+            .run(true)
+            .expect("upgrade to current");
+        let version: u32 = c
+            .query_row("SELECT MAX(version) FROM schema_meta;", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(
+            version, CURRENT_VERSION,
+            "the runner must reach the current version"
+        );
+
+        // The legacy row is now flagged non-idempotent: not safe to repeat.
+        let flagged: i64 = c
+            .query_row(
+                "SELECT idempotent FROM task_effects WHERE idempotency_key = 'k';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read back");
+        assert_eq!(
+            flagged, 0,
+            "an effect whose repeat-safety was never recorded must not be treated as safe"
+        );
+
+        // And the schema still refuses to write a status outside the vocabulary.
+        assert!(
+            c.execute(
+                "UPDATE task_effects SET status = 'in-flux' WHERE idempotency_key = 'k';",
+                [],
+            )
+            .is_err(),
+            "the status CHECK must survive the ALTER"
+        );
+        let _ = c;
+    }
+
+    /// A legacy approval whose digest was never 32 bytes is **discarded**, not
+    /// migrated. V-94, and a deliberate loss.
+    ///
+    /// Migration 12 cannot add a `CHECK` to an existing table, so it recreates the table
+    /// and copies rows across. A row whose digest was not a valid authority digest is not
+    /// an approval that could ever be honoured -- the binding between it and its
+    /// operation was never established -- and the two available readings are "keep it"
+    /// and "discard it". Keeping it would preserve the exact state the migration exists
+    /// to remove, and the `CHECK` would then have to be absent for those rows forever.
+    ///
+    /// So they go, and an operator who needs that authority re-approves, which is the
+    /// correct remedy for authority that was never recorded.
+    #[test]
+    fn a_legacy_approval_with_a_malformed_digest_is_discarded_rather_than_migrated() {
+        let c = rusqlite::Connection::open_in_memory().expect("open");
+        for m in crate::migration::MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 11)
+        {
+            c.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("{}: {e}", m.name));
+            c.execute(
+                "INSERT OR REPLACE INTO schema_meta (version, name, applied_at)
+                 VALUES (?1, ?2, 0);",
+                rusqlite::params![i64::from(m.version), m.name],
+            )
+            .expect("record");
+        }
+        c.execute(
+            "INSERT INTO tasks (id, kind, state, idempotent, max_attempts, run_after_ms,
+                                 created_at_ms, updated_at_ms, max_steps, steps_completed)
+             VALUES ('good','workflow','running',0,3,0,0,0,1,0),
+                    ('bad','workflow','running',0,3,0,0,0,1,0);",
+            [],
+        )
+        .expect("tasks");
+        // One well-formed approval, and one carrying the 8-byte digest the old parser
+        // could produce from unparseable input.
+        for (id, blob) in [("good", vec![1u8; 32]), ("bad", vec![2u8; 8])] {
+            c.execute(
+                "INSERT INTO task_approvals (task_id, step_no, attempt_no, digest,
+                                             capability, params, issued_at_ms, expires_at_ms)
+                 VALUES (?1, 1, 1, ?2, 'c', '{}', 0, 1);",
+                rusqlite::params![id, blob],
+            )
+            .expect("approval");
+        }
+
+        crate::migration::MigrationRunner::new(&c)
+            .run(true)
+            .expect("upgrade");
+        let version: u32 = c
+            .query_row("SELECT MAX(version) FROM schema_meta;", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, crate::migration::CURRENT_VERSION);
+
+        let remaining: Vec<String> = {
+            let mut stmt = c
+                .prepare("SELECT task_id FROM task_approvals ORDER BY task_id;")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .expect("query");
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.expect("row"));
+            }
+            v
+        };
+        assert_eq!(
+            remaining,
+            vec!["good".to_owned()],
+            "the well-formed approval survives; the malformed one is discarded"
+        );
+
+        // And the constraint is in force for every future write.
+        assert!(
+            c.execute(
+                "INSERT INTO task_approvals (task_id, step_no, attempt_no, digest,
+                                             capability, params, issued_at_ms, expires_at_ms)
+                 VALUES ('bad', 1, 2, ?1, 'c', '{}', 0, 1);",
+                rusqlite::params![vec![2u8; 8]],
+            )
+            .is_err(),
+            "a malformed digest must not be writable after the migration"
+        );
+    }
 
     const NOW: i64 = 1_767_225_600_000;
     const LEASE: i64 = 5_000;
@@ -4546,11 +5658,11 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let first = repo
-            .reserve_effect("key-1", &tid("t"), 1, "step-1", NOW)
+            .reserve_effect("key-1", &tid("t"), 1, 1, "step-1", false, NOW)
             .expect("reserve");
         assert!(first.is_some());
         let second = repo
-            .reserve_effect("key-1", &tid("t"), 2, "step-1", NOW)
+            .reserve_effect("key-1", &tid("t"), 1, 2, "step-1", false, NOW)
             .expect("reserve");
         assert!(
             second.is_none(),
@@ -4573,7 +5685,7 @@ mod tests {
         {
             let key = format!("k{i}");
             let _ = repo
-                .reserve_effect(&key, &tid("t"), 1, "s", NOW)
+                .reserve_effect(&key, &tid("t"), 1, 1, "s", false, NOW)
                 .expect("reserve");
             assert!(
                 repo.resolve_effect(&key, status, None, NOW + 1)
@@ -4592,7 +5704,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", NOW)
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Pending, None, NOW)
@@ -4606,7 +5718,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", NOW)
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Unknown, None, NOW)
@@ -4628,7 +5740,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, "s", NOW)
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
             .expect("reserve");
         assert!(!repo.all_effects_resolved(&tid("t")).expect("resolved?"));
         let _ = repo.resolve_effect("k", EffectStatus::Unknown, None, NOW);
@@ -5073,7 +6185,15 @@ mod tests {
         insert(&mut repo, "t", TaskKind::Workflow);
         for i in 0..3 {
             let _ = repo
-                .reserve_effect(&format!("k{i}"), &tid("t"), 1, &format!("s{i}"), NOW + i)
+                .reserve_effect(
+                    &format!("k{i}"),
+                    &tid("t"),
+                    1,
+                    1,
+                    &format!("s{i}"),
+                    false,
+                    NOW + i,
+                )
                 .expect("r");
         }
         let keys: Vec<String> = repo
@@ -5098,18 +6218,228 @@ mod tests {
         assert!(matches!(err, TaskRepoError::Corrupt(_)), "{err}");
     }
 
+    // ---------------------------------------------------------- digest parsing
+
+    /// **The panic this exists for.** 64 *bytes* whose 62nd byte is the second half of a
+    /// two-byte character.
+    ///
+    /// The previous parser checked length in bytes, then sliced the string by byte offset
+    /// to name the bad character. Byte 62 here is inside 'e-acute', so that slice panicked
+    /// with "byte index 62 is not a char boundary" instead of returning `InvalidDigest`.
+    ///
+    /// Built as a byte-length construction on purpose: 61 ASCII characters, one two-byte
+    /// character and one more ASCII character is 64 bytes but 63 characters, which is
+    /// exactly how it slipped past both length gates.
     #[test]
-    fn hex_round_trips_through_the_blob_column() {
-        assert_eq!(hex_to_bytes("00ff10"), vec![0x00, 0xff, 0x10]);
-        assert_eq!(hex_to_bytes(""), Vec::<u8>::new());
+    fn a_64_byte_digest_with_a_multibyte_character_is_refused_and_does_not_panic() {
+        let mut hex = String::with_capacity(64);
+        hex.push_str(&"a".repeat(61));
+        hex.push('\u{00e9}'); // bytes 61..63, so byte 62 is this character's second half
+        hex.push('a');
         assert_eq!(
-            hex_to_bytes("zz"),
-            Vec::<u8>::new(),
-            "non-hex must not silently decode"
+            hex.len(),
+            APPROVAL_DIGEST_BYTES * 2,
+            "the fixture must satisfy the length gate that used to be checked first"
+        );
+        assert_eq!(
+            hex.chars().count(),
+            63,
+            "and disagree with it -- that disagreement is the bug"
+        );
+
+        // Asserted on the *result*, not merely the absence of a panic: a version that
+        // returned some other error would pass a "did not panic" check.
+        let out = parse_approval_digest(&hex);
+        assert!(
+            matches!(out, Err(TaskRepoError::InvalidDigest { .. })),
+            "a malformed digest must be the documented typed error, got {out:?}"
         );
     }
-}
 
+    /// Every shape of malformed input is a typed error, and none panics. A parser that
+    /// panics on caller-controlled bytes is a denial of service on an authority path.
+    #[test]
+    fn malformed_digests_are_always_a_typed_refusal() {
+        // A digest whose 62nd byte falls inside a multi-byte character.
+        let mut boundary_shifting = String::with_capacity(64);
+        boundary_shifting.push_str(&"ab".repeat(30));
+        boundary_shifting.push('a');
+        boundary_shifting.push('\u{00e9}');
+        boundary_shifting.push('a');
+
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("empty", String::new(), false),
+            ("valid lowercase", "ab".repeat(32), true),
+            ("valid uppercase", "AB".repeat(32), true),
+            ("valid mixed case", "aB".repeat(32), true),
+            ("valid all zeros", "0".repeat(64), true),
+            ("valid all fs", "f".repeat(64), true),
+            ("one short", "ab".repeat(16), false),
+            ("one long", "ab".repeat(64), false),
+            ("odd length", "a".repeat(63), false),
+            ("odd length, one over", "a".repeat(65), false),
+            (
+                "invalid ascii g",
+                format!("{}g{}", "ab".repeat(31), "a"),
+                false,
+            ),
+            ("invalid ascii z", "zz".repeat(32), false),
+            ("leading space", format!(" {}", "ab".repeat(32)), false),
+            ("trailing newline", format!("{}\n", "ab".repeat(32)), false),
+            (
+                "internal space",
+                format!("{} {}", "ab".repeat(31), "ab"),
+                false,
+            ),
+            ("trailing nul", format!("{}\0", "ab".repeat(31)), false),
+            (
+                "two-byte e-acute at the end",
+                format!("{}\u{00e9}", "ab".repeat(31)),
+                false,
+            ),
+            ("two-byte, boundary-shifting", boundary_shifting, false),
+            (
+                "three-byte cjk",
+                format!("{}\u{4e2d}", "ab".repeat(31)),
+                false,
+            ),
+            ("emoji", format!("{}\u{1f600}", "ab".repeat(31)), false),
+            (
+                "combining mark",
+                format!("{}\u{0301}", "ab".repeat(31)),
+                false,
+            ),
+            (
+                "latin-1 supplement",
+                format!("{}\u{00ff}", "ab".repeat(31)),
+                false,
+            ),
+            (
+                "mixed valid and multibyte",
+                format!("{}{}", "ab".repeat(31), "\u{00e9}"),
+                false,
+            ),
+            ("all multibyte", "\u{00e9}".repeat(32), false),
+            ("single high byte", "\u{00ff}".to_owned(), false),
+        ];
+
+        for (name, hex, expect_ok) in &cases {
+            let out = parse_approval_digest(hex);
+            if *expect_ok {
+                assert!(out.is_ok(), "{name} must be accepted, got {out:?}");
+            } else {
+                assert!(
+                    matches!(out, Err(TaskRepoError::InvalidDigest { .. })),
+                    "{name} must be InvalidDigest, got {out:?}"
+                );
+            }
+        }
+    }
+
+    /// Uppercase is accepted and decodes to the same bytes as lowercase. A digest is a
+    /// byte string with a hex rendering; treating the two spellings as different values
+    /// would make an approval that verifies in one place fail in another.
+    #[test]
+    fn hex_case_is_a_rendering_not_a_different_value() {
+        let lower = parse_approval_digest(&"ab".repeat(32)).expect("lower");
+        let upper = parse_approval_digest(&"AB".repeat(32)).expect("upper");
+        let mixed = parse_approval_digest(&"aB".repeat(32)).expect("mixed");
+        assert_eq!(lower, upper);
+        assert_eq!(lower, mixed);
+    }
+
+    /// The refusal says which byte and where, so an operator is not left guessing. The
+    /// position is a byte offset, which is where the offending byte lives.
+    #[test]
+    fn a_non_ascii_refusal_names_the_offending_byte() {
+        let mut hex = String::with_capacity(64);
+        hex.push_str(&"ab".repeat(20));
+        hex.push('\u{00e9}'); // byte 40
+        hex.push_str(&"ab".repeat(21));
+        let err = parse_approval_digest(&hex).expect_err("non-ASCII must be refused");
+        let TaskRepoError::InvalidDigest { reason } = err else {
+            panic!("expected InvalidDigest");
+        };
+        assert!(
+            reason.contains("non-ASCII") && reason.contains("40"),
+            "the reason must name the byte and its position, got {reason:?}"
+        );
+    }
+
+    /// The end-to-end shape, so the parser is not only correct in isolation: a refused
+    /// digest leaves **no** row, rather than a row holding a truncated or empty value.
+    #[test]
+    fn a_multibyte_digest_leaves_no_row_rather_than_a_truncated_one() {
+        let mut conn = mem();
+        let mut repo = TaskRepository::new(&mut conn);
+        insert(&mut repo, "t", TaskKind::Workflow);
+        let mut hex = String::with_capacity(64);
+        hex.push_str(&"ab".repeat(30));
+        hex.push('a');
+        hex.push('\u{00e9}');
+        hex.push('a');
+        let err = repo
+            .record_approval(&ApprovalRow {
+                task_id: tid("t"),
+                step_no: 1,
+                attempt_no: 1,
+                digest_hex: hex,
+                capability: "c".to_owned(),
+                target: None,
+                params: "{}".to_owned(),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 60_000,
+                consumed_at_ms: None,
+            })
+            .expect_err("must be refused");
+        assert!(
+            matches!(err, TaskRepoError::InvalidDigest { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            repo.approval_for_attempt(&tid("t"), 1, 1)
+                .expect("read")
+                .is_none(),
+            "a refused digest must leave no row at all: a truncated or empty blob under \
+             the column that binds an approval to the operation it authorises is exactly \
+             what V-94 existed to prevent"
+        );
+    }
+
+    /// The parser has exactly two answers: the 32 bytes, or a refusal.
+    ///
+    /// The old parser had a third -- an empty vector -- and that answer is what made a
+    /// malformed digest storable. These are the cases that proved it, kept as a unit
+    /// because the interesting property is the *shape* of the failure, not any one case.
+    #[test]
+    fn the_digest_parser_refuses_rather_than_manufacturing_a_value() {
+        let good = "ab".repeat(32);
+        assert_eq!(parse_approval_digest(&good).expect("valid"), [0xab; 32]);
+
+        // Case-insensitive on input; the stored bytes are what matter.
+        assert_eq!(
+            parse_approval_digest(&good.to_uppercase()).expect("upper case"),
+            [0xab; 32]
+        );
+
+        let odd = "ab".repeat(32);
+        let one_bad = format!("{}zz", "ab".repeat(31));
+        for (label, input) in [
+            ("empty", String::new()),
+            ("odd length", odd[..63].to_owned()),
+            ("too short", "ab".repeat(16)),
+            ("too long", "ab".repeat(64)),
+            ("non-hex", "zz".repeat(32)),
+            ("one bad digit", one_bad),
+        ] {
+            let err = parse_approval_digest(&input).expect_err(&format!("{label} must be refused"));
+            assert!(
+                matches!(err, TaskRepoError::InvalidDigest { .. }),
+                "{label} must produce a typed refusal, got {err:?}"
+            );
+        }
+    }
+}
 /// Stage 3b: the repository side of bounded linear composition.
 ///
 /// Nothing here advances a task. These tests exist to prove that the storage primitives
@@ -5800,7 +7130,9 @@ mod composition_tests {
                     "INSERT INTO task_approvals (task_id,attempt_no,digest,capability,target,
                                                  params,issued_at_ms,expires_at_ms)
                      VALUES (?1,?2,?3,'filesystem/write-text','a.txt','{}',1,2);",
-                    rusqlite::params![id, attempt, vec![attempt as u8; 8]],
+                    // A real digest is 32 bytes. Migration 12 refuses anything else, so a
+                    // shorter seed would be discarded rather than migrated -- which is the point.
+                    rusqlite::params![id, attempt, vec![attempt as u8; 32]],
                 )
                 .expect("approval");
             }
@@ -5843,6 +7175,10 @@ mod composition_tests {
 /// fails loudly about: a result with no counter, a counter with no result, and a terminal
 /// task whose last step is unrecorded.
 #[cfg(test)]
+// Several tests here deliberately use the deprecated lease-without-spending
+// operation: it is the only way to construct "lease held, approval unspent"
+// without hand-written SQL, and the recovery tests need exactly that.
+#[allow(deprecated)]
 mod advancement_tests {
     use super::*;
     use crate::migration::MigrationRunner;
@@ -6607,6 +7943,10 @@ mod advancement_tests {
 /// continuation of the previous one, and that two workers racing for it produce one winner
 /// rather than two owners of one step.
 #[cfg(test)]
+// Several tests here deliberately use the deprecated lease-without-spending
+// operation: it is the only way to construct "lease held, approval unspent"
+// without hand-written SQL, and the recovery tests need exactly that.
+#[allow(deprecated)]
 mod next_step_claim_tests {
     use super::*;
     use crate::migration::MigrationRunner;

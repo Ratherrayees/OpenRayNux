@@ -75,6 +75,21 @@ pub enum FaultPoint {
     /// Inside `cancel`'s first transaction, between marking the tasks row and
     /// recording the cancellation event.
     CancelBeforeEvent,
+    /// In the daemon's dispatch path, after the side effect has been *reserved* and
+    /// before its outcome has been recorded.
+    ///
+    /// The one window this crate's transaction semantics cannot cover, and the reason
+    /// this point exists rather than a fifth repository transaction. Between a
+    /// reservation and its resolution there is no transaction to abort inside: the
+    /// durable facts are a `task_effects` row at `pending` and a task row that is
+    /// `running` under a lease the dying process still holds. That is exactly the
+    /// shape `TaskRepository::recover` has to recognise, and a crash here is the
+    /// only faithful way to produce it.
+    ///
+    /// Called from `orxnud-daemon`, so it is the only fault point outside this
+    /// crate. It lives here rather than there for the reason above: this module is
+    /// the single place `process::abort` may appear.
+    ExecutionReservedBeforeOutcome,
 }
 
 impl FaultPoint {
@@ -85,6 +100,7 @@ impl FaultPoint {
             Self::CompleteAfterUpdateBeforeAttempt => "complete-after-update-before-attempt",
             Self::AdvanceStepAfterResultBeforeCounter => "advance-step-after-result-before-counter",
             Self::CancelBeforeEvent => "cancel-before-event",
+            Self::ExecutionReservedBeforeOutcome => "execution-reserved-before-outcome",
         }
     }
 }
@@ -96,6 +112,7 @@ pub fn all() -> Vec<FaultPoint> {
         FaultPoint::CompleteAfterUpdateBeforeAttempt,
         FaultPoint::AdvanceStepAfterResultBeforeCounter,
         FaultPoint::CancelBeforeEvent,
+        FaultPoint::ExecutionReservedBeforeOutcome,
     ]
 }
 
@@ -217,6 +234,7 @@ mod tests {
                 "complete-after-update-before-attempt",
                 "advance-step-after-result-before-counter",
                 "cancel-before-event",
+                "execution-reserved-before-outcome",
             ]
         );
     }
@@ -231,6 +249,10 @@ mod tests {
 /// kill-from-the-outside suite cannot check: the window is microseconds wide and
 /// inside someone else's function, so the only way in is to be called from there.
 #[cfg(test)]
+// Several tests here deliberately use the deprecated lease-without-spending
+// operation: it is the only way to construct "lease held, approval unspent"
+// without hand-written SQL, and the recovery tests need exactly that.
+#[allow(deprecated)]
 mod atomicity {
     use super::*;
     use crate::migration::MigrationRunner;

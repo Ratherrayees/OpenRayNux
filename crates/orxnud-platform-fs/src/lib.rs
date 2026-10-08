@@ -281,11 +281,12 @@ fn is_runnable(path: &std::path::Path) -> bool {
 /// # Why it lives here
 ///
 /// It was in `orxnud-daemon` as an unconditional `std::os::unix::fs::PermissionsExt`,
-/// which is a mistake with two faces. Gate **G3** greps for `cfg`, and this code had
-/// none, so the gate passed -- while the MSVC build failed outright, because
+/// which is a mistake with two faces. Gate **G3** looked only for `cfg`, and this code
+/// had none, so the gate passed -- while the MSVC build failed outright, because
 /// `PermissionsExt` does not exist on Windows. V-29's "consequence of drift" predicted
 /// exactly this: *G3 only greps for `cfg`, not for a Linux type name.* A platform API
-/// used without a `cfg` is the same defect wearing a different hat.
+/// used without a `cfg` is the same defect wearing a different hat, and G3 now detects
+/// `std::os::{unix,windows}` paths directly, so this specific hole is closed.
 ///
 /// So the branch lives here, where `cfg` is permitted, and the portable core asks for the
 /// behaviour rather than reaching for the mechanism.

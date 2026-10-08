@@ -64,10 +64,9 @@ pub mod runtime;
 pub mod task_service;
 pub mod transport;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use orxnud_capability::dispatch::{AdapterBundle, ExecutionBackend};
+use orxnud_capability::dispatch::{AdapterRegistry, ExecutionBackend};
 use orxnud_capability::subprocess::SandboxExecutionBackend;
 use orxnud_capability::{CapabilityDeclaration, CapabilityRegistry};
 use orxnud_config::{ConfigSchemaVersion, LayeredConfig};
@@ -373,11 +372,12 @@ impl InstanceLock {
 pub struct DispatchWiring {
     /// Capability id to the implementation that satisfies it.
     ///
-    /// Empty until a capability is registered, which is the correct state: an
-    /// adapter is a capability, and no capability exists yet. `Dispatcher::new`
-    /// accepts an empty map, and every dispatch is refused with
-    /// `NoImplementation` — the fail-closed result, not a gap.
-    bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>,
+    /// Built by [`orxnud_capability::AdapterRegistry::shipped`], because an adapter
+    /// is capability code and the set of them is that crate's business.
+    ///
+    /// An empty registry is the fail-closed state, not a gap: `Dispatcher::new`
+    /// accepts one, and every dispatch is refused with `NoImplementation`.
+    bundles: AdapterRegistry,
     /// The only route to a Tier-1 process.
     ///
     /// Not an `Option`, deliberately. The governed dispatcher does accept `None`
@@ -552,44 +552,6 @@ fn register_shipped_declarations(registry: &mut CapabilityRegistry) {
     }
 }
 
-/// The adapter/verifier pairs the dispatcher resolves against.
-///
-/// Exactly one implementation per capability, chosen here rather than discovered: a
-/// second implementation of `text/word-count` would be a version-conflict bug, and the
-/// dispatcher's own `register` refuses duplicates for that reason.
-fn shipped_bundles(paths: &Paths) -> BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> {
-    let mut bundles: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
-    bundles.insert(
-        CapabilityId::new(orxnud_capability::text::WORD_COUNT_ID),
-        Arc::new(orxnud_capability::text::WordCountBundle::default()),
-    );
-    // `None` rather than a bundle with no program: a Tier-1 capability whose child
-    // cannot be located must be *absent*, so the dispatcher answers `NoImplementation`
-    // and names the capability, rather than constructing a plan with an empty program
-    // that would fail later and further from the cause. `spec_for` would refuse it too,
-    // but "the child binary is missing" is a deployment problem and saying so at
-    // composition is more useful than saying it per dispatch.
-    if let Some(helper) = orxnud_capability::write_text::resolve_helper() {
-        bundles.insert(
-            CapabilityId::new(orxnud_capability::write_text::WRITE_TEXT_ID),
-            Arc::new(orxnud_capability::write_text::WriteTextBundle::new(
-                paths.workspace(),
-                helper,
-            )),
-        );
-    }
-    if let Some(helper) = orxnud_capability::read_text::resolve_helper() {
-        bundles.insert(
-            CapabilityId::new(orxnud_capability::read_text::READ_TEXT_ID),
-            Arc::new(orxnud_capability::read_text::ReadTextBundle::new(
-                paths.workspace(),
-                helper,
-            )),
-        );
-    }
-    bundles
-}
-
 /// Every shipped declaration, in one list.
 ///
 /// A single list so the registry, the bundles and the policy table cannot drift apart:
@@ -721,7 +683,7 @@ impl Daemon {
         let mut registry = CapabilityRegistry::empty();
         register_shipped_declarations(&mut registry);
         let dispatch = DispatchWiring {
-            bundles: shipped_bundles(&paths),
+            bundles: orxnud_capability::dispatch::AdapterRegistry::shipped(&paths.workspace()),
             execution: Arc::new(SandboxExecutionBackend::new()),
         };
         let instance = InstanceLock::at(paths.instance_lock.clone());

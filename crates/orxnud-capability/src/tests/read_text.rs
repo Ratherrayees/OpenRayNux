@@ -12,13 +12,14 @@
 
 use std::path::PathBuf;
 
-use orxnud_capability::dispatch::{AdapterBundle, SandboxPlan};
-use orxnud_capability::read_text::{self, ReadTextBundle};
+use crate::dispatch::{AdapterBundle, SandboxPlan};
+use crate::read_text::{self, ReadTextBundle};
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, CapabilityInvocation, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel};
 use orxnud_policy::PolicyEngine;
+use orxnud_policy::authority::CapabilityInvocation;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::policy_set::{Grant, PolicySet};
 
@@ -114,9 +115,48 @@ fn workspace(tag: &str) -> PathBuf {
     dir
 }
 
+/// The plan for `path`, or `None` when the bundle declares none.
+///
+/// Unwraps the `Result` deliberately: the tests that use this are about the plan's
+/// *shape* for an acceptable path, so a rejection here means the test's premise is
+/// wrong and should fail loudly rather than be read as "no plan". Rejections are
+/// asserted through [`plan_rejection`] instead, which is the point of them.
 fn plan_for(ws: &PathBuf, path: &str) -> Option<SandboxPlan> {
     let bundle = ReadTextBundle::new(ws, "/nonexistent/orxnud-fsread");
-    bundle.sandbox_plan(&invocation(path))
+    bundle
+        .sandbox_plan(&invocation(path))
+        .expect("an acceptable path must not be a plan error")
+}
+
+/// No plan is produced for `path`, by either route.
+///
+/// Both outcomes — a bundle that declares no plan, and parameters it rejects — count as
+/// "no plan", which is the security property this asserts: nothing outside the workspace
+/// reaches a child. Which of the two it *was* is asserted separately, by
+/// [`plan_rejection`], because "no plan" and "your parameters were refused" are
+/// different facts about different layers.
+fn no_plan(ws: &PathBuf, path: &str) -> bool {
+    let bundle = ReadTextBundle::new(ws, "/nonexistent/orxnud-fsread");
+    match bundle.sandbox_plan(&invocation(path)) {
+        Ok(None) | Err(crate::dispatch::PlanError::InvalidParams(_)) => true,
+        Ok(Some(_)) => false,
+        Err(crate::dispatch::PlanError::NoPlanDeclared) => false,
+    }
+}
+
+/// Why the bundle refused to build a plan for `path`.
+///
+/// A distinct helper so a test can assert the *reason*. Before `sandbox_plan` returned
+/// `Result`, a rejected path and a bundle with no plan were both `None`, so the only
+/// thing any test could say about an escaping path was "no plan was built" — which is
+/// also what a build missing the adapter entirely would have said. The reason is the
+/// whole value of the retype.
+fn plan_rejection(ws: &PathBuf, path: &str) -> crate::dispatch::PlanError {
+    let bundle = ReadTextBundle::new(ws, "/nonexistent/orxnud-fsread");
+    match bundle.sandbox_plan(&invocation(path)) {
+        Ok(_) => panic!("{path:?} was expected to be rejected but produced a plan"),
+        Err(e) => e,
+    }
 }
 
 /// The load-bearing one: a read capability is granted **nothing** writable.
@@ -188,9 +228,42 @@ fn no_plan_is_built_for_a_path_outside_the_workspace() {
         "a/../../escape.txt".to_owned(),
         "sub/../../../escape.txt".to_owned(),
     ] {
+        assert!(no_plan(&ws, &escape), "no plan may be built for {escape:?}");
+    }
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// The same escapes, asserted to be reported as *the caller's bad parameters*.
+///
+/// This is the regression for the classification bug. These five paths were all
+/// `None`, and `None` meant "this adapter declares no sandbox plan", which reached the
+/// caller as `sandbox-unavailable` — *"the execution backend cannot establish the
+/// required sandbox guarantees"* — on a host whose sandbox had just run a neighbouring
+/// capability. The classification was false, and the reason that would have identified
+/// the offending field was discarded by `.ok()?`.
+///
+/// Each must now be `InvalidParams`, carrying a reason. `NoPlanDeclared` would be
+/// equally wrong in the opposite direction: that is a defect in this build, and it is
+/// the one answer the caller cannot fix by editing their request.
+#[test]
+fn an_escaping_or_absolute_path_is_reported_as_invalid_parameters_not_a_missing_sandbox() {
+    let ws = workspace("escape-reason");
+    for escape in [
+        "/etc/passwd",
+        "/etc/hostname",
+        "../escape.txt",
+        "a/../../escape.txt",
+        "sub/../../../escape.txt",
+    ] {
+        let reason = plan_rejection(&ws, escape);
         assert!(
-            plan_for(&ws, &escape).is_none(),
-            "no plan may be built for {escape:?}"
+            matches!(reason, crate::dispatch::PlanError::InvalidParams(_)),
+            "{escape:?} must be InvalidParams, got {reason:?}"
+        );
+        let text = reason.to_string();
+        assert!(
+            !text.is_empty(),
+            "{escape:?} must carry a reason, not an empty string"
         );
     }
     let _ = std::fs::remove_dir_all(&ws);

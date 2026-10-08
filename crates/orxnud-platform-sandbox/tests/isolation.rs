@@ -643,3 +643,175 @@ fn the_hostile_helper_actually_runs() {
     );
     let _ = Failure::explain();
 }
+
+// ---------------------------------------------------------------------------
+// The phase an execution result reports about itself
+// ---------------------------------------------------------------------------
+
+/// A real payload, really started, and then a give-up reported afterwards.
+///
+/// This is the shape of `BwrapRunner::run`'s cgroup-membership branch: a supervisor is
+/// created, the poll for its membership does not succeed, and the runner stops the
+/// execution and reports that it could not establish the guarantee it had promised. It is
+/// reproduced here rather than provoked on purpose because provoking it needs a host that
+/// delegates a cgroup base *and* a supervisor that fails to appear in it -- and a fixture
+/// that silently skipped on every other machine would be a test that reports nothing.
+///
+/// What is real here is the part that matters: a **real child process** runs the real
+/// helper to completion, so a real file lands on disk, and only then does the runner give
+/// up. The capability layer is a different crate and cannot be reached from here, so this
+/// asserts the two predicates the vocabulary's own contract rests on; the capability crate
+/// asserts the rest of the chain against the same status.
+#[test]
+fn a_give_up_after_starting_reports_a_phase_not_a_disproof() {
+    use orxnud_platform_sandbox::contract::{AvailableGuarantees, CapturedStream, ExecutionResult};
+
+    /// Starts the payload for real, then reports that it could not vouch for the run.
+    struct GivesUp {
+        inner: BwrapRunner,
+    }
+
+    impl SandboxRunner for GivesUp {
+        fn run(&self, spec: &SandboxSpec) -> Result<ExecutionResult, SandboxUnavailable> {
+            // A real child, run to completion, with no sandbox -- because the phase is the
+            // subject and the isolation is not. Un-sandboxed is the point: it is the
+            // strongest possible demonstration that a real process ran and completed, and
+            // that the status must therefore say so rather than claim nothing ran.
+            let mut cmd = std::process::Command::new(&spec.program);
+            cmd.args(&spec.args).stdin(std::process::Stdio::null());
+            // The helper takes its mode from the environment, which a sandbox would have
+            // set and a bare spawn would not.
+            for (k, v) in &spec.env {
+                cmd.env(k, v);
+            }
+            let status = cmd
+                .status()
+                .expect("the real helper must be startable, or the phase was never reached");
+            assert!(
+                status.success(),
+                "the real payload must succeed, or this proves nothing about a completed \
+                 execution: {status}"
+            );
+            Ok(ExecutionResult {
+                status: ExecutionStatus::Abandoned(SandboxUnavailable::GuaranteeUnavailable {
+                    guarantee: "OS-enforced resource ceilings",
+                    detail: "the supervisor did not join the dedicated cgroup".to_owned(),
+                }),
+                stdout: CapturedStream::empty(),
+                stderr: CapturedStream::empty(),
+                elapsed: Duration::ZERO,
+                unproven: Vec::new(),
+            })
+        }
+
+        fn cancel(&self) -> Result<(), SandboxUnavailable> {
+            self.inner.cancel()
+        }
+
+        fn available_guarantees(&self) -> AvailableGuarantees {
+            self.inner.available_guarantees()
+        }
+    }
+
+    // A real payload that writes something observable, so "it ran" is not an assertion.
+    let d = scratch("abandoned-after-start");
+    let target = d.join("landed.txt");
+    let spec = closed_spec_arg("fs-write", target.display().to_string().as_str());
+
+    let result = GivesUp {
+        inner: BwrapRunner::new(),
+    }
+    .run(&spec)
+    .expect("a give-up is a result, not an error: an error means nothing was started");
+
+    assert!(
+        target.exists(),
+        "a real child must really have written the file, or the status under test is not \
+         describing an execution"
+    );
+
+    assert!(
+        result.did_start(),
+        "this status reports a process that existed, so `did_start` must say so. It said \
+         `false` for every status before `Abandoned` existed, which is how a real, \
+         completed execution came to be recorded as 'nothing ran'"
+    );
+    assert!(
+        !result.is_clean_exit(),
+        "and it is emphatically not a clean exit, so its outcome is neither established \
+         nor negative -- which is the whole reason it needed its own value"
+    );
+    let summary = result.summary();
+    assert!(
+        summary.starts_with("abandoned after starting: "),
+        "an operator reading the summary must be able to tell this from a pre-execution \
+         refusal: {summary}"
+    );
+}
+
+/// And the property that makes the new status necessary, stated where it can be measured.
+///
+/// `Abandoned` and `Refused` must not be distinguishable by shape, by predicate or by
+/// summary -- they are two outcomes, and the one difference that matters is the one a
+/// downstream reader acts on. Asserted here rather than left to the capability crate's
+/// table so that the sandbox crate's own vocabulary is shown to be sufficient on its own.
+#[test]
+fn abandoned_and_refused_differ_in_exactly_the_one_way_that_matters() {
+    use orxnud_platform_sandbox::contract::{CapturedStream, ExecutionResult};
+
+    let mk = |status: ExecutionStatus| ExecutionResult {
+        status,
+        stdout: CapturedStream::empty(),
+        stderr: CapturedStream::empty(),
+        elapsed: Duration::ZERO,
+        unproven: Vec::new(),
+    };
+    let refused = mk(ExecutionStatus::Refused(
+        SandboxUnavailable::GuaranteeUnavailable {
+            guarantee: "OS-enforced resource ceilings",
+            detail: "a required ceiling could not be established".to_owned(),
+        },
+    ));
+    let abandoned = mk(ExecutionStatus::Abandoned(
+        SandboxUnavailable::GuaranteeUnavailable {
+            guarantee: "OS-enforced resource ceilings",
+            detail: "a required ceiling could not be established".to_owned(),
+        },
+    ));
+
+    // Concrete values, not `assert_ne!` on the pairs.
+    //
+    // The pair comparison this replaces was satisfied by *any* difference between the two
+    // tuples -- so removing one of the two subjects from `is_indeterminate` left the pairs
+    // as `(true, false)` and `(false, false)`, still unequal, still green. A test that
+    // cannot fail when one of its subjects is wrong is not testing the relationship.
+    // These are the facts a caller acts on, stated outright.
+    assert!(
+        !refused.did_start(),
+        "a refusal is decided before anything starts, so nothing ran"
+    );
+    assert!(
+        !refused.is_clean_exit(),
+        "and it is not a run that reported anything"
+    );
+    assert!(
+        abandoned.did_start(),
+        "an abandonment is reported after a process existed"
+    );
+    assert!(
+        !abandoned.is_clean_exit(),
+        "and it is emphatically not a clean exit"
+    );
+    assert!(
+        refused.summary().starts_with("refused: "),
+        "and a refusal is legible as one in the text an operator reads: {}",
+        refused.summary()
+    );
+    assert!(
+        abandoned
+            .summary()
+            .starts_with("abandoned after starting: "),
+        "while an abandonment says in words that something had already started: {}",
+        abandoned.summary()
+    );
+}

@@ -24,19 +24,19 @@
 //! subprocess isolation while running only in-process fixtures would be worse than no
 //! suite, because it would let a reviewer believe the boundary was tested.
 
-mod support;
+// Declared once in `tests/mod.rs`, since a module path inside
+// `tests/` would otherwise resolve per-file.
+use super::{Registry, support};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use orxnud_capability::credential::CredentialHandle;
-use orxnud_capability::dispatch::{AdapterBundle, CapabilityAdapter};
-use orxnud_capability::verification::{
-    ExecutionOutcome, VerificationOutcome, Verifier, VerifyError,
-};
+use crate::credential::CredentialHandle;
+use crate::dispatch::{AdapterBundle, CapabilityAdapter};
+use crate::verification::{ExecutionOutcome, VerificationOutcome, Verifier, VerifyError};
 use orxnud_domain::enums::DataClass;
 use orxnud_domain::ids::CapabilityId;
-use orxnud_domain::invocation::DispatchView;
+use orxnud_policy::authority::DispatchView;
 
 // ---------------------------------------------------------------- the harness
 
@@ -339,7 +339,8 @@ fn a_contract_adapter_can_actually_be_dispatched() {
     ));
 
     let secrets = support::FakeSecrets::new();
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, registry);
+    let mut d =
+        crate::dispatch::Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(registry));
 
     let request = orxnud_domain::ActionRequest::new(
         orxnud_domain::TaskId::new("t-1"),

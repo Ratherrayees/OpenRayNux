@@ -621,6 +621,18 @@ impl DisclosureRecord {
             // The dedicated correlation. This is what keeps the disclosure from closing, or
             // being closed by, the read's own authorisation record.
             request: Some(self.disclosure_request.clone()),
+            // Settles nothing, and says so. A disclosure is not the terminal
+            // disposition of an authorisation: it is an additional fact about the world,
+            // recorded because the bytes left the machine. The authorisation it depends
+            // on is the read's, and that one is settled by the read's own terminal
+            // record — so claiming it here would settle the same authorisation twice,
+            // which is exactly the double-count the identity model exists to prevent.
+            //
+            // A `Finished` record with no `settles` therefore means "a recorded fact
+            // that is not a settlement", and contributes nothing to
+            // `unresolved_authorisations`' settled set. That is why no separate
+            // "settles nothing" flag is needed.
+            settles: None,
             outcome: AuditOutcome::Finished {
                 kind: OutcomeKind::Completed,
                 at_ms: self.at_ms,
@@ -1382,11 +1394,38 @@ mod disclosure_tests {
             1,
             "the disclosure closed the read's authorisation"
         );
+        // `.settling(0)` because that is what production writes: `record_terminal` names
+        // the authorisation it closes. Without it this record is a fact about the world
+        // that settles nothing — the disclosure's case — and the read stays open, which is
+        // the correct behaviour for a record with no identity and the *wrong* one here.
         chain
-            .append(read.finished(OutcomeKind::Completed, NOW, None))
+            .append(read.finished(OutcomeKind::Completed, NOW, None).settling(0))
             .expect("append");
         assert!(chain.unresolved_authorisations().is_empty());
         chain.verify().expect("the chain still verifies");
+    }
+
+    /// A disclosure's terminal record carries no authorisation identity, so it cannot
+    /// close anything — including a read whose authorisation it happens to share a
+    /// request label with.
+    ///
+    /// Asserted separately from the test above because it is a different claim: that one
+    /// shows the disclosure does not *wrongly* close the read, this one shows the read's
+    /// own terminal record is what closes it. Between them they pin the direction of the
+    /// rule, which is the one that has to be right: a disclosure may under-claim, never
+    /// over-claim.
+    #[test]
+    fn a_disclosure_record_settles_nothing() {
+        let record = disclosure("a.txt", 42).to_audit_record(approver());
+        assert_eq!(
+            record.settles_authorisation(),
+            None,
+            "a disclosure is a recorded fact, not the disposition of an authorisation"
+        );
+        assert!(
+            matches!(record.outcome, AuditOutcome::Finished { .. }),
+            "it is still a terminal record about something"
+        );
     }
 
     /// And a disclosure never manufactures one either.

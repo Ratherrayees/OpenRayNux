@@ -15,17 +15,20 @@
 //! Every case below is either impossible to write, caught by a gate, or refused at
 //! runtime by a named stage.
 
-mod support;
+// Declared once in `tests/mod.rs`, since a module path inside
+// `tests/` would otherwise resolve per-file.
+use super::{Registry, support};
 
 use std::collections::BTreeMap;
 
-use orxnud_capability::dispatch::CapabilityAdapter;
-use orxnud_capability::verification::ExecutionOutcome;
+use crate::dispatch::CapabilityAdapter;
+use crate::verification::ExecutionOutcome;
 use orxnud_domain::approval::NormalizedParams;
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, DispatchView, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel, RequestId};
+use orxnud_policy::authority::DispatchView;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::policy_set::{Grant, PolicySet};
 use orxnud_policy::{CapabilityDeclaration, PolicyEngine};
@@ -94,17 +97,13 @@ fn params() -> NormalizedParams {
     NormalizedParams::canonical("{}")
 }
 
-fn registry(
-    b: Bundle<impl CapabilityAdapter + 'static>,
-) -> BTreeMap<
-    CapabilityId,
-    std::sync::Arc<dyn orxnud_capability::dispatch::AdapterBundle + Send + Sync>,
-> {
-    use orxnud_capability::dispatch::AdapterBundle as _;
-    let mut m = BTreeMap::new();
+fn registry(b: Bundle<impl CapabilityAdapter + 'static>) -> Registry {
+    use crate::dispatch::AdapterBundle;
+    use std::sync::Arc;
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     let id = b.adapter().capability_id().clone();
     m.insert(id, b.into_arc());
-    m
+    Registry::from_bundles(m)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +153,7 @@ fn an_adapter_cannot_re_enter_the_dispatcher() {
         fn invoke(
             &self,
             _v: &DispatchView<'_>,
-            _c: Option<&orxnud_capability::credential::CredentialHandle>,
+            _c: Option<&crate::credential::CredentialHandle>,
         ) -> Result<ExecutionOutcome, String> {
             self.attempts.store(true, Ordering::SeqCst);
             // A real adapter holding a dispatcher reference would call back here. The
@@ -170,7 +169,7 @@ fn an_adapter_cannot_re_enter_the_dispatcher() {
     };
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(
+    let mut d = crate::dispatch::Dispatcher::new(
         &mut engine,
         &secrets,
         registry(Bundle::unverifiable(adapter)),
@@ -207,7 +206,7 @@ fn the_dispatcher_refuses_a_nested_dispatch_while_one_is_in_flight() {
     // the point of that route, and is why this is a narrow check.
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(
+    let mut d = crate::dispatch::Dispatcher::new(
         &mut engine,
         &secrets,
         registry(Bundle::confirming(SuccessfulAdapter::new(CAP))),
@@ -243,7 +242,7 @@ fn an_external_actor_cannot_self_authorise_by_claiming_verification() {
     };
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(
+    let mut d = crate::dispatch::Dispatcher::new(
         &mut engine,
         &secrets,
         registry(Bundle::confirming(SuccessfulAdapter::new(CAP))),
@@ -266,7 +265,7 @@ fn an_external_actor_cannot_self_authorise_by_claiming_verification() {
         )
         .expect_err("an external actor must not grant");
     assert!(
-        matches!(&err, orxnud_capability::dispatch::DispatchError::Policy(_)),
+        matches!(&err, crate::dispatch::DispatchError::Policy(_)),
         "{err}"
     );
 
@@ -275,7 +274,7 @@ fn an_external_actor_cannot_self_authorise_by_claiming_verification() {
     let adapter = SuccessfulAdapter::new(CAP);
     let calls = adapter.calls.clone();
     let registry = registry(Bundle::confirming(adapter));
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(&mut engine, &secrets, registry);
+    let mut d = crate::dispatch::Dispatcher::new(&mut engine, &secrets, registry);
     let _ = d.dispatch(
         request(),
         external,
@@ -316,7 +315,7 @@ fn a_consumed_approval_cannot_authorise_a_second_dispatch() {
         0,
     ));
     let secrets = FakeSecrets::new();
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(
+    let mut d = crate::dispatch::Dispatcher::new(
         &mut engine,
         &secrets,
         registry(Bundle::confirming(SuccessfulAdapter::new(CAP))),
@@ -386,7 +385,7 @@ fn a_refuted_effect_cannot_be_reported_as_a_dispatch_success() {
     let adapter = MisreportingAdapter::new(CAP);
     let mut engine = policy();
     let secrets = FakeSecrets::new();
-    let mut d = orxnud_capability::dispatch::Dispatcher::new(
+    let mut d = crate::dispatch::Dispatcher::new(
         &mut engine,
         &secrets,
         registry(Bundle::refuting(adapter)),
@@ -409,7 +408,7 @@ fn a_refuted_effect_cannot_be_reported_as_a_dispatch_success() {
     assert!(
         matches!(
             &err,
-            orxnud_capability::dispatch::DispatchError::VerificationRefuted { .. }
+            crate::dispatch::DispatchError::VerificationRefuted { .. }
         ),
         "{err}"
     );

@@ -909,25 +909,46 @@ impl TaskService {
             })
     }
 
-    /// Marks an approval spent, so the task domain's own record says so.
-    ///
-    /// A thin pass-through. The authoritative single-use record is the policy engine's spent
-    /// digest ledger, which `authorise` writes; this is the task domain's own copy of the same
-    /// fact, and it is what a later approval-replacement decision reads.
+    /// Reserves the idempotency key for a side effect about to be dispatched.
     ///
     /// # Errors
     ///
-    /// [`TaskFault`] if the write fails, or if the attempt has no unconsumed approval.
-    pub fn consume_approval(
+    /// [`TaskFault`] if the write fails.
+    /// The identity is spelled out rather than bundled; see the note on
+    /// [`orxnud_store::task_repo::TaskRepository::reserve_effect`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_effect(
         &mut self,
+        key: &str,
         id: &TaskId,
         step_no: u32,
         attempt_no: u32,
+        step_key: &str,
+        idempotent: bool,
         now_ms: i64,
-    ) -> Result<(), TaskFault> {
-        self.guard_running()?;
+    ) -> Result<bool, TaskFault> {
         self.engine
-            .consume_approval(id, step_no, attempt_no, now_ms)
+            .reserve_effect(key, id, step_no, attempt_no, step_key, idempotent, now_ms)
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
+    }
+
+    /// Records how a reserved side effect turned out.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if the write fails.
+    pub fn resolve_effect(
+        &mut self,
+        key: &str,
+        status: orxnud_store::task_repo::EffectStatus,
+        detail: Option<&str>,
+        now_ms: i64,
+    ) -> Result<bool, TaskFault> {
+        self.engine
+            .resolve_effect(key, status, detail, now_ms)
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
                 detail: e.to_string(),
@@ -992,7 +1013,13 @@ impl TaskService {
     /// # Errors
     ///
     /// [`TaskFault`] if the proposal is not approved, or the task is not waiting.
-    pub fn begin_approved_execution(
+    /// Begins a governed execution: takes the lease and spends the approval, atomically.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] of the repository's cause. Every one of them is a refusal, and
+    /// every one of them leaves the task exactly as it was.
+    pub fn begin_execution_spending_approval(
         &mut self,
         proposal_id: &str,
         worker: &str,
@@ -1000,7 +1027,7 @@ impl TaskService {
     ) -> Result<ProposalRow, TaskFault> {
         self.guard_running()?;
         self.engine
-            .begin_approved_execution(proposal_id, worker, now_ms)
+            .begin_execution_spending_approval(proposal_id, worker, now_ms)
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
                 detail: e.to_string(),

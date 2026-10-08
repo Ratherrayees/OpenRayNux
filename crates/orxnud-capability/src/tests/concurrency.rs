@@ -19,19 +19,22 @@
 //! actor runtime is introduced: ADR-0024 rejects one, and a test that needed one would
 //! be testing the wrong thing.
 
-mod support;
+// Declared once in `tests/mod.rs`, since a module path inside
+// `tests/` would otherwise resolve per-file.
+use super::{Registry, support};
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use orxnud_capability::dispatch::{AdapterBundle, CapabilityAdapter, Dispatcher};
-use orxnud_capability::verification::ExecutionOutcome;
+use crate::dispatch::{AdapterBundle, CapabilityAdapter, Dispatcher};
+use crate::verification::ExecutionOutcome;
 use orxnud_domain::approval::{ApprovalRecord, NormalizedParams};
 use orxnud_domain::enums::{DataClass, RiskClass};
 use orxnud_domain::ids::{CapabilityId, GrantId, RunId, TaskId, UserId};
-use orxnud_domain::invocation::{ActionRequest, DispatchView, InvocationContext};
+use orxnud_domain::invocation::{ActionRequest, InvocationContext};
 use orxnud_domain::{Actor, AuthChannel, RequestId, SecretRef};
+use orxnud_policy::authority::DispatchView;
 use orxnud_policy::budget::BudgetLedger;
 use orxnud_policy::digest::digest_for;
 use orxnud_policy::policy_set::{Grant, PolicySet};
@@ -122,9 +125,9 @@ impl CapabilityAdapter for RecordingAdapter {
     fn invoke(
         &self,
         view: &DispatchView<'_>,
-        _c: Option<&orxnud_capability::credential::CredentialHandle>,
+        _c: Option<&crate::credential::CredentialHandle>,
     ) -> Result<ExecutionOutcome, String> {
-        self.rec.invocations.lock().expect("lock").push(view.step);
+        self.rec.invocations.lock().expect("lock").push(view.step());
         Ok(ExecutionOutcome::Succeeded { output: None })
     }
 }
@@ -132,21 +135,16 @@ impl CapabilityAdapter for RecordingAdapter {
 /// Confirms, so verification never masks the property under test.
 struct Confirm;
 
-impl orxnud_capability::verification::Verifier for Confirm {
+impl crate::verification::Verifier for Confirm {
     fn verify(
         &self,
         _e: &ExecutionOutcome,
         _params: &serde_json::Value,
         _at: i64,
-    ) -> Result<
-        orxnud_capability::verification::VerificationOutcome,
-        orxnud_capability::verification::VerifyError,
-    > {
-        Ok(
-            orxnud_capability::verification::VerificationOutcome::Verified {
-                evidence: "confirmed".into(),
-            },
-        )
+    ) -> Result<crate::verification::VerificationOutcome, crate::verification::VerifyError> {
+        Ok(crate::verification::VerificationOutcome::Verified {
+            evidence: "confirmed".into(),
+        })
     }
 }
 
@@ -158,7 +156,7 @@ impl AdapterBundle for RecBundle {
     fn adapter(&self) -> &dyn CapabilityAdapter {
         &self.adapter
     }
-    fn verifier(&self) -> &dyn orxnud_capability::verification::Verifier {
+    fn verifier(&self) -> &dyn crate::verification::Verifier {
         &Confirm
     }
 }
@@ -166,7 +164,7 @@ impl AdapterBundle for RecBundle {
 /// Builds the registry, doing the `Arc<Concrete> -> Arc<dyn AdapterBundle + Send + Sync>`
 /// coercion once.
 fn registry_for(rec: &Arc<Recorder>) -> Registry {
-    let mut m: Registry = BTreeMap::new();
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     m.insert(
         cap(),
         Arc::new(RecBundle {
@@ -176,11 +174,8 @@ fn registry_for(rec: &Arc<Recorder>) -> Registry {
             },
         }) as Arc<dyn AdapterBundle + Send + Sync>,
     );
-    m
+    Registry::from_bundles(m)
 }
-
-/// The dispatcher's registry type, named so the coercion site is easy to find.
-type Registry = BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>>;
 
 // ---------------------------------------------------------------- concurrency
 
@@ -467,7 +462,7 @@ fn the_reentrancy_guard_is_not_left_set_after_a_panicking_adapter() {
         fn invoke(
             &self,
             _v: &DispatchView<'_>,
-            _c: Option<&orxnud_capability::credential::CredentialHandle>,
+            _c: Option<&crate::credential::CredentialHandle>,
         ) -> Result<ExecutionOutcome, String> {
             panic!("faulty adapter");
         }
@@ -477,7 +472,7 @@ fn the_reentrancy_guard_is_not_left_set_after_a_panicking_adapter() {
         fn adapter(&self) -> &dyn CapabilityAdapter {
             &Panicky
         }
-        fn verifier(&self) -> &dyn orxnud_capability::verification::Verifier {
+        fn verifier(&self) -> &dyn crate::verification::Verifier {
             &Confirm
         }
     }
@@ -489,7 +484,7 @@ fn the_reentrancy_guard_is_not_left_set_after_a_panicking_adapter() {
         cap(),
         Arc::new(PanicBundle) as Arc<dyn AdapterBundle + Send + Sync>,
     );
-    let mut d = Dispatcher::new(&mut engine, &secrets, m);
+    let mut d = Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m));
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));

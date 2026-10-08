@@ -384,12 +384,42 @@ pub enum ExecutionStatus {
         /// The cap that was hit.
         cap: u64,
     },
-    /// The supervisor could not establish the requested sandbox.
+    /// The supervisor could not establish the requested sandbox, **before starting
+    /// anything**.
+    ///
+    /// The phase is part of the value, not a convention the caller has to know. There is
+    /// a second way for a runner to fail to establish a sandbox — see
+    /// [`Self::Abandoned`] — and a caller that cannot tell them apart has to guess, and
+    /// the optimistic guess turns a capability that ran into one that provably did not.
     Refused(SandboxUnavailable),
+    /// The runner started the process and **then** could not establish a required
+    /// guarantee, so it stopped the execution and is reporting on something that existed.
+    ///
+    /// # Why this is not `Refused`
+    ///
+    /// The concrete case is the Linux backend's cgroup-membership check: it waits for the
+    /// supervisor to appear in the dedicated cgroup, and if it never does it kills what it
+    /// started and gives up. By then a payload may have run to completion — the check can
+    /// fail *because* the supervisor came and went faster than the poll — and the runner
+    /// has no way to tell that case from the one where the supervisor never got started at
+    /// all.
+    ///
+    /// Reporting both as [`Self::Refused`] makes "nothing ran" unrepresentable-but-claimed.
+    /// A caller reading `Refused` as a disproof then records *"definitely did not happen"*
+    /// for an execution whose defining property is that nobody can say, and that verdict is
+    /// what authorises an automatic retry of a side effect that may already exist.
+    ///
+    /// The security-relevant question is not "did it succeed?" but "did anything run?", and
+    /// this is the value that answers it.
+    Abandoned(SandboxUnavailable),
     /// The process could not be started at all.
     ///
     /// Distinct from a process that was killed: **nothing ran**. A caller retrying a
     /// spawn failure is retrying something that never began.
+    ///
+    /// The phase is load-bearing here too, for the same reason as [`Self::Refused`]: a
+    /// runner may only report this when no process was created. Losing track of a process
+    /// that already exists is [`Self::Killed`].
     SpawnFailed(String),
     /// The process was terminated by a signal.
     ///
@@ -397,6 +427,10 @@ pub enum ExecutionStatus {
     /// killed by `SIGKILL` — including one killed by the kernel for exceeding a
     /// resource ceiling — has no exit code, and folding that into `SpawnFailed` would
     /// claim nothing ran when something did.
+    ///
+    /// Also the value a runner must use when it has started a process and can no longer
+    /// account for it. There is no separate status for that, because the fact both share
+    /// is the one that matters: a process existed and its outcome is not established.
     Killed,
 }
 
@@ -445,27 +479,15 @@ impl ExecutionResult {
     ///
     /// False for a refusal and for a spawn failure. The security-relevant question:
     /// "did anything run?" is not the same as "did it succeed?".
+    ///
+    /// This is the whole reason [`ExecutionStatus::Abandoned`] exists rather than being
+    /// folded into [`ExecutionStatus::Refused`]: a refusal and an abandonment look alike
+    /// from the outside, and this predicate is the one place that has to tell them apart.
     #[must_use]
     pub fn did_start(&self) -> bool {
         !matches!(
             self.status,
             ExecutionStatus::SpawnFailed(_) | ExecutionStatus::Refused(_)
-        )
-    }
-
-    /// Whether the process ran but did not report success.
-    ///
-    /// True for every terminal state that is not a clean exit and not "never started",
-    /// which is what a caller needs in order to decide the effect's truth is unknown
-    /// rather than negative (TP-12).
-    #[must_use]
-    pub fn is_indeterminate(&self) -> bool {
-        matches!(
-            self.status,
-            ExecutionStatus::TimedOut
-                | ExecutionStatus::Cancelled
-                | ExecutionStatus::OutputExceeded { .. }
-                | ExecutionStatus::Killed
         )
     }
 
@@ -480,6 +502,7 @@ impl ExecutionResult {
                 format!("output cap on {stream} at {cap} bytes")
             }
             ExecutionStatus::Refused(e) => format!("refused: {e}"),
+            ExecutionStatus::Abandoned(e) => format!("abandoned after starting: {e}"),
             ExecutionStatus::SpawnFailed(e) => format!("spawn failed: {e}"),
             ExecutionStatus::Killed => "killed by a signal".to_owned(),
         };
@@ -518,6 +541,18 @@ pub trait SandboxRunner: Send + Sync {
     /// [`SandboxUnavailable`] only when the sandbox could not be established. A
     /// *helper* that fails is an [`ExecutionStatus`], not an error: the sandbox
     /// worked, the helper did not.
+    ///
+    /// # The phase is part of the error contract
+    ///
+    /// `Err` means **no process was created**, exactly as
+    /// [`ExecutionStatus::SpawnFailed`] does. There is no way to report "I gave up on a
+    /// process I had already started" as an error, and the reason is deliberate: a
+    /// caller holding an `Err` has nothing that could indicate whether anything ran, so
+    /// it has to record "nothing ran", and a runner that could return `Err` after
+    /// spawning would make that recording false.
+    ///
+    /// A runner that has started something reports [`ExecutionStatus::Abandoned`] or
+    /// [`ExecutionStatus::Killed`] instead — never `Err`.
     ///
     /// # Panics
     ///

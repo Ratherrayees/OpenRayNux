@@ -272,6 +272,33 @@ impl SandboxRunner for BwrapRunner {
         Ok(())
     }
 
+    /// # `Refused` means *before*, and that is checkable rather than promised
+    ///
+    /// This function has one spawn point. Five refusals sit above it — the availability
+    /// check, the limit translation, the "required but nothing named" rule, cgroup
+    /// creation under `Resource::Required`, and command construction — and each is
+    /// textually unreachable from anything below. Two failures sit *below* it, and
+    /// neither may report itself as a refusal:
+    ///
+    /// | below the spawn point | status | why not `Refused` |
+    /// |---|---|---|
+    /// | the supervisor never joins the dedicated cgroup | [`ExecutionStatus::Abandoned`] | a process existed, and up to two seconds of polling passed while it did whatever it did |
+    /// | `try_wait` fails while waiting for the supervisor | [`ExecutionStatus::Killed`] | a process existed and we lost track of it |
+    ///
+    /// This split is what makes the invariant enforceable rather than promised. Both used
+    /// to report [`ExecutionStatus::Refused`], which is a claim that nothing ran, and the
+    /// capability layer turns that claim into *"definitely did not happen, so retrying is
+    /// safe"* — while the membership check can fail *because* the payload joined, ran and
+    /// exited inside the poll interval. The comment that used to assert "every `Err` and
+    /// `Refused` path below is decided before `spawn_supervisor` is reached" was, by
+    /// inspection of this function, false.
+    ///
+    /// # The `unproven` field answers a different question
+    ///
+    /// A non-empty `unproven` means the caller *accepted* best-effort containment and this
+    /// host could not provide it. That is an agreed weakening, recorded so the audit record
+    /// can carry it — not a failure, and never a substitute for
+    /// [`ExecutionStatus::Abandoned`].
     fn run(&self, spec: &SandboxSpec) -> Result<ExecutionResult, SandboxUnavailable> {
         let available = Self::probe();
 
@@ -447,7 +474,23 @@ impl SandboxRunner for BwrapRunner {
             let _ = child.wait();
             drop(owned);
             return Ok(ExecutionResult {
-                status: ExecutionStatus::Refused(SandboxUnavailable::GuaranteeUnavailable {
+                // `Abandoned`, not `Refused`, and this is the site the distinction exists
+                // for. A supervisor was created: `spawn_supervisor` returned `Ok` above,
+                // and up to two seconds elapsed while this function polled for its
+                // membership.
+                //
+                // The poll can fail for reasons that have nothing to do with whether the
+                // payload ran — `contains` swallows every read error, and the loop also
+                // gives up when `try_wait` finds the supervisor *already reaped*, which is
+                // what happens when it joined, ran the payload and exited between two
+                // polls. The kill below is not evidence either: it is issued after the
+                // fact, and on an already-exited supervisor it does nothing.
+                //
+                // Reporting this as `Refused` claimed "nothing ran" for an execution that
+                // may have completed its side effect, and every consumer downstream reads
+                // that claim as permission to repeat the effect. `Abandoned` says what is
+                // actually known: a process existed, and its outcome is not established.
+                status: ExecutionStatus::Abandoned(SandboxUnavailable::GuaranteeUnavailable {
                     guarantee: "OS-enforced resource ceilings",
                     detail,
                 }),
@@ -476,9 +519,26 @@ impl SandboxRunner for BwrapRunner {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) => {}
-                Err(e) => {
+                Err(_errno) => {
+                    // `Killed`, not `SpawnFailed`. `spawn_supervisor` succeeded above, so
+                    // a process exists; `SpawnFailed` is documented as *nothing ran*, and
+                    // losing track of a live supervisor is exactly the case it must not be
+                    // used for. Both reach the capability layer as `Unknown`, so this
+                    // corrects the label rather than the behaviour.
+                    //
+                    // The errno is deliberately dropped. It is the second thing lost here,
+                    // after the process, and every channel this crate has for it is either
+                    // the payload's own stdout/stderr — which would corrupt the record of
+                    // what the payload said — or `unproven`, which means "the caller agreed
+                    // to run without this guarantee" and would turn a fault into an
+                    // agreed degradation. The status is the security-relevant part, and it
+                    // is reported exactly.
+                    //
+                    // The two reader threads are left running: they are bounded, they hold
+                    // no authority, and joining them here would mean blocking in the one
+                    // branch whose whole point is that we have already lost the thread.
                     return Ok(ExecutionResult {
-                        status: ExecutionStatus::SpawnFailed(e.to_string()),
+                        status: ExecutionStatus::Killed,
                         stdout: CapturedStream::empty(),
                         stderr: CapturedStream::empty(),
                         elapsed: started.elapsed(),
@@ -935,6 +995,102 @@ pub fn observed_only_limits() -> ResourceLimits {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // ------------------------------------------- `Refused` means "before", structurally
+
+    /// This file's own text, at compile time.
+    ///
+    /// `include_str!` rather than a `fs::read` of a path: the constant is checked against
+    /// the file being compiled, so a renamed or moved module cannot leave the check reading
+    /// something else, and there is no path to get wrong.
+    const SOURCE: &str = include_str!("linux.rs");
+
+    /// The production `BwrapRunner::run` body, with comments and the test module removed.
+    ///
+    /// Comments have to go because this function's own documentation names every status it
+    /// is *about*, and a check that could not tell a mention from a construction would be a
+    /// check nobody could satisfy. Stripping whole lines is enough: a construction is always
+    /// on a line of its own or the first of a struct literal, so no line here has a
+    /// construction and a comment in the same place.
+    fn production_run() -> String {
+        let body = SOURCE
+            .split_once("impl SandboxRunner for BwrapRunner {")
+            .expect("the Linux runner's trait impl must still be here")
+            .1
+            .split_once("#[cfg(all(test, unix))]")
+            .expect("the test module must still be here")
+            .0;
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **`ExecutionStatus::Refused` may only be constructed before `spawn_supervisor`.**
+    ///
+    /// # Why a source check and not a test
+    ///
+    /// The property is about control flow, and the control flow in question is unreachable
+    /// by execution: the give-up branch fires only when a host delegates a cgroup base
+    /// *and* the supervisor fails to appear in it within two seconds. A test that provoked
+    /// it would need that host, so on every other machine it would either skip or — worse —
+    /// pass vacuously, which is how "the boundary was never exercised" comes to read as
+    /// success.
+    ///
+    /// So the check is on the text, and it is a real check rather than a comment: it finds
+    /// the one call that starts a process and asserts that no `Refused` is constructed after
+    /// it. `Refused` means "nothing ran", and a caller reads that as permission to repeat the
+    /// effect; the single site that violated it returned a status indistinguishable from the
+    /// five legitimate refusals, and the capability layer had no way to tell them apart.
+    ///
+    /// `Abandoned` exists so that site has a correct value to return, and this is what keeps
+    /// it correct. The failure mode it guards against is a future edit adding a sixth
+    /// pre-spawn refusal *below* the spawn point, which would compile, pass every other test
+    /// in the workspace, and re-open the same hole.
+    #[test]
+    fn no_refusal_is_constructed_after_a_process_exists() {
+        let run = production_run();
+        let spawn = run
+            .find("spawn_supervisor(&argv")
+            .expect("the spawn call must still be here; if it moved, this check is stale");
+        for (at, _) in run.match_indices("ExecutionStatus::Refused") {
+            assert!(
+                at < spawn,
+                "an ExecutionStatus::Refused is constructed at byte {at} of `run`, which is \
+                 after the spawn point at byte {spawn}. `Refused` claims nothing ran, so it may \
+                 only be built before a process exists; a failure after the spawn point is \
+                 `ExecutionStatus::Abandoned` or `ExecutionStatus::Killed`."
+            );
+        }
+    }
+
+    /// The same property stated from the other side: the post-spawn give-up really does
+    /// report the post-spawn value, and the pre-spawn count is what it is claimed to be.
+    ///
+    /// Without it the check above would also pass on a build that had *deleted* the
+    /// membership check, or that had reached it and returned nothing at all.
+    #[test]
+    fn the_post_spawn_give_up_reports_abandoned_and_the_pre_spawn_refusals_are_five() {
+        let run = production_run();
+        let spawn = run
+            .find("spawn_supervisor(&argv")
+            .expect("the spawn call must still be here");
+        let abandon = run
+            .find("ExecutionStatus::Abandoned")
+            .expect("the membership check must report a value that admits a process existed");
+        assert!(
+            abandon > spawn,
+            "the abandonment has to be reachable, so it must be constructed after the spawn \
+             point, not above it"
+        );
+        assert_eq!(
+            run.match_indices("ExecutionStatus::Refused").count(),
+            5,
+            "five pre-spawn refusals, and no sixth: the availability check, the limit \
+             translation, the required-but-unnamed rule, cgroup creation under Required, and \
+             command construction"
+        );
+    }
 
     #[test]
     fn a_relative_program_is_refused_rather_than_reinterpreted() {
