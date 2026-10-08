@@ -602,3 +602,73 @@ impl crate::dispatch::ExecutionBackend for StubBackend {
         true
     }
 }
+
+/// A Tier-1 backend that performs a **real side effect** and then reports nothing.
+///
+/// # Why this exists
+///
+/// The defect this suite guards against was a *phase* error: a backend failure was
+/// recorded as "nothing ran", so a capability whose side effect may already be on disk
+/// became re-dispatchable. Proving that requires a backend that genuinely produces an
+/// effect, because a fixture that only returns an error proves nothing about the world.
+///
+/// So this writes a real file, then returns `SandboxRefusal` with
+/// `ExecutionCertainty::Unknown` — exactly the shape a `catch_unwind` around a panicking
+/// backend produces, and the one event that must never be recorded as a disproof.
+///
+/// `certainty: Unknown` is hardcoded rather than inferred. Nothing in this crate can know
+/// where a real backend panicked, and inferring it would be exactly the mistake under
+/// test.
+pub struct EffectThenUnknownBackend {
+    /// Where the side effect is written.
+    pub path: std::path::PathBuf,
+    /// What is written, so the test can prove the effect happened.
+    pub contents: &'static str,
+}
+
+impl crate::dispatch::ExecutionBackend for EffectThenUnknownBackend {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        std::fs::write(&self.path, self.contents).expect("the simulated side effect must land");
+        Err(crate::dispatch::SandboxRefusal {
+            capability: orxnud_domain::ids::CapabilityId::new("filesystem/write-text"),
+            reason: "the execution backend panicked after starting the capability".to_owned(),
+            missing: vec!["a functioning execution backend"],
+            certainty: crate::dispatch::ExecutionCertainty::Unknown,
+        })
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}
+
+/// A Tier-1 backend that refuses **before** doing anything, carrying the certainty that
+/// says so.
+///
+/// The counterpart to [`EffectThenUnknownBackend`], and the reason a test can tell the
+/// two `SandboxRefused` shapes apart by observation rather than by reading the type: this
+/// one leaves no file behind.
+pub struct RefuseBeforeEffectBackend {
+    /// Where a file would have been written, had the backend proceeded.
+    pub path: std::path::PathBuf,
+}
+
+impl crate::dispatch::ExecutionBackend for RefuseBeforeEffectBackend {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        Err(crate::dispatch::SandboxRefusal::nothing_attempted(
+            orxnud_domain::ids::CapabilityId::new("filesystem/write-text"),
+            "no execution backend is configured, so a Tier-1 capability cannot be sandboxed",
+            vec!["a sandbox execution backend"],
+        ))
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}
