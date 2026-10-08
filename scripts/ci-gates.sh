@@ -389,6 +389,53 @@ gate_G2() {
     ok "only the sandbox crate spawns capability processes"
   fi
 
+  # --- (g) no SandboxRunner may report a refusal after it has started a process ---
+  #
+  # `ExecutionStatus::Refused` is a *claim that nothing ran*. A runner that starts a
+  # process and then reports it is claiming something it cannot know, and the two
+  # shipped consumers turn that claim into a retry permission: the capability layer reads
+  # it as `ExecutionCertainty::NothingAttempted`, the journal as `Denied`, and the effect
+  # ledger as `not-performed` -- the one status `recover()` reads as "a repeat cannot
+  # duplicate anything".
+  #
+  # `ExecutionStatus::Abandoned` exists for the post-start case, so there is no reason for
+  # a runner to reach for `Refused` after a spawn, and the compile-time check that would
+  # make the mistake impossible does not exist. A mutation experiment confirmed the gap:
+  # a *second* `SandboxRunner` that spawns a real process and then returns `Refused`
+  # compiles, and the whole workspace suite stays green.
+  #
+  # Per `impl SandboxRunner for`, because the whole point is to cover implementations the
+  # Linux backend's own unit test cannot see. Scoped to production sources: a test fixture
+  # that returns a chosen status is not claiming anything about the world.
+  local runners refusal_after_spawn
+  runners="$(grep -RIl 'impl .*SandboxRunner for' crates/*/src --include='*.rs' || true)"
+  refusal_after_spawn=""
+  for runner in $runners; do
+    refusal_after_spawn="$refusal_after_spawn$(awk '
+      /^impl .*SandboxRunner for/ { inimpl = 1; depth = 0 }
+      inimpl {
+        n = gsub(/\{/, "{"); depth += n
+        n = gsub(/\}/, "}"); depth -= n
+        # A comment line is not a construction. Stripped whole-line, which is enough
+        # because a construction is never on the same line as a comment marker.
+        line = $0
+        sub(/[ \t]*\/\/.*$/, "", line)
+        if (line ~ /ExecutionStatus::Refused/ && seen_spawn) {
+          printf "%s:%d:%s\n", FILENAME, FNR, line
+        }
+        if (line ~ /Command::new|spawn_supervisor|\.spawn\(/) { seen_spawn = 1 }
+        if (depth <= 0 && NR > 1 && inimpl) { inimpl = 0; seen_spawn = 0 }
+      }
+    ' "$runner")"
+  done
+  if [ -n "$refusal_after_spawn" ]; then
+    printf '%s\n' "$refusal_after_spawn" | sed 's/^/     /'
+    fail_gate "a SandboxRunner reports ExecutionStatus::Refused after starting a process; Refused claims nothing ran, and a post-start give-up is ExecutionStatus::Abandoned"
+    ok_all=0
+  else
+    ok "no SandboxRunner reports a pre-spawn-only status after starting a process"
+  fi
+
   [ "$ok_all" -eq 1 ] && ok "all internal dependency edges point inward"
 }
 

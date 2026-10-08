@@ -98,7 +98,28 @@ impl SandboxExecutionBackend {
         }
     }
 
-    /// A backend over a supplied runner, for tests.
+    /// A backend over a supplied runner.
+    ///
+    /// **Not only for tests**, and the earlier comment saying so understated what this
+    /// constructor is. It is the seam that makes [`SandboxRunner`] implementable from
+    /// outside this crate, so it is a statement about the *trust domain* rather than about
+    /// convenience: a caller who supplies a runner is asserting, in code, that their runner
+    /// reports the phase of an execution honestly, because this crate will read a
+    /// `Refused` as a positive claim that nothing ran.
+    ///
+    /// The tests here are the in-crate user of it. The one out-of-crate user is a real
+    /// consequence and it is bounded by the extension model rather than by this function:
+    /// `docs/07-extension-capability-model.md` §2.1 places host-side execution at **core
+    /// trust** and admits untrusted code only as a Tier-1 `Subprocess` capability, which
+    /// *consumes* a runner rather than supplying one. So no untrusted extension can reach
+    /// this constructor. Within the trust domain, an implementation that reports a
+    /// pre-spawn-only status after starting a process is a bug in trusted code, and gate G2
+    /// rule (g) now fails the build if one is written.
+    ///
+    /// Were that model to change — were a third-party sandbox backend ever to become a
+    /// supported, untrusted extension — this constructor would stop being a composition
+    /// point and would need to be sealed the way `CapabilityAdapter` is, for the same
+    /// reason: a trait object of it is an execution primitive.
     #[must_use]
     pub fn with_runner(runner: Arc<dyn SandboxRunner>) -> Self {
         Self { runner }
