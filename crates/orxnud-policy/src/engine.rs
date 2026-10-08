@@ -55,6 +55,54 @@ impl CapabilityDeclaration {
     }
 }
 
+/// Whether a durable audit journal is fully settled.
+///
+/// # What this is for
+///
+/// The invariant the dispatcher now enforces by construction is that **every**
+/// authorisation it creates reaches a terminal record. This is the check on the
+/// consequence: if the invariant were ever broken — by a future stage, a panic that
+/// unwound past the settle, or a process killed mid-dispatch — the journal would show
+/// it here rather than leaving it to be discovered during an audit.
+///
+/// It is deliberately *not* a startup gate. A process that died between authorising and
+/// recording leaves a fact about the world that no amount of restarting resolves, and
+/// refusing to start would convert a reportable unknown into an outage with no way out
+/// short of hand-editing the database. Serving with the finding reported is the operable
+/// choice; refusing to serve would only hide it behind a daemon that will not start.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettlementReport {
+    /// Authorisations with no terminal record naming them.
+    ///
+    /// Empty is the healthy state. Each entry is a `seq` an operator can read
+    /// directly out of `audit_log`.
+    pub unresolved_authorisations: Vec<u64>,
+    /// Terminal records naming an authorisation that does not exist, as
+    /// `(terminal_seq, claimed_seq)`.
+    ///
+    /// Non-empty means the journal claims to close authorisations it cannot show, which
+    /// is a writer bug rather than a crash. Reported rather than ignored because it means
+    /// the journal is overstating its own coverage.
+    pub dangling_settlements: Vec<(u64, u64)>,
+}
+
+impl SettlementReport {
+    /// Reads the state out of a chain.
+    #[must_use]
+    pub fn of(chain: &AuditChain) -> Self {
+        Self {
+            unresolved_authorisations: chain.unresolved_authorisations(),
+            dangling_settlements: chain.dangling_settlements(),
+        }
+    }
+
+    /// Whether the journal is fully settled.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.unresolved_authorisations.is_empty() && self.dangling_settlements.is_empty()
+    }
+}
+
 /// The deterministic policy engine.
 ///
 /// # The two durable pieces
@@ -82,6 +130,8 @@ pub struct PolicyEngine {
     /// Which approval digests have been spent. Single-use is this port's contract.
     ledger: Box<dyn ApprovalLedger + Send>,
     policy_version: String,
+    /// What the durable journal looked like when it was restored, if it was.
+    restored_settlement: Option<SettlementReport>,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -120,6 +170,7 @@ impl PolicyEngine {
             journal: None,
             ledger: Box::new(InMemoryApprovals::new()),
             policy_version: policy_version.into(),
+            restored_settlement: None,
         }
     }
 
@@ -156,9 +207,34 @@ impl PolicyEngine {
     pub fn restore(&mut self, journal: &dyn AuditJournal) -> Result<(), PolicyError> {
         let chain = AuditChain::restore(journal)
             .map_err(|e| PolicyError::AuditUnavailable(e.to_string()))?;
+        // Computed here, while the journal is being loaded and before anything is
+        // served, because that is the only moment the answer means "what did the
+        // *previous* process leave behind". Computing it per-dispatch would find only
+        // what this process broke, and computing it never would leave the whole class
+        // of question unaskable in production.
+        self.restored_settlement = Some(SettlementReport::of(&chain));
         self.audit = chain;
         self.journal = None;
         Ok(())
+    }
+
+    /// What loading the durable journal found left unsettled.
+    ///
+    /// `Some` only when a durable journal was restored, so `None` means "nothing
+    /// durable has been loaded" rather than "everything is fine" — the distinction
+    /// matters for a caller deciding whether it has looked.
+    #[must_use]
+    pub fn restored_settlement(&self) -> Option<&SettlementReport> {
+        self.restored_settlement.as_ref()
+    }
+
+    /// The settlement state of the journal as it stands now.
+    ///
+    /// Live rather than the restored snapshot, so a caller can assert the invariant
+    /// after a dispatch as well as at startup.
+    #[must_use]
+    pub fn settlement_report(&self) -> SettlementReport {
+        SettlementReport::of(&self.audit)
     }
 
     /// Whether a durable journal is attached.
@@ -476,6 +552,29 @@ impl PolicyEngine {
         approval: Option<&ApprovalRecord>,
         now_ms: i64,
     ) -> Result<Decision, PolicyError> {
+        self.authorise_traced(request, actor, context, target, params, approval, now_ms)
+            .map(|(decision, _)| decision)
+    }
+
+    /// [`Self::authorise`], also returning the `seq` of the authorisation record it wrote.
+    ///
+    /// The sequence number is the authorisation's durable identity, and the caller
+    /// needs it to settle the authorisation when the action later reaches a terminal
+    /// state. It is returned rather than re-derived because the chain is the only
+    /// thing that assigns it: recomputing "the record I just wrote" from a counter
+    /// here would be a second opinion about the same durable state, and the two
+    /// would disagree the moment anything else appended in between.
+    #[allow(clippy::too_many_arguments)]
+    fn authorise_traced(
+        &mut self,
+        request: ActionRequest,
+        actor: Actor,
+        context: InvocationContext,
+        target: Option<String>,
+        params: NormalizedParams,
+        approval: Option<&ApprovalRecord>,
+        now_ms: i64,
+    ) -> Result<(Decision, u64), PolicyError> {
         let decision = self.evaluate(
             &request,
             &actor,
@@ -507,7 +606,7 @@ impl PolicyEngine {
                     spent: tightest.2,
                 },
             };
-            self.audit_pair(
+            let (seq, _terminal) = self.audit_pair(
                 &request,
                 &actor,
                 &risk,
@@ -516,11 +615,15 @@ impl PolicyEngine {
                 &denial,
                 now_ms,
             )?;
-            return Ok(denial);
+            return Ok((denial, seq));
         }
 
         // --- 3 + 5. Audit. Fails closed. ---
-        self.audit_pair(
+        //
+        // `seq` is this authorisation's durable identity. Whoever authorised must
+        // settle it: if this function returns `Ok` with a permit, the caller now
+        // holds an obligation to write a terminal record naming that exact `seq`.
+        let (seq, _terminal) = self.audit_pair(
             &request,
             &actor,
             &risk,
@@ -531,7 +634,7 @@ impl PolicyEngine {
         )?;
 
         if decision.is_denied() {
-            return Ok(decision);
+            return Ok((decision, seq));
         }
 
         // --- 3b. Consume the approval, now that the decision is to proceed. ---
@@ -575,7 +678,7 @@ impl PolicyEngine {
             };
             // Record the refusal, so the journal shows an attempt that was turned
             // away at the burn rather than one that never happened.
-            self.audit_pair(
+            let (seq, _terminal) = self.audit_pair(
                 &request,
                 &actor,
                 &risk,
@@ -584,7 +687,7 @@ impl PolicyEngine {
                 &decision,
                 now_ms,
             )?;
-            return Ok(decision);
+            return Ok((decision, seq));
         }
 
         // --- 4. Charge, now that the decision is to proceed. ---
@@ -610,7 +713,7 @@ impl PolicyEngine {
         // demands this crate's seal, and gate G2 forbids any other crate from
         // naming it.
         let _invocation = CapabilityInvocation::authorise(request, actor, context, proof);
-        Ok(decision)
+        Ok((decision, seq))
     }
 
     /// [`Self::authorise`], but **returns** the authorised invocation instead of
@@ -649,7 +752,7 @@ impl PolicyEngine {
         approval: Option<&ApprovalRecord>,
         now_ms: i64,
     ) -> Result<AuthorisedInvocation, PolicyError> {
-        let decision = self.authorise(
+        let (decision, authorisation_seq) = self.authorise_traced(
             request.clone(),
             actor.clone(),
             context.clone(),
@@ -690,14 +793,21 @@ impl PolicyEngine {
         Ok(AuthorisedInvocation {
             invocation,
             decision,
+            authorisation_seq,
         })
     }
 
     /// Writes the pre-call authorisation record, plus a terminal record when the
     /// decision was a refusal.
     ///
-    /// Both records share a correlation key, so `unresolved_authorisations`
-    /// closes correctly (the journal is append-only; a record cannot be updated).
+    /// Returns `(authorisation_seq, terminal_seq)`. The first is the authorisation's
+    /// durable identity and the caller must settle it on every later exit; the second
+    /// is `Some` **only** when this function already settled it here, because a denial
+    /// is complete the moment it is decided -- nothing was authorised to run, so
+    /// there is no later stage that could owe a record.
+    ///
+    /// The denial's terminal record carries `settles = authorisation_seq`, so it names
+    /// the exact authorisation it closes rather than relying on a shared label.
     #[allow(clippy::too_many_arguments)]
     fn audit_pair(
         &mut self,
@@ -708,7 +818,7 @@ impl PolicyEngine {
         approval: Option<&ApprovalRecord>,
         decision: &Decision,
         now_ms: i64,
-    ) -> Result<(), PolicyError> {
+    ) -> Result<(u64, Option<u64>), PolicyError> {
         let request_id = RequestId::new(correlation_of(request));
         let approved_digest = match decision {
             Decision::Gate {
@@ -729,7 +839,7 @@ impl PolicyEngine {
             Some(request_id.clone()),
             now_ms,
         );
-        self.record(authorised)?;
+        let authorisation_seq = self.record(authorised)?;
 
         if let Decision::Deny { reason } = decision {
             let terminal = orxnud_audit::AuditRecord::authorised(
@@ -745,10 +855,12 @@ impl PolicyEngine {
                 Some(request_id),
                 now_ms,
             )
-            .finished(OutcomeKind::Denied, now_ms, Some(reason.code().to_owned()));
-            self.record(terminal)?;
+            .finished(OutcomeKind::Denied, now_ms, Some(reason.code().to_owned()))
+            .settling(authorisation_seq);
+            let terminal_seq = self.record(terminal)?;
+            return Ok((authorisation_seq, Some(terminal_seq)));
         }
-        Ok(())
+        Ok((authorisation_seq, None))
     }
 
     /// Writes the terminal record for an action this engine authorised.
@@ -781,6 +893,7 @@ impl PolicyEngine {
         risk: RiskClass,
         target: Option<&str>,
         approval_digest: Option<orxnud_domain::approval::ApprovalDigest>,
+        authorisation_seq: u64,
         outcome: OutcomeKind,
         detail: Option<String>,
         now_ms: i64,
@@ -798,7 +911,8 @@ impl PolicyEngine {
             Some(RequestId::new(correlation_of(request))),
             now_ms,
         )
-        .finished(outcome, now_ms, detail);
+        .finished(outcome, now_ms, detail)
+        .settling(authorisation_seq);
         self.record(terminal).map(|_| ())
     }
 
@@ -834,11 +948,18 @@ impl PolicyEngine {
     }
 }
 
-/// A stable correlation key for the two audit records of one authorisation.
+/// A human-readable correlation label for the two audit records of one authorisation.
 ///
-/// Derived from the task and step, so a retry of the *same* step correlates to
-/// the *same* key (which is what lets the journal see the retry as a retry)
-/// while a different step does not.
+/// Derived from the task and step, so a retry of the *same* step carries the *same*
+/// label while a different step does not. That is a useful thing to read and a useless
+/// thing to pair on, which is why it is not the identity: an ad-hoc dispatch over the
+/// local socket has no task and no step of its own, so its label is the constant
+/// `ipc#0` for every such request ever made.
+///
+/// **Pairing on this is what made the journal misreport outcomes.** Settling is now
+/// done by [`AuditRecord::settles`], which names the authorisation's own `seq`. This
+/// label remains on the record for the reader, and for the task engine's own
+/// bookkeeping, and nothing pairs on it any more.
 fn correlation_of(request: &ActionRequest) -> String {
     format!("{}#{}", request.task, request.step)
 }
@@ -861,6 +982,18 @@ pub struct AuthorisedInvocation {
     pub invocation: CapabilityInvocation,
     /// The decision that permitted it.
     pub decision: Decision,
+    /// The `seq` of the authorisation record written for this action.
+    ///
+    /// **An obligation, not a label.** Holding this means an audit record exists that
+    /// says the action was permitted, so the holder now owns the duty to settle it
+    /// with exactly one terminal record naming this `seq` — on success, on refusal,
+    /// and on failure. Dropping it without settling leaves the journal claiming an
+    /// action was authorised with no record of what became of it.
+    ///
+    /// The dispatcher is the only production caller, and it settles unconditionally:
+    /// every exit after authorisation runs through one point that writes the terminal
+    /// record. This is why the obligation is checkable rather than aspirational.
+    pub authorisation_seq: u64,
 }
 
 #[cfg(test)]

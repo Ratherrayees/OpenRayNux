@@ -411,8 +411,8 @@ impl AdapterBundle for WordCountBundle {
     fn sandbox_plan(
         &self,
         _invocation: &orxnud_policy::authority::CapabilityInvocation,
-    ) -> Option<crate::dispatch::SandboxPlan> {
-        None
+    ) -> Result<Option<crate::dispatch::SandboxPlan>, crate::dispatch::PlanError> {
+        Ok(None)
     }
 
     fn verifier(&self) -> &dyn Verifier {

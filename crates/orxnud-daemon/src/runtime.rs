@@ -678,6 +678,41 @@ impl<S: SecretsContract> Runtime<S> {
         self.governed.lock().await.0.has_durable_audit()
     }
 
+    /// Whether the durable audit journal was found fully settled when it was loaded.
+    ///
+    /// # Why production asks this at all
+    ///
+    /// The dispatcher settles every authorisation by construction now, so this is not
+    /// the primary defence — it is the check on the consequence. A `false` here means
+    /// the journal contains an authorisation that no terminal record names, which is
+    /// either a process that died mid-dispatch or a writer that skipped the settle.
+    /// Both are facts about the world that a reader of the journal has to be told
+    /// about, and until this existed nothing in production ever asked.
+    ///
+    /// Computed while the journal is being restored, before anything is served, so the
+    /// answer describes what the *previous* process left behind rather than what this
+    /// one has done so far.
+    #[must_use]
+    pub async fn restored_settlement(&self) -> orxnud_policy::SettlementReport {
+        self.governed
+            .lock()
+            .await
+            .0
+            .policy()
+            .restored_settlement()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The live settlement state of the journal.
+    ///
+    /// For asserting the invariant after a dispatch, and for the status surface an
+    /// operator can poll.
+    #[must_use]
+    pub async fn settlement_report(&self) -> orxnud_policy::SettlementReport {
+        self.governed.lock().await.0.policy().settlement_report()
+    }
+
     /// Serves until `shutdown` resolves, then releases the endpoint.
     ///
     /// Stops accepting first, then lets in-flight requests finish. That ordering is
@@ -1979,6 +2014,7 @@ fn effect_status_for_dispatch_failure(
         | DispatchError::ClassEscalation { .. }
         | DispatchError::Credential(_)
         | DispatchError::Reentrant(_)
+        | DispatchError::InvalidInput { .. }
         | DispatchError::VerificationRefuted { .. } => EffectStatus::NotPerformed,
     }
 }
@@ -2023,17 +2059,34 @@ fn dispatch_failure(e: &orxnud_capability::dispatch::DispatchError) -> RequestEr
         //
         // The detail names the missing guarantees, which are this daemon's own vocabulary
         // (`visibility`, `tree_lifetime`, `resources`) and never a path or a syscall.
+        //
+        // `missing` is reported, and `reason` is reported alongside it rather than
+        // replaced by a fixed sentence. The fixed sentence was the bug: it asserted the
+        // backend could not establish its guarantees on *every* refusal reaching here,
+        // including ones decided long before the backend was consulted. A caller that
+        // had supplied a traversing path was told their sandbox was broken, on a host
+        // whose sandbox had executed a neighbouring capability seconds earlier, and the
+        // reason the capability actually gave — which said exactly what was wrong — was
+        // dropped on the floor here.
         DispatchError::SandboxRefused(r) => RequestError::Unavailable {
             reason: "sandbox-unavailable".to_owned(),
             detail: Some(format!(
-                "the execution backend cannot establish the required sandbox guarantees \
-                 (missing: {})",
+                "no sandbox could be established for this capability: {} (missing: {})",
+                r.reason,
                 if r.missing.is_empty() {
                     "none".to_owned()
                 } else {
                     r.missing.join(", ")
                 }
             )),
+        },
+
+        // The capability rejected the request. Invalid-request, not environment: the
+        // cause is the parameters, the caller can fix them, and nothing ran. Routing
+        // this to `unavailable` is what made a bad path look like a host fault.
+        DispatchError::InvalidInput { capability, detail } => RequestError::Declined {
+            reason: "invalid-capability-parameters".to_owned(),
+            detail: Some(format!("{capability} rejected the request: {detail}")),
         },
 
         // A credential that is not configured is fixed by *adding the credential*, which is
@@ -5081,11 +5134,11 @@ mod effect_status_for_dispatch_failure_tests {
     }
 
     fn refusal() -> SandboxRefusal {
-        SandboxRefusal {
-            capability: cap(),
-            reason: "no execution backend is configured".to_owned(),
-            missing: vec!["a sandbox execution backend"],
-        }
+        SandboxRefusal::nothing_attempted(
+            cap(),
+            "no execution backend is configured",
+            vec!["a sandbox execution backend"],
+        )
     }
 
     /// Requirement: a dispatch that definitively fails *before* execution is recorded as

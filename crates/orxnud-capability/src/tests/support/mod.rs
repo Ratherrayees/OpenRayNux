@@ -580,3 +580,25 @@ pub fn with_dispatch_view<R>(
     let invocation = authorised_invocation(capability, params);
     f(&invocation.dispatch_view())
 }
+
+/// An execution backend that never runs anything.
+///
+/// For tests whose subject is what happens **before** execution — the classification of
+/// a refusal, the disposition recorded for it — and which would otherwise be blocked at
+/// "no execution backend is configured" before reaching the stage under test. `execute`
+/// panics rather than returning a report, so a test that accidentally gets past the
+/// check it meant to fail at fails loudly instead of quietly measuring a successful run.
+pub struct StubBackend;
+
+impl crate::dispatch::ExecutionBackend for StubBackend {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        panic!("StubBackend::execute must not be reached by a test that stops before execution")
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}

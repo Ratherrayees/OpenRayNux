@@ -79,8 +79,43 @@ pub struct AuditRecord {
     /// Which task.
     pub task: Option<TaskId>,
     /// Correlation id for the originating request.
+    ///
+    /// **Advisory only.** This is a human-readable label, not the identity used to
+    /// settle an authorisation -- see [`Self::settles`]. It is retained because it is
+    /// useful when reading the journal, and because the task engine's records are
+    /// keyed by it.
     pub request: Option<RequestId>,
-    /// The outcome.
+    /// The `seq` of the **authorisation record this one settles**, if this is a
+    /// terminal record.
+    ///
+    /// # Why this exists
+    ///
+    /// Settling used to be inferred: [`Self::correlation_key`] matched a terminal
+    /// record to an authorisation by matching their request ids, and
+    /// [`crate::AuditChain::unresolved_authorisations`] resolved what was left over by
+    /// popping the *earliest* open authorisation with a matching key. Both halves of
+    /// that are unsound under concurrency, because the key is not unique per
+    /// operation.
+    ///
+    /// For every dispatch over the local socket the request id is derived from the
+    /// task and step, and an ad-hoc invocation has no task of its own -- so the key
+    /// was the literal string `ipc#0` for *every* such dispatch. A FIFO pop over a
+    /// non-unique key will happily resolve authorisation A with the completion of
+    /// unrelated authorisation B. A live run did exactly that: two `write-text`
+    /// authorisations that never reached a terminal record were reported as settled,
+    /// while two successful `read-text` operations were reported as unresolved.
+    ///
+    /// The `seq` of the authorisation record is the correct identity and needs no new
+    /// namespace: it is assigned by the single-writer chain, it is the primary key of
+    /// `audit_log`, it is durable across restarts, and it cannot collide between
+    /// concurrent dispatches because only one writer ever assigns it.
+    ///
+    /// `None` on an authorisation record — it settles nothing — and `None` on any
+    /// record written before this field existed, which is why the detector below also
+    /// treats a legacy record as unsettleable rather than silently ignoring it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settles: Option<u64>,
+    /// The outcome half of the record.
     pub outcome: AuditOutcome,
 }
 
@@ -114,6 +149,7 @@ impl AuditRecord {
             secret_ref,
             task,
             request,
+            settles: None,
             outcome: AuditOutcome::Authorised { at_ms },
         }
     }
@@ -127,6 +163,30 @@ impl AuditRecord {
             detail,
         };
         self
+    }
+
+    /// Marks this record as settling the authorisation at `seq`.
+    ///
+    /// Separate from [`Self::finished`] because the two answer different questions:
+    /// `finished` says *what happened*, this says *to which authorisation*. A
+    /// terminal record with no `settles` is a journal entry nobody can reconcile, so
+    /// the two are always set together by the callers that write terminal records.
+    #[must_use]
+    pub fn settling(mut self, seq: u64) -> Self {
+        self.settles = Some(seq);
+        self
+    }
+
+    /// The authorisation this record settles.
+    ///
+    /// Only meaningful on a terminal record. An authorisation record settles nothing,
+    /// and returns `None`.
+    #[must_use]
+    pub fn settles_authorisation(&self) -> Option<u64> {
+        match self.outcome {
+            AuditOutcome::Finished { .. } => self.settles,
+            AuditOutcome::Authorised { .. } => None,
+        }
     }
 
     /// The key used to correlate a terminal record with its authorisation.
@@ -199,6 +259,18 @@ impl AuditRecord {
                 )
             }
         });
+        // Appended last, and **only when present**, so that a record written before
+        // `settles` existed hashes to exactly the bytes it hashed to then. Adding a
+        // segment unconditionally would invalidate every stored hash and turn a
+        // schema addition into a data migration; appending nothing for `None` keeps
+        // the old format byte-identical and the new format self-describing.
+        //
+        // The digest covering this field is what makes the identity tamper-evident:
+        // rewriting a terminal record to point at a different authorisation changes
+        // its hash and breaks the chain at `verify`.
+        if let Some(seq) = self.settles {
+            s.push_str(&format!("|settles={seq}"));
+        }
         s.into_bytes()
     }
 }
@@ -292,6 +364,74 @@ mod tests {
         for v in &variants {
             assert_ne!(base_h, h(v), "a field change did not alter the hash");
         }
+
+        // `settles` is bound too, which is what makes an identity tamper-evident:
+        // rewriting a terminal record to claim a different authorisation changes its
+        // hash and breaks the chain at `verify`.
+        let repointed = base
+            .clone()
+            .finished(OutcomeKind::Completed, 2000, None)
+            .settling(7);
+        assert_ne!(
+            base_h,
+            h(&repointed),
+            "the authorisation identity must be covered by the hash"
+        );
+        let mut elsewhere = repointed.clone();
+        elsewhere.settles = Some(8);
+        assert_ne!(
+            h(&repointed),
+            h(&elsewhere),
+            "pointing the same record at a different authorisation must change the hash"
+        );
+        let mut none = repointed.clone();
+        none.settles = None;
+        assert_ne!(
+            h(&repointed),
+            h(&none),
+            "removing the identity must change the hash too"
+        );
+    }
+
+    /// The compatibility property that makes `settles` a schema addition and not a data
+    /// migration.
+    ///
+    /// `canonical_bytes` appends the identity segment **only when it is present**, so a
+    /// record written before the field existed — which deserialises with `settles: None`
+    /// — hashes to exactly the bytes it hashed to under the old format. Every stored
+    /// `record_hash` in every journal written by an earlier build therefore still
+    /// verifies, and `AuditChain::restore` accepts them.
+    ///
+    /// Had the segment been appended unconditionally, adding this field would have
+    /// invalidated every hash ever written and turned a report-writing change into a
+    /// data migration across all installations. The test pins the exact bytes so a
+    /// later "tidy up the canonical form" cannot quietly reintroduce that.
+    #[test]
+    fn a_record_without_an_identity_hashes_exactly_as_it_did_before_the_field_existed() {
+        let r = rec();
+        assert_eq!(r.settles, None);
+        let bytes = String::from_utf8_lossy(&r.canonical_bytes()).to_string();
+        assert!(
+            !bytes.contains("settles"),
+            "an absent identity must contribute no bytes at all: {bytes}"
+        );
+        assert!(
+            !bytes.ends_with('|'),
+            "no trailing separator either, or the bytes would differ: {bytes}"
+        );
+    }
+
+    #[test]
+    fn an_identity_is_present_in_the_canonical_form_when_set() {
+        let r = rec()
+            .finished(OutcomeKind::Completed, 2000, None)
+            .settling(42);
+        let bytes = String::from_utf8_lossy(&r.canonical_bytes()).to_string();
+        assert!(
+            bytes.ends_with("|settles=42"),
+            "the identity must be bound into the canonical form: {bytes}"
+        );
+        assert_eq!(r.settles_authorisation(), Some(42));
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub use authority::{AuthorisationProof, CapabilityInvocation, DispatchView};
 pub use budget::{BudgetError, BudgetLedger, Ceiling};
 pub use decision::{Decision, DenialReason, PolicyError};
 pub use digest::{DigestError, canonical_params, digest_for, issue_approval};
-pub use engine::{AuthorisedInvocation, CapabilityDeclaration, PolicyEngine};
+pub use engine::{AuthorisedInvocation, CapabilityDeclaration, PolicyEngine, SettlementReport};
 pub use policy_set::{Grant, PolicySet};
 
 // `PolicySeal` and `seal()` used to live here. They are gone, and

@@ -105,6 +105,26 @@ pub enum DispatchError {
     /// A required credential could not be produced. The value is never in here.
     Credential(CredentialError),
 
+    /// The capability's own parameters were rejected.
+    ///
+    /// Distinct from [`Self::SandboxRefused`] because the cause is the request, not
+    /// the host: a traversing path and a missing bubblewrap binary both end in "no
+    /// plan", and conflating them told operators to go and inspect their kernel
+    /// settings for a malformed argument. Also distinct from a capability that
+    /// declares no plan at all ([`PlanError::NoPlanDeclared`]), which is a defect in
+    /// this build and is reported as [`Self::SandboxRefused`] so it still surfaces as
+    /// an environment fault.
+    ///
+    /// Nothing ran. The caller can fix the request and retry, so the terminal audit
+    /// record for this authorisation is a `Denied`, not an `Uncertain`.
+    InvalidInput {
+        /// Which capability rejected the parameters.
+        capability: CapabilityId,
+        /// What was wrong, in the capability's words. Never a path outside the
+        /// workspace and never parameter content.
+        detail: String,
+    },
+
     // --- stages 7-8: execution and verification ---
     /// The adapter failed, timed out, or did not report.
     ///
@@ -147,6 +167,9 @@ impl std::fmt::Display for DispatchError {
                     r.missing.join(", ")
                 },
             ),
+            Self::InvalidInput { capability, detail } => {
+                write!(f, "{capability} rejected the request: {detail}")
+            }
             Self::NoImplementation(c) => write!(f, "{c} is declared but has no implementation"),
             Self::Disabled(c) => write!(f, "{c} is disabled"),
             Self::ClassEscalation {
@@ -762,7 +785,14 @@ mod redact_tests {
     fn control_characters_are_still_replaced_and_the_budget_still_applies() {
         // The original two responsibilities, unchanged: scrub framing characters,
         let mut s = "x".repeat(MAX - 4);
-        s.push_str("\n\r\u{0} ");
+        // U+2028 is a 3-byte line separator and is **not** a control character, so
+        // `is_control()` leaves it alone. That is the point: this input is 514 bytes,
+        // truncation cuts at 512, and 512 falls *inside* that last character, so the
+        // backwards boundary walk in `redact` is what keeps it from slicing a code
+        // point in half. A plain space here would make the input exactly 512 bytes,
+        // which returns early, never truncates, and leaves `reported_total` with no
+        // suffix to parse.
+        s.push_str("\n\r\u{0}\u{2028}");
         let out = redact(&s);
         assert!(
             !out.contains('\n') && !out.contains('\r') && !out.contains('\u{0}'),
@@ -870,6 +900,70 @@ pub struct SandboxRefusal {
     pub reason: String,
     /// Guarantees that were not established.
     pub missing: Vec<&'static str>,
+    /// Whether this refusal establishes that nothing ran.
+    ///
+    /// A field rather than an assumption, because the two are not the same and the
+    /// difference decides whether a retry is safe. Every refusal below is decided
+    /// *before* a process exists -- no backend configured, no plan, incomplete
+    /// resource policy, guarantees the host cannot establish, or the backend declining
+    /// to build a spec. One is not: a backend that **panicked** may have spawned its
+    /// child before unwinding, so from the journal alone nothing ran and something ran
+    /// are indistinguishable.
+    ///
+    /// The journal records that difference rather than flattening both to "refused",
+    /// because `OutcomeKind::Denied` asserts the capability did not execute and
+    /// `OutcomeKind::Uncertain` declines to. Getting this wrong in the optimistic
+    /// direction is what makes a task engine retry an effect that already happened.
+    pub certainty: ExecutionCertainty,
+}
+
+/// What a refusal establishes about execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionCertainty {
+    /// The refusal was decided before anything was spawned, so nothing ran.
+    NothingAttempted,
+    /// A process may have been started. The outcome is not established either way.
+    Unknown,
+}
+
+impl SandboxRefusal {
+    /// A refusal decided before anything was spawned.
+    ///
+    /// The constructor exists so that `NothingAttempted` is the *default* spelling at
+    /// every pre-execution site. A site that genuinely ran has to say so out loud by
+    /// passing [`ExecutionCertainty::Unknown`], which is the direction this wants to
+    /// be wrong in: an extra `Unknown` costs a retry, a missing one costs correctness.
+    #[must_use]
+    pub fn nothing_attempted(
+        capability: CapabilityId,
+        reason: impl Into<String>,
+        missing: Vec<&'static str>,
+    ) -> Self {
+        Self {
+            capability,
+            reason: reason.into(),
+            missing,
+            certainty: ExecutionCertainty::NothingAttempted,
+        }
+    }
+}
+
+/// Why a Tier-1 adapter could not produce a sandbox plan.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlanError {
+    /// The invocation's parameters are not acceptable to this capability.
+    ///
+    /// Caller's error, and the adapter's own words about why. Reported as invalid
+    /// input, never as a missing sandbox.
+    #[error("{0}")]
+    InvalidParams(String),
+
+    /// A Tier-1 adapter that declares no plan at all.
+    ///
+    /// A defect in the build rather than in the request. Nothing about the invocation
+    /// was examined, so no caller edit can change the answer.
+    #[error("the adapter is Tier-1 but declares no sandbox plan")]
+    NoPlanDeclared,
 }
 
 /// What a Tier-1 adapter wants from its sandbox, in portable terms.
@@ -1039,8 +1133,28 @@ pub(crate) trait AdapterBundle {
 
     /// The sandbox plan for this invocation, for a Tier-1 adapter.
     ///
-    /// `None` for Tier 0, and for a Tier-1 adapter it is a configuration error the
+    /// `Ok(None)` for Tier 0, and for a Tier-1 adapter it is a configuration error the
     /// dispatcher refuses rather than guessing.
+    ///
+    /// # Why this returns a `Result` and not an `Option`
+    ///
+    /// `Option<SandboxPlan>` cannot say *why* there is no plan, and the two reasons are
+    /// not the same event:
+    ///
+    /// * `Err(PlanError::InvalidParams(..))` -- the caller supplied parameters this
+    ///   capability will not accept (a traversing path, an absolute path, a missing
+    ///   field). Nothing ran, the caller can fix the request, and the answer belongs
+    ///   with invalid input.
+    /// * `Err(PlanError::NoPlanDeclared)` -- a Tier-1 adapter that declares no plan.
+    ///   That is a defect in this build, not in the request, and no caller edit fixes
+    ///   it.
+    ///
+    /// Collapsing both to `None` made a caller-supplied bad path surface as
+    /// *"the execution backend cannot establish the required sandbox guarantees
+    /// (missing: a sandbox plan)"* -- on a host where the sandbox had just executed a
+    /// neighbouring capability successfully. An operator's runbook sends them to check
+    /// bubblewrap and user namespaces for what was actually a bad request. The
+    /// diagnostic the adapter already had was discarded by `.ok()?` on the way.
     ///
     /// Takes the invocation because a Tier-1 adapter's `invoke` is **never called** —
     /// the dispatcher executes the contract built from this plan instead — so this is
@@ -1049,8 +1163,11 @@ pub(crate) trait AdapterBundle {
     /// unimplementable, or worse, implementable only by smuggling data through the
     /// credential environment variable, which is for credentials and is redacted
     /// accordingly.
-    fn sandbox_plan(&self, _invocation: &CapabilityInvocation) -> Option<SandboxPlan> {
-        None
+    fn sandbox_plan(
+        &self,
+        _invocation: &CapabilityInvocation,
+    ) -> Result<Option<SandboxPlan>, PlanError> {
+        Ok(None)
     }
 
     /// How to verify its effects.
@@ -1258,13 +1375,18 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             .bundles
             .get(capability)
             .ok_or_else(|| DispatchError::NoImplementation(capability.clone()))?;
-        let sandboxed = bundle.sandbox_plan(invocation).ok_or_else(|| {
-            DispatchError::SandboxRefused(SandboxRefusal {
-                capability: capability.clone(),
-                reason: "the adapter is Tier-1 but declares no sandbox plan".to_owned(),
-                missing: vec!["a sandbox plan"],
-            })
-        })?;
+        let sandboxed = match plan_for(Some(bundle), invocation, capability)? {
+            Some(plan) => plan,
+            None => {
+                return Err(DispatchError::SandboxRefused(
+                    SandboxRefusal::nothing_attempted(
+                        capability.clone(),
+                        "the adapter is Tier-1 but declares no sandbox plan",
+                        vec!["a sandbox plan"],
+                    ),
+                ));
+            }
+        };
         Ok(ExecutionContract {
             capability: capability.clone(),
             program: sandboxed.program,
@@ -1339,7 +1461,125 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             .map_err(DispatchError::Policy)?;
         let invocation = authorised.invocation;
         let decision = authorised.decision;
+        // The authorisation's durable identity. Everything below is obliged to settle
+        // exactly this record.
+        let authorisation_seq = authorised.authorisation_seq;
 
+        // --- stages 5-8, as a value: no exit may skip the settle below ---
+        //
+        // `authorisation_seq` is an obligation, not a label. Policy wrote an audit
+        // record saying this action was permitted, and from this line on something owns
+        // the duty to settle it with exactly one terminal record naming that `seq`.
+        //
+        // Stages 5-8 can refuse for reasons that have nothing to do with authority -- no
+        // implementation, a data class above what the adapter declares, an unconfigured
+        // credential, parameters the capability rejects, a sandbox the host cannot
+        // establish -- and every one of those used to `return Err(..)` straight out of
+        // this function, past the audit write at the bottom. A controlled run found
+        // exactly that: two `write-text` authorisations whose parameters were rejected
+        // by the plan builder, each with no terminal record at all.
+        //
+        // So the refusing part is a value, and the settle is unconditional.
+        let settled = self.run_authorised(&invocation, &capability, credential_ref, now_ms);
+
+        // --- stage 9: AUDIT / SETTLE ---
+        //
+        // Reached on every path out of `dispatch` after authorisation: success, every
+        // refusal, and every failure. Written here by the one component that holds both
+        // the policy engine and the adapter registry, because the record has to be
+        // built from the same fields the authorisation was built from and because this
+        // is the only place the authorisation's identity is known.
+        //
+        // It used to sit at the end of the success path only, which is what made every
+        // early return above invisible from here.
+        let risk = match &decision {
+            orxnud_policy::Decision::Allow { risk }
+            | orxnud_policy::Decision::Gate { risk, .. } => *risk,
+            orxnud_policy::Decision::Deny { .. } => orxnud_domain::enums::RiskClass::UNKNOWN,
+        };
+        let (kind, detail) = match &settled {
+            Ok(outcome) => terminal_outcome(outcome),
+            Err(error) => terminal_outcome_for_failure(error),
+        };
+        // State the approval economics on the record when an approval was presented and
+        // the action was then refused.
+        //
+        // The burn happens inside policy, before the dispatcher reaches stage 5, so a
+        // capability that rejects its own parameters has already had the user's approval
+        // consumed. That is a deliberate choice — burning after execution would reopen the
+        // replay window single-use exists to close — and V-43 records the reservation
+        // model as the better long-term answer. It is not free of consequence for anyone
+        // reading the journal later, though: the record says an approval authorised a
+        // write that was then refused, and the natural reading is that the approval is
+        // still good for a retry. It is not. Saying so costs one clause and removes the
+        // inference.
+        //
+        // Keyed on `approval.is_some()` rather than on the decision's `required_digest`,
+        // because those are different questions. `required_digest` is `Some` only for a
+        // `Gate` — an action that *demanded* an approval. Here the question is whether an
+        // approval was *presented and consumed*, which is true for the ordinary case too:
+        // a High-risk capability the user approved in advance reaches `Allow`, and its
+        // digest is spent at policy's burn just the same. Keying on the gate would have
+        // stated the economics only for the paths where it is least in doubt.
+        let detail = match (detail, approval) {
+            (Some(d), Some(_)) => Some(format!(
+                "{d}; the approval presented for this action was already spent and \
+                 remains spent, so it cannot be presented again"
+            )),
+            (other, _) => other,
+        };
+        let (audit_request, audit_actor, audit_target) = &audit_subject;
+        self.policy
+            .record_terminal(
+                audit_request,
+                audit_actor,
+                risk,
+                audit_target.as_deref(),
+                required_digest(&decision),
+                authorisation_seq,
+                kind,
+                detail,
+                now_ms,
+            )
+            .map_err(|e| DispatchError::Audit(e.to_string()))?;
+
+        match settled {
+            // The verifier ran and disproved the effect. The terminal record above
+            // already describes the execution honestly; this is only the wire error.
+            Ok(outcome) if outcome.verification.is_refuted() => {
+                Err(DispatchError::VerificationRefuted {
+                    evidence: match &outcome.verification {
+                        VerificationOutcome::Refuted { evidence } => evidence.clone(),
+                        _ => unreachable!("checked by is_refuted"),
+                    },
+                })
+            }
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Stages 5-8: everything that can happen between "authorised" and "ran".
+    ///
+    /// Split out of [`Self::dispatch`] for one reason: so that none of it can
+    /// `return` out of `dispatch`. Each of these stages used to be an early `return
+    /// Err(..)`, and an early return from `dispatch` after stage 1 left the
+    /// authorisation record already written with nothing to settle it. As a value
+    /// rather than a control-flow exit, "every exit settles its authorisation" becomes
+    /// a property of the shape of the function instead of a rule that has to be
+    /// remembered at each new refusal.
+    ///
+    /// Nothing here writes an audit record. That is deliberate: this method decides
+    /// *what happened*, and exactly one place in `dispatch` decides *what to record
+    /// about* it.
+    fn run_authorised(
+        &mut self,
+        invocation: &CapabilityInvocation,
+        capability: &CapabilityId,
+        credential_ref: Option<&SecretRef>,
+        now_ms: i64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let capability = capability.clone();
         // --- stage 5: CAPABILITY RESOLUTION ---
         let bundle = self
             .bundles
@@ -1385,45 +1625,52 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
                 // free, and a refusal here must not be able to read a secret. The
                 // contract check below happens before the backend is asked to run.
                 let Some(backend) = self.execution.clone() else {
-                    return Err(DispatchError::SandboxRefused(SandboxRefusal {
-                        capability: capability.clone(),
-                        reason: "no execution backend is configured, so a Tier-1 \
-                                 capability cannot be sandboxed"
-                            .to_owned(),
-                        missing: vec!["a sandbox execution backend"],
-                    }));
+                    return Err(DispatchError::SandboxRefused(
+                        SandboxRefusal::nothing_attempted(
+                            capability.clone(),
+                            "no execution backend is configured, so a Tier-1 capability \
+                             cannot be sandboxed",
+                            vec!["a sandbox execution backend"],
+                        ),
+                    ));
                 };
                 // Policy completeness is checked here, ahead of the backend, so an
                 // incomplete policy costs no subprocess and no execution side effect.
                 // `contract_for` reads the same plan, so this cannot disagree with it.
-                let plan_resources = self
-                    .bundles
-                    .get(&capability)
-                    .and_then(|b| b.sandbox_plan(&invocation))
-                    .map(|p| p.resources)
-                    .ok_or_else(|| {
-                        DispatchError::SandboxRefused(SandboxRefusal {
-                            capability: capability.clone(),
-                            reason: "the adapter is Tier-1 but declares no sandbox plan".to_owned(),
-                            missing: vec!["a sandbox plan"],
-                        })
-                    })?;
+                let plan_resources = {
+                    let bundle = self.bundles.get(&capability);
+                    match plan_for(bundle, invocation, &capability)? {
+                        Some(plan) => plan.resources,
+                        None => {
+                            return Err(DispatchError::SandboxRefused(
+                                SandboxRefusal::nothing_attempted(
+                                    capability.clone(),
+                                    "the adapter is Tier-1 but declares no sandbox plan",
+                                    vec!["a sandbox plan"],
+                                ),
+                            ));
+                        }
+                    }
+                };
                 if let Err(incomplete) = plan_resources.validate() {
-                    return Err(DispatchError::SandboxRefused(SandboxRefusal {
-                        capability: capability.clone(),
-                        reason: format!("incomplete resource policy: {incomplete}"),
-                        missing: incomplete.missing,
-                    }));
+                    return Err(DispatchError::SandboxRefused(
+                        SandboxRefusal::nothing_attempted(
+                            capability.clone(),
+                            format!("incomplete resource policy: {incomplete}"),
+                            incomplete.missing,
+                        ),
+                    ));
                 }
-                let contract = self.contract_for(&invocation, &capability)?;
+                let contract = self.contract_for(invocation, &capability)?;
                 if !backend.can_fulfil(&contract) {
-                    return Err(DispatchError::SandboxRefused(SandboxRefusal {
-                        capability: capability.clone(),
-                        reason: "the execution backend cannot establish the required \
-                                 sandbox guarantees"
-                            .to_owned(),
-                        missing: vec!["the requested sandbox guarantees"],
-                    }));
+                    return Err(DispatchError::SandboxRefused(
+                        SandboxRefusal::nothing_attempted(
+                            capability.clone(),
+                            "the execution backend cannot establish the required sandbox \
+                             guarantees",
+                            vec!["the requested sandbox guarantees"],
+                        ),
+                    ));
                 }
                 self.reentrancy.enter(&capability)?;
                 let report = {
@@ -1433,12 +1680,22 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
                     self.reentrancy.leave();
                     match caught {
                         Err(_) => {
-                            // A backend that panics must not be treated as success,
-                            // and must not be retried as though the capability failed.
+                            // A backend that panics must not be treated as success, and
+                            // must not be retried as though the capability failed.
+                            //
+                            // `Unknown` certainty, and this is the one site that says so:
+                            // `execute` may have spawned its child before unwinding, so
+                            // from here nothing ran and something ran are
+                            // indistinguishable. Every other refusal is decided before a
+                            // process exists and is `NothingAttempted`. Recording this as
+                            // a plain refusal would let a later reader — or a retry —
+                            // treat an effect that may have happened as one that
+                            // definitely did not.
                             return Err(DispatchError::SandboxRefused(SandboxRefusal {
                                 capability: capability.clone(),
                                 reason: "the execution backend panicked".to_owned(),
                                 missing: vec!["a functioning execution backend"],
+                                certainty: ExecutionCertainty::Unknown,
                             }));
                         }
                         Ok(Ok(r)) => r,
@@ -1493,61 +1750,45 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             },
         };
 
-        // --- stage 9: AUDIT / FINAL STATE ---
-        //
-        // The authorisation half was stage 1's `audit_pair`: policy wrote the
-        // permit record, and a refusal record with the same correlation key, before
-        // this dispatcher saw a `Decision`. What remains is the terminal record,
-        // and it is written **here** rather than delegated.
-        //
-        // It used to be delegated "to the caller that owns the journal", on the
-        // reasoning that only the caller knows whether the *task* may now be marked
-        // done. That was correct about the task and wrong about the action: the
-        // caller does not exist, so the terminal record was never written, and an
-        // action that ran left a journal entry with no outcome — which
-        // `unresolved_authorisations` then reads as "outcome unknown", forever.
-        // A refusal to record is now a refusal to report success, which is what
-        // `DispatchError::Audit` has always claimed to mean.
-        let outcome = DispatchOutcome {
+        Ok(DispatchOutcome {
             execution,
             verification,
             capability: capability.clone(),
             // Read from the same `bundle` the plan and verifier came from, so the flag
             // cannot disagree with the effect it describes.
             output_is_ephemeral: bundle.output_is_ephemeral(),
-        };
-        let _ = decision;
+        })
+    }
+}
 
-        let (audit_request, audit_actor, audit_target) = &audit_subject;
-        let risk = match &decision {
-            orxnud_policy::Decision::Allow { risk }
-            | orxnud_policy::Decision::Gate { risk, .. } => *risk,
-            orxnud_policy::Decision::Deny { .. } => orxnud_domain::enums::RiskClass::UNKNOWN,
-        };
-        let (kind, detail) = terminal_outcome(&outcome);
-        self.policy
-            .record_terminal(
-                audit_request,
-                audit_actor,
-                risk,
-                audit_target.as_deref(),
-                required_digest(&decision),
-                kind,
-                detail,
-                now_ms,
-            )
-            .map_err(|e| DispatchError::Audit(e.to_string()))?;
-
-        if outcome.verification.is_refuted() {
-            return Err(DispatchError::VerificationRefuted {
-                evidence: match &outcome.verification {
-                    VerificationOutcome::Refuted { evidence } => evidence.clone(),
-                    _ => unreachable!("checked by is_refuted"),
-                },
-            });
-        }
-
-        Ok(outcome)
+/// Asks a bundle for its sandbox plan, translating the adapter's refusal.
+///
+/// `Ok(None)` means "this bundle declares no plan" -- for Tier 0 that is ordinary, and
+/// for Tier 1 it is a build defect, which the callers report as a sandbox refusal so it
+/// still reads as an environment fault rather than a bad request.
+///
+/// `Err(PlanError::InvalidParams)` becomes [`DispatchError::InvalidInput`]. That
+/// mapping is the entire point of retyping this: the capability had a precise reason and
+/// a caller can act on it, and neither fact survives being flattened into "no plan".
+fn plan_for(
+    bundle: Option<&Arc<dyn AdapterBundle + Send + Sync>>,
+    invocation: &CapabilityInvocation,
+    capability: &CapabilityId,
+) -> Result<Option<SandboxPlan>, DispatchError> {
+    let Some(bundle) = bundle else {
+        return Ok(None);
+    };
+    match bundle.sandbox_plan(invocation) {
+        Ok(plan) => Ok(plan),
+        Err(PlanError::InvalidParams(detail)) => Err(DispatchError::InvalidInput {
+            capability: capability.clone(),
+            detail,
+        }),
+        // A bundle that returns this *as an error* is saying something stronger than
+        // `Ok(None)`: it looked, and there is nothing. Either way the answer is a
+        // defect in this build, so it is reported as a sandbox refusal by the callers
+        // and never as the caller's fault.
+        Err(PlanError::NoPlanDeclared) => Ok(None),
     }
 }
 
@@ -1573,6 +1814,110 @@ fn terminal_outcome(outcome: &DispatchOutcome) -> (orxnud_audit::OutcomeKind, Op
         ),
         (ExecutionOutcome::Failed { detail }, _) => (OutcomeKind::Failed, Some(redact(detail))),
         (ExecutionOutcome::Unknown { detail }, _) => (OutcomeKind::Uncertain, Some(redact(detail))),
+    }
+}
+
+/// How a dispatch that returned `Err` should be described in the journal.
+///
+/// # Why this exists separately from [`terminal_outcome`]
+///
+/// [`terminal_outcome`] describes a dispatch that *ran*: it has an execution and a
+/// verification to weigh. This one describes a dispatch that returned an error, and
+/// the question it answers is different — **did the capability run?** That is not a
+/// detail. `OutcomeKind::Denied` asserts the action did not execute, and
+/// `OutcomeKind::Uncertain` declines to say, and the difference decides whether a
+/// caller may safely retry.
+///
+/// Before this existed there was no mapping at all: an early return wrote no record
+/// and the journal was left claiming an action had been authorised with no outcome.
+/// Every arm is written out, so adding a `DispatchError` variant breaks the build here,
+/// where somebody has to say whether it ran.
+fn terminal_outcome_for_failure(
+    error: &DispatchError,
+) -> (orxnud_audit::OutcomeKind, Option<String>) {
+    use orxnud_audit::OutcomeKind;
+    match error {
+        // --- Demonstrably did not execute. A `Denied`, so a retry is offered. ---
+        //
+        // All of these are decided before a process exists, which is what makes the
+        // distinction from the group below structural rather than a judgement call.
+        DispatchError::Policy(_) => (OutcomeKind::Denied, Some("refused by policy".to_owned())),
+        DispatchError::NoImplementation(c) => (
+            OutcomeKind::Denied,
+            Some(format!("no implementation is registered for {c}")),
+        ),
+        DispatchError::Disabled(c) => (OutcomeKind::Denied, Some(format!("{c} is disabled"))),
+        DispatchError::ClassEscalation { .. } => (
+            OutcomeKind::Denied,
+            Some("the data class exceeds what the implementation declares".to_owned()),
+        ),
+        DispatchError::Credential(_) => (
+            OutcomeKind::Denied,
+            Some("a required credential could not be produced".to_owned()),
+        ),
+        DispatchError::InvalidInput { capability, .. } => (
+            OutcomeKind::Denied,
+            Some(format!("{capability} rejected the supplied parameters")),
+        ),
+        // A sandbox refusal is a `Denied` **only** where the refusal itself establishes
+        // that nothing was spawned. A backend that panicked may have spawned its child
+        // before unwinding, and there `Uncertain` is the honest answer.
+        DispatchError::SandboxRefused(refusal) => match refusal.certainty {
+            ExecutionCertainty::NothingAttempted => (
+                OutcomeKind::Denied,
+                Some(format!(
+                    "no sandbox could be established: {}",
+                    refusal.reason
+                )),
+            ),
+            ExecutionCertainty::Unknown => (
+                OutcomeKind::Uncertain,
+                Some(format!(
+                    "the execution backend did not report, and a child may have run: {}",
+                    refusal.reason
+                )),
+            ),
+        },
+
+        // --- Reached the capability; it ran or may have run. ---
+        //
+        // `Failed` where the capability reported a failure, `Uncertain` where the
+        // report itself is missing or the verifier could not settle it. Neither is
+        // offered for retry, because neither establishes that repeating the call
+        // cannot duplicate the effect.
+        DispatchError::Execution(detail) => (OutcomeKind::Failed, Some(redact(detail))),
+        DispatchError::Verification(e) => (
+            OutcomeKind::Uncertain,
+            Some(format!("verification did not settle the effect: {e}")),
+        ),
+
+        // The verifier disproved the effect. The capability ran and demonstrably did
+        // not do what was asked, which is a stronger statement than "failed" and must
+        // not be recorded as an ordinary failure.
+        DispatchError::VerificationRefuted { .. } => (
+            OutcomeKind::Failed,
+            Some("verification refuted the reported effect".to_owned()),
+        ),
+
+        // An adapter called back into the dispatcher. Refused before the adapter's own
+        // work, but the adapter's earlier work in this call is not rewindable, so the
+        // journal declines to claim nothing happened.
+        DispatchError::Reentrant(_) => (
+            OutcomeKind::Uncertain,
+            Some("a capability re-entered the dispatcher".to_owned()),
+        ),
+
+        // Reached here only if a future stage raised it before stage 9. Stage 9's own
+        // audit failure returns without reaching this function, because there is no
+        // journal left to record it in -- and that limitation is why `Audit` is
+        // documented as fatal in both directions.
+        DispatchError::Audit(detail) => (
+            OutcomeKind::Uncertain,
+            Some(format!(
+                "the audit journal failed: {}",
+                redact(&detail.to_owned())
+            )),
+        ),
     }
 }
 
