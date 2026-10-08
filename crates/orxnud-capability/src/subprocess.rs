@@ -201,15 +201,21 @@ pub fn redact_env(env: &std::collections::BTreeMap<String, String>) -> Vec<(Stri
 }
 
 impl ExecutionBackend for SandboxExecutionBackend {
+    /// # `NothingAttempted` is a claim the status has to earn
+    ///
+    /// Every `Err` and every [`ExecutionStatus::Refused`] below is decided before
+    /// `SandboxRunner::run` creates a process, and that is now **checkable rather than
+    /// asserted**: the status vocabulary has a separate value for a runner that gave up
+    /// after starting something ([`ExecutionStatus::Abandoned`]), so a post-start failure
+    /// cannot be spelled as a refusal at all. Reading `Refused` as a disproof is therefore
+    /// reading the status, not trusting a comment about this function.
+    ///
+    /// The one remaining assumption is [`SandboxRunner::run`]'s `Err`, which its contract
+    /// defines as "no process was created" and which both shipped runners honour.
+    ///
+    /// A panic in here is the other thing this cannot see, and the dispatcher classifies it
+    /// as `Unknown` for exactly that reason.
     fn execute(&self, contract: &ExecutionContract) -> Result<ExecutionReport, SandboxRefusal> {
-        // `NothingAttempted` throughout this function, and it is checked rather than
-        // assumed: every `Err` and `Refused` path below is decided before
-        // `spawn_supervisor` is reached. Once a supervisor exists, this function
-        // returns an `ExecutionResult` with a status — `SpawnFailed`, `Refused`,
-        // `Killed`, `TimedOut` — and never an `Err`. That is what makes
-        // "the backend refused, so nothing ran" a verified property here instead of a
-        // comment. The one place that cannot promise it is a panic in `execute`, which
-        // the dispatcher classifies as `Unknown` for exactly this reason.
         let refuse = |why: String, missing: Vec<&'static str>| {
             SandboxRefusal::nothing_attempted(contract.capability.clone(), why, missing)
         };
@@ -242,13 +248,34 @@ impl ExecutionBackend for SandboxExecutionBackend {
             ExecutionStatus::OutputExceeded { .. } => ExecutionOutcomeKind::OutputCapped,
             ExecutionStatus::SpawnFailed(_) => ExecutionOutcomeKind::Killed,
             ExecutionStatus::Killed => ExecutionOutcomeKind::Killed,
-            // A refusal from the runner reaches here only if `can_fulfil` was bypassed
-            // by a caller using `run` directly. It must not be reported as execution.
+            // A refusal from the runner reaches here only if `can_fulfil` was bypassed by
+            // a caller using `run` directly. It must not be reported as execution, and by
+            // the status's own definition it is decided before a process exists.
             ExecutionStatus::Refused(e) => {
                 return Err(refuse(
                     format!("the sandbox refused the request: {e}"),
                     vec!["the requested sandbox guarantees"],
                 ));
+            }
+            // The runner started the capability and then could not establish a guarantee it
+            // had promised, so it stopped the execution and gave up.
+            //
+            // **`Unknown`, and this is the one place in this file where a refusal-shaped
+            // answer is *not* a disproof.** The status says a process existed; the payload
+            // may have completed its side effect before the runner noticed it could not
+            // vouch for the run. Recording this as `NothingAttempted` is what let a
+            // non-idempotent write be re-dispatched with no human involved, while the
+            // journal and the effect ledger agreed with each other and both were wrong.
+            ExecutionStatus::Abandoned(e) => {
+                return Err(SandboxRefusal {
+                    capability: contract.capability.clone(),
+                    reason: format!(
+                        "the sandbox could not establish a guarantee it had promised, after \
+                         the capability was started: {e}"
+                    ),
+                    missing: vec!["a guarantee the started execution depended on"],
+                    certainty: crate::dispatch::ExecutionCertainty::Unknown,
+                });
             }
         };
 

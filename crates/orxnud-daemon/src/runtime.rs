@@ -1976,18 +1976,21 @@ const NO_MODEL_PROPOSED: &str = "none/direct-proposal";
 /// `outcome_from_report` says the same from the other side. That contract is what makes
 /// an ordinary sandbox refusal a *positive* statement that the capability did not run.
 ///
-/// It does not extend to every way stage 7 can fail. `execute` is called inside a
-/// `catch_unwind`, so a backend that **panicked** produces the same error type with no
-/// backend-supplied claim about whether a child was started — `execute` may have spawned
-/// before unwinding. `SandboxRefusal::certainty` is how the two are told apart, and this
-/// function reads it. Treating every `SandboxRefused` as a disproof would record
-/// "definitely did not happen" for an event whose defining property is that nobody can say.
+/// It does not extend to every way stage 7 can fail, and there are two ways it does not:
+/// `execute` is called inside a `catch_unwind`, so a backend that **panicked** produces the
+/// same error type with no backend-supplied claim about whether a child was started; and a
+/// backend that **gave up on a guarantee it had promised** produces it too, after it has
+/// already started the capability. `SandboxRefusal::certainty` is how all three are told
+/// apart, and this function reads it. Treating every `SandboxRefused` as a disproof records
+/// "definitely did not happen" for events whose defining property is that nobody can say.
 ///
-/// The shipped Linux runner has no post-spawn panic path, so `Unknown` is not reachable
-/// from it today. That is recorded as a property of one implementation, not as a reason to
-/// weaken the mapping: `ExecutionBackend` is public, and a second backend — or a future
-/// edit to that runner — must not be able to make `not-performed` mean something it does
-/// not.
+/// Both of those are unreachable-or-rare properties of *particular* runners rather than
+/// guarantees of the type — a panic needs a panicking backend, and a give-up needs a runner
+/// that can start a process and then lose track of it — so neither is a reason to weaken the
+/// mapping. `ExecutionBackend` and `SandboxRunner` are public traits, and the sandbox
+/// vocabulary now makes the give-up *reportable* rather than conflatable with a refusal
+/// (`ExecutionStatus::Abandoned`), so a second backend or a future edit to the shipped one
+/// cannot make `not-performed` mean something it does not.
 ///
 /// # The two classes
 ///
@@ -2039,9 +2042,13 @@ fn effect_status_for_dispatch_failure(
         // The distinction is exactly the refusal's, and neither value is inferred:
         // `NothingAttempted` is set only where the refusal is decided before a process
         // exists, and `Unknown` only where the backend's own reporting failed. A backend
-        // panic stays `Unknown` even though the shipped Linux runner cannot panic after
-        // spawning, because `ExecutionBackend` is a public trait and that is not a
-        // property the type system enforces.
+        // panic stays `Unknown`, and so does a backend that gives up on a containment
+        // guarantee after the capability has started — the shipped Linux runner can do the
+        // second without any fault injected, because its cgroup-membership poll gives up
+        // both when the supervisor never joined and when it joined, ran and exited inside
+        // the poll interval. `ExecutionBackend` and `SandboxRunner` are public traits, and
+        // neither phase is inferable from the error, so the field is the only honest
+        // source and this arm is the only place it can be read.
         DispatchError::SandboxRefused(r) => match r.certainty {
             orxnud_capability::dispatch::ExecutionCertainty::NothingAttempted => {
                 EffectStatus::NotPerformed
