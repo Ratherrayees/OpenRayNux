@@ -889,9 +889,16 @@ pub enum ExecutionTier {
 /// A refusal to invoke a Tier-1 capability because no sandbox could be established.
 ///
 /// Its own type rather than a `DispatchError` variant so it cannot be confused with a
-/// *capability* failing. A sandbox refusal means nothing ran; an adapter error means
-/// something ran and failed. Collapsing them would let a caller retry a refusal as
-/// though retrying could help.
+/// *capability* failing. An adapter error means something ran and failed; a refusal that
+/// carries [`ExecutionCertainty::NothingAttempted`] means nothing ran. Collapsing them
+/// would let a caller retry a refusal as though retrying could help.
+///
+/// **A refusal is not automatically a disproof.** This type exists partly to say "nothing
+/// ran", but a backend that panicked reaches the same error type with no such claim —
+/// `execute` may have spawned its child before unwinding — so [`Self::certainty`] is the
+/// field a consumer must read. Treating every `SandboxRefusal` as proof that nothing ran
+/// is what previously let a non-idempotent side effect be re-dispatched after a backend
+/// failure nobody could characterise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxRefusal {
     /// Which capability was refused.
@@ -1832,7 +1839,16 @@ fn terminal_outcome(outcome: &DispatchOutcome) -> (orxnud_audit::OutcomeKind, Op
 /// and the journal was left claiming an action had been authorised with no outcome.
 /// Every arm is written out, so adding a `DispatchError` variant breaks the build here,
 /// where somebody has to say whether it ran.
-fn terminal_outcome_for_failure(
+///
+/// # Visibility
+///
+/// Public because this is the *audit channel's* authoritative mapping, and the daemon
+/// holds the *effect channel's* mapping for the same input. The property worth holding is
+/// that the two never contradict — "no component may represent a may-have-run execution
+/// as definitely not-performed" — and that cannot be asserted from either side alone.
+/// `runtime.rs` asserts it over every `DispatchError` variant in one table.
+#[must_use]
+pub fn terminal_outcome_for_failure(
     error: &DispatchError,
 ) -> (orxnud_audit::OutcomeKind, Option<String>) {
     use orxnud_audit::OutcomeKind;
@@ -1899,11 +1915,22 @@ fn terminal_outcome_for_failure(
             Some("verification refuted the reported effect".to_owned()),
         ),
 
-        // An adapter called back into the dispatcher. Refused before the adapter's own
-        // work, but the adapter's earlier work in this call is not rewindable, so the
-        // journal declines to claim nothing happened.
+        // An adapter called back into the dispatcher.
+        //
+        // `Denied`, because `ReentrancyGuard::enter` is called *before* `execute` (stage
+        // 7, subprocess tier) and before `invoke` (stage 7, in-process tier). The
+        // capability this dispatch was about to run therefore never ran, which is a fact
+        // about the code's order rather than an inference, and it is what the effect
+        // ledger already records.
+        //
+        // This said `Uncertain` on the reasoning that "the adapter's earlier work in this
+        // call is not rewindable". That was the wrong subject: the adapter that did that
+        // work belongs to an *outer* dispatch, which has its own record and its own
+        // outcome. Here the claim on the table was simply `Unknown` while
+        // `effect_status_for_dispatch_failure` said `NotPerformed`, and the two disagreed
+        // about an event whose outcome is settled by the order of two statements.
         DispatchError::Reentrant(_) => (
-            OutcomeKind::Uncertain,
+            OutcomeKind::Denied,
             Some("a capability re-entered the dispatcher".to_owned()),
         ),
 
