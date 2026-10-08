@@ -22,6 +22,27 @@
 //! check and the daemon would refuse to start for an unrelated reason, which would make
 //! this test pass without ever reaching the settlement report.
 
+// Unix-only, whole-file, and not negotiable as a narrower gate.
+//
+// The subject is settlement-after-orphan *observed across a real Unix-domain socket*:
+// the daemon is spawned as a process, driven over its IPC endpoint, killed, and restarted.
+// `std::os::unix::net::UnixStream` has no Windows equivalent, and gating only the
+// transport would leave a test binary that compiles on Windows while silently losing its
+// one observable -- the startup banner read back over the socket -- which is precisely
+// the "a partial lane that looks like evidence" failure this repository's CI exclusions
+// are written to avoid. So on Windows this suite is absent rather than hollow, and the
+// portable half of the claim is carried by the `windows-portability` lane.
+//
+// The Windows `cargo check --all-targets` job compiles this file and previously failed
+// here with E0433, because an integration test file with no `cfg` is compiled for every
+// target. It arrived with 76de89c, which is not on origin/main, so the breakage was only
+// ever visible on this line.
+//
+// Recorded, not forgotten: Windows has no evidence for the unsettled-authorisation
+// startup report. That gap belongs to a Windows verification slice with a Windows
+// transport, and it is not evidence this file can produce.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
