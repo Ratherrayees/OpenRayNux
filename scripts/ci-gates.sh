@@ -606,6 +606,14 @@ gate_G9() {
       # `test(...)` matches a substring of the test's own name, which for a `#[cfg(test)]`
       # module inside a crate does not include the module path -- hence plain names here.
       #
+      # The three `orxnud-capability` suites are selected by module path rather than by
+      # `binary(...)`. They used to live in `crates/orxnud-capability/tests/`, where
+      # `binary(governed_path)` was correct; 1123a63 moved the suite inside the crate, so
+      # they are now lib tests and `binary()` can never match them again. Selecting them by
+      # their real path is what keeps the exclusion honest after that move -- a
+      # `binary(...)` that matches nothing is not a narrower suite, it is nextest refusing
+      # to parse the filterset, which fails the whole gate run.
+      #
       # The `linux::tests::` module is excluded whole rather than name by name: it is the
       # Linux backend's own suite, it is unobservable on a host with no sandbox, and
       # naming five of its tests would be a list with five more places to rot. The one
@@ -624,7 +632,8 @@ gate_G9() {
       # here for that reason; the three that do not execute a capability are NOT excluded
       # and run everywhere.
       filter=(
-        -E 'not (binary(governed_path) or binary(read_text_real) or binary(write_text) or binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper) or binary(disclosure)
+        -E 'not ((binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper) or binary(disclosure))
+              or test(suites::governed_path::) or test(suites::read_text_real::) or test(suites::write_text::)
               or test(linux::tests::)
               or test(the_host_backend_is_selected_at_compile_time_and_reports_honestly)
               or test(a_proposed_action_is_approved_executed_verified_and_completes_its_task)
