@@ -1268,6 +1268,7 @@ dependencies = [
  "orxnud-task",
  "proptest",
  "rcgen",
+ "rusqlite",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

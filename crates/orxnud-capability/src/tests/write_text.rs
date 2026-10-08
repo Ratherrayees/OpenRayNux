@@ -23,6 +23,7 @@ use super::{Registry, support};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dispatch::{AdapterBundle, DispatchOutcome, Dispatcher, ExecutionBackend, SandboxPlan};
 use crate::verification::VerificationOutcome;
@@ -859,4 +860,261 @@ fn the_adapter_is_tier_1_and_refuses_to_execute_in_process() {
         refused.is_err(),
         "an in-process write would be the tier bypass"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A refusal decided *after* the capability ran
+// ---------------------------------------------------------------------------
+
+/// A runner that reproduces the one branch of the shipped Linux backend that gives up
+/// **after** it has started a process.
+///
+/// `BwrapRunner::run` polls the dedicated cgroup for the supervisor's membership and, if
+/// the supervisor never appears there, kills what it started and gives up. By that point
+/// a payload may have run to completion -- the poll also gives up when it finds the
+/// supervisor *already reaped*, which is what a payload that joined, ran and exited looks
+/// like -- and the runner cannot tell that from a supervisor that never started at all.
+///
+/// So this runner does what that branch does, in the order it does it: it **produces the
+/// effect**, and only then reports the give-up. The effect is a real file written at the
+/// path the plan named, and the reported status is the value that branch reports.
+///
+/// # Why the effect is produced in this process
+///
+/// Gate G2 forbids this crate from spawning a process at all -- correctly, since a
+/// `Command::new` here would be a second execution route outside `ExecutionBackend` -- so a
+/// real child is not available to this fixture and asking for one would mean weakening the
+/// gate. Nothing is lost by it. The property under test is what the two durable records say
+/// about a *phase*, and the phase is carried by the status; the side effect only has to be
+/// real and observable on disk so that a "nothing ran" claim would be falsifiable, and a
+/// file this runner writes is exactly that. That the effect came from this process rather
+/// than a supervisor is in fact the stronger form: it removes any argument that the
+/// capability layer might be excused for reasoning about where an effect came from.
+///
+/// The real-child version of this, in the one crate allowed to spawn, is
+/// `a_give_up_after_starting_reports_a_phase_not_a_disproof` in
+/// `orxnud-platform-sandbox`'s isolation suite, which runs a real payload and asserts the
+/// same predicates over the same status.
+struct GivesUpAfterStarting {
+    /// Everything the real runner has, so `can_fulfil` behaves normally.
+    inner: Arc<dyn orxnud_platform_sandbox::contract::SandboxRunner>,
+    /// Where the effect lands. Taken from the contract's own grants rather than
+    /// synthesised, so it is the path the plan really named.
+    workspace: std::path::PathBuf,
+    /// Whether the effect was actually produced.
+    started: Arc<AtomicBool>,
+}
+
+impl orxnud_platform_sandbox::contract::SandboxRunner for GivesUpAfterStarting {
+    fn available_guarantees(&self) -> orxnud_platform_sandbox::contract::AvailableGuarantees {
+        self.inner.available_guarantees()
+    }
+
+    fn cancel(&self) -> Result<(), orxnud_platform_sandbox::contract::SandboxUnavailable> {
+        self.inner.cancel()
+    }
+
+    fn run(
+        &self,
+        spec: &orxnud_platform_sandbox::contract::SandboxSpec,
+    ) -> Result<
+        orxnud_platform_sandbox::contract::ExecutionResult,
+        orxnud_platform_sandbox::contract::SandboxUnavailable,
+    > {
+        // The plan is the real one, built by `WriteTextBundle` from the dispatcher's own
+        // parameters, so `--path` and `--contents` are the real values and the effect is
+        // the real effect.
+        let mut path = String::new();
+        let mut contents = String::new();
+        let mut rest = spec.args.iter();
+        while let Some(flag) = rest.next() {
+            match (flag.as_str(), rest.next().map(String::as_str)) {
+                ("--path", Some(v)) => path = v.to_owned(),
+                ("--contents", Some(v)) => contents = v.to_owned(),
+                _ => {}
+            }
+        }
+        assert!(!path.is_empty(), "the real plan must name a path to write");
+        let target = self.workspace.join(
+            std::path::Path::new(&path)
+                .file_name()
+                .expect("the capability writes a single file name"),
+        );
+        std::fs::write(&target, contents).expect("the effect must really land on disk");
+        self.started.store(true, Ordering::SeqCst);
+
+        Ok(orxnud_platform_sandbox::contract::ExecutionResult {
+            status: orxnud_platform_sandbox::contract::ExecutionStatus::Abandoned(
+                orxnud_platform_sandbox::contract::SandboxUnavailable::GuaranteeUnavailable {
+                    guarantee: "OS-enforced resource ceilings",
+                    detail: "the supervisor did not join the dedicated cgroup; the requested \
+                             ceilings would not have applied"
+                        .to_owned(),
+                },
+            ),
+            stdout: orxnud_platform_sandbox::contract::CapturedStream::empty(),
+            stderr: orxnud_platform_sandbox::contract::CapturedStream::empty(),
+            elapsed: std::time::Duration::ZERO,
+            unproven: Vec::new(),
+        })
+    }
+}
+
+/// **K.1.** A capability whose side effect really happened, whose runner then gave up on
+/// the containment it had promised, is recorded as *a refusal that ran nothing*.
+///
+/// This is the same shape of bug as the backend panic, and the same bug class: a failure
+/// the backend cannot characterise was recorded as a disproof. `Denied` in the journal and
+/// `not-performed` in the effect ledger together say "definitely did not happen", and
+/// `not-performed` is the one status recovery reads as *a repeat cannot duplicate
+/// anything* — so a non-idempotent write that may already be on disk became claimable and
+/// re-dispatchable with no human involved.
+///
+/// The fix is that the status vocabulary carries the phase, so a give-up after a start
+/// cannot be spelled as a refusal at all. Asserted here from the outside: the file
+/// exists, so the world changed; then the two records for that one event.
+#[test]
+fn a_give_up_after_the_capability_started_is_not_recorded_as_a_disproof() {
+    let fixture = Fixture::new("abandoned-after-start");
+    let approval = fixture.approval("a.txt", "alpha", 60_000);
+    let started = Arc::new(AtomicBool::new(false));
+
+    let backend =
+        crate::subprocess::SandboxExecutionBackend::with_runner(Arc::new(GivesUpAfterStarting {
+            inner: Arc::new(orxnud_platform_sandbox::linux::BwrapRunner::new()),
+            workspace: fixture.workspace.clone(),
+            started: Arc::clone(&started),
+        }));
+    let secrets = FakeSecrets::new();
+    let mut engine = policy();
+    let mut d =
+        Dispatcher::new(&mut engine, &secrets, fixture.bundles()).with_execution(Arc::new(backend));
+
+    let err = d
+        .dispatch(
+            request("a.txt", "alpha"),
+            human(),
+            context(),
+            Some("a.txt".to_owned()),
+            params("a.txt", "alpha"),
+            Some(&approval),
+            None,
+            NOW,
+        )
+        .expect_err("the runner gave up, so this must be a refusal");
+
+    // 1. The world changed. Nothing below may claim otherwise.
+    assert!(
+        started.load(Ordering::SeqCst),
+        "the payload must actually have been started, or the phase under test was never reached"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("a.txt")).expect("the file exists"),
+        "alpha",
+        "the simulated side effect must really have happened for this test to mean anything"
+    );
+
+    // 2. The refusal must not claim nothing ran.
+    match &err {
+        crate::dispatch::DispatchError::SandboxRefused(r) => assert_eq!(
+            r.certainty,
+            crate::dispatch::ExecutionCertainty::Unknown,
+            "a process existed and completed, so nothing here establishes that nothing ran; \
+             `NothingAttempted` is the one claim that re-opens a duplicate write"
+        ),
+        other => panic!("expected a sandbox refusal, got {other:?}"),
+    }
+
+    // 3. The journal must decline to call it a denial, and must say what was lost.
+    let entries = engine.audit().entries();
+    let last = entries.last().expect("a terminal record");
+    let (kind, detail) = match &last.outcome {
+        orxnud_audit::AuditOutcome::Finished { kind, detail, .. } => (*kind, detail.clone()),
+        other => panic!("expected a terminal record, got {other:?}"),
+    };
+    assert_eq!(
+        kind,
+        orxnud_audit::OutcomeKind::Uncertain,
+        "the journal must not record a denial for an effect that landed; detail {detail:?}"
+    );
+    let detail = detail.expect("a terminal record must carry its detail");
+    assert!(
+        detail.contains("after the capability was started"),
+        "the record must say *when* the runner gave up, because that is what distinguishes \
+         this from a refusal: {detail}"
+    );
+
+    // 4. The approval is spent, so the tempting retry needs a fresh approval even before
+    //    any human-facing state is consulted. The burn happens in policy before stage 5.
+    let again = fixture.dispatch_with(
+        &mut engine,
+        "a.txt",
+        "alpha",
+        Some("a.txt"),
+        Some(&approval),
+        NOW,
+    );
+    assert!(
+        again.is_err(),
+        "the approval was already spent by an execution whose effect may exist"
+    );
+    assert!(
+        engine.settlement_report().is_settled(),
+        "and the authorisation is still settled exactly once: {:?}",
+        engine.settlement_report().unresolved_authorisations
+    );
+}
+
+/// The counterpart, and the reason the distinction is observable rather than asserted: a
+/// runner that gives up **before** anything is started leaves no file and is a denial.
+///
+/// Without it the test above would pass for a runner that simply never ran, and
+/// `NothingAttempted` would have no observable consequence to be wrong about.
+#[test]
+fn a_refusal_before_anything_starts_is_a_denial_and_leaves_no_effect() {
+    let fixture = Fixture::new("refused-before-start");
+    let approval = fixture.approval("a.txt", "alpha", 60_000);
+
+    let backend = crate::subprocess::SandboxExecutionBackend::with_runner(Arc::new(
+        orxnud_platform_sandbox::UnsupportedRunner::new(),
+    ));
+    let secrets = FakeSecrets::new();
+    let mut engine = policy();
+    let mut d =
+        Dispatcher::new(&mut engine, &secrets, fixture.bundles()).with_execution(Arc::new(backend));
+
+    // `can_fulfil` is false on a host with no sandbox, so the refusal is decided before
+    // the runner is even asked — the other pre-execution route to the same verdict.
+    let err = d
+        .dispatch(
+            request("a.txt", "alpha"),
+            human(),
+            context(),
+            Some("a.txt".to_owned()),
+            params("a.txt", "alpha"),
+            Some(&approval),
+            None,
+            NOW,
+        )
+        .expect_err("a host with no sandbox must refuse Tier-1 work");
+    match &err {
+        crate::dispatch::DispatchError::SandboxRefused(r) => assert_eq!(
+            r.certainty,
+            crate::dispatch::ExecutionCertainty::NothingAttempted
+        ),
+        other => panic!("expected a sandbox refusal, got {other:?}"),
+    }
+    assert!(
+        !fixture.path("a.txt").exists(),
+        "a refusal decided before anything started must leave no effect"
+    );
+    let entries = engine.audit().entries();
+    let last = entries.last().expect("a terminal record");
+    assert!(matches!(
+        &last.outcome,
+        orxnud_audit::AuditOutcome::Finished {
+            kind: orxnud_audit::OutcomeKind::Denied,
+            ..
+        }
+    ));
 }

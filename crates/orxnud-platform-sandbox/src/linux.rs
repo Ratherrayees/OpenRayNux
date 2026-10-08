@@ -998,6 +998,100 @@ mod tests {
 
     // ------------------------------------------- `Refused` means "before", structurally
 
+    /// This file's own text, at compile time.
+    ///
+    /// `include_str!` rather than a `fs::read` of a path: the constant is checked against
+    /// the file being compiled, so a renamed or moved module cannot leave the check reading
+    /// something else, and there is no path to get wrong.
+    const SOURCE: &str = include_str!("linux.rs");
+
+    /// The production `BwrapRunner::run` body, with comments and the test module removed.
+    ///
+    /// Comments have to go because this function's own documentation names every status it
+    /// is *about*, and a check that could not tell a mention from a construction would be a
+    /// check nobody could satisfy. Stripping whole lines is enough: a construction is always
+    /// on a line of its own or the first of a struct literal, so no line here has a
+    /// construction and a comment in the same place.
+    fn production_run() -> String {
+        let body = SOURCE
+            .split_once("impl SandboxRunner for BwrapRunner {")
+            .expect("the Linux runner's trait impl must still be here")
+            .1
+            .split_once("#[cfg(all(test, unix))]")
+            .expect("the test module must still be here")
+            .0;
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **`ExecutionStatus::Refused` may only be constructed before `spawn_supervisor`.**
+    ///
+    /// # Why a source check and not a test
+    ///
+    /// The property is about control flow, and the control flow in question is unreachable
+    /// by execution: the give-up branch fires only when a host delegates a cgroup base
+    /// *and* the supervisor fails to appear in it within two seconds. A test that provoked
+    /// it would need that host, so on every other machine it would either skip or — worse —
+    /// pass vacuously, which is how "the boundary was never exercised" comes to read as
+    /// success.
+    ///
+    /// So the check is on the text, and it is a real check rather than a comment: it finds
+    /// the one call that starts a process and asserts that no `Refused` is constructed after
+    /// it. `Refused` means "nothing ran", and a caller reads that as permission to repeat the
+    /// effect; the single site that violated it returned a status indistinguishable from the
+    /// five legitimate refusals, and the capability layer had no way to tell them apart.
+    ///
+    /// `Abandoned` exists so that site has a correct value to return, and this is what keeps
+    /// it correct. The failure mode it guards against is a future edit adding a sixth
+    /// pre-spawn refusal *below* the spawn point, which would compile, pass every other test
+    /// in the workspace, and re-open the same hole.
+    #[test]
+    fn no_refusal_is_constructed_after_a_process_exists() {
+        let run = production_run();
+        let spawn = run
+            .find("spawn_supervisor(&argv")
+            .expect("the spawn call must still be here; if it moved, this check is stale");
+        for (at, _) in run.match_indices("ExecutionStatus::Refused") {
+            assert!(
+                at < spawn,
+                "an ExecutionStatus::Refused is constructed at byte {at} of `run`, which is \
+                 after the spawn point at byte {spawn}. `Refused` claims nothing ran, so it may \
+                 only be built before a process exists; a failure after the spawn point is \
+                 `ExecutionStatus::Abandoned` or `ExecutionStatus::Killed`."
+            );
+        }
+    }
+
+    /// The same property stated from the other side: the post-spawn give-up really does
+    /// report the post-spawn value, and the pre-spawn count is what it is claimed to be.
+    ///
+    /// Without it the check above would also pass on a build that had *deleted* the
+    /// membership check, or that had reached it and returned nothing at all.
+    #[test]
+    fn the_post_spawn_give_up_reports_abandoned_and_the_pre_spawn_refusals_are_five() {
+        let run = production_run();
+        let spawn = run
+            .find("spawn_supervisor(&argv")
+            .expect("the spawn call must still be here");
+        let abandon = run
+            .find("ExecutionStatus::Abandoned")
+            .expect("the membership check must report a value that admits a process existed");
+        assert!(
+            abandon > spawn,
+            "the abandonment has to be reachable, so it must be constructed after the spawn \
+             point, not above it"
+        );
+        assert_eq!(
+            run.match_indices("ExecutionStatus::Refused").count(),
+            5,
+            "five pre-spawn refusals, and no sixth: the availability check, the limit \
+             translation, the required-but-unnamed rule, cgroup creation under Required, and \
+             command construction"
+        );
+    }
+
     #[test]
     fn a_relative_program_is_refused_rather_than_reinterpreted() {
         let spec = SandboxSpec::new("relative/path");

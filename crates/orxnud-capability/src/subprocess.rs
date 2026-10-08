@@ -320,7 +320,9 @@ pub fn known_capability(id: &CapabilityId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orxnud_platform_sandbox::contract::AvailableGuarantees;
+    use orxnud_platform_sandbox::contract::{
+        AvailableGuarantees, CapturedStream, ExecutionResult, ExecutionStatus, SandboxUnavailable,
+    };
     use std::collections::BTreeMap;
 
     /// A runner that always refuses, to test the fail-closed path without a real
@@ -363,6 +365,229 @@ mod tests {
             output_cap_bytes: 64 * 1024,
             resources: crate::dispatch::ResourcePolicy::default(),
         }
+    }
+
+    // ------------------------------------------------- the phase survives the crossing
+
+    /// A runner that returns exactly the status it is told to, having started nothing.
+    struct StatusOnlyRunner(ExecutionStatus);
+
+    impl SandboxRunner for StatusOnlyRunner {
+        fn run(&self, _spec: &SandboxSpec) -> Result<ExecutionResult, SandboxUnavailable> {
+            Ok(ExecutionResult {
+                status: self.0.clone(),
+                stdout: CapturedStream::empty(),
+                stderr: CapturedStream::empty(),
+                elapsed: std::time::Duration::ZERO,
+                unproven: Vec::new(),
+            })
+        }
+        fn cancel(&self) -> Result<(), SandboxUnavailable> {
+            Ok(())
+        }
+        fn available_guarantees(&self) -> AvailableGuarantees {
+            AvailableGuarantees {
+                visibility: true,
+                tree_lifetime: true,
+                resources: true,
+            }
+        }
+    }
+
+    /// One row per `ExecutionStatus`: what it establishes about whether anything ran.
+    fn every_status() -> Vec<(ExecutionStatus, bool)> {
+        use SandboxUnavailable as U;
+        vec![
+            (ExecutionStatus::Exited(0), true),
+            (ExecutionStatus::Exited(1), true),
+            (ExecutionStatus::TimedOut, true),
+            (ExecutionStatus::Cancelled, true),
+            (
+                ExecutionStatus::OutputExceeded {
+                    stream: "stdout",
+                    cap: 8,
+                },
+                true,
+            ),
+            (
+                ExecutionStatus::Refused(U::MechanismMissing("bwrap".into())),
+                false,
+            ),
+            (
+                ExecutionStatus::Abandoned(U::GuaranteeUnavailable {
+                    guarantee: "OS-enforced resource ceilings",
+                    detail: "the supervisor did not join the dedicated cgroup".into(),
+                }),
+                true,
+            ),
+            (ExecutionStatus::SpawnFailed("no such file".into()), false),
+            (ExecutionStatus::Killed, true),
+        ]
+    }
+
+    /// **The crossing.** Two vocabularies meet here — the sandbox's `ExecutionStatus` and
+    /// the dispatcher's `ExecutionCertainty` — and the safety of the whole system turns on
+    /// them agreeing about one thing: did anything run?
+    ///
+    /// `ExecutionResult::did_start` is the sandbox crate's own answer to that question, and
+    /// it is the one `execute` is *not* using; the certainty is derived from the status by
+    /// hand, one arm at a time. That is exactly the shape of defect this file's K.1 was:
+    /// one arm disagreed with the status it was reading, the journal read the status, the
+    /// effect ledger read the arm, and the two recorded opposite facts about one event.
+    ///
+    /// So the correspondence is asserted over the closed set, in the direction that is
+    /// unsafe to get wrong:
+    ///
+    /// ```text
+    /// execute() reports NothingAttempted  =>  did_start() is false
+    /// ```
+    ///
+    /// The converse is deliberately **not** asserted. Being more cautious than a status
+    /// requires costs a retry and no correctness, and `SpawnFailed` is the row where this
+    /// system is exactly that: nothing ran, yet it is reported as an execution whose
+    /// outcome is unknown rather than as a disproof. `ExecutionStatus::SpawnFailed` is
+    /// pinned separately below so that asymmetry stays a decision rather than drifting
+    /// into an accident.
+    ///
+    /// A new `ExecutionStatus` fails the count below before it can disagree quietly, and an
+    /// arm edited to the optimistic reading fails the `did_start` comparison. Neither
+    /// failure needs a host with a delegated cgroup, which is the only thing the end-to-end
+    /// version of this needs.
+    #[test]
+    fn the_execution_certainty_never_contradicts_the_reported_phase() {
+        use crate::dispatch::ExecutionCertainty;
+
+        let statuses = every_status();
+        assert_eq!(
+            statuses.len(),
+            9,
+            "one row per ExecutionStatus; extend this table when one is added"
+        );
+
+        for (status, started) in &statuses {
+            let label = format!("{status:?}");
+            let result = ExecutionResult {
+                status: status.clone(),
+                stdout: CapturedStream::empty(),
+                stderr: CapturedStream::empty(),
+                elapsed: std::time::Duration::ZERO,
+                unproven: Vec::new(),
+            };
+            assert_eq!(
+                result.did_start(),
+                *started,
+                "{label}: the row says whether this status means a process existed"
+            );
+
+            // Whatever `execute` does with this status, it must never turn a started
+            // execution into a disproof.
+            if let Err(r) =
+                SandboxExecutionBackend::with_runner(Arc::new(StatusOnlyRunner(status.clone())))
+                    .execute(&contract())
+                && r.certainty == ExecutionCertainty::NothingAttempted
+            {
+                assert!(
+                    !*started,
+                    "{label}: `execute` claimed NothingAttempted for a status that reports a \
+                     process existed. That single claim is what let a non-idempotent effect \
+                     be re-dispatched after a runner gave up on it"
+                );
+            }
+        }
+    }
+
+    /// The over-cautious row, pinned so it stays a decision.
+    ///
+    /// `SpawnFailed` is documented as *nothing ran*, so `did_start()` is false and the
+    /// honest classification would be a disproof. This backend reports it as a killed
+    /// execution instead, which reaches the ledger as `unknown` — a retry is withheld where
+    /// one would be safe. That costs an operator a retry after a transient exec failure and
+    /// buys nothing, so it is a candidate for correction; it is recorded rather than fixed
+    /// because correcting it is not what K.1 was about and the current direction is the safe
+    /// one. **It is not evidence that `SpawnFailed` may be read as a disproof**, and this
+    /// test is here so nobody concludes that from the row above.
+    #[test]
+    fn a_spawn_failure_is_deliberately_treated_as_uncertain_rather_than_as_a_disproof() {
+        let status = ExecutionStatus::SpawnFailed("no such file or directory".into());
+        let result = ExecutionResult {
+            status: status.clone(),
+            stdout: CapturedStream::empty(),
+            stderr: CapturedStream::empty(),
+            elapsed: std::time::Duration::ZERO,
+            unproven: Vec::new(),
+        };
+        assert!(!result.did_start(), "the status itself says nothing ran");
+        let out = SandboxExecutionBackend::with_runner(Arc::new(StatusOnlyRunner(status)))
+            .execute(&contract())
+            .expect("a spawn failure is reported as an execution whose outcome is unknown");
+        assert_eq!(
+            out.status,
+            ExecutionOutcomeKind::Killed,
+            "and it lands on the uncertain side of the outcome model, not the failed one"
+        );
+    }
+
+    /// The one arm that a `Refused` is a disproof is what makes `Refused` safe to read.
+    ///
+    /// Stated separately because it is the *load-bearing* half of the table above: every
+    /// other row is over-cautious if wrong, and this one is catastrophic if wrong.
+    #[test]
+    fn a_refusal_is_the_only_status_that_may_claim_nothing_ran() {
+        let Err(r) = SandboxExecutionBackend::with_runner(Arc::new(StatusOnlyRunner(
+            ExecutionStatus::Refused(SandboxUnavailable::GuaranteeUnavailable {
+                guarantee: "OS-enforced resource ceilings",
+                detail: "a required ceiling could not be established".into(),
+            }),
+        )))
+        .execute(&contract()) else {
+            panic!("a refusal must not produce an execution report")
+        };
+        assert_eq!(
+            r.certainty,
+            crate::dispatch::ExecutionCertainty::NothingAttempted,
+            "the status says the sandbox could not be established before starting anything, \
+             so this is the one disproof the ledger is allowed"
+        );
+        assert!(
+            r.reason.contains("refused"),
+            "and the reason must still say what happened: {}",
+            r.reason
+        );
+    }
+
+    /// A give-up after a start is never a disproof, whatever the runner calls it.
+    ///
+    /// The mirror of the test above, asserted through the real reason string rather than
+    /// through a fixture: an operator reading this record has to be able to tell that a
+    /// capability ran, and "no sandbox could be established" would tell them the opposite.
+    #[test]
+    fn a_give_up_after_a_start_names_its_phase_and_never_claims_a_disproof() {
+        let Err(r) = SandboxExecutionBackend::with_runner(Arc::new(StatusOnlyRunner(
+            ExecutionStatus::Abandoned(SandboxUnavailable::GuaranteeUnavailable {
+                guarantee: "OS-enforced resource ceilings",
+                detail: "the supervisor did not join the dedicated cgroup".into(),
+            }),
+        )))
+        .execute(&contract()) else {
+            panic!("an abandoned execution must not produce an execution report")
+        };
+        assert_eq!(
+            r.certainty,
+            crate::dispatch::ExecutionCertainty::Unknown,
+            "a process existed, so nothing here establishes that nothing ran"
+        );
+        assert!(
+            r.reason.contains("after the capability was started")
+                && r.reason.contains("did not join the dedicated cgroup"),
+            "the reason must carry both the phase and the runner's own words: {}",
+            r.reason
+        );
+        assert!(
+            !r.reason.contains("the sandbox refused the request"),
+            "and it must not be dressed as a pre-execution refusal, which is the wording \
+             that used to reach the audit record: {}",
+            r.reason
+        );
     }
 
     #[test]

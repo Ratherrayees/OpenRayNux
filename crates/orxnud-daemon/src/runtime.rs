@@ -5341,6 +5341,190 @@ mod effect_status_for_dispatch_failure_tests {
         );
     }
 
+    /// The same certainty, reached the way production reaches it, all the way to recovery.
+    ///
+    /// # What this adds to the test above
+    ///
+    /// The test above hand-builds the `SandboxRefusal`, so it proves the *mapping* and
+    /// nothing about whether any producer ever emits that shape. Every K.1 in this area has
+    /// been a producer disagreeing with a consumer while both were internally consistent and
+    /// every hand-built test passed — the backend panic, and then the runner that gives up
+    /// on containment after the capability has already started. Both were caught by
+    /// production code emitting a value the consumers had no way to question.
+    ///
+    /// So the error here is the one the real `SandboxExecutionBackend` builds, obtained by
+    /// asking it to execute against a runner that reports the post-spawn give-up, and the
+    /// status it produces is then written through the real `TaskRepository` and read back by
+    /// the real `recover()`. The chain under test is therefore:
+    ///
+    /// ```text
+    /// sandbox reports a give-up after a start
+    ///     -> SandboxRefusal with Unknown certainty      (orxnud-capability)
+    ///     -> EffectStatus::Unknown                      (this module)
+    ///     -> task_effects.status = 'unknown'            (orxnud-store)
+    ///     -> recover(): needs-verification, terminal    (orxnud-store)
+    /// ```
+    ///
+    /// and the claim is about the *end* of it: after a restart, a worker cannot claim this
+    /// task and cannot re-dispatch the effect. `NotPerformed` would have made it claimable,
+    /// and `not-performed` is the one status recovery reads as "a repeat cannot duplicate
+    /// anything".
+    #[test]
+    fn a_give_up_after_a_start_survives_to_recovery_as_an_uncertain_effect() {
+        use orxnud_capability::dispatch::ExecutionBackend;
+        use orxnud_domain::TaskId;
+        use orxnud_domain::task_state::{TaskKind, TaskState};
+        use orxnud_platform_sandbox::contract::{
+            AvailableGuarantees, CapturedStream, ExecutionResult, ExecutionStatus, SandboxRunner,
+            SandboxSpec, SandboxUnavailable,
+        };
+        use orxnud_store::migration::MigrationRunner;
+        use orxnud_store::pragma::Pragma;
+        use orxnud_store::task_repo::{NewTask, TargetedClaimOutcome, TaskRepository};
+        use std::sync::Arc;
+
+        const NOW: i64 = 1_767_225_600_000;
+        const LEASE: i64 = 60_000;
+
+        /// A runner that gives up after starting, which is what
+        /// `BwrapRunner::run`'s membership check does.
+        struct GivesUp;
+        impl SandboxRunner for GivesUp {
+            fn run(&self, _spec: &SandboxSpec) -> Result<ExecutionResult, SandboxUnavailable> {
+                Ok(ExecutionResult {
+                    status: ExecutionStatus::Abandoned(SandboxUnavailable::GuaranteeUnavailable {
+                        guarantee: "OS-enforced resource ceilings",
+                        detail: "the supervisor did not join the dedicated cgroup".to_owned(),
+                    }),
+                    stdout: CapturedStream::empty(),
+                    stderr: CapturedStream::empty(),
+                    elapsed: std::time::Duration::ZERO,
+                    unproven: Vec::new(),
+                })
+            }
+            fn cancel(&self) -> Result<(), SandboxUnavailable> {
+                Ok(())
+            }
+            fn available_guarantees(&self) -> AvailableGuarantees {
+                AvailableGuarantees {
+                    visibility: true,
+                    tree_lifetime: true,
+                    resources: true,
+                }
+            }
+        }
+
+        // --- the error, from the producer rather than from a literal -----------------
+        let err =
+            orxnud_capability::subprocess::SandboxExecutionBackend::with_runner(Arc::new(GivesUp))
+                .execute(&orxnud_capability::dispatch::ExecutionContract {
+                    capability: cap(),
+                    program: "/bin/true".to_owned(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    working_dir: "/".to_owned(),
+                    grant_rw: Vec::new(),
+                    grant_ro: Vec::new(),
+                    network: false,
+                    deadline_ms: 1_000,
+                    output_cap_bytes: 1_024,
+                    resources: orxnud_capability::dispatch::ResourcePolicy::default(),
+                })
+                .expect_err("a give-up after a start is a refusal-shaped error");
+        let err = DispatchError::SandboxRefused(err);
+
+        // --- both channels agree, and the effect channel withholds the retry ---------
+        let status = effect_status_for_dispatch_failure(&err);
+        assert_eq!(
+            status,
+            EffectStatus::Unknown,
+            "the effect ledger must not call an execution that started a disproof"
+        );
+        assert_eq!(
+            orxnud_capability::dispatch::terminal_outcome_for_failure(&err).0,
+            orxnud_audit::OutcomeKind::Uncertain,
+            "and the journal must not call it a denial either"
+        );
+
+        // --- the status, written and read back through the real repository -----------
+        let dir = std::env::temp_dir().join(format!("k1-abandon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let db = dir.join("state.db");
+        let key = orxnud_task::DurableEngine::idempotency_key(
+            &TaskId::new("k1-task"),
+            "filesystem/write-text",
+            "1/1",
+        );
+        {
+            let mut c = rusqlite::Connection::open(&db).expect("open");
+            Pragma::critical().apply(&c).expect("pragmas");
+            MigrationRunner::new(&c).run(true).expect("migrate");
+            let mut repo = TaskRepository::new(&mut c);
+            repo.insert(
+                &NewTask::new(TaskId::new("k1-task"), TaskKind::Query, NOW),
+                NOW,
+            )
+            .expect("insert");
+            assert!(
+                matches!(
+                    repo.claim_specific(&TaskId::new("k1-task"), "w1", NOW, LEASE),
+                    Ok(TargetedClaimOutcome::Claimed(_))
+                ),
+                "a fresh task must be claimable"
+            );
+            // What `execute_proposal` does, in the order it does it.
+            assert!(
+                repo.reserve_effect(
+                    &key,
+                    &TaskId::new("k1-task"),
+                    1,
+                    1,
+                    "filesystem/write-text",
+                    // The capability declares itself non-idempotent, which is the whole
+                    // reason this case is interesting.
+                    false,
+                    NOW,
+                )
+                .expect("reserve")
+                .is_some(),
+                "the effect must be reserved before it is dispatched"
+            );
+            assert!(
+                repo.resolve_effect(&key, status, Some(&err.to_string()), NOW + 1)
+                    .expect("resolve"),
+                "the dispatch's verdict must be recorded"
+            );
+        }
+
+        // --- the restart, and what recovery decides ----------------------------------
+        {
+            let mut c = rusqlite::Connection::open(&db).expect("reopen");
+            Pragma::critical().apply(&c).expect("pragmas");
+            let mut repo = TaskRepository::new(&mut c);
+            assert_eq!(repo.recover(NOW + LEASE + 1).expect("recover"), 1);
+            let row = repo
+                .get(&TaskId::new("k1-task"))
+                .expect("read")
+                .expect("present");
+            assert_eq!(
+                row.state,
+                TaskState::NeedsVerification,
+                "an effect that may have happened on a non-idempotent capability must park \
+                 the task for a human. `pending` here is the retry this whole chain exists \
+                 to withhold."
+            );
+            assert!(
+                !matches!(
+                    repo.claim_specific(&TaskId::new("k1-task"), "w2", NOW + LEASE + 2, LEASE),
+                    Ok(TargetedClaimOutcome::Claimed(_))
+                ),
+                "and a second worker must not be able to pick it up"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The invariant, over every production `DispatchError` variant at once.
     ///
     /// Two channels map the same input — this one to `EffectStatus` and
