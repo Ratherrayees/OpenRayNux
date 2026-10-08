@@ -175,9 +175,9 @@ impl AdapterBundle for HelperBundle {
     fn sandbox_plan(
         &self,
         _invocation: &orxnud_policy::authority::CapabilityInvocation,
-    ) -> Option<SandboxPlan> {
+    ) -> Result<Option<SandboxPlan>, crate::dispatch::PlanError> {
         let (ro, rw) = self.grants.clone();
-        Some(SandboxPlan {
+        Ok(Some(SandboxPlan {
             program: helper_path().display().to_string(),
             args: vec![
                 "--exact".into(),
@@ -199,7 +199,7 @@ impl AdapterBundle for HelperBundle {
             // ceilings. A capability that could exhaust the host would demand them and
             // be refused on a host that cannot provide them (V-46).
             resources: crate::dispatch::ResourcePolicy::default(),
-        })
+        }))
     }
 }
 
@@ -1254,8 +1254,8 @@ mod v46 {
         fn sandbox_plan(
             &self,
             _invocation: &orxnud_policy::authority::CapabilityInvocation,
-        ) -> Option<SandboxPlan> {
-            Some(SandboxPlan {
+        ) -> Result<Option<SandboxPlan>, crate::dispatch::PlanError> {
+            Ok(Some(SandboxPlan {
                 program: helper_path().display().to_string(),
                 args: vec![
                     "--exact".into(),
@@ -1271,7 +1271,7 @@ mod v46 {
                 deadline_ms: self.deadline_ms,
                 output_cap_bytes: 256 * 1024,
                 resources: self.resources.clone(),
-            })
+            }))
         }
     }
 

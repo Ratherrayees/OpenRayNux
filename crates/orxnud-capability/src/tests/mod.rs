@@ -29,4 +29,5 @@ mod durable_state;
 mod governed_path;
 mod read_text;
 mod read_text_real;
+mod settlement;
 mod write_text;

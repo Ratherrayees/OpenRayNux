@@ -118,11 +118,8 @@ impl Default for SandboxExecutionBackend {
 /// A refusal when the contract cannot be expressed — a relative program path, or a
 /// grant set the backend cannot build.
 fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal> {
-    let refuse = |why: &str| SandboxRefusal {
-        capability: contract.capability.clone(),
-        reason: why.to_owned(),
-        missing: Vec::new(),
-    };
+    let refuse =
+        |why: &str| SandboxRefusal::nothing_attempted(contract.capability.clone(), why, Vec::new());
 
     if contract.program.is_empty() {
         return Err(refuse("the contract names no program"));
@@ -205,16 +202,23 @@ pub fn redact_env(env: &std::collections::BTreeMap<String, String>) -> Vec<(Stri
 
 impl ExecutionBackend for SandboxExecutionBackend {
     fn execute(&self, contract: &ExecutionContract) -> Result<ExecutionReport, SandboxRefusal> {
-        let refuse = |why: String, missing: Vec<&'static str>| SandboxRefusal {
-            capability: contract.capability.clone(),
-            reason: why,
-            missing,
+        // `NothingAttempted` throughout this function, and it is checked rather than
+        // assumed: every `Err` and `Refused` path below is decided before
+        // `spawn_supervisor` is reached. Once a supervisor exists, this function
+        // returns an `ExecutionResult` with a status — `SpawnFailed`, `Refused`,
+        // `Killed`, `TimedOut` — and never an `Err`. That is what makes
+        // "the backend refused, so nothing ran" a verified property here instead of a
+        // comment. The one place that cannot promise it is a panic in `execute`, which
+        // the dispatcher classifies as `Unknown` for exactly this reason.
+        let refuse = |why: String, missing: Vec<&'static str>| {
+            SandboxRefusal::nothing_attempted(contract.capability.clone(), why, missing)
         };
 
         let mut spec = spec_for(contract).map_err(|e| SandboxRefusal {
             capability: e.capability,
             reason: e.reason,
             missing: e.missing,
+            certainty: e.certainty,
         })?;
 
         // The credential, if any, is added to the *spec* here and nowhere else. It is

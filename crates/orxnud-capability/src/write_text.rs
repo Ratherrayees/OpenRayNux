@@ -72,6 +72,7 @@ use orxnud_domain::enums::{DataClass, IsolationTier, RiskClass};
 use orxnud_domain::ids::CapabilityId;
 use orxnud_policy::authority::{CapabilityInvocation, DispatchView};
 
+use crate::dispatch::PlanError;
 use crate::dispatch::{
     AdapterBundle, CapabilityAdapter, ExecutionTier, ResourceBudget, ResourcePolicy, SandboxPlan,
 };
@@ -308,11 +309,26 @@ impl AdapterBundle for WriteTextBundle {
     /// plan that ignores `invocation` — would produce a child with no idea what to
     /// write, so an error here is a refusal of the whole dispatch rather than a
     /// fallback to something that merely runs.
-    fn sandbox_plan(&self, invocation: &CapabilityInvocation) -> Option<SandboxPlan> {
-        let parsed = parse(invocation.params()).ok()?;
-        let absolute = resolve(&self.workspace, &parsed.path).ok()?;
+    fn sandbox_plan(
+        &self,
+        invocation: &CapabilityInvocation,
+    ) -> Result<Option<SandboxPlan>, PlanError> {
+        // Both refusals are the caller's parameters, and both already carry a precise
+        // reason from `parse`/`resolve`.
+        //
+        // These were `.ok()?`, which discarded those reasons and reported a bare `None`.
+        // The dispatcher read `None` as "this adapter declares no sandbox plan", so a
+        // traversing or absolute path — refused correctly, with nothing written — was
+        // reported to the operator as *"the execution backend cannot establish the
+        // required sandbox guarantees (missing: a sandbox plan)"*. That is false on any
+        // host where the sandbox is working, which this one demonstrably was: a
+        // `write-text` had completed seconds earlier. It also sent the reader to the
+        // wrong layer entirely, checking bubblewrap and user namespaces for what was a
+        // malformed argument.
+        let parsed = parse(invocation.params()).map_err(PlanError::InvalidParams)?;
+        let absolute = resolve(&self.workspace, &parsed.path).map_err(PlanError::InvalidParams)?;
 
-        Some(SandboxPlan {
+        Ok(Some(SandboxPlan {
             program: self.helper.display().to_string(),
             // The contents travel in argv because `SandboxSpec` has no stdin channel.
             // Recorded as a known limitation rather than worked around by smuggling
@@ -367,7 +383,7 @@ impl AdapterBundle for WriteTextBundle {
                     cpu_cores: Some(1.0),
                 },
             },
-        })
+        }))
     }
 
     fn verifier(&self) -> &dyn Verifier {

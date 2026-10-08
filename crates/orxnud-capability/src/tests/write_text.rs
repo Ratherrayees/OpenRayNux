@@ -676,6 +676,7 @@ fn the_plan_never_requests_a_network_and_grants_only_the_workspace() {
         .sandbox_plan(&invocation(
             &serde_json::json!({"path": "a.txt", "contents": "x"}),
         ))
+        .expect("acceptable parameters must not be a plan error")
         .expect("a plan");
     assert!(
         !plan.network,
@@ -685,6 +686,157 @@ fn the_plan_never_requests_a_network_and_grants_only_the_workspace() {
         plan.grant_rw,
         vec![fixture.workspace.display().to_string()],
         "the only writable path is the workspace"
+    );
+}
+
+/// An invocation carrying exactly `params`.
+///
+/// Not `invocation(params)`: that helper's `params` argument only reaches policy's
+/// evaluation and the approval digest — `CapabilityInvocation::authorise` takes the
+/// parameters from the `ActionRequest`, so the existing helper always produced an
+/// invocation holding `{"path":"a.txt","contents":"x"}` no matter what it was passed.
+/// Every malformed case would then have been tested against valid parameters and
+/// cheerfully reported as "a plan was produced".
+fn invocation_with(params: &serde_json::Value) -> orxnud_policy::authority::CapabilityInvocation {
+    let mut engine = policy();
+    let canonical = orxnud_policy::canonical_params(params);
+    engine
+        .authorise_for_dispatch(
+            ActionRequest::new(
+                TaskId::new("t-1"),
+                RunId::new("r-1"),
+                0,
+                cap(),
+                params.clone(),
+                DataClass::Public,
+                DataClass::Public,
+            ),
+            human(),
+            context(),
+            Some("a.txt".to_owned()),
+            canonical.clone(),
+            Some(&orxnud_policy::issue_approval(
+                &human(),
+                &human(),
+                &cap(),
+                Some("a.txt"),
+                &canonical,
+                NOW,
+                NOW + 60_000,
+                RiskClass::High,
+                1,
+            )),
+            NOW,
+        )
+        .expect("a permitted, approved request yields an invocation")
+        .invocation
+}
+
+/// Why the bundle refused to plan for `params`.
+///
+/// A distinct helper from the plan tests so the *reason* can be asserted, which is the
+/// whole point of `sandbox_plan` returning a `Result`: before the retype this was a bare
+/// `None` and the only thing any test could say about a malformed request was "no plan
+/// was built" — which is also what a build missing the adapter would have said.
+fn plan_rejection(fixture: &Fixture, params: &serde_json::Value) -> crate::dispatch::PlanError {
+    match fixture.bundle.sandbox_plan(&invocation_with(params)) {
+        Ok(_) => panic!("{params} was expected to be rejected but produced a plan"),
+        Err(e) => e,
+    }
+}
+
+/// Every malformed shape, and each must be reported as the caller's bad parameters.
+///
+/// The regression for the classification bug, in the shape §11 asks for: missing field,
+/// wrong type, unknown field, empty path, absolute path, traversal, nested path, and
+/// non-object params.
+///
+/// Two things are asserted for each. That it is `InvalidParams` and not
+/// `NoPlanDeclared` — the former is a request the caller can fix, the latter a defect in
+/// this build that no caller edit could fix, and conflating them sends an operator to
+/// the wrong layer. And that a reason survives, because `.ok()?` used to discard the one
+/// `parse` had already written.
+#[test]
+fn malformed_parameters_are_reported_as_invalid_parameters_with_a_reason() {
+    let cases: &[(&str, serde_json::Value)] = &[
+        // missing field
+        ("missing contents", serde_json::json!({"path": "a.txt"})),
+        ("missing path", serde_json::json!({"contents": "x"})),
+        ("empty object", serde_json::json!({})),
+        // wrong type
+        (
+            "path is a number",
+            serde_json::json!({"path": 7, "contents": "x"}),
+        ),
+        (
+            "contents is an object",
+            serde_json::json!({"path": "a.txt", "contents": {"a": 1}}),
+        ),
+        ("params is an array", serde_json::json!(["path", "a.txt"])),
+        // unknown field
+        (
+            "unknown field",
+            serde_json::json!({"path": "a.txt", "contents": "x", "mode": 0o777}),
+        ),
+        // empty / absolute / traversal / nested
+        (
+            "empty path",
+            serde_json::json!({"path": "", "contents": "x"}),
+        ),
+        (
+            "absolute path",
+            serde_json::json!({"path": "/etc/passwd", "contents": "x"}),
+        ),
+        (
+            "traversal",
+            serde_json::json!({"path": "../escape.txt", "contents": "x"}),
+        ),
+        (
+            "traversal mid-path",
+            serde_json::json!({"path": "a/../../escape.txt", "contents": "x"}),
+        ),
+        (
+            "nested path",
+            serde_json::json!({"path": "sub/a.txt", "contents": "x"}),
+        ),
+    ];
+
+    for (what, params) in cases {
+        let fixture = Fixture::new(&format!("bad-{}", what.replace(' ', "-")));
+        let reason = plan_rejection(&fixture, params);
+        assert!(
+            matches!(reason, crate::dispatch::PlanError::InvalidParams(_)),
+            "{what}: must be InvalidParams, got {reason:?}"
+        );
+        assert!(
+            !reason.to_string().is_empty(),
+            "{what}: must carry a reason"
+        );
+    }
+}
+
+/// A rejected request must not have written anything.
+///
+/// The classification fix changes what is *reported*. It must not change what is
+/// *done*, and this is the assertion that it did not: `sandbox_plan` builds the argv the
+/// child would run, so a rejection before it is built means no child, and no file.
+#[test]
+fn a_rejected_request_writes_nothing() {
+    let fixture = Fixture::new("no-write");
+    for params in [
+        serde_json::json!({"path": "../escape.txt", "contents": "pwned"}),
+        serde_json::json!({"path": "/tmp/escape.txt", "contents": "pwned"}),
+        serde_json::json!({"path": "a.txt", "contents": "x", "extra": true}),
+    ] {
+        let _ = plan_rejection(&fixture, &params);
+    }
+    let wrote: Vec<_> = std::fs::read_dir(&fixture.workspace)
+        .expect("the workspace exists")
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        wrote.is_empty(),
+        "a rejected request must leave the workspace empty, found {wrote:?}"
     );
 }
 
