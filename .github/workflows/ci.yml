@@ -22,6 +22,30 @@
 # CI a missing tool is therefore a hard failure rather than a silent skip — the
 # whole failure mode being prevented is a green build that checked less than it
 # claimed to.
+#
+# # Pinned inputs, and why every one of them
+#
+# The architectural claims in this repo are evidence claims, and evidence is only
+# evidence if the thing that produced it is identifiable afterwards. Four classes
+# of input are pinned for that reason, and each was verified to exist rather than
+# assumed — a typo in an action tag does not degrade, it hard-fails the job:
+#
+# * `actions/checkout@v7.0.1` and `Swatinem/rust-cache@v2.9.2`, exact versions
+#   rather than major tags. A major tag is a moving pointer: `rust-cache@v2` in
+#   particular does not reliably resolve to the newest 2.x, so two runs a week
+#   apart can use different action code under one commit SHA.
+# * `ubuntu-24.04` and `windows-2025` rather than `*-latest`. `ubuntu-latest` currently
+#   aliases 24.04 and GitHub publishes 26.04 as a selectable label already, so the
+#   alias can move under us; the Tier-1 sandbox result is explicitly a measurement of a
+#   particular image (see the `sandbox-integration` job), and letting the label move
+#   underneath a recorded finding would silently change what the finding is about. Pinning
+#   names the image in the finding. Moving to 26.04 becomes a deliberate commit with the
+#   sandbox suite re-run on it, rather than an invisible upgrade.
+# * The four gate tools, pinned to exact releases — see the install step.
+# * The toolchain itself, in `rust-toolchain.toml`, which this workflow reads rather
+#   than duplicating.
+#
+# When a pin moves, it moves as its own commit with the reason attached.
 name: CI
 
 on:
@@ -50,10 +74,10 @@ env:
 jobs:
   linux-gates:
     name: Linux gates (G1-G11)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0 # cargo semver-checks needs history; audit needs tags
 
@@ -66,18 +90,30 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.2
 
+      # Every gate tool is pinned to an exact release, and `--locked` is necessary but
+      # not sufficient on its own: `--locked` pins the *dependency graph* of whichever
+      # release is installed, not *which* release gets installed. Left unpinned, the same
+      # commit runs a different cargo-deny today and tomorrow, which for this repository
+      # is the difference between auditable evidence and evidence that quietly changed
+      # underneath a frozen finding.
+      #
+      # Each pin was verified to build and run under the pinned toolchain (1.98.1) before
+      # being written here; every MSRV below is well under it.
+      #
+      # To move a pin, change it here and re-run `./scripts/ci-gates.sh` locally. Do not
+      # widen a caret range -- the point is that a run is attributable to these versions.
       - name: Install the gate tools
         run: |
-          cargo install cargo-deny --locked
-          cargo install cargo-audit --locked
-          cargo install cargo-semver-checks --locked
-          cargo install cargo-nextest --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-semver-checks --version 0.51.0 --locked
+          cargo install cargo-nextest --version 0.9.148 --locked
 
       # What this runner can actually do, before anything is inferred from a red test.
       #
-      # `bwrap` is preinstalled on `ubuntu-latest` but cannot create a user namespace
+      # `bwrap` is preinstalled on `ubuntu-24.04` but cannot create a user namespace
       # there, so a host-level `bwrap --version` check would report success on a runner
       # that can isolate nothing — which is exactly how two governed CLI tests came to
       # fail with no visible reason. The suites are environment-aware and assert whichever
@@ -148,16 +184,16 @@ jobs:
 
   windows-check:
     name: Windows cargo check (nightly)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.2
 
       # Check, not build or test: the MSVC target has no working linker for every
       # dependency on a bare runner, and Phase 1's Windows requirement is that the
@@ -194,15 +230,15 @@ jobs:
   # V-29 needs, and `cargo check` cannot make it.
   windows-portability:
     name: Windows portability tests
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
 
       - name: Portable-core and adapter tests
         run: >-
@@ -252,22 +288,22 @@ jobs:
   # running a reduced suite and going green.
   sandbox-integration:
     name: Tier-1 sandbox (production configuration)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: sandbox-integration
 
       # A cold build of the workspace, including bundled SQLite. Cached after the first
       # run, which is why the timeout is generous rather than tight.
       #
-      # On `ubuntu-latest` this job currently *reports* that the environment cannot create
+      # On `ubuntu-24.04` this job currently *reports* that the environment cannot create
       # an unprivileged user namespace and produces no positive Tier-1 evidence -- measured,
       # not assumed, and printed on every run. It still runs because the measurement is the
       # point: it is the only place the gap is recorded against the exact image it happens
@@ -280,13 +316,13 @@ jobs:
   # failure would invalidate an architectural claim rather than just a build.
   portable-core:
     name: Portable core builds for wasm32
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - run: rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Check the portable core
         run: cargo check -p orxnud-domain -p orxnud-protocol --target wasm32-unknown-unknown
