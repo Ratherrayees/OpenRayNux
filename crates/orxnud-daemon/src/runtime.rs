@@ -1966,25 +1966,38 @@ const NO_MODEL_PROPOSED: &str = "none/direct-proposal";
 /// | 1-4 authority, policy, approval, budget | no | `Policy` |
 /// | 5 capability resolution | no | `NoImplementation`, `ClassEscalation`, `Disabled` |
 /// | 6 credential resolution | no | `Credential` |
-/// | 7 execution | **yes** | `SandboxRefused` (a refusal), `Audit` (see below) |
+/// | 7 execution | **yes** | `SandboxRefused` (a refusal, whose `certainty` says whether), `Audit` (see below) |
 /// | 8 verification | ran already | — (a verifier error becomes `Undetermined`) |
 /// | 9 audit / terminal record | ran already | `Audit` |
 ///
-/// The stage-7 error is the load-bearing one. `ExecutionBackend::execute` documents its
-/// own error as *"A refusal. Nothing was executed, and the caller must not retry the
-/// capability as though it had"*, and `outcome_from_report` says the same thing from the
-/// other side: *"a sandbox that refused never reaches here, so anything arriving is
-/// something that actually ran."* So a `SandboxRefused` is a positive statement that the
-/// capability did not run, not an absence of information.
+/// The stage-7 error is the load-bearing one, and it is the one that is **not** a single
+/// class. `ExecutionBackend::execute` documents its own error as *"A refusal. Nothing was
+/// executed, and the caller must not retry the capability as though it had"*, and
+/// `outcome_from_report` says the same from the other side. That contract is what makes
+/// an ordinary sandbox refusal a *positive* statement that the capability did not run.
+///
+/// It does not extend to every way stage 7 can fail. `execute` is called inside a
+/// `catch_unwind`, so a backend that **panicked** produces the same error type with no
+/// backend-supplied claim about whether a child was started — `execute` may have spawned
+/// before unwinding. `SandboxRefusal::certainty` is how the two are told apart, and this
+/// function reads it. Treating every `SandboxRefused` as a disproof would record
+/// "definitely did not happen" for an event whose defining property is that nobody can say.
+///
+/// The shipped Linux runner has no post-spawn panic path, so `Unknown` is not reachable
+/// from it today. That is recorded as a property of one implementation, not as a reason to
+/// weaken the mapping: `ExecutionBackend` is public, and a second backend — or a future
+/// edit to that runner — must not be able to make `not-performed` mean something it does
+/// not.
 ///
 /// # The two classes
 ///
-/// * **`NotPerformed`** — the capability demonstrably did not run. Stages 1-6 cannot run
-///   it, a stage-7 *refusal* declines to, and `VerificationRefuted` is the verifier
-///   positively disproving it. Recording this as `not-performed` is not a guess: it is the
-///   one verdict in the ledger's vocabulary that means "a repeat cannot duplicate
-///   anything", and it restores the retry that V-93 correctly closed for the *uncertain*
-///   case.
+/// * **`NotPerformed`** — the capability demonstrably did not run, or ran and was
+///   *disproved*. Stages 1-6 cannot run it, a stage-7 refusal that carries
+///   `NothingAttempted` declines to, `Reentrant` is refused before `execute`/`invoke` is
+///   reached, and `VerificationRefuted` is the verifier positively disproving it. Recording
+///   this as `not-performed` is not a guess: it is the one verdict in the ledger's
+///   vocabulary that means "a repeat cannot duplicate anything", and it restores the retry
+///   that V-93 correctly closed for the *uncertain* case.
 /// * **`Unknown`** — the capability ran, or the contract cannot say. `Audit` is the
 ///   important one: it is raised in stage 9, *after* the capability has run and been
 ///   verified, and it discards the verdict on its way out. `dispatch_failure` already
@@ -2006,9 +2019,38 @@ fn effect_status_for_dispatch_failure(
             EffectStatus::Unknown
         }
 
+        // **The refusal carries its own certainty, and this arm has to read it.**
+        //
+        // This was `DispatchError::SandboxRefused(_)` in the `NotPerformed` list, with
+        // the `_` discarding the field. That made a *generic backend panic* — which the
+        // dispatcher classifies as `Unknown` precisely because `execute` may have
+        // spawned its child before unwinding — resolve to `NotPerformed` here, and
+        // `NotPerformed` is the one status `recover()` treats as "a repeat cannot
+        // duplicate anything". The task went to `pending`, any worker could claim it,
+        // and the next attempt reserved a *fresh* idempotency key because that key
+        // includes `attempt_no`. A non-idempotent capability whose side effect may have
+        // happened was therefore re-dispatchable with no human involved.
+        //
+        // The defect was not the mapping's shape but one missing read, and it was
+        // invisible because the *audit* channel (`terminal_outcome_for_failure`) did read
+        // `certainty` — so the journal said `Uncertain` while this ledger said the
+        // opposite, and the journal's claim was the correct one.
+        //
+        // The distinction is exactly the refusal's, and neither value is inferred:
+        // `NothingAttempted` is set only where the refusal is decided before a process
+        // exists, and `Unknown` only where the backend's own reporting failed. A backend
+        // panic stays `Unknown` even though the shipped Linux runner cannot panic after
+        // spawning, because `ExecutionBackend` is a public trait and that is not a
+        // property the type system enforces.
+        DispatchError::SandboxRefused(r) => match r.certainty {
+            orxnud_capability::dispatch::ExecutionCertainty::NothingAttempted => {
+                EffectStatus::NotPerformed
+            }
+            orxnud_capability::dispatch::ExecutionCertainty::Unknown => EffectStatus::Unknown,
+        },
+
         // Demonstrably did not run. See the stage table above.
         DispatchError::Policy(_)
-        | DispatchError::SandboxRefused(_)
         | DispatchError::NoImplementation(_)
         | DispatchError::Disabled(_)
         | DispatchError::ClassEscalation { .. }
@@ -5125,7 +5167,7 @@ mod durable_output_tests {
 #[cfg(test)]
 mod effect_status_for_dispatch_failure_tests {
     use super::effect_status_for_dispatch_failure;
-    use orxnud_capability::dispatch::{DispatchError, SandboxRefusal};
+    use orxnud_capability::dispatch::{DispatchError, ExecutionCertainty, SandboxRefusal};
     use orxnud_domain::ids::CapabilityId;
     use orxnud_store::task_repo::EffectStatus;
 
@@ -5238,5 +5280,295 @@ mod effect_status_for_dispatch_failure_tests {
             EffectStatus::Unknown,
             "if these compared equal the classification would be untestable"
         );
+    }
+
+    /// A refusal that carries `NothingAttempted` is a disproof in **both** channels.
+    ///
+    /// The refusal is decided before a process exists, so "nothing ran" is a fact rather
+    /// than an absence of information, and both records may say so. Asserted across both
+    /// channels because a one-sided assertion would pass while the other drifted.
+    #[test]
+    fn a_definite_pre_execution_refusal_is_not_performed_and_denied() {
+        let e = DispatchError::SandboxRefused(refusal());
+        assert_eq!(
+            effect_status_for_dispatch_failure(&e),
+            EffectStatus::NotPerformed,
+            "a refusal decided before any process exists is a disproof"
+        );
+        let (kind, _) = orxnud_capability::dispatch::terminal_outcome_for_failure(&e);
+        assert_eq!(
+            kind,
+            orxnud_audit::OutcomeKind::Denied,
+            "the journal must agree: `Denied` is the disposition that asserts no execution"
+        );
+    }
+
+    /// A refusal that carries `Unknown` is `Unknown` in the effect ledger and `Uncertain`
+    /// in the journal.
+    ///
+    /// **This is the defect, pinned.** A generic backend panic reaches this shape: `execute`
+    /// is called inside a `catch_unwind`, and a panic there says nothing about whether the
+    /// child was spawned. The arm used to discard `certainty` and answer `NotPerformed`,
+    /// which is the one status `recover()` treats as "a repeat cannot duplicate anything" —
+    /// so a non-idempotent capability whose side effect may have happened became claimable
+    /// and re-dispatchable, while the journal said `Uncertain` and was right.
+    #[test]
+    fn an_unknown_execution_is_unknown_in_the_ledger_and_uncertain_in_the_journal() {
+        let e = DispatchError::SandboxRefused(SandboxRefusal {
+            capability: cap(),
+            reason: "the execution backend panicked".to_owned(),
+            missing: vec!["a functioning execution backend"],
+            certainty: ExecutionCertainty::Unknown,
+        });
+        assert_eq!(
+            effect_status_for_dispatch_failure(&e),
+            EffectStatus::Unknown,
+            "nothing established that the child was never spawned, so `not-performed` \
+             would be a fabricated disproof"
+        );
+        let (kind, _) = orxnud_capability::dispatch::terminal_outcome_for_failure(&e);
+        assert_eq!(
+            kind,
+            orxnud_audit::OutcomeKind::Uncertain,
+            "the journal must decline to claim an outcome"
+        );
+    }
+
+    /// The invariant, over every production `DispatchError` variant at once.
+    ///
+    /// Two channels map the same input — this one to `EffectStatus` and
+    /// `terminal_outcome_for_failure` to the journal's `OutcomeKind` — and they were
+    /// separate `match`es over separate groupings. A variant added to one and not the
+    /// other compiles, passes both modules' tests, and ships a contradiction. The defect
+    /// this table exists to prevent is exactly that: it compiled cleanly and every test
+    /// that existed at the time passed.
+    ///
+    /// The property asserted is the one the architecture needs: **no component may
+    /// represent a may-have-run execution as definitely not-performed.** It is checked
+    /// directly, per variant, rather than inferred from the two channels happening to
+    /// agree today.
+    ///
+    /// `retry` is the operational consequence, not a separate claim: `recover()` sends a
+    /// task to `needs-verification` unless the effect is `not-performed`
+    /// (`status <> 'not-performed' AND idempotent = 0`), so `NotPerformed` *is* the retry
+    /// permission and `Unknown` withholds it.
+    #[test]
+    fn the_two_channels_never_contradict_on_execution_certainty() {
+        use orxnud_capability::dispatch::ExecutionCertainty;
+
+        /// One row per `DispatchError` variant: what each channel must answer.
+        struct Row {
+            what: &'static str,
+            error: DispatchError,
+            /// Whether the capability could have executed. The fact the table is about.
+            may_have_run: bool,
+            /// What the effect ledger must record.
+            effect: EffectStatus,
+            /// What the journal must record.
+            audit: orxnud_audit::OutcomeKind,
+        }
+
+        let unknown_refusal = SandboxRefusal {
+            capability: cap(),
+            reason: "the execution backend panicked".to_owned(),
+            missing: vec!["a functioning execution backend"],
+            certainty: ExecutionCertainty::Unknown,
+        };
+
+        let rows = vec![
+            Row {
+                what: "policy",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::Policy(orxnud_policy::PolicyError::Denied {
+                    reason: orxnud_policy::DenialReason::UnknownCapability {
+                        capability: cap().to_string(),
+                    },
+                }),
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "no implementation",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::NoImplementation(cap()),
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "disabled",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::Disabled(cap()),
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "class escalation",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::ClassEscalation {
+                    id: cap(),
+                    declared: orxnud_domain::enums::DataClass::Public,
+                    actual: orxnud_domain::enums::DataClass::Regulated,
+                },
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "credential unavailable",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::Credential(
+                    orxnud_capability::credential::CredentialError::Absent("svc".to_owned()),
+                ),
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "invalid parameters",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::InvalidInput {
+                    capability: cap(),
+                    detail: "traversing path".to_owned(),
+                },
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "reentrant",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::Reentrant("called back in".to_owned()),
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "sandbox refused, nothing attempted",
+                audit: orxnud_audit::OutcomeKind::Denied,
+                error: DispatchError::SandboxRefused(refusal()),
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+            Row {
+                what: "sandbox refused, execution unknown",
+                audit: orxnud_audit::OutcomeKind::Uncertain,
+                error: DispatchError::SandboxRefused(unknown_refusal),
+                may_have_run: true,
+                effect: EffectStatus::Unknown,
+            },
+            Row {
+                what: "audit failure",
+                audit: orxnud_audit::OutcomeKind::Uncertain,
+                error: DispatchError::Audit("journal unavailable".to_owned()),
+                may_have_run: true,
+                effect: EffectStatus::Unknown,
+            },
+            Row {
+                what: "execution failed",
+                audit: orxnud_audit::OutcomeKind::Failed,
+                error: DispatchError::Execution("exit 1".to_owned()),
+                may_have_run: true,
+                effect: EffectStatus::Unknown,
+            },
+            Row {
+                what: "verification failed",
+                audit: orxnud_audit::OutcomeKind::Uncertain,
+                error: DispatchError::Verification(orxnud_capability::verification::VerifyError(
+                    "could not run".to_owned(),
+                )),
+                may_have_run: true,
+                effect: EffectStatus::Unknown,
+            },
+            Row {
+                what: "verification refuted",
+                audit: orxnud_audit::OutcomeKind::Failed,
+                error: DispatchError::VerificationRefuted {
+                    evidence: "the file is absent".to_owned(),
+                },
+                // It ran, and the verifier *disproved* the effect, so the effect ledger may
+                // still say `not-performed`: this is the one row where "it ran" and "the
+                // effect is absent" are both true, and the ledger is right to say so.
+                may_have_run: false,
+                effect: EffectStatus::NotPerformed,
+            },
+        ];
+
+        // Every arm of the classifier, or the table is not exhaustive. Adding a variant
+        // without a row here is caught by the assertion below, because the classifier's
+        // own exhaustiveness means an unlisted variant cannot reach it -- but the reverse
+        // is not true, so the count is pinned.
+        assert_eq!(
+            rows.len(),
+            13,
+            "one row per DispatchError variant; extend this table when one is added"
+        );
+
+        for row in rows {
+            assert_eq!(
+                effect_status_for_dispatch_failure(&row.error),
+                row.effect,
+                "{}: the effect ledger must answer {:?}",
+                row.what,
+                row.effect
+            );
+
+            let (kind, detail) =
+                orxnud_capability::dispatch::terminal_outcome_for_failure(&row.error);
+            assert_eq!(
+                kind, row.audit,
+                "{}: the journal must record {:?} (got {kind:?}, detail {detail:?})",
+                row.what, row.audit
+            );
+
+            // The invariant, stated in the two directions that matter.
+            //
+            // 1. **Unsafe direction.** A capability that may have run must not be
+            //    recorded as definitely-absent by either channel. `Denied` asserts no
+            //    execution and `not-performed` is the retry permission `recover()`
+            //    grants, so either one alone re-opens the repeat.
+            if row.may_have_run {
+                assert_ne!(
+                    row.effect,
+                    EffectStatus::NotPerformed,
+                    "{}: the capability may have run, so `not-performed` permits exactly \
+                     the repeat this ledger exists to prevent",
+                    row.what
+                );
+            }
+
+            // 2. **The two channels must not disagree about whether the effect is
+            //    established absent.** The relation is a lattice, not an equality:
+            //
+            //    | journal       | effect ledger            |
+            //    |---------------|--------------------------|
+            //    | `Denied`      | `NotPerformed` only      |
+            //    | `Uncertain`   | `Unknown` only            |
+            //    | `Completed`   | `Observed` only           |
+            //    | `Failed`      | `NotPerformed` or `Unknown` |
+            //
+            //    `Failed` is the one row with two answers, and legitimately so: a
+            //    capability can run and still leave no effect — that is exactly what
+            //    `VerificationRefuted` means, and the ledger is right to say the effect is
+            //    absent while the journal says the action ran.
+            //
+            //    Every other pairing would be a contradiction in one direction or the
+            //    other. `Denied` with `Unknown` contradicts the journal. `Uncertain` with
+            //    `NotPerformed` is the defect this table was written for.
+            let allowed: &[EffectStatus] = match row.audit {
+                orxnud_audit::OutcomeKind::Denied => &[EffectStatus::NotPerformed],
+                orxnud_audit::OutcomeKind::Uncertain => &[EffectStatus::Unknown],
+                orxnud_audit::OutcomeKind::Completed => &[EffectStatus::Observed],
+                orxnud_audit::OutcomeKind::Failed | orxnud_audit::OutcomeKind::Cancelled => {
+                    &[EffectStatus::NotPerformed, EffectStatus::Unknown]
+                }
+                // Never a terminal disposition, so no row can carry it. Listed rather than
+                // wildcarded so that adding a new `OutcomeKind` forces a decision here
+                // instead of silently inheriting a relation.
+                other => panic!("{other:?} is not a terminal disposition"),
+            };
+            assert!(
+                allowed.contains(&row.effect),
+                "{}: journal {:?} does not admit effect status {:?}; allowed {allowed:?}",
+                row.what,
+                row.audit,
+                row.effect
+            );
+        }
     }
 }
