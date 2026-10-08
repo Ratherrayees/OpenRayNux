@@ -564,6 +564,88 @@ fn a_non_idempotent_task_whose_effect_was_recorded_unknown_is_still_uncertain() 
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// **The equivalence.** A process death and a backend that fails to report are two
+/// different mechanisms reaching the same world state: the capability may have run and
+/// nobody can say. They must produce the same *operational safety*, and they arrive there
+/// by different routes — a crash leaves the row `pending` because there is no process left
+/// to write anything, while a reported failure has to be classified deliberately.
+///
+/// So the two are run side by side on the same fixture and their final safety state
+/// compared. Only the safety is required to match: the ledger rows differ, and that is
+/// the point — `pending` means "never resolved" and `unknown` means "resolved as
+/// unsettleable", and a system that only ever produced the first would be safe by
+/// accident rather than by decision.
+#[test]
+fn a_process_death_and_a_reported_unknown_reach_the_same_safety_state() {
+    // Route A: a real SIGKILL inside the execution window. The row stays `pending`.
+    let crashed_dir = dir("equiv-crash");
+    let crashed_db = db_in(&crashed_dir);
+    kill_during_execution(&crashed_db, &crashed_dir.join("ready"), "workflow");
+    let crashed_key = DurableEngine::idempotency_key(&tid("v93-task"), "external-call", "initial");
+
+    // Route B: the same crash window, then the dispatcher *reports* the same uncertainty
+    // it would have reported had it survived — a backend that could not say whether the
+    // capability ran. This is the row a `SandboxRefusal` carrying
+    // `ExecutionCertainty::Unknown` now produces.
+    let reported_dir = dir("equiv-reported");
+    let reported_db = db_in(&reported_dir);
+    kill_during_execution(&reported_db, &reported_dir.join("ready"), "workflow");
+    let reported_key = DurableEngine::idempotency_key(&tid("v93-task"), "external-call", "initial");
+
+    let mut crashed = open_engine(&crashed_db);
+    crashed.recover(NOW).expect("recovery");
+    let mut reported = open_engine(&reported_db);
+    assert!(
+        reported
+            .resolve_effect(
+                &reported_key,
+                EffectStatus::Unknown,
+                Some("backend reported nothing"),
+                NOW
+            )
+            .expect("resolve"),
+        "the reported uncertainty must be recorded"
+    );
+    reported.recover(NOW).expect("recovery");
+
+    // The rows differ, and are *allowed* to: the mechanism differs.
+    let crashed_status = effect_status_in(&crashed_db, &crashed_key);
+    let reported_status = effect_status_in(&reported_db, &reported_key);
+    assert_eq!(crashed_status, EffectStatus::Pending);
+    assert_eq!(reported_status, EffectStatus::Unknown);
+    assert_ne!(
+        crashed_status, reported_status,
+        "if the routes produced the same row this test would not be comparing two \
+         mechanisms, only one twice"
+    );
+
+    // The safety is what must match, and it is asserted through the whole contract
+    // rather than by comparing two states to each other — two equal assertions prove less
+    // than one against the property that matters.
+    assert_terminally_uncertain(&mut crashed, &tid("v93-task"), "process death");
+    assert_terminally_uncertain(&mut reported, &tid("v93-task"), "reported unknown");
+
+    let _ = std::fs::remove_dir_all(&crashed_dir);
+    let _ = std::fs::remove_dir_all(&reported_dir);
+}
+
+/// Reads one effect row's status straight out of the database.
+///
+/// Raw SQL, like the malformed-status test above, because there is no engine accessor
+/// for a single effect's verdict — and reading the row a recovery decision is made from is
+/// the point of this comparison.
+fn effect_status_in(db: &Path, key: &str) -> EffectStatus {
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let raw: String = conn
+        .query_row(
+            "SELECT status FROM task_effects WHERE idempotency_key = ?1;",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
+        .expect("the effect row must exist");
+    EffectStatus::parse(&raw).unwrap_or_else(|| panic!("unrecognised effect status {raw:?}"))
+}
+
 /// An effect recorded as `observed` is not uncertain, but it is also not safe to
 /// *repeat* for a non-idempotent task: the effect happened, so dispatching it
 /// again duplicates it. Recovery must therefore not make it claimable.

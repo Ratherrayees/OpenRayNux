@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::dispatch::{
-    AdapterBundle, CapabilityAdapter, DispatchError, Dispatcher, ExecutionTier, PlanError,
-    SandboxPlan,
+    AdapterBundle, CapabilityAdapter, DispatchError, Dispatcher, ExecutionCertainty, ExecutionTier,
+    PlanError, SandboxPlan,
 };
 use orxnud_audit::{AuditOutcome, OutcomeKind};
 use orxnud_domain::approval::{ApprovalRecord, NormalizedParams};
@@ -845,6 +845,64 @@ impl AdapterBundle for RejectingParams {
     }
 }
 
+/// A Tier-1 bundle that yields a real plan, so the dispatcher reaches the backend.
+///
+/// The counterpart to `RejectingParams`. Needed by the tests that assert on what a
+/// backend *did* rather than on what an adapter refused: a bundle that rejects its
+/// parameters never gets as far as `execute`, so the backend's behaviour would be
+/// unobservable.
+///
+/// The plan is never executed as a program — the test backends ignore the contract — so it
+/// only has to be well-formed enough for the dispatcher to build a contract from it.
+struct WithValidPlan {
+    inner: Bundle<Tier1Adapter>,
+}
+
+impl WithValidPlan {
+    fn new(id: &str) -> Self {
+        Self {
+            inner: Bundle::confirming(Tier1Adapter {
+                id: CapabilityId::new(id),
+            }),
+        }
+    }
+}
+
+impl AdapterBundle for WithValidPlan {
+    fn adapter(&self) -> &dyn CapabilityAdapter {
+        self.inner.adapter()
+    }
+
+    fn sandbox_plan(
+        &self,
+        _invocation: &orxnud_policy::authority::CapabilityInvocation,
+    ) -> Result<Option<SandboxPlan>, PlanError> {
+        Ok(Some(SandboxPlan {
+            program: "/nonexistent/test-helper".to_owned(),
+            args: Vec::new(),
+            env: Default::default(),
+            working_dir: std::env::temp_dir().display().to_string(),
+            grant_rw: Vec::new(),
+            grant_ro: vec!["/nonexistent/test-helper".to_owned()],
+            network: false,
+            deadline_ms: 30_000,
+            output_cap_bytes: 64 * 1024,
+            resources: crate::dispatch::ResourcePolicy::default(),
+        }))
+    }
+
+    fn verifier(&self) -> &dyn crate::verification::Verifier {
+        self.inner.verifier()
+    }
+}
+
+/// A registry whose bundle produces a valid plan, so the backend is reached.
+fn backend_reached_bundle(id: &str) -> Registry {
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
+    m.insert(CapabilityId::new(id), Arc::new(WithValidPlan::new(id)));
+    Registry::from_bundles(m)
+}
+
 /// A Tier-1 bundle that declares no plan at all: a defect in this build.
 ///
 /// The trait's default `sandbox_plan` is `Ok(None)`, so this is the plain fixture with
@@ -860,6 +918,226 @@ fn rejecting_bundle(id: &str) -> Registry {
     let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
     m.insert(CapabilityId::new(id), Arc::new(RejectingParams::new(id)));
     Registry::from_bundles(m)
+}
+
+// ------------------------------------------- a real side effect, and an unknown result
+
+/// A capability that writes a real file, whose backend then fails to report.
+///
+/// # The defect this was written for
+///
+/// The system recorded a backend failure as *"nothing ran"*, which is the one statement
+/// that re-opens a duplicate side effect: `recover()` treats a `not-performed` effect as
+/// proof that a repeat cannot duplicate anything. The proof that this is wrong needs a
+/// capability that genuinely produced an effect, because no fixture that only returns an
+/// error says anything about the world.
+///
+/// So the capability writes a real file into an isolated scratch directory, and the
+/// backend then reports nothing. Asserted here: the file exists, the refusal carries
+/// `Unknown`, and the journal records `Uncertain` rather than a disproof.
+#[test]
+fn a_capability_whose_effect_happened_is_never_recorded_as_not_run() {
+    let dir = std::env::temp_dir().join(format!(
+        "orxnud-effect-then-unknown-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let written = dir.join("effect.txt");
+    let _ = std::fs::remove_file(&written);
+
+    let mut engine = high_risk_policy();
+    let approval = approval_for(&params(), NOW);
+    let secrets = FakeSecrets::new();
+    let mut d = dispatcher(&mut engine, &secrets, backend_reached_bundle(CAP)).with_execution(
+        Arc::new(support::EffectThenUnknownBackend {
+            path: written.clone(),
+            contents: "the side effect landed",
+        }),
+    );
+
+    let err = d
+        .dispatch(
+            request(),
+            human(),
+            context(),
+            None,
+            params(),
+            Some(&approval),
+            None,
+            NOW,
+        )
+        .expect_err("the backend reported nothing, so this must be an error");
+
+    // The world changed.
+    assert!(
+        written.exists(),
+        "the simulated side effect must actually have happened"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("read back"),
+        "the side effect landed"
+    );
+
+    // And the refusal says so rather than claiming the opposite.
+    match &err {
+        DispatchError::SandboxRefused(r) => assert_eq!(
+            r.certainty,
+            ExecutionCertainty::Unknown,
+            "a backend that already produced an effect cannot report NothingAttempted"
+        ),
+        other => panic!("expected SandboxRefused, got {other}"),
+    }
+
+    // The journal must decline to call it a disproof.
+    let (kind, detail) = terminal(&engine);
+    assert_eq!(
+        kind,
+        OutcomeKind::Uncertain,
+        "the journal must not record a denial for an effect that landed; detail: {detail:?}"
+    );
+    assert_settled(&engine);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The counterpart: a refusal that carries `NothingAttempted` leaves no file and is
+/// recorded as a denial.
+///
+/// Without this, the test above would pass for a backend that simply never ran — the
+/// distinction the whole `certainty` field exists to carry has to be observable, and the
+/// only way to observe it is to look at what each backend did to the world.
+#[test]
+fn a_refusal_that_reports_nothing_attempted_leaves_no_effect_and_is_a_denial() {
+    let dir = std::env::temp_dir().join(format!(
+        "orxnud-refuse-before-effect-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let written = dir.join("must-not-exist.txt");
+    let _ = std::fs::remove_file(&written);
+
+    let mut engine = high_risk_policy();
+    let approval = approval_for(&params(), NOW);
+    let secrets = FakeSecrets::new();
+    let mut d = dispatcher(&mut engine, &secrets, backend_reached_bundle(CAP)).with_execution(
+        Arc::new(support::RefuseBeforeEffectBackend {
+            path: written.clone(),
+        }),
+    );
+
+    let err = d
+        .dispatch(
+            request(),
+            human(),
+            context(),
+            None,
+            params(),
+            Some(&approval),
+            None,
+            NOW,
+        )
+        .expect_err("a backend refusal must be an error");
+
+    match &err {
+        DispatchError::SandboxRefused(r) => {
+            assert_eq!(r.certainty, ExecutionCertainty::NothingAttempted)
+        }
+        other => panic!("expected SandboxRefused, got {other}"),
+    }
+    assert!(
+        !written.exists(),
+        "a backend that reports NothingAttempted must not have produced an effect"
+    );
+    assert_eq!(
+        terminal(&engine).0,
+        OutcomeKind::Denied,
+        "nothing ran, so the journal may say so"
+    );
+    assert_settled(&engine);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unknown execution still consumes the approval, and the approval cannot be reused.
+///
+/// The burn happens in policy, before stage 5, so it happens regardless of what stage 7
+/// reports. That is the fail-closed direction and it is unchanged by this work — but it is
+/// asserted here *for the unknown case specifically*, because the unknown case is the one
+/// where a retry is most tempting and the temptation is what would replay the approval.
+#[test]
+fn an_unknown_execution_spends_the_approval_and_the_approval_stays_spent() {
+    let dir = std::env::temp_dir().join(format!(
+        "orxnud-unknown-approval-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let written = dir.join("approved.txt");
+    let _ = std::fs::remove_file(&written);
+
+    let mut engine = high_risk_policy();
+    let approval = approval_for(&params(), NOW);
+    let secrets = FakeSecrets::new();
+
+    {
+        let mut d = dispatcher(&mut engine, &secrets, backend_reached_bundle(CAP)).with_execution(
+            Arc::new(support::EffectThenUnknownBackend {
+                path: written.clone(),
+                contents: "approved side effect",
+            }),
+        );
+        let _ = d.dispatch(
+            request(),
+            human(),
+            context(),
+            None,
+            params(),
+            Some(&approval),
+            None,
+            NOW,
+        );
+    }
+    assert!(
+        written.exists(),
+        "the effect landed, so the approval authorised something that happened"
+    );
+
+    // The record must say the approval is gone, so an operator does not read the refusal
+    // as "still good for a retry".
+    let (_, detail) = terminal(&engine);
+    let detail = detail.expect("the terminal record must carry a detail");
+    assert!(
+        detail.contains("spent"),
+        "the record must state the approval economics: {detail}"
+    );
+
+    // And a second presentation of the same digest is refused by the ledger.
+    {
+        let mut d = dispatcher(&mut engine, &secrets, backend_reached_bundle(CAP)).with_execution(
+            Arc::new(support::RefuseBeforeEffectBackend {
+                path: written.clone(),
+            }),
+        );
+        let second = d.dispatch(
+            request(),
+            human(),
+            context(),
+            None,
+            params(),
+            Some(&approval),
+            None,
+            NOW,
+        );
+        assert!(
+            second.is_err(),
+            "an approval spent by an unknown execution must not be reusable"
+        );
+    }
+    assert_settled(&engine);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ------------------------------------------------- the production detector runs
