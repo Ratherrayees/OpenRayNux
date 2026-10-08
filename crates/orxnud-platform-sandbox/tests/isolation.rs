@@ -737,12 +737,9 @@ fn a_give_up_after_starting_reports_a_phase_not_a_disproof() {
          completed execution came to be recorded as 'nothing ran'"
     );
     assert!(
-        result.is_indeterminate(),
-        "and its outcome is not established, so it is indeterminate rather than negative"
-    );
-    assert!(
         !result.is_clean_exit(),
-        "it is emphatically not a clean exit"
+        "and it is emphatically not a clean exit, so its outcome is neither established \
+         nor negative -- which is the whole reason it needed its own value"
     );
     let summary = result.summary();
     assert!(
@@ -782,27 +779,39 @@ fn abandoned_and_refused_differ_in_exactly_the_one_way_that_matters() {
         },
     ));
 
+    // Concrete values, not `assert_ne!` on the pairs.
+    //
+    // The pair comparison this replaces was satisfied by *any* difference between the two
+    // tuples -- so removing one of the two subjects from `is_indeterminate` left the pairs
+    // as `(true, false)` and `(false, false)`, still unequal, still green. A test that
+    // cannot fail when one of its subjects is wrong is not testing the relationship.
+    // These are the facts a caller acts on, stated outright.
     assert!(
         !refused.did_start(),
         "a refusal is decided before anything starts, so nothing ran"
     );
     assert!(
+        !refused.is_clean_exit(),
+        "and it is not a run that reported anything"
+    );
+    assert!(
         abandoned.did_start(),
         "an abandonment is reported after a process existed"
     );
-    assert_ne!(
-        (refused.did_start(), refused.is_indeterminate()),
-        (abandoned.did_start(), abandoned.is_indeterminate()),
-        "the two must be separable by the predicates a caller actually reads, or splitting \
-         the status buys nothing"
+    assert!(
+        !abandoned.is_clean_exit(),
+        "and it is emphatically not a clean exit"
     );
     assert!(
-        refused.summary().starts_with("refused: ")
-            && abandoned
-                .summary()
-                .starts_with("abandoned after starting: "),
-        "and separable in the text an operator reads: {} / {}",
-        refused.summary(),
+        refused.summary().starts_with("refused: "),
+        "and a refusal is legible as one in the text an operator reads: {}",
+        refused.summary()
+    );
+    assert!(
+        abandoned
+            .summary()
+            .starts_with("abandoned after starting: "),
+        "while an abandonment says in words that something had already started: {}",
         abandoned.summary()
     );
 }

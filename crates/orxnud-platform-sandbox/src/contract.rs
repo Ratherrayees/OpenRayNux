@@ -491,23 +491,6 @@ impl ExecutionResult {
         )
     }
 
-    /// Whether the process ran but did not report success.
-    ///
-    /// True for every terminal state that is not a clean exit and not "never started",
-    /// which is what a caller needs in order to decide the effect's truth is unknown
-    /// rather than negative (TP-12).
-    #[must_use]
-    pub fn is_indeterminate(&self) -> bool {
-        matches!(
-            self.status,
-            ExecutionStatus::TimedOut
-                | ExecutionStatus::Cancelled
-                | ExecutionStatus::OutputExceeded { .. }
-                | ExecutionStatus::Abandoned(_)
-                | ExecutionStatus::Killed
-        )
-    }
-
     /// A short, redacted summary suitable for an audit record.
     #[must_use]
     pub fn summary(&self) -> String {
