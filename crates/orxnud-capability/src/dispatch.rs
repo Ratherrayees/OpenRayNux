@@ -1752,17 +1752,32 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
         // The verifier gets the validated parameters, not just the adapter's output:
         // without the input it could only check the adapter against itself. See
         // `Verifier::verify`.
-        let verification = match bundle
-            .verifier()
-            .verify(&execution, invocation.params(), now_ms)
-        {
-            Ok(v) => v,
-            // A verifier that cannot run produces "undetermined", never "verified"
-            // and never "refuted".
-            Err(e) => VerificationOutcome::Undetermined {
-                reason: e.to_string(),
+        //
+        // **The one admission point for every verification answer in the system.**
+        // Whatever comes back is passed through `admit_verification` before it can
+        // reach a `DispatchOutcome`, and therefore before anything downstream -- the
+        // terminal audit record, `EffectStatus`, `Certainty`, the task state, retry
+        // eligibility -- can see it. Three things funnel through here and nothing else:
+        // the verifier's answer, a verifier that could not run, and the admissibility
+        // rule itself. That is deliberate: an invariant enforced at two of three exits
+        // from a function is an invariant with a hole in it, and this is the exit every
+        // governed execution takes.
+        let verification = admit_verification(
+            &execution,
+            match bundle
+                .verifier()
+                .verify(&execution, invocation.params(), now_ms)
+            {
+                Ok(v) => v,
+                // A verifier that cannot run produces "undetermined", never "verified"
+                // and never "refuted". Already conservative, so admission is a no-op on
+                // it; it goes through the same function anyway so that there is one
+                // place where a verification answer becomes a claim.
+                Err(e) => VerificationOutcome::Undetermined {
+                    reason: e.to_string(),
+                },
             },
-        };
+        );
 
         Ok(DispatchOutcome {
             execution,
@@ -1772,6 +1787,133 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             // cannot disagree with the effect it describes.
             output_is_ephemeral: bundle.output_is_ephemeral(),
         })
+    }
+}
+
+/// Decides what a verifier's finding is allowed to mean, given what the execution did.
+///
+/// # The invariant
+///
+/// ```text
+/// Verified or Refuted is admissible only against a Succeeded execution.
+/// ```
+///
+/// Everything else degrades to [`VerificationOutcome::Undetermined`].
+///
+/// # Why this is one function and not verifier policy
+///
+/// A verifier is asked for a *finding*; the dispatcher owns what the finding is allowed
+/// to mean. That split is the whole point, because the two answers are not symmetric:
+///
+/// * `Undetermined` withholds a decision. Nothing downstream can act on it.
+/// * `Refuted` is the single finding the effect ledger converts into `not-performed`,
+///   and `not-performed` is the only status `recover()` reads as *"a repeat cannot
+///   duplicate anything"*. A refutation is therefore a **retry permission**.
+///
+/// So the failure this guards is not a wrong observation, it is a right observation in an
+/// inadmissible frame: "the target does not hold the requested bytes" is a true sentence
+/// about the world after a capability that was killed mid-write, and acting on it re-runs
+/// a non-idempotent effect that may already exist. `WriteTextVerifier` returned
+/// `Undetermined` for an unknown execution, correctly, and nothing checked -- a mutation
+/// flipping that one arm to `Refuted` reproduced the whole chain against a real daemon,
+/// with a real file on disk, and left every test in the workspace green.
+///
+/// Three properties keep this a rule rather than a convention:
+///
+/// * **It is central.** One call site, immediately after [`Verifier::verify`] and before
+///   the answer can reach `DispatchOutcome`. Every verifier and every capability is
+///   covered, and no verifier needs to know the rule exists.
+/// * **It is exhaustive, not advisory.** The match below names all nine
+///   `ExecutionOutcome` x `VerificationOutcome` pairs with no wildcard, so adding a
+///   variant to either enum breaks the build *here*, where somebody has to say whether a
+///   new answer is admissible against a new execution. That is the same discipline the
+///   cross-channel table in the daemon uses, and it is why this can honestly be called
+///   enforced rather than documented.
+/// * **It cannot lose the finding.** A refusal keeps the verifier's words, redacted, so
+///   an operator can see what was claimed and why it was not accepted. The alternative
+///   -- discarding the answer -- would make a systematically over-refusing verifier
+///   indistinguishable from one that is merely unlucky.
+///
+/// # Admissible outcomes, exhaustively
+///
+/// | execution | `Verified` | `Refuted` | `Undetermined` |
+/// |---|---|---|---|
+/// | `Succeeded` | admissible | **admissible** -- the legitimate refutation | admissible |
+/// | `Failed`    | refused | **refused** -- the capability may have written before failing | admissible |
+/// | `Unknown`   | refused | **refused** -- the capability may have written before going silent | admissible |
+///
+/// `Cancelled` and every post-start sandbox status arrive here as
+/// [`ExecutionOutcome::Unknown`] -- `outcome_from_report` collapses them -- so the
+/// `Unknown` row covers the whole post-start family rather than a hypothetical fourth
+/// execution state. That collapse is why the rule is written over `ExecutionOutcome` and
+/// not over `ExecutionOutcomeKind`: the kind is an implementation detail of the sandbox
+/// bridge and has already been resolved by the time anything here could use it.
+#[must_use]
+pub fn admit_verification(
+    execution: &ExecutionOutcome,
+    reported: VerificationOutcome,
+) -> VerificationOutcome {
+    use ExecutionOutcome as E;
+    use VerificationOutcome as V;
+    // All nine cells named, no wildcard. Written out rather than compressed with a `_`
+    // so that adding a variant to *either* enum breaks the build right here, where
+    // somebody has to say whether the new answer is admissible against the new execution.
+    // A first draft that grouped the answers instead was rejected by rustc for leaving
+    // two cells uncovered, which is the behaviour this shape is here to get.
+    match (execution, &reported) {
+        // A capability that ran and finished is the only case where there is a world to
+        // look at, so every answer stands -- including the refutation, which is exactly
+        // where `Succeeded + Refuted` earns its retry permission.
+        (E::Succeeded { .. }, V::Verified { .. })
+        | (E::Succeeded { .. }, V::Refuted { .. })
+        | (E::Succeeded { .. }, V::Undetermined { .. }) => reported,
+
+        // "Nobody can say" never over-claims, so it is admissible against anything.
+        (E::Failed { .. }, V::Undetermined { .. })
+        | (E::Unknown { .. }, V::Undetermined { .. }) => reported,
+
+        // The four inadmissible cells, and only these: a finding about a capability that
+        // failed or went silent.
+        (E::Failed { .. }, V::Verified { .. })
+        | (E::Failed { .. }, V::Refuted { .. })
+        | (E::Unknown { .. }, V::Verified { .. })
+        | (E::Unknown { .. }, V::Refuted { .. }) => refuse_claim(execution, &reported),
+    }
+}
+
+/// Builds the conservative replacement for a finding that was not admissible.
+///
+/// Split out so [`admit_verification`] stays a table, and so the two matches over the
+/// closed vocabulary are each exhaustive in their own right. Every `return reported` below
+/// is unreachable given the caller and is written out anyway: a claim being refused is
+/// the only thing this function does, and a caller reaching either arm by accident gets
+/// the claim back rather than a panic.
+fn refuse_claim(
+    execution: &ExecutionOutcome,
+    reported: &VerificationOutcome,
+) -> VerificationOutcome {
+    use ExecutionOutcome as E;
+    use VerificationOutcome as V;
+    let phase = match execution {
+        E::Failed { detail } => format!("reported a failure ({})", redact(detail)),
+        E::Unknown { detail } => format!("did not report ({})", redact(detail)),
+        E::Succeeded { .. } => return reported.clone(),
+    };
+    let claimed = match reported {
+        V::Verified { evidence } => {
+            format!("claimed the effect happened ({})", redact(evidence))
+        }
+        V::Refuted { evidence } => {
+            format!("claimed the effect is absent ({})", redact(evidence))
+        }
+        V::Undetermined { .. } => return reported.clone(),
+    };
+    V::Undetermined {
+        reason: format!(
+            "the capability {phase}, and verification {claimed}; the finding is not \
+             admissible against an execution that did not report success, because a \
+             capability that fails or goes silent may still have produced its effect"
+        ),
     }
 }
 
@@ -2001,3 +2143,212 @@ pub fn approval_satisfied(
 
 /// Re-exported so a caller building a dispatcher has one import site.
 pub use crate::verification::VerificationOutcome as Outcome;
+
+// ---------------------------------------------------------------------------
+// Admissibility: what a verification answer is allowed to mean
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admit_verification_tests {
+    use super::admit_verification;
+    use crate::verification::{ExecutionOutcome as E, VerificationOutcome as V};
+
+    /// Every `ExecutionOutcome`, so a new variant has to be added to the table below.
+    fn executions() -> Vec<(&'static str, E)> {
+        vec![
+            ("succeeded", E::Succeeded { output: None }),
+            (
+                "failed",
+                E::Failed {
+                    detail: "exit 1".to_owned(),
+                },
+            ),
+            (
+                "unknown",
+                E::Unknown {
+                    detail: "killed".to_owned(),
+                },
+            ),
+        ]
+    }
+
+    /// Every `VerificationOutcome`, likewise.
+    fn verifications() -> Vec<(&'static str, V)> {
+        vec![
+            (
+                "verified",
+                V::Verified {
+                    evidence: "e".to_owned(),
+                },
+            ),
+            (
+                "refuted",
+                V::Refuted {
+                    evidence: "e".to_owned(),
+                },
+            ),
+            (
+                "undetermined",
+                V::Undetermined {
+                    reason: "r".to_owned(),
+                },
+            ),
+        ]
+    }
+
+    /// The whole cross-product, as the table the rule *is*.
+    ///
+    /// A: the invariant, over every pair. `Refuted` and `Verified` are a disproof and a
+    /// confirmation respectively, and only a `Succeeded` execution has standing to issue
+    /// either. Anything else arrives as `Undetermined`, which withholds a decision and so
+    /// cannot become a retry permission downstream.
+    ///
+    /// The count is pinned so a variant added to either enum cannot join the product
+    /// silently: the loop below iterates 3x3, and a fourth execution would make it 4x3
+    /// without touching a single assertion.
+    #[test]
+    fn only_a_succeeded_execution_may_issue_a_finding() {
+        let (execs, vers) = (executions(), verifications());
+        assert_eq!(
+            (execs.len(), vers.len()),
+            (3, 3),
+            "the table is the whole cross-product; extend it when either enum grows"
+        );
+
+        for (ename, execution) in &execs {
+            for (vname, reported) in &vers {
+                let admitted = admit_verification(execution, reported.clone());
+                let label = format!("{ename} + {vname}");
+
+                match *vname {
+                    "verified" | "refuted" => {
+                        if *ename == "succeeded" {
+                            assert_eq!(
+                                &admitted, reported,
+                                "{label}: a capability that ran and finished is the only \
+                                 execution with a world to look at, so the finding stands"
+                            );
+                        } else {
+                            assert!(
+                                admitted.is_undetermined(),
+                                "{label}: `{vname}` is a claim about the world, and a \
+                                 capability that {ename} may still have produced its \
+                                 effect, so the claim is not admissible and must be \
+                                 withheld. Got {admitted:?}"
+                            );
+                            assert_eq!(
+                                admitted.to_string(),
+                                "undetermined",
+                                "{label}: and it must be withheld, not silently kept"
+                            );
+                        }
+                    }
+                    // `Undetermined` is admissible everywhere: "nobody can say" is not a
+                    // claim, so there is nothing for it to over-claim.
+                    _ => assert_eq!(
+                        &admitted, reported,
+                        "{label}: withholding a decision never over-claims, so it passes \
+                         through untouched"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The property the runtime depends on, stated over the closed vocabulary alone.
+    ///
+    /// Downstream, `VerificationOutcome::Refuted` is the *only* finding
+    /// `certainty_of` maps to `Certainty::Disproved`, and `Disproved` is the only
+    /// verification-derived value that becomes `EffectStatus::NotPerformed` -- the status
+    /// `recover()` excludes from its uncertainty predicate, and therefore the retry
+    /// permission. So the whole chain reduces to this: a claim must never survive an
+    /// execution that did not report success.
+    #[test]
+    fn a_claim_never_survives_an_execution_that_did_not_report_success() {
+        for (ename, execution) in executions() {
+            for claim in [
+                V::Verified {
+                    evidence: "confirmed".to_owned(),
+                },
+                V::Refuted {
+                    evidence: "absent".to_owned(),
+                },
+            ] {
+                let admitted = admit_verification(&execution, claim.clone());
+                if ename != "succeeded" {
+                    assert!(
+                        !admitted.is_verified() && !admitted.is_refuted(),
+                        "{ename} + {claim:?}: a claim leaked through as {admitted:?}, and \
+                         that is the one conversion that would authorise repeating a \
+                         non-idempotent effect"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A refusal keeps the verifier's words, bounded.
+    ///
+    /// Two reasons this matters rather than being cosmetic. An operator has to be able to
+    /// see *what was claimed* and *why it was refused*, or a systematically over-refusing
+    /// verifier is indistinguishable from an unlucky one. And the claim's `evidence` is
+    /// verifier-controlled text, so it goes through the same `redact` the rest of this
+    /// module uses for untrusted output: control characters stripped, capped at 512 bytes
+    /// with the total reported.
+    #[test]
+    fn a_refused_claim_keeps_bounded_evidence_and_says_why() {
+        let long = "€".repeat(400); // three bytes each, so this overruns a byte budget
+        let admitted = admit_verification(
+            &E::Unknown {
+                detail: "killed by a signal".to_owned(),
+            },
+            V::Refuted {
+                evidence: format!("absent\n{long}"),
+            },
+        );
+        let V::Undetermined { reason } = &admitted else {
+            panic!("expected a withheld finding, got {admitted:?}")
+        };
+        assert!(
+            reason.contains("claimed the effect is absent"),
+            "the operator must see the claim that was refused: {reason}"
+        );
+        assert!(
+            reason.contains("killed by a signal"),
+            "and the execution phase it was refused against: {reason}"
+        );
+        assert!(
+            reason.contains("may still have produced its effect"),
+            "and the reason the refusal is the safe direction: {reason}"
+        );
+        assert!(
+            !reason.contains('\n') && !reason.contains('\r'),
+            "a newline here would be a framing hazard: {reason:?}"
+        );
+        // Bounded by construction rather than by a named constant: `redact` caps each
+        // piece of untrusted text at 512 bytes, and this reason embeds two of them plus a
+        // fixed frame, so 4096 is a ceiling no input can approach. The point of the
+        // assertion is that the composition cannot grow without limit, not that it
+        // matches a particular constant.
+        assert!(
+            reason.len() < 4096,
+            "the reason must stay bounded whatever the verifier wrote, got {} bytes",
+            reason.len()
+        );
+    }
+
+    /// The refusals are not silent, and they are not panics either.
+    ///
+    /// Written out because the two inner matches in `refuse_claim` each carry an
+    /// unreachable arm, and an unreachable arm that panics is a latent failure in a
+    /// function that decides whether a non-idempotent effect may be repeated.
+    #[test]
+    fn a_refusal_degrades_rather_than_failing() {
+        for execution in executions() {
+            for reported in verifications() {
+                // Total function: every pair returns something, nothing unwinds.
+                let _ = admit_verification(&execution.1, reported.1);
+            }
+        }
+    }
+}

@@ -54,6 +54,22 @@ pub enum VerifyMode {
     Refutes,
     /// Cannot run.
     Unavailable,
+    /// Refutes **whatever the execution did**, including after the capability failed or
+    /// went silent. The inadmissible-finding case.
+    ///
+    /// # Why this is a separate mode and not a flag
+    ///
+    /// Every other mode here reads `execution`, because a verifier that ignored it could
+    /// confirm an effect that never happened. This one is the opposite mistake and the
+    /// more dangerous one: it produces a *true sentence about the world* — "the effect is
+    /// not there" — from an execution that may have produced the effect, and
+    /// `Refuted` is the single finding the effect ledger turns into `not-performed`,
+    /// which is the only status recovery reads as "a repeat cannot duplicate anything".
+    ///
+    /// It is the shape a real verifier takes when written as "the target must not hold
+    /// the old bytes": absent and never-written look identical to it. So it is a fixture
+    /// the dispatcher has to survive, not an error case.
+    RefutesRegardless,
 }
 
 /// Pairs an adapter with a verifier.
@@ -88,7 +104,15 @@ impl Verifier for ModeVerifier {
     ) -> Result<VerificationOutcome, VerifyError> {
         // A verifier that ignored the execution outcome could confirm an effect that
         // never happened. Every mode below reads it.
-        if let ExecutionOutcome::Failed { .. } | ExecutionOutcome::Unknown { .. } = execution {
+        //
+        // `RefutesRegardless` is the documented exception, and it is an exception to the
+        // *fixture's* discipline rather than to the dispatcher's: the point is to hand the
+        // dispatcher an inadmissible finding and require it to refuse one, so the mode has
+        // to be able to produce it. Nothing downstream of `verify` is expected to take
+        // this at face value.
+        if !matches!(self.0, VerifyMode::RefutesRegardless)
+            && let ExecutionOutcome::Failed { .. } | ExecutionOutcome::Unknown { .. } = execution
+        {
             return Ok(VerificationOutcome::Undetermined {
                 reason: "execution did not report success".into(),
             });
@@ -97,7 +121,7 @@ impl Verifier for ModeVerifier {
             VerifyMode::Confirms => VerificationOutcome::Verified {
                 evidence: "the fixture confirms".into(),
             },
-            VerifyMode::Refutes => VerificationOutcome::Refuted {
+            VerifyMode::Refutes | VerifyMode::RefutesRegardless => VerificationOutcome::Refuted {
                 evidence: "the fixture refutes: the effect did not occur".into(),
             },
             VerifyMode::Unavailable => {
@@ -131,8 +155,19 @@ impl<A: CapabilityAdapter + 'static> Bundle<A> {
     pub fn unverifiable(adapter: A) -> Self {
         Self::new(adapter, VerifyMode::Unavailable)
     }
+    /// A bundle whose verifier refutes whatever the execution did.
+    pub fn refuting_regardless(adapter: A) -> Self {
+        Self::new(adapter, VerifyMode::RefutesRegardless)
+    }
     pub fn into_arc(self) -> Arc<dyn AdapterBundle + Send + Sync> {
         Arc::new(self)
+    }
+    /// Which verdict this bundle's verifier will reach for.
+    ///
+    /// For a bundle that supplies its own plan (and so cannot be cloned by
+    /// construction), which needs to forward the mode to the plan-carrying half.
+    pub fn mode(&self) -> VerifyMode {
+        self.mode
     }
 }
 
@@ -666,6 +701,37 @@ impl crate::dispatch::ExecutionBackend for RefuseBeforeEffectBackend {
             "no execution backend is configured, so a Tier-1 capability cannot be sandboxed",
             vec!["a sandbox execution backend"],
         ))
+    }
+
+    fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {
+        true
+    }
+}
+
+/// A Tier-1 backend that returns a chosen [`crate::dispatch::ExecutionOutcomeKind`].
+///
+/// The only way to reach a *specific* execution outcome through the real dispatcher,
+/// because `outcome_from_report` collapses the sandbox's status vocabulary down to three
+/// `ExecutionOutcome` values and tests need all three -- including the two post-start ones
+/// (`TimedOut`, `Killed`, `Cancelled`, `OutputCapped` all arrive as `Unknown`) that a
+/// refusal-shaped backend cannot produce at all, since a refusal is an `Err` and never
+/// becomes a report.
+pub struct ReportsStatus(pub crate::dispatch::ExecutionOutcomeKind);
+
+impl crate::dispatch::ExecutionBackend for ReportsStatus {
+    fn execute(
+        &self,
+        _contract: &crate::dispatch::ExecutionContract,
+    ) -> Result<crate::dispatch::ExecutionReport, crate::dispatch::SandboxRefusal> {
+        Ok(crate::dispatch::ExecutionReport {
+            exit_code: match self.0 {
+                crate::dispatch::ExecutionOutcomeKind::Exited(c) => Some(c),
+                _ => None,
+            },
+            stdout: String::new(),
+            stderr: String::new(),
+            status: self.0,
+        })
     }
 
     fn can_fulfil(&self, _contract: &crate::dispatch::ExecutionContract) -> bool {

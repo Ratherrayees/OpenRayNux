@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::dispatch::{
-    AdapterBundle, CapabilityAdapter, DispatchError, Dispatcher, ExecutionCertainty, ExecutionTier,
-    PlanError, SandboxPlan,
+    AdapterBundle, CapabilityAdapter, DispatchError, DispatchOutcome, Dispatcher,
+    ExecutionCertainty, ExecutionTier, PlanError, SandboxPlan,
 };
 use orxnud_audit::{AuditOutcome, OutcomeKind};
 use orxnud_domain::approval::{ApprovalRecord, NormalizedParams};
@@ -1319,4 +1319,240 @@ fn a_clean_journal_reports_settled_on_restore() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Admissibility, through the real governed path
+// ---------------------------------------------------------------------------
+//
+// These four drive `Dispatcher::dispatch` end to end -- real policy, real approval, real
+// Tier-1 backend, real audit chain -- with a verifier that refutes *whatever the execution
+// did*, and a backend that reports a chosen execution status. Together they are the
+// runtime shape of the defect this closes: a real statement about the world ("the effect
+// is not there") issued by a capability that may have produced the effect.
+//
+// The layer-level rule is asserted in `dispatch::admit_verification_tests`. These assert
+// the consequence, because the consequence is what the safety argument rests on:
+// `Refuted` reaching `dispatch` is what becomes `Err(VerificationRefuted)`, and that is
+// what becomes `EffectStatus::NotPerformed`, and that is the retry permission.
+
+/// A Tier-1 bundle whose plan is valid, so the backend is actually reached.
+struct PlanTier1 {
+    inner: Bundle<Tier1Adapter>,
+}
+
+impl PlanTier1 {
+    fn with(mode: support::VerifyMode) -> Self {
+        Self {
+            inner: Bundle::new(Tier1Adapter { id: cap() }, mode),
+        }
+    }
+}
+
+impl AdapterBundle for PlanTier1 {
+    fn adapter(&self) -> &dyn CapabilityAdapter {
+        self.inner.adapter()
+    }
+
+    fn sandbox_plan(
+        &self,
+        _invocation: &orxnud_policy::authority::CapabilityInvocation,
+    ) -> Result<Option<SandboxPlan>, PlanError> {
+        Ok(Some(SandboxPlan {
+            program: "/nonexistent/test-helper".to_owned(),
+            args: Vec::new(),
+            env: Default::default(),
+            working_dir: std::env::temp_dir().display().to_string(),
+            grant_rw: Vec::new(),
+            grant_ro: vec!["/nonexistent/test-helper".to_owned()],
+            network: false,
+            deadline_ms: 30_000,
+            output_cap_bytes: 64 * 1024,
+            resources: crate::dispatch::ResourcePolicy::default(),
+        }))
+    }
+
+    fn verifier(&self) -> &dyn crate::verification::Verifier {
+        self.inner.verifier()
+    }
+}
+
+/// One governed dispatch of a Tier-1 capability with a refusing-always verifier and a
+/// backend that reports `status`.
+///
+/// Returns the dispatcher outcome and the journal's terminal disposition, because the
+/// invariant has to hold in both channels at once.
+fn dispatch_with_status(
+    status: crate::dispatch::ExecutionOutcomeKind,
+) -> (
+    Result<DispatchOutcome, DispatchError>,
+    (OutcomeKind, Option<String>),
+) {
+    let mut engine = high_risk_policy();
+    let approval = approval_for(&params(), NOW);
+    let secrets = FakeSecrets::new();
+    let mut m: BTreeMap<CapabilityId, Arc<dyn AdapterBundle + Send + Sync>> = BTreeMap::new();
+    m.insert(
+        cap(),
+        Arc::new(PlanTier1::with(support::VerifyMode::RefutesRegardless)),
+    );
+    let mut d = Dispatcher::new(&mut engine, &secrets, Registry::from_bundles(m))
+        .with_execution(Arc::new(support::ReportsStatus(status)));
+    let outcome = d.dispatch(
+        request(),
+        human(),
+        context(),
+        None,
+        params(),
+        Some(&approval),
+        None,
+        NOW,
+    );
+    (outcome, terminal(&engine))
+}
+
+/// **Test A.** A capability that went silent, whose verifier nonetheless refutes.
+///
+/// The M5 shape. Before the fix this returned `Err(VerificationRefuted)`, which the
+/// daemon turns into `EffectStatus::NotPerformed` and recovery reads as a repeat cannot
+/// duplicate anything. The whole chain is asserted here in the two channels that matter,
+/// and the full `task_effects` / `recover()` consequence is asserted at the daemon layer
+/// in `a_refuted_claim_from_a_silent_capability_can_never_become_a_disproof`.
+#[test]
+fn a_refutation_of_a_silent_capability_is_withheld() {
+    use crate::dispatch::ExecutionOutcomeKind;
+    use crate::verification::ExecutionOutcome;
+    let (outcome, (kind, detail)) = dispatch_with_status(ExecutionOutcomeKind::TimedOut);
+
+    // The dispatch must not report a refutation. `VerificationRefuted` is the wire error
+    // the daemon maps to `not-performed`, so asserting its absence is the assertion.
+    match &outcome {
+        Ok(o) => {
+            assert!(
+                matches!(o.execution, ExecutionOutcome::Unknown { .. }),
+                "the sandbox stopped the capability, so the execution is unknown, got {:?}",
+                o.execution
+            );
+            assert!(
+                o.verification.is_undetermined() && !o.verification.is_refuted(),
+                "a refutation of an unknown execution is not admissible and must be \
+                 withheld, got {:?}",
+                o.verification
+            );
+        }
+        Err(e) => panic!(
+            "a withheld refutation must not surface as an error, and {e:?} is the error \
+             that becomes `not-performed`"
+        ),
+    }
+    assert_eq!(
+        kind,
+        OutcomeKind::Uncertain,
+        "and the journal must decline to call it a failure: detail {detail:?}"
+    );
+}
+
+/// **Test B.** The same for a capability that reported a failure.
+///
+/// A subprocess can write its file and *then* exit non-zero, so "I looked and it is not
+/// there" is not a statement about a failed run either. The journal says `Failed` here and
+/// the effect ledger must not -- that asymmetry is the documented lattice, and the ledger
+/// half is the one with consequences.
+#[test]
+fn a_refutation_of_a_failed_capability_is_withheld() {
+    use crate::dispatch::ExecutionOutcomeKind;
+    use crate::verification::ExecutionOutcome;
+    let (outcome, (kind, _)) = dispatch_with_status(ExecutionOutcomeKind::Exited(1));
+
+    let Ok(o) = outcome else {
+        panic!("a withheld refutation must not become an error")
+    };
+    assert!(
+        matches!(o.execution, ExecutionOutcome::Failed { .. }),
+        "the child exited non-zero, so the execution failed"
+    );
+    assert!(
+        o.verification.is_undetermined() && !o.verification.is_refuted(),
+        "a refutation of a failed execution is not admissible, got {:?}",
+        o.verification
+    );
+    assert_eq!(
+        kind,
+        OutcomeKind::Failed,
+        "the journal may report a reported failure; only the effect ledger must not read it \
+         as a disproof"
+    );
+}
+
+/// **Test C.** Cancellation after the capability started.
+///
+/// `Cancelled` is its own sandbox status, and it is worth naming: a cancelled capability
+/// may have been running for an arbitrary length of time before the request arrived.
+/// `outcome_from_report` collapses it into `ExecutionOutcome::Unknown`, so this exercises
+/// the same row of the table as test A -- asserted separately so the post-start family is
+/// covered by name rather than by inference.
+#[test]
+fn a_refutation_of_a_cancelled_capability_is_withheld() {
+    use crate::dispatch::ExecutionOutcomeKind;
+    use crate::verification::ExecutionOutcome;
+    let (outcome, _) = dispatch_with_status(ExecutionOutcomeKind::Cancelled);
+
+    let Ok(o) = outcome else {
+        panic!("a withheld refutation must not become an error")
+    };
+    assert!(
+        matches!(o.execution, ExecutionOutcome::Unknown { .. }),
+        "cancellation collapses into the unknown execution state, which is exactly why the \
+         rule is written over ExecutionOutcome: it is the post-start family"
+    );
+    assert!(
+        o.verification.is_undetermined() && !o.verification.is_refuted(),
+        "a capability cancelled after it started may still have written, got {:?}",
+        o.verification
+    );
+}
+
+/// **Test D.** The positive control: the legitimate refutation is untouched.
+///
+/// A capability that ran, finished, and left the world in a state the verifier can
+/// positively disprove is the *only* shape in which a disproof is earned, and it is the
+/// one that makes a retry safe. If this test ever had to be relaxed to accommodate the
+/// rule, the rule would have swallowed the legitimate case along with the dangerous one.
+#[test]
+fn a_refutation_of_a_successful_capability_still_stands() {
+    use crate::dispatch::ExecutionOutcomeKind;
+    let (outcome, (kind, detail)) = dispatch_with_status(ExecutionOutcomeKind::Exited(0));
+
+    let err = outcome.expect_err("a refutation of a successful run must still be reported");
+    assert!(
+        matches!(err, DispatchError::VerificationRefuted { .. }),
+        "this is the one finding that earns a retry, and it must survive the rule: {err:?}"
+    );
+    // The evidence is what the operator needs to see, so the wire error keeps it.
+    let DispatchError::VerificationRefuted { evidence } = &err else {
+        panic!("expected VerificationRefuted, got {err:?}")
+    };
+    assert!(
+        evidence.contains("did not occur"),
+        "and the verifier's own words must survive into the durable record: {evidence}"
+    );
+
+    // The journal says `Uncertain`, not `Failed`, and that is a real asymmetry worth
+    // pinning rather than papering over. `dispatch` writes the terminal record from
+    // `terminal_outcome` — the `Ok`-path mapping, which cannot distinguish a refutation
+    // from an undetermined one because both are "succeeded but not confirmed" — and only
+    // *then* converts the refutation into `Err(VerificationRefuted)`. So the journal
+    // under-claims relative to the effect ledger, which records the disproof.
+    //
+    // It is the safe direction: `Uncertain` withholds a claim, and the ledger's claim is
+    // the legitimate one for a `Succeeded` execution. Recorded here because the daemon's
+    // cross-channel lattice asserts `Uncertain ⇒ Unknown` and this is the row that does
+    // not fit it; the discrepancy is in the journal's wording, not in any safety
+    // decision, and it is pre-existing rather than introduced here.
+    assert_eq!(
+        kind,
+        OutcomeKind::Uncertain,
+        "the `Ok`-path journal mapping cannot tell a refutation from an undetermined \
+         verdict; detail {detail:?}"
+    );
 }
