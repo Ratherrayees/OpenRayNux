@@ -90,12 +90,22 @@ fn parse_args() -> Result<Action, String> {
     let mut base_url: Option<String> = None;
     let mut model: Option<String> = None;
     let mut scripted = false;
+    let mut doctor = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" | "-V" => return Ok(Action::Version),
             "--help" | "-h" => return Ok(Action::Help),
-            "--doctor" => return Ok(Action::Doctor),
+            // Deferred to the end of parsing, not returned here.
+            //
+            // `--doctor` used to `return Ok(Action::Doctor)` inside this loop, which
+            // meant (a) `--state-root` had to appear *before* `--doctor` to be seen at
+            // all, and (b) even when it was seen, the `Action::Doctor` variant carried
+            // no root, so the value was dropped and `doctor` reported the default
+            // root's paths. The flag was accepted, validated, and ignored — worse than
+            // rejecting it, because the output looked like a real diagnosis of the
+            // root the operator asked about.
+            "--doctor" => doctor = true,
             "--state-root" => {
                 root = Some(
                     args.next()
@@ -129,11 +139,16 @@ fn parse_args() -> Result<Action, String> {
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
+    // Resolved once, for every verb that has a state root.
+    let root = root.map_or_else(
+        orxnud_platform_ipc::default_state_root,
+        std::path::PathBuf::from,
+    );
+    if doctor {
+        return Ok(Action::Doctor { root });
+    }
     Ok(Action::Serve {
-        root: root.map_or_else(
-            orxnud_platform_ipc::default_state_root,
-            std::path::PathBuf::from,
-        ),
+        root,
         provider: ProviderChoice::new(base_url, model, scripted),
     })
 }
@@ -145,7 +160,11 @@ enum Action {
     /// Print usage and exit.
     Help,
     /// Print the state layout and exit.
-    Doctor,
+    Doctor {
+        /// The root to report on. Carried rather than re-derived, because re-deriving
+        /// it from the environment is how `--state-root` came to be ignored.
+        root: std::path::PathBuf,
+    },
     /// Serve, optionally with a proposal provider configured.
     Serve {
         /// Durable state root.
@@ -200,7 +219,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let (root, provider) = match &action {
+    let root = match &action {
+        Action::Serve { root, .. } => root.clone(),
+        Action::Doctor { root } => root.clone(),
+        Action::Version | Action::Help => orxnud_platform_ipc::default_state_root(),
+    };
+    let provider = match &action {
         Action::Version => {
             println!("orxnud {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -209,11 +233,21 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Action::Doctor => {
-            doctor(&Paths::under(orxnud_platform_ipc::default_state_root()));
+        Action::Doctor { .. } => {
+            // Honour `--state-root`.
+            //
+            // This used to call `default_state_root()` unconditionally, so
+            // `orxnud --doctor --state-root /somewhere/else` printed a confident
+            // diagnosis of the *default* root and said nothing about the one asked
+            // for. An operator auditing a specific state root — after an incident, or
+            // when several instances exist on one host — was therefore reading a
+            // report about a different installation's paths. Silently ignoring an
+            // argument is worse than refusing it, and this now simply answers the
+            // question that was asked.
+            doctor(&Paths::under(&root));
             return ExitCode::SUCCESS;
         }
-        Action::Serve { root, provider } => (root.clone(), provider.clone()),
+        Action::Serve { provider, .. } => provider.clone(),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -318,6 +352,40 @@ async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
         runtime.is_durable().await
     );
 
+    // What the previous process left unsettled, reported before the first request is
+    // accepted rather than on demand.
+    //
+    // The dispatcher settles every authorisation it creates, so this is normally
+    // empty and stays that way. A non-empty report is the one case the journal cannot
+    // resolve by itself: an authorisation that no terminal record names. Serving
+    // continues — refusing to start would turn a reportable unknown into an outage no
+    // restart could clear — but an operator reading the startup banner now learns
+    // about it, instead of the information existing only in a function called from
+    // tests.
+    let settlement = runtime.restored_settlement().await;
+    if settlement.is_settled() {
+        eprintln!("orxnud: audit journal restored, fully settled");
+    } else {
+        eprintln!(
+            "orxnud: WARNING: audit journal restored with {} unsettled authorisation(s): \
+             {:?}",
+            settlement.unresolved_authorisations.len(),
+            settlement.unresolved_authorisations
+        );
+        if !settlement.dangling_settlements.is_empty() {
+            eprintln!(
+                "orxnud: WARNING: {} terminal record(s) name an authorisation that does \
+                 not exist (terminal_seq, claimed_seq): {:?}",
+                settlement.dangling_settlements.len(),
+                settlement.dangling_settlements
+            );
+        }
+        eprintln!(
+            "orxnud: each listed seq is readable from the audit_log table; the action it \
+             authorised has no recorded disposition"
+        );
+    }
+
     match runtime.serve(orxnud_platform_ipc::shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -327,22 +395,64 @@ async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
     }
 }
 
+/// Prints a diagnosis of the configured paths. Creates nothing.
+///
+/// # Why the list is annotated rather than bare
+///
+/// This used to print `paths.all()` — five paths — with no indication of which
+/// existed. Three of the five are never created by anything: there is no `audit.log`
+/// (the journal is the `audit_log` **table** inside `state.db`), no `daemon.lock`
+/// (`InstanceLock` is an in-memory record; the single-instance rule is enforced by the
+/// endpoint refusing to be replaced), and no `daemon.log` (logs go to stderr). An
+/// operator reading a bare list has no way to tell "this file exists" from "this file
+/// is a name this daemon has always had", and the first thing anyone does with a
+/// diagnosis is go and look at the paths in it.
+///
+/// So each entry states whether it is present, and the two facts an operator cannot
+/// otherwise infer — where the audit records actually live, and what actually enforces
+/// one-instance-per-root — are stated outright.
 fn doctor(paths: &Paths) {
+    let present = |p: &std::path::Path| {
+        if p.exists() { "present" } else { "absent" }
+    };
+    let endpoint = orxnud_platform_ipc::endpoint_for(&paths.root);
+    let socket_present = endpoint.exists();
+
     println!("orxnud {}", env!("CARGO_PKG_VERSION"));
-    println!("state root: {}", paths.root.display());
-    for p in paths.all() {
-        println!("  {}", p.display());
-    }
-    println!("ipc backend: {}", orxnud_platform_ipc::backend_name());
     println!(
-        "ipc endpoint: {}",
-        orxnud_platform_ipc::endpoint_for(&paths.root).display()
+        "state root: {} ({})",
+        paths.root.display(),
+        present(&paths.root)
     );
+    println!("  {}", paths.database.display());
+    println!("    present: {}", present(&paths.database));
+    println!("  {}", endpoint.display());
+    println!("    present: {}", present(&endpoint));
+    println!("  {}", paths.root.join("workspace").display());
+    println!("    present: {}", present(&paths.root.join("workspace")));
+    println!(
+        "durable audit: the audit_log table inside {}",
+        paths.database.display()
+    );
+    println!("  (there is no separate audit.log file; the journal is SQLite, hash-chained)");
+    println!("single instance: enforced by the endpoint above, not by a lock file");
+    println!("  (no daemon.lock is created; a live endpoint refuses a second daemon)");
+    println!("logs: stderr");
+    println!("  (no daemon.log is created)");
+    println!("ipc backend: {}", orxnud_platform_ipc::backend_name());
+    if !socket_present {
+        println!(
+            "ipc endpoint: {} (not currently bound — no daemon is serving this root)",
+            endpoint.display()
+        );
+    }
     // The backend *name* is a compile-time fact and says nothing about whether this host
     // can actually isolate anything: it reads `bwrap` on a machine where `bwrap` cannot
     // create a user namespace and every Tier-1 capability is refused. So the guarantees
     // are printed too, and the verdict says whether a Tier-1 capability can run here.
     print!("{}", orxnud_platform_sandbox::host_capability().report());
-    println!("durable security state: attach_durable_security_state on start");
+    println!("durable security state: the audit_log and spent_approvals tables inside");
+    println!("  {}", paths.database.display());
+    println!("  both are attached and verified before the endpoint is bound");
     println!("(no paths were created; --doctor only reports)");
 }
