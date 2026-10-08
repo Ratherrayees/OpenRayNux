@@ -3101,6 +3101,59 @@ impl<'a> TaskRepository<'a> {
     /// | `not-performed` | it definitely did not happen | no |
     /// | anything else | a row this build cannot read | treated as `pending` |
     ///
+    /// ### `not-performed` is a claim, and a claim needs a warrant
+    ///
+    /// Because this is the one status the predicate below *excludes*, `not-performed` is
+    /// not a neutral record — it is a **retry permission**. Two producers were able to
+    /// issue it without a warrant, and both are now closed at their source rather than
+    /// here, because compensating in recovery would mean recovery had to second-guess a
+    /// verdict it cannot re-derive:
+    ///
+    /// * A sandbox runner that gave up on a containment guarantee *after* starting the
+    ///   capability reported the same status as one that refused before starting. The
+    ///   sandbox vocabulary now distinguishes them (`ExecutionStatus::Abandoned`).
+    /// * A capability verifier could return `Refuted` for an execution that did not report
+    ///   success, and `Refuted` is the only verification finding that becomes
+    ///   `not-performed`. The dispatcher now refuses that finding unless the execution
+    ///   succeeded (`admit_verification`).
+    ///
+    /// So the rule in this function is unchanged and still correct, and it is now correct
+    /// for a reason that is checked rather than trusted.
+    ///
+    /// ### Rows written before those two fixes
+    ///
+    /// **No migration, and the decision is deliberate.** A pre-fix `not-performed` row may
+    /// be a fabricated disproof, and a fabricated disproof is a duplicate side effect for
+    /// any task still in that shape. Three things were weighed:
+    ///
+    /// 1. *Can it be told apart?* No, not structurally. A genuine pre-start refusal and a
+    ///    post-start give-up were both journaled `Denied` with effect `not-performed` and
+    ///    the same `missing` list; they differ only in the prose inside
+    ///    `task_effects.detail`. A free-text matcher would therefore be the *only*
+    ///    discriminator available, and a prose matcher is not a correctness mechanism.
+    /// 2. *How much was exposed?* The verifier half of the exposure is zero: no verifier
+    ///    in this workspace's history has ever had a `Refuted` arm reachable outside its
+    ///    `Succeeded` arm, so no shipped build could have written such a row. That leaves
+    ///    the sandbox half, which needs a host that delegates a cgroup base *and* a
+    ///    supervisor that fails to appear in it.
+    /// 3. *What would a blanket downgrade cost?* Every legitimately disproved
+    ///    non-idempotent effect — a traversing path, a refused approval, a write that
+    ///    landed with the wrong bytes — would become `unknown` and therefore
+    ///    `needs-verification`, manufacturing a queue of human adjudications for ordinary
+    ///    mistakes. That is a permanent, growing cost paid for a narrow and bounded
+    ///    exposure, and it would penalise all future history for one bug's window.
+    ///
+    /// So: **no schema change, no data rewrite, no prose matcher.** Historical evidence
+    /// is not rewritten into a more certain state, and it is not rewritten into a less
+    /// certain one either on the strength of a guess. The exposure that remains is
+    /// visible rather than silent — a task in that shape is `pending` and claimable, and
+    /// the claim is an audited event — so an operator who wants to enumerate candidates
+    /// can, and an installation that never delegated a cgroup base never had any.
+    ///
+    /// The durable mitigation is the invariant above, not a migration: the class is
+    /// unreachable from this build forward, which is what bounds the exposure to the
+    /// window in which it existed.
+    ///
     /// ## The rule
     ///
     /// An orphaned task is settled into [`TaskState::NeedsVerification`] **iff** it holds

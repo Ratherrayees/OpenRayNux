@@ -5525,6 +5525,170 @@ mod effect_status_for_dispatch_failure_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **Test E, and the end of the chain.** A refuted claim from a capability that did
+    /// not report success cannot become a disproof, and cannot survive every layer that
+    /// could turn one back into one.
+    ///
+    /// # The shape under test
+    ///
+    /// A `DispatchOutcome` whose execution is post-start and whose verification is
+    /// `Refuted`. Before the capability layer's admission rule, that was reachable: a
+    /// verifier written as "the target must not hold the old bytes" answers *absent*
+    /// whenever it cannot confirm the write, and the daemon read that as
+    /// `Certainty::Disproved`. The whole downstream chain is then exercised here, in the
+    /// production order and through the production functions, against real durable state:
+    ///
+    /// ```text
+    /// certainty_of(verification)  ->  EffectStatus
+    ///   -> resolve_effect          (real write, real file database)
+    ///   -> reopen                  (a process restart, which is the only thing that
+    ///                              ever calls recover() in production)
+    ///   -> recover()               (the uncertainty predicate)
+    ///   -> claim_specific          (may a second worker repeat the effect?)
+    /// ```
+    ///
+    /// The expected verdict is `Undetermined` rather than `Refuted` because the admission
+    /// rule already refused the claim, and this asserts it stays refused. So the two
+    /// halves are the property and its proof that the property is not an accident of the
+    /// particular verdict: a `Refuted` that *did* survive admission would have to be
+    /// turned into `NotPerformed` by something downstream, and nothing downstream has a
+    /// channel to do that.
+    #[test]
+    fn a_refuted_claim_from_a_silent_capability_can_never_become_a_disproof() {
+        use super::{Certainty, certainty_of};
+        use orxnud_capability::dispatch::admit_verification;
+        use orxnud_capability::verification::{
+            ExecutionOutcome, VerificationOutcome, Verifier as _,
+        };
+        use orxnud_domain::task_state::{TaskKind, TaskState};
+        use orxnud_store::migration::MigrationRunner;
+        use orxnud_store::pragma::Pragma;
+        use orxnud_store::task_repo::{NewTask, TaskRepository};
+
+        const NOW: i64 = 1_767_225_600_000;
+        const LEASE: i64 = 60_000;
+
+        /// The M5 shape: a verifier that refutes whatever the execution did.
+        struct RefutesRegardless;
+        impl orxnud_capability::verification::Verifier for RefutesRegardless {
+            fn verify(
+                &self,
+                _execution: &ExecutionOutcome,
+                _params: &serde_json::Value,
+                _at_ms: i64,
+            ) -> Result<VerificationOutcome, orxnud_capability::verification::VerifyError>
+            {
+                Ok(VerificationOutcome::Refuted {
+                    evidence: "the target does not hold the requested bytes".to_owned(),
+                })
+            }
+        }
+
+        // The verifier's raw answer, the admission rule's answer, and the effect status
+        // each would produce -- for every post-start execution state.
+        for (name, execution) in [
+            (
+                "failed",
+                ExecutionOutcome::Failed {
+                    detail: "exit 1".to_owned(),
+                },
+            ),
+            (
+                "silent",
+                ExecutionOutcome::Unknown {
+                    detail: "stopped at its deadline".to_owned(),
+                },
+            ),
+        ] {
+            let reported = RefutesRegardless
+                .verify(&execution, &serde_json::json!({}), NOW)
+                .expect("a verifier that always answers");
+            assert!(
+                reported.is_refuted(),
+                "{name}: the fixture must produce the inadmissible finding under test"
+            );
+
+            let admitted = admit_verification(&execution, reported.clone());
+            assert!(
+                !admitted.is_refuted() && !admitted.is_verified(),
+                "{name}: the admission rule must refuse a claim made against an execution \
+                 that did not report success; got {admitted:?}"
+            );
+            assert_ne!(
+                certainty_of(&admitted),
+                Certainty::Disproved,
+                "{name}: and therefore certainty_of must not be able to see a disproof here"
+            );
+
+            // What the ledger would have written before the rule existed, asserted so the
+            // shape cannot be dismissed as a fiction. Checked first, on a clone, because
+            // `admit_verification` consumes the answer.
+            assert_eq!(
+                certainty_of(&reported),
+                Certainty::Disproved,
+                "{name}: without the admission rule this answer is a disproof, which is the \
+                 entire reason the rule has to exist"
+            );
+
+            // Now the full durable chain with the admitted (conservative) verdict.
+            let dir = std::env::temp_dir().join(format!("k1-claim-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let db = dir.join("state.db");
+            let tid = orxnud_domain::ids::TaskId::new("claim-task");
+            let key =
+                orxnud_task::DurableEngine::idempotency_key(&tid, "filesystem/write-text", "1/1");
+            let status = match certainty_of(&admitted) {
+                Certainty::Established => EffectStatus::Observed,
+                Certainty::Disproved => EffectStatus::NotPerformed,
+                Certainty::Unknown => EffectStatus::Unknown,
+            };
+            {
+                let mut c = rusqlite::Connection::open(&db).expect("open");
+                Pragma::critical().apply(&c).expect("pragmas");
+                MigrationRunner::new(&c).run(true).expect("migrate");
+                let mut repo = TaskRepository::new(&mut c);
+                repo.insert(&NewTask::new(tid.clone(), TaskKind::Query, NOW), NOW)
+                    .expect("insert");
+                assert!(matches!(
+                    repo.claim_specific(&tid, "w1", NOW, LEASE),
+                    Ok(orxnud_store::task_repo::TargetedClaimOutcome::Claimed(_))
+                ));
+                // Non-idempotent, because that is the only case where repeating the
+                // effect can do harm.
+                repo.reserve_effect(&key, &tid, 1, 1, "filesystem/write-text", false, NOW)
+                    .expect("reserve")
+                    .expect("inserted");
+                assert!(
+                    repo.resolve_effect(&key, status, None, NOW + 1)
+                        .expect("resolve")
+                );
+            }
+            {
+                // A restart, which is the only thing that calls recover() in production.
+                let mut c = rusqlite::Connection::open(&db).expect("reopen");
+                Pragma::critical().apply(&c).expect("pragmas");
+                let mut repo = TaskRepository::new(&mut c);
+                assert_eq!(repo.recover(NOW + LEASE + 1).expect("recover"), 1);
+                let row = repo.get(&tid).expect("read").expect("present");
+                assert_eq!(
+                    row.state,
+                    TaskState::NeedsVerification,
+                    "{name}: a claim from a capability that did not report success must \
+                     never leave the task retryable"
+                );
+                assert!(
+                    !matches!(
+                        repo.claim_specific(&tid, "w2", NOW + LEASE + 2, LEASE),
+                        Ok(orxnud_store::task_repo::TargetedClaimOutcome::Claimed(_))
+                    ),
+                    "{name}: and a second worker must not be able to repeat the effect"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// The invariant, over every production `DispatchError` variant at once.
     ///
     /// Two channels map the same input — this one to `EffectStatus` and
