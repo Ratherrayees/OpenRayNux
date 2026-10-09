@@ -1,10 +1,13 @@
 # OpenRayNux — Documentation Index
 
-Status: **Stages 1–4b delivered. The 4c governance core is delivered. The 4c runtime
-continuation and observation wiring is intentionally not enabled.**
+Status: **Stages 1–4c delivered. Both 4c wirings are in production: the continuation loop
+(`task/continue`, ADR-0047) and the observation/disclosure path (ADR-0048).**
 
-Reconciled **2026-10-05** against `HEAD` (`1721761`) and CI run `37343986458`, where all
-five jobs are green.
+Reconciled **2026-10-09** against `HEAD` (`c5934970`). Workspace suite: **1655 passed,
+0 failed**. All five CI lanes pass on run `37919194011` — but the same commit also has a
+failing run, so `linux-gates` is **not** reliably green: an intermittent `v95_concurrency`
+failure under load is open and undiagnosed. See
+[§8](#-8-ci-state-the-tool-install-problem-is-resolved-one-test-flake-is-not).
 
 OpenRayNux is a local-first personal AI operating layer: one long-lived Rust process owning
 the user's time, data and integrations, with several surfaces driving the *same* governed
@@ -113,30 +116,35 @@ limitation rather than weakening anything to hide it — see §6.
 
 ## 5. What is intentionally not wired
 
-The 4c *governance core* is delivered. The loop that would drive it is not.
+The 4c governance core **and both of its wirings** are delivered. What remains unwired is
+the surfaces listed last, and nothing else.
 
-* **`AwaitingNextStep`, step-scoped attempts and approvals, and `claim_next_step()` exist
-  and are tested — and nothing in production calls it.** No IPC method reaches it. A
-  multi-step task stops at the boundary *by design*, not by accident (ADR-0043, V-84). The
-  boundary is now crossed by `task/continue`, which claims one step and proposes the next
-  through the ordinary approval gate (ADR-0047).
-* An **approved, verified read** now informs **one** subsequent proposal, to the
-  `(endpoint, model)` identity that asked for the read, and only across the **immediately
-  following** step. `PriorStepContext` is untouched and stays metadata-only — the content
-  travels on a separate, ephemeral channel that is consumed on release and never becomes
-  durable (ADR-0048, V-88). This is the first path in the build on which workspace content can
-  leave the machine.
-* **`PriorStepContext` exists and is tested; the observation store exists and is tested; the
-  daemon's runtime does not read or write it.** A model can propose a read and has nowhere
-  to receive the bytes. `3c8a413` names itself the rollback point immediately before moving
-  approved workspace content to a third party.
+* **Continuation is wired.** `task/continue` crosses a step boundary by claiming one step
+  and proposing the next through the ordinary approval gate (ADR-0047). `claim_next_step()`
+  is called from `orxnud-daemon`'s runtime, not only from tests — see
+  `runtime.rs`, the `continue_task` handler. A multi-step task still stops at the boundary
+  until somebody asks it to continue, which is the designed behaviour rather than a gap
+  (ADR-0043, V-84).
+* **Observation/disclosure is wired.** An **approved, verified read** informs **one**
+  subsequent proposal, to the `(endpoint, model)` identity that asked for the read, and
+  only across the **immediately following** step. `PriorStepContext` is untouched and stays
+  metadata-only — the content travels on a separate, ephemeral channel that is consumed on
+  release and never becomes durable (ADR-0048, V-88). This is the first path in the build on
+  which workspace content can leave the machine, and `3c8a413` names itself the rollback
+  point immediately before that happens.
+* **An earlier version of this section claimed both of the above were absent** — that
+  `claim_next_step()` had "nothing in production calls it", and that the runtime "does not
+  read or write" the observation store. Both statements were true when written and are now
+  false, and they contradicted §3 of [`03-system-architecture.md`](03-system-architecture.md),
+  which already described the 4c governance core as delivered *with* both wirings. They are
+  corrected here rather than left to contradict a normative document.
 * Also absent: no GUI or Tauri application, no TUI, no MCP surface, no messaging, no local
   ASR/TTS, no general shell capability, no unrestricted filesystem capability, no Windows
   sandbox backend, no actor runtime beyond the local authority model.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**1419 tests, 1419 passed, 5 skipped** locally, with 1–2 *leaky* results depending on
+**1655 tests, 1655 passed, 0 failed** locally, with 1–2 *leaky* results depending on
 scheduling — both are pre-existing `cgroup.kill` tests that pass and are named in
 [`08`](08-testing-engineering-standards.md) §19. On the hosted runner, gate G9 runs fewer
 and all of those pass — the difference is the Tier-1 sandbox-evidence suites, which the
@@ -162,13 +170,88 @@ Two claims that look like guarantees and are not:
 
 ## 7. Current next milestone
 
-Wire the 4c runtime: the continuation loop that calls `claim_next_step()`, and the
-observation path that hands an approved, verified read to the next proposal. Both are
-one-way doors — the second is the first time approved workspace content leaves the machine —
-so each needs its own decision record and its own evidence, not a drive-by.
+**The next milestone is deliberately undecided, and that is the finding rather than an
+omission.** Verification work has been carried out under the identifiers V-93, V-94, V-95
+and V-97 — all of them now in `main`, all of them recorded in
+[`12`](12-verification-register.md) as of this reconciliation. There is a **gap at V-96**,
+and no definition of V-96 exists anywhere in the repository: not in `docs/`, not in the
+register, not in the commit history, not in the tree.
 
-After that: the actor model beyond one local human (V-70), and a decision on where positive
-Tier-1 evidence should live, since GitHub-hosted runners cannot supply it.
+So V-96 is **not** something this document will define by guessing. Inventing a plausible
+defeating for an unknown ID would put a fabricated requirement into a normative document,
+which is the exact failure mode
+[`12`](12-verification-register.md)'s freshness policy exists to prevent. The next
+engineering milestone therefore has two steps in order:
+
+1. **Recover or define V-96 explicitly** — decide whether it was a planned slice that was
+   skipped (in which case define its scope and evidence) or a numbering artefact (in which
+   case record the gap the way V-44 and ADR-0041/0042 are recorded: named, not renumbered).
+2. **Then** implement and verify it.
+
+Standing candidates already named in this document, offered as input to that decision and
+not as its answer: the actor model beyond one local human (V-70), where positive Tier-1
+isolation evidence should live given that hosted runners cannot supply it, and the
+`linux-gates` timeout defect in §8.
+
+## 8. CI state: the tool-install problem is resolved, one test flake is not
+
+**`linux-gates` passes on `main` as of `c5934970`.** It did not, for a while, and the
+failure mode was misleading enough to be worth recording.
+
+### Resolved: the gate tools could not be installed in the budget
+
+Between `6224fa57` and `965a509` the lane was **cancelled** on three consecutive runs. It was
+not failing on the code: it reached `G9: tests` and was killed there having produced **zero**
+test results, which places the death in the cold workspace compile rather than in any test.
+A cancelled lane reports nothing about the code at all, and next to four green lanes it
+reads as though five things had been verified.
+
+The cause was our own reproducibility work. `a1c0b2e` pinned the four gate tools to exact
+versions, which is right, but installed them with `cargo install … --locked` — and that
+compiles each tool from source on a cold runner, before any project test can start, against a
+`timeout-minutes: 15` budget. Fixed in three steps: install from prebuilt upstream binaries via
+`taiki-e/install-action` pinned to a full commit SHA with `fallback: none` (`6bc2d44`); correct
+`cargo-nextest` to `0.9.146`, the ceiling of that action's manifest rather than the upstream
+release feed (`965a509`); raise the job timeout to 30 minutes as headroom, explicitly the
+second line rather than the fix.
+
+`Run the gates` is now green: **all selected gates passed**, nextest 1505/1505. The
+tool-install problem is resolved.
+
+### Open: an intermittent `v95_concurrency` failure under load
+
+Run `37916621851` at `c5934970` failed at G9 on
+`orxnud-task::v95_concurrency::recovery_racing_a_claim_leaves_exactly_one_owner`:
+
+```
+recovery was told the database was busy rather than what it settled:
+sqlite error: database is locked
+```
+
+**A later run of the identical commit is green.** `37919194011`, same SHA `c5934970`, all five
+jobs succeeded, all selected gates passed, and all 13 `v95_concurrency` tests passed
+individually — including the one above. So the lane is not deterministically broken, and
+whether a given push is red on G9 is currently a coin-flip.
+
+Reproduced locally only under artificial load: 0 failures in 25 runs unloaded, **9 in 30** with
+the box CPU-saturated. The observed error is `SQLITE_BUSY_SNAPSHOT` (extended code 5) at
+`BEGIN IMMEDIATE`, which is returned immediately by SQLite when a write transaction cannot
+upgrade its snapshot; a `busy_timeout` or busy handler does not absorb it.
+
+**No root cause is established and no fix exists.** The working hypothesis is a defect in the
+test's own `race()` fixture rather than in production code — it installs a busy handler and
+assumes that is sufficient — but that has not been proven, and an edit attempted on
+2026-10-08 was reverted because a controlled comparison showed it changed nothing (10/30 under
+load versus 9/30 for the unmodified binary). Recorded here as an open defect with its
+reproduced symptoms, not as a diagnosed cause. It is invisible locally on an idle machine,
+which is exactly the property that makes it worth writing down.
+
+### Everything else is green
+
+`windows-check` (MSVC), `windows-portability`, `portable-core` (wasm32) and
+`sandbox-integration` (Tier-1) pass. G12 is skipped for want of a release tag to compare
+against. Local: 1655/1655, and `CI=true ./scripts/ci-gates.sh` passes end to end in about 21
+seconds on a warm target directory.
 
 ---
 
@@ -176,9 +259,9 @@ Tier-1 evidence should live, since GitHub-hosted runners cannot supply it.
 
 | # | Document | What it is for |
 |---|----------|----------------|
-| **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, and **§9a: where the implementation actually stands.** |
-| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 86 entries: every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
-| **09** | [Architecture Decision Records](09-decisions.md) | 47 ADRs, ADR-0001…ADR-0049 (0041 and 0042 deliberately unused). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
+| **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, **§9a: where the implementation actually stands**, and **§10: the verifier-admission invariant (K.1)**. |
+| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 96 rows: every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
+| **09** | [Architecture Decision Records](09-decisions.md) | 51 ADRs, ADR-0001…ADR-0053 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, which is not a separate record). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
 | **06** | [Deployment & Platform Model](06-deployment-platform-model.md) | Profiles, the platform boundary, and **§2.3: the honest per-platform assessment.** |

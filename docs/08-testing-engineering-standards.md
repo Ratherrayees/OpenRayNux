@@ -1,7 +1,8 @@
 # 08 — Testing & Engineering Standards
 
-Status: **Draft v0.3** · Reconciled **2026-10-05** against `HEAD` (`1721761`) and CI run
-`37343986458`.
+Status: **Draft v0.5** · Reconciled **2026-10-09** against `HEAD` (`c5934970`). All five CI
+lanes green; one known intermittent failure under load in `v95_concurrency` — see
+[`README.md`](README.md) §8.
 
 **This document previously described a CI that does not exist.** Four items in its gate
 list had no gate behind them, and its platform-lane list named runners that are not
@@ -304,7 +305,8 @@ recorded as redundant rather than artificially isolated.
 ### Actually enforced — every item below is a real gate or a real workflow step
 
 Gates are `scripts/ci-gates.sh` G1–G12, run on every push and every PR, and re-runnable
-locally. Verified against run `37343986458`, all green.
+locally. Was verified against run `37343986458` (all green); see the pinned-inputs section
+below for the current CI state on `main`.
 
 | Gate | What it runs |
 |---|---|
@@ -323,7 +325,7 @@ locally. Verified against run `37343986458`, all green.
 
 Plus, in `.github/workflows/ci.yml`: `cargo doc --workspace --no-deps` with
 `RUSTDOCFLAGS: -D warnings`; a `windows-check` lane (`cargo check --workspace
---all-targets` on `windows-latest`, nightly); a `windows-portability` lane running the
+--all-targets` on `windows-2025`, on every push and PR as well as nightly); a `windows-portability` lane running the
 platform-neutral suites as tests; a `portable-core` wasm32 lane; a `sandbox-integration`
 lane; and a preflight step that prints the runner's measured sandbox capability.
 
@@ -343,8 +345,13 @@ Property tests **do** run (`proptest` in `orxnud-policy` and `orxnuctl`).
 | Cross-compile check for the portable core | **True** — gate G5 plus the `portable-core` job. |
 | `cfg(target_os)` gate | **True** — gate G3. Two blind spots, both now closed. **V-29:** it grepped for `cfg` rather than a platform *API*, so unguarded `std::os::unix` passed it and broke MSVC; G3 now detects `std::os::{unix,windows}` paths directly. **V-96:** it matched raw text, so a comment could switch it off and seven of nine `cfg` spellings -- every nested one -- were invisible; G3 now classifies source lexically and reads predicates at any depth. Self-tested against fixtures by gate G13. |
 
-**Non-blocking / scheduled — what is actually configured:** the AI evaluation track and
-the nightly `windows-check`. **Not configured:** full soak, performance comparison reports,
+**Non-blocking / scheduled — what is actually configured:** the AI evaluation track.
+`windows-check` is **not** nightly-only: it carries no `if:` condition and no path filter, so
+the workflow-level `pull_request:` trigger runs it on every PR as well as on the nightly cron.
+*(Corrected 2026-10-08; this document previously called it nightly-only, and being wrong in
+that direction is not harmless — it is why a real MSVC breakage, an integration test using
+`std::os::unix` with no `cfg`, sat undetected until a pull request ran the lane for the
+first time.)* **Not configured:** full soak, performance comparison reports,
 fuzz targets, macOS, Linux aarch64, and any release pipeline with signature.
 
 ---
@@ -488,12 +495,15 @@ Transitive additions are reviewed via `cargo deny`.
 
 ## 19. CI — what is configured
 
-Five jobs, all green on run `37343986458` (2026-10-05):
+Five jobs; all were green on run `37343986458` (2026-10-05). **Currently, on `main` at
+`c5934970`, all five pass** — run `37919194011`, "all selected gates passed", nextest
+1505/1505. One earlier run of the same commit (`37916621851`) failed at G9 on an intermittent
+`v95_concurrency` `SQLITE_BUSY_SNAPSHOT`; see [`README.md`](README.md) §8.
 
 | Job | Trigger | What it proves |
 |---|---|---|
 | `linux-gates` (G1–G11) | every push and PR | the twelve gates, over the host-applicable test scope |
-| `windows-check` | nightly | all 16 crates compile for MSVC, all targets |
+| `windows-check` | every push and PR, plus nightly | all 16 crates compile for MSVC, all targets |
 | `windows-portability` | every push and PR | the platform-neutral suites **run** on Windows, not merely compile |
 | `portable-core` | every push and PR | the portable core builds for `wasm32-unknown-unknown` |
 | `sandbox-integration` | every push and PR | measures whether a Tier-1 sandbox is possible here, and says so |
@@ -505,11 +515,94 @@ Caching is keyed on `Cargo.lock` and the toolchain. The scheduled lane is delibe
 off the hour (03:17 UTC), because scheduled runs cluster at `:00` and the queue is longer
 than the work.
 
+### The pinned CI inputs, and why every one of them
+
+Adopted 2026-10-08. This repository's claims are evidence claims, and evidence is only
+evidence if the thing that produced it can be identified afterwards. Four classes of input
+to a CI run were floating; all four are now pinned.
+
+| Input | Was | Now |
+|---|---|---|
+| `actions/checkout` | `@v4` | `@v7.0.1` — exact version at all five call sites |
+| `Swatinem/rust-cache` | `@v2` | `@v2.9.2` |
+| Linux runner | `ubuntu-latest` | `ubuntu-24.04` |
+| Windows runner | `windows-latest` | `windows-2025` |
+| `cargo-deny` | unpinned | `0.20.2` |
+| `cargo-audit` | unpinned | `0.22.2` |
+| `cargo-semver-checks` | unpinned | `0.51.0` |
+| `cargo-nextest` | unpinned | `0.9.146` (see the note below) |
+
+**A major tag is a moving pointer.** `rust-cache@v2` in particular does not reliably resolve
+to the newest 2.x, so two runs a week apart can execute different action code under one
+commit SHA.
+
+**`--locked` was doing less than it appeared to.** It pins the *dependency graph* of
+whichever release is installed; it does not pin *which* release gets installed. So
+`cargo install cargo-deny --locked` means today's CI and tomorrow's CI can run different
+cargo-deny under an unchanged commit. That drift was not hypothetical: two of the four tools
+whose latest release had moved past what the reference machine had installed were
+`cargo-semver-checks 0.50.0 → 0.51.0` and `cargo-nextest 0.9.146 → 0.9.148`, so an unpinned
+run would have silently upgraded the very gates producing the evidence. (The nextest drift is
+historical: the installed pin settled at 0.9.146 for the manifest reason given below.)
+
+**The pins are installed from prebuilt binaries, not compiled.** Pinning by
+`cargo install <tool> --version X --locked` compiles each tool from source on a cold hosted
+runner, before any project test can run. That made `linux-gates` unreliable in a specific
+and misleading way: the job declared `timeout-minutes: 15` and was killed inside G9 having
+produced **zero** test results, three runs in a row. A cancelled lane reports nothing at all
+about the code, and beside four green lanes it reads as though five things were verified.
+
+`taiki-e/install-action` fetches upstream release binaries instead, pinned to a full commit
+SHA (`f7e5d7c9…`, release 2.87.26) rather than a major tag, with `fallback: none` on every
+step so a source build is impossible rather than merely unlikely. The `linux-gates` timeout
+was raised to 30 minutes as headroom — explicitly the second line, not the fix.
+
+**`cargo-nextest` is pinned to 0.9.146, and that is not a typo.** The action installs from a
+manifest of known versions with recorded hashes, and *that manifest is the ceiling* — not
+the upstream release feed. Its `cargo-nextest` entries stop at 0.9.146, so requesting 0.9.148
+fails the step outright with "supported but version 0.9.148 for 'x86_64_linux' is not
+supported", even though the upstream gnu asset exists and downloads fine. The other three
+pins sit exactly on their ceilings (deny 0.20.2, audit 0.22.2, semver-checks 0.51.0), which
+is why they installed. The two releases in between contain no test-runner behaviour change:
+0.9.147 and 0.9.148 are stress-run exit-code corrections, a setup-script config error, and
+dependency bumps. `fallback: none` is what made this loud — without it the step would have
+quietly compiled 0.9.148 from source and reinstated the cost the prebuilt install removes.
+
+**The runner images are pinned for an evidentiary reason, not a hygienic one.** The
+`sandbox-integration` job exists to produce positive Tier-1 evidence, and that result is a
+measurement of a *particular image* — it refuses `--privileged` because that would weaken
+the identity-inside-the-sandbox claim. A floating label lets the image change underneath
+such a finding without anything recording that it changed. `ubuntu-latest` currently
+aliases 24.04 and GitHub publishes 26.04 as a selectable label already, so pinning names
+the image in the finding and upgrading becomes a deliberate commit.
+
+Every version above was checked to exist before being written, because a wrong action tag
+does not degrade gracefully — it fails the job. Each tool's MSRV (1.88 / 1.88 / 1.93 / 1.91)
+sits below the pinned toolchain's 1.98.1, and the two versions that moved were installed
+from source under that toolchain and the full gate set re-run with them actually present,
+rather than declared and assumed.
+
+> **The cost of pinning, and how it was paid.** `cargo install … --locked` builds each
+> tool from source on every run instead of resolving a cached binary, which consumed most of
+> the `linux-gates` budget: the job declared `timeout-minutes: 15`, and on `main` at
+> `6224fa57` it reached `G9: tests` and was killed there having produced **zero** test results.
+> Three runs in a row, all `cancelled` rather than `failure` — so the lane was not reporting a
+> defect, it was reporting nothing at all.
+>
+> **Paid, not deferred.** The tools now install from prebuilt upstream binaries via
+> `taiki-e/install-action`, SHA-pinned, `fallback: none`; and `timeout-minutes` is 30 as
+> headroom. Note that caching was considered and is the weaker option: `rust-cache` saves only
+> after a successful job, so a lane that repeatedly times out may never establish a useful
+> cache — it is not a dependable first-run solution. Prebuilt installs have no such dependency.
+>
+> Full account in [`README.md`](README.md) §8.
+
 ### The current baseline, precisely
 
-* **1419 tests, 1419 passed, 0 failed, 5 skipped** locally on a host that can create an
-  unprivileged user namespace.
-* The **5 skips** are `#[ignore]`d child-process entry points — re-exec targets for
+* **1655 tests, 1655 passed, 0 failed, 7 ignored** locally on a host that can create an
+    unprivileged user namespace. *(Was 1419/1419 with 5 skipped before the 2026-10-08
+    reconciliation: the suite grew by 236 tests and the ignored count by 2.)*
+* The **7 ignores** are `#[ignore]`d child-process entry points — re-exec targets for
   power-loss and failure injection, and the hostile sandbox helper. They are entry points,
   not tests.
 * **Leaky tests: 1 or 2, and the count is not stable.** nextest's leak detector samples

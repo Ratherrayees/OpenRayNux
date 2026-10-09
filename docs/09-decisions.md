@@ -1,7 +1,7 @@
 # 09 — Architecture Decision Records
 
-Status: **Draft v0.3** · Adopted 2026-09-30 · index and metadata reconciled
-**2026-10-06** against `HEAD` (`4ad1832`).
+Status: **Draft v0.4** · Adopted 2026-09-30 · index and metadata reconciled
+**2026-10-09** against `HEAD` (`c5934970`).
 
 Each ADR follows: Context · Problem · Options · Evidence · Decision · Why ·
 Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
@@ -9,11 +9,23 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**47 ADRs, numbered ADR-0001 … ADR-0049.** Two numbers in that range are
+**51 ADRs, numbered ADR-0001 … ADR-0053.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
 verification register for the same reason.
+
+**Added since 2026-10-06, previously missing from this header.** The four records below
+existed while the header still claimed 47 ADRs through ADR-0049:
+
+* **ADR-0050** — `INTERNAL_ERROR` means nothing the caller did could change the outcome
+  (closes V-89, with a later amendment for the sweep that closed V-90).
+* **ADR-0051** — an `Actor` is derived from the transport peer, never from the request
+  (closes V-91). This one also corrected [`03`](03-system-architecture.md) §9a, which had
+  described the actor as a principal assertion.
+* **ADR-0052** — two decisions the V-25 measurement had to make explicitly.
+* **ADR-0053** — an uncertain side effect is a durable state, not a delay before a retry
+  (closes V-92).
 
 **Reading the dates.** ADR-0001 … ADR-0030 were written on 2026-09-30 against
 `Draft v0.1` of the architecture, and their *reasoning* is a point-in-time record

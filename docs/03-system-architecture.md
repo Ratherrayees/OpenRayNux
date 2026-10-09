@@ -1,8 +1,9 @@
 # 03 — System Architecture
 
-Status: **Draft v0.4** · Decisions referenced as ADR-NNNN live in
-`09-decisions.md`. Reconciled **2026-10-05** against `HEAD`
-(`1721761`) and CI run `37343986458`.
+Status: **Draft v0.5** · Decisions referenced as ADR-NNNN live in
+`09-decisions.md`. Reconciled **2026-10-09** against `HEAD` (`c5934970`). All five CI lanes
+green; one known intermittent failure under load — recorded in
+[`README.md`](README.md) §8.
 
 **How to read this document now.** Sections 1–6 and 9 describe the architecture as
 *implemented*. Section 7 is the component inventory and has been corrected against the
@@ -761,9 +762,91 @@ integration boundary). No messaging integration. No local ASR or TTS runtime. No
 shell capability. No unrestricted filesystem capability — both filesystem capabilities
 address exactly one file inside a sandbox-controlled workspace, with no directory creation,
 no deletion, no copy and no permission change. No Windows Tier-1 sandbox backend. No actor
-runtime beyond the authority model implemented here: `Actor` is still a *principal
-assertion* over the local socket, not an authenticated identity (V-70), and no delegated
-actor can reach the dispatcher.
+runtime beyond the authority model implemented here: an `Actor` is now derived from the
+**transport peer** — the local socket's uid — and never from the request body
+(ADR-0051, V-91), but there is still no delegated actor that can reach the dispatcher
+(V-70).
+
+> **Corrected 2026-10-08.** This paragraph previously described `Actor` as "a *principal
+> assertion* over the local socket, not an authenticated identity". That was true when
+> written and was reversed by V-91 / ADR-0051, which derived the actor from the peer and
+> removed the request-supplied identity. The remainder of the sentence — no delegated
+> actor reaches the dispatcher — still stands. Leaving the stale clause would have
+> contradicted [`04-security-threat-model.md`](04-security-threat-model.md) and ADR-0051
+> itself.
+
+## 9b. The verifier-admission invariant (K.1)
+
+**Recorded here because it was frozen, and a frozen invariant that lives only in a commit
+message stops existing the moment someone reads the code instead of the history.**
+
+A capability verifier answers a question about *the world*. Before this invariant nothing
+constrained **which worlds it was entitled to speak about**, and the gap was a natural
+one-line mistake: a verifier written as "the target must not hold the old bytes" answers
+*absent* whenever it cannot confirm the write. `Verifier::verify` warned against `Verified`
+for a `Failed` execution and said nothing about `Refuted` against one.
+
+That asymmetry is load-bearing. `Refuted` is the only verification finding the effect
+ledger turns into `not-performed` — the one status `recover()` reads as *a repeat cannot
+duplicate anything*. A refutation is therefore a **retry permission**, and one issued from a
+frame where nothing ran to look at is a duplicate side effect with no human involved.
+
+The invariant, enforced centrally by `admit_verification` at the single production
+`verify(…)` call site, before the answer can reach an audit record, an `EffectStatus`, a
+`Certainty` or a task state:
+
+```
+ExecutionOutcome          VerificationOutcome      admitted?
+─────────────────────────────────────────────────────────────────────────────
+Succeeded                Verified                  yes
+Succeeded                Refuted                   yes
+Succeeded                Undetermined              yes
+Failed                   Undetermined              yes
+Unknown                  Undetermined              yes
+Failed                   Verified                  NO  → Undetermined
+Failed                   Refuted                   NO  → Undetermined
+Unknown                  Verified                  NO  → Undetermined
+Unknown                  Refuted                   NO  → Undetermined
+```
+
+All nine cells are named with **no wildcard**, so adding a variant to *either* enum breaks
+the build at that match. That is deliberate and was enforced by rustc during development: a
+first draft that grouped the answers was rejected for leaving cells uncovered.
+
+**Two corrections to how this is often described, both checked against the code:**
+
+* The row set is **three × three**. `Cancelled` and `Killed` are variants of
+  `ExecutionStatus`, not `ExecutionOutcome`, so they are not cells here — `Cancelled` maps
+  onto `Unknown` before admission. A table that lists `Cancelled` as a fourth
+  `ExecutionOutcome` describes a type this codebase does not have.
+* The enforced property is **execution standing**: `Verified` and `Refuted` are admissible
+  only against an execution that reported success; everything else degrades to
+  `Undetermined`, which withholds a decision and so cannot become a retry permission.
+
+**What it does not do — and this scope boundary is the part worth preserving.** The
+invariant constrains what a verifier is *permitted to claim*, not whether its claim is
+*true*. An admissible claim can still be wrong; that is a semantic error in a capability,
+caught by reviewing that capability. A claim in an inadmissible frame is now impossible. A
+wrong claim in an admissible frame is a different defect with a different detector. After
+admission a `Succeeded + Refuted` is trusted exactly as V-92 chose to trust it — including
+the journal/ledger asymmetry V-92 documented, which is carried forward unchanged and
+deliberately not fixed here.
+
+**Evidence, and why it is stronger than a test count.** A mutation flipping the single
+`Undetermined` arm for an unknown execution reproduced the whole chain against a real
+daemon with a real file on disk and **all 1647 tests green**: `not-performed`, task
+`pending`, a second worker claiming `attempt 2`. With the invariant the same scenario ends
+`unknown` → `NeedsVerification` → the second worker is refused. Mutation-checked in four
+states — fix 1656/0, fix + mutation 1656/0 (inert, which is the point), enforcement
+disabled 1649/**7 failed**, both disabled and mutated 1649/7 failed.
+
+**No migration and no prose matcher, by decision.** A genuine pre-start refusal and a
+post-start give-up were journaled identically and differ only in prose, so a text matcher
+would be the only available discriminator. The verifier half of the historical exposure is
+zero — no verifier in this repository's history ever had a `Refuted` arm reachable outside
+its `Succeeded` arm. A blanket downgrade of every disproved non-idempotent effect would
+manufacture a permanent queue of human adjudications for ordinary mistakes. The reasoning
+is recorded beside the recovery predicate in `crates/orxnud-store/src/task_repo.rs`.
 
 ## 10. Deliberate non-architectures
 
