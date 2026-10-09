@@ -2,7 +2,7 @@
 //!
 //! # There are no authorised invocations in this crate
 //!
-//! [`CapabilityInvocation`], [`AuthorisationProof`] and [`DispatchView`] used to
+//! `CapabilityInvocation`, `AuthorisationProof` and `DispatchView` used to
 //! live here, and this module documented a two-part enforcement story: private
 //! fields, plus gate G2's lexical scan to stop other crates naming the minting
 //! verbs. The second half is the part that was not true.
@@ -13,14 +13,14 @@
 //! for. A checker that cannot fail is worse than no checker, because it reports
 //! `ok` on the trees it exists to catch.
 //!
-//! So the types moved to [`orxnud-policy`], next to the constructors that mint
+//! So the types moved to `orxnud-policy`, next to the constructors that mint
 //! them, and those constructors are `pub(crate)`. Rust cannot say "callable by
 //! exactly one crate" about a `pub` item, which is the whole reason the seal was
 //! needed; it can say it about a `pub(crate)` one. The boundary is now decided
 //! by `rustc` rather than by a pattern match over source text.
 //!
 //! What is left here is deliberately untrusted: a caller must be able to
-//! describe the action it wants. [`CapabilityRequest`] and [`ActionRequest`]
+//! describe the action it wants. `CapabilityRequest` and [`ActionRequest`]
 //! carry no authority to forge, and neither can be promoted into something that
 //! does -- there is no `From`/`Into` from a request to an invocation.
 //!
@@ -148,7 +148,7 @@ impl InvocationContext {
 /// # What it deliberately does not carry
 ///
 /// No `assessed_risk`, no `policy_version`, no approval digest, no credential
-/// handle, no [`PolicySeal`], no [`AuthorisationProof`]. Those are *derived by trusted
+/// handle, no `PolicySeal`, no `AuthorisationProof`. Those are *derived by trusted
 /// deterministic code* during authorisation. A field here that a caller could set
 /// would be a field the caller could lie about.
 ///
@@ -170,7 +170,7 @@ impl InvocationContext {
 /// any plan exists. Converting one into the other is a step of the authorisation
 /// pipeline, not a field copy.
 ///
-/// [`orxnud_policy::CapabilityInvocation::authorise`] is not a method on this
+/// `orxnud_policy::CapabilityInvocation::authorise` is not a method on this
 /// type precisely because authorisation needs an actor, a policy evaluation and a
 /// proof, none of which exist at ingress.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

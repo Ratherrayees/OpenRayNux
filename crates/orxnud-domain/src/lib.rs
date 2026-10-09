@@ -14,7 +14,7 @@
 //!    [`Proposal`] is *inert data*. It has no method that reaches an adapter,
 //!    and a compile-fail test (`tests/compile_fail/proposal_is_inert.rs`)
 //!    proves that. Writing the unsafe path requires deliberately constructing an
-//!    authorised [`CapabilityInvocation`], which only `orxnud-policy` can do.
+//!    authorised `CapabilityInvocation`, which only `orxnud-policy` can do.
 //!
 //! 2. **Who is acting is a first-class value** (ADR-0027). [`Actor`] is carried
 //!    on every invocation and carries its own *delegation chain*, so authority

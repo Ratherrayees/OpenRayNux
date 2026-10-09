@@ -208,7 +208,7 @@ fn type_name(value: &Value) -> &'static str {
 
 /// The adapter: counts, in-process, deterministically.
 ///
-/// Receives only a [`DispatchView`], which carries no actor — so this cannot learn who
+/// Receives only a `DispatchView`, which carries no actor — so this cannot learn who
 /// asked, and a capability that could is a confused deputy (ADR-0027 S8).
 #[derive(Debug, Default)]
 pub struct WordCountAdapter;

@@ -17,7 +17,7 @@
 //!   refuses a write even if the helper were changed to attempt one. Confinement and
 //!   capability are stated in the same place.
 //! * **The output is ephemeral.** The bytes are the point of the call, and the bundle
-//!   declares [`AdapterBundle::output_is_ephemeral`](crate::dispatch::AdapterBundle) so the
+//!   declares `AdapterBundle::output_is_ephemeral` so the
 //!   daemon records metadata and
 //!   drops the content instead of copying file contents into `task_step_results`.
 //! * **The verifier re-reads and compares.** `write-text`'s verifier re-reads to confirm the

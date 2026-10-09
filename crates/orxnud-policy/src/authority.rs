@@ -44,12 +44,12 @@ use serde::Serialize;
 /// Proof that the policy layer evaluated and authorised an action.
 ///
 /// Fields are private, so this cannot be assembled from parts outside
-/// `orxnud-domain`. It is the value that makes [`CapabilityInvocation`]
+/// `orxnud-domain`. It is the value that makes `CapabilityInvocation`
 /// unforgeable, which is the mechanism behind "the LLM must never be the
 /// authority that grants itself permission".
 ///
-/// Obtain one from [`AuthorisationProof::issue`], which additionally requires a
-/// [`PolicySeal`].
+/// Obtain one from `AuthorisationProof::issue`, which additionally requires a
+/// `PolicySeal`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorisationProof {
     policy_version: String,
@@ -95,8 +95,8 @@ impl AuthorisationProof {
     }
 }
 
-/// Fields are private. The only constructor is [`Self::authorise`], which requires
-/// an [`AuthorisationProof`], and both are `pub(crate)` in this crate.
+/// Fields are private. The only constructor is `Self::authorise`, which requires
+/// an `AuthorisationProof`, and both are `pub(crate)` in this crate.
 ///
 /// A capability adapter never sees this type's `actor` field: the dispatcher
 /// strips it. That is deliberate — a capability that learns its caller becomes
@@ -105,8 +105,8 @@ impl AuthorisationProof {
 /// # This type is NOT `Deserialize`, and that is load-bearing
 ///
 /// A derived `Deserialize` is a *second, unrestricted constructor*. It writes the
-/// private fields without going through [`Self::authorise`], so it bypasses
-/// [`PolicySeal`], [`AuthorisationProof`], and policy evaluation entirely — which is
+/// private fields without going through `Self::authorise`, so it bypasses
+/// `PolicySeal`, `AuthorisationProof`, and policy evaluation entirely — which is
 /// exactly what the private fields were there to prevent.
 ///
 /// This was not theoretical. Before Phase 3, this type derived both `Serialize` and
@@ -125,7 +125,7 @@ impl AuthorisationProof {
 /// claim in ADR-0012 — "it is not *possible* to do this without going through policy" —
 /// was false for this type until the derive was removed.
 ///
-/// Inbound data uses [`CapabilityRequest`], which is a *request* and carries no
+/// Inbound data uses `CapabilityRequest`, which is a *request* and carries no
 /// authority to lose. See ADR-0034.
 ///
 /// `Serialize` remains, for audit records and for hashing: serialising an
@@ -150,7 +150,7 @@ impl CapabilityInvocation {
     /// # Safety of this boundary
     ///
     /// The safety here is *type-level*, not documentary: both this method and
-    /// [`AuthorisationProof::issue`] are `pub(crate)`, so the only code in the
+    /// `AuthorisationProof::issue` are `pub(crate)`, so the only code in the
     /// workspace that can call either is in this crate — and the only call sites are
     /// inside [`PolicyEngine::authorise`], after a policy evaluation has returned.
     /// A caller that has not evaluated policy cannot call this, and `rustc` is what

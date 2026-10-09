@@ -982,7 +982,7 @@ pub enum PlanError {
 
 /// What a Tier-1 adapter wants from its sandbox, in portable terms.
 ///
-/// Separate from [`CapabilityAdapter`] because only Tier-1 adapters have one, and
+/// Separate from `CapabilityAdapter` because only Tier-1 adapters have one, and
 /// requiring every Tier-0 adapter to answer "which program do you run?" would be a
 /// lie for an in-process implementation.
 #[derive(Debug, Clone, PartialEq)]
@@ -1014,7 +1014,7 @@ pub struct SandboxPlan {
 /// # Why this type exists
 ///
 /// It exists so that `Dispatcher::new` can stay `pub` while the things it stores are
-/// not. [`AdapterBundle`] is `pub(crate)` — the boundary that makes an adapter
+/// not. `AdapterBundle` is `pub(crate)` — the boundary that makes an adapter
 /// uncallable and unimplementable from another crate — so a `pub fn new(…,
 /// BTreeMap<CapabilityId, Arc<dyn AdapterBundle>>)` would leak a crate-private type
 /// into a public signature. This is a `pub` wrapper with a private field and
@@ -1137,7 +1137,7 @@ impl AdapterRegistry {
 
 /// Verification strategy, looked up alongside the adapter.
 ///
-/// Crate-private for the same reason as [`CapabilityAdapter`]: implementing it is
+/// Crate-private for the same reason as `CapabilityAdapter`: implementing it is
 /// supplying an adapter, and `sandbox_plan` is how a Tier-1 capability's parameters
 /// reach its child, so it is part of the execution surface rather than a description
 /// of one.
@@ -1975,9 +1975,9 @@ fn terminal_outcome(outcome: &DispatchOutcome) -> (orxnud_audit::OutcomeKind, Op
 
 /// How a dispatch that returned `Err` should be described in the journal.
 ///
-/// # Why this exists separately from [`terminal_outcome`]
+/// # Why this exists separately from `terminal_outcome`
 ///
-/// [`terminal_outcome`] describes a dispatch that *ran*: it has an execution and a
+/// `terminal_outcome` describes a dispatch that *ran*: it has an execution and a
 /// verification to weigh. This one describes a dispatch that returned an error, and
 /// the question it answers is different — **did the capability run?** That is not a
 /// detail. `OutcomeKind::Denied` asserts the action did not execute, and

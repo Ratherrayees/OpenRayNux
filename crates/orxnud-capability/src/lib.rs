@@ -13,11 +13,11 @@
 //!
 //! # The three pieces
 //!
-//! * [`CapabilityContract`] — what a capability declares about itself: its risk,
+//! * `CapabilityContract` — what a capability declares about itself: its risk,
 //!   data classes, whether it is idempotent, whether it is enabled.
 //! * [`CapabilityRegistry`] — the set of known capabilities. Lookup is by
 //!   [`CapabilityId`]; registration is explicit and there is no dynamic discovery.
-//! * [`Dispatcher`] — resolves an authorised [`CapabilityInvocation`] against the
+//! * [`Dispatcher`] — resolves an authorised `CapabilityInvocation` against the
 //!   registry and refuses if the capability is absent, disabled, or mismatched.
 //!
 //! # Why the dispatcher checks again
