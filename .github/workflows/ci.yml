@@ -120,7 +120,7 @@ jobs:
       #   cargo-deny          0.20.2   EmbarkStudios/cargo-deny        x86_64-unknown-linux-musl
       #   cargo-audit          0.22.2   rustsec/rustsec                 x86_64-unknown-linux-musl
       #   cargo-semver-checks 0.51.0   obi1kenobi/cargo-semver-checks  x86_64-unknown-linux-musl
-      #   cargo-nextest        0.9.148  nextest-rs/nextest              x86_64-unknown-linux-musl
+      #   cargo-nextest        0.9.146  nextest-rs/nextest              x86_64-unknown-linux-gnu
       #
       # The versions are identical to the ones previously compiled, so this changes where
       # the binary comes from and nothing about which version runs. Pinning that mattered is
@@ -163,10 +163,20 @@ jobs:
           tool: cargo-semver-checks@0.51.0
           fallback: none
 
-      - name: Install cargo-nextest (prebuilt 0.9.148)
+      # 0.9.146, not 0.9.148. The action's manifest is the ceiling, not the upstream
+      # release feed: it carries hashes for cargo-nextest only up to 0.9.146, so asking for
+      # 0.9.148 fails the step with "supported but version ... is not supported" even
+      # though the upstream gnu asset exists. Found by the CI run, not by reading.
+      #
+      # The two-release gap contains no test-runner behaviour change -- 0.9.147/0.9.148 are
+      # stress-run exit-code corrections, a setup-script config error, and dependency bumps.
+      # Nothing this repository's gates rely on changed, and 0.9.146 was verified to run the
+      # full gate set. If a future nextest release matters, it needs a manifest update
+      # upstream or a source install, and that is a deliberate decision rather than a bump.
+      - name: Install cargo-nextest (prebuilt 0.9.146)
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: cargo-nextest@0.9.148
+          tool: cargo-nextest@0.9.146
           fallback: none
 
       # The pins are enforced, not assumed. `ci-gates.sh` treats a *missing* tool as a hard
