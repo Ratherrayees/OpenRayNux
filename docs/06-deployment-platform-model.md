@@ -1,7 +1,8 @@
 # 06 — Deployment & Platform Model
 
-Status: **Draft v0.3** · Reconciled **2026-10-05** against `HEAD` (`1721761`) and CI run
-`37343986458`, where both Windows lanes and the Linux gates are green.
+Status: **Draft v0.4** · Reconciled **2026-10-09** against `HEAD` (`c5934970`). Both Windows
+lanes are green on `main`, as are the wasm32 and Tier-1 sandbox lanes. No platform finding is
+open; see [`README.md`](README.md) §8 for CI state.
 
 **The one thing to read first.** Windows is **not** "untested" and it is **not**
 "sandbox-supported". Both of those were wrong here. It is *portable and compiled, and its

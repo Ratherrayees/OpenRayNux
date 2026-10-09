@@ -1,6 +1,8 @@
 # 10 — Open Questions
 
-Status: **Draft v0.3** · Reconciled **2026-10-05** against `HEAD`.
+Status: **Draft v0.4** · Reconciled **2026-10-09** against `HEAD` (`c5934970`).
+  Entries carrying 2026-10-06 amendments were re-read on 2026-10-08; the body below is
+  otherwise unchanged, and no entry's status was altered by this reconciliation.
 
 **This file says it contains "only unresolved items", and it did not — it also held three
 resolved answers as full records.** That is a defensible format and it is kept, but the
