@@ -75,7 +75,13 @@ jobs:
   linux-gates:
     name: Linux gates (G1-G11)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Headroom, not the fix. The four gate tools now install from prebuilt binaries
+    # instead of compiling from source, which is what actually made 15 minutes
+    # unreliable; this budget is the second line so that ordinary suite growth does not
+    # recreate the same failure. Kept explicit rather than generous-by-accident, because a
+    # lane that is "cancelled" has produced zero test results and so reports nothing at all
+    # about the code -- a red lane that never ran the tests is worse than a slow one.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -92,24 +98,87 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2.9.2
 
-      # Every gate tool is pinned to an exact release, and `--locked` is necessary but
-      # not sufficient on its own: `--locked` pins the *dependency graph* of whichever
-      # release is installed, not *which* release gets installed. Left unpinned, the same
-      # commit runs a different cargo-deny today and tomorrow, which for this repository
-      # is the difference between auditable evidence and evidence that quietly changed
-      # underneath a frozen finding.
+      # Every gate tool is pinned to an exact release, and `--locked` was never sufficient
+      # on its own: `--locked` pins the *dependency graph* of whichever release is
+      # installed, not *which* release gets installed. Left unpinned, the same commit runs
+      # a different cargo-deny today and tomorrow, which for this repository is the
+      # difference between auditable evidence and evidence that quietly changed underneath
+      # a frozen finding.
       #
-      # Each pin was verified to build and run under the pinned toolchain (1.98.1) before
-      # being written here; every MSRV below is well under it.
+      # **Prebuilt, not `cargo install`.** The pins above were originally installed with
+      # `cargo install --version X --locked`, which compiles each tool from source. On a
+      # cold hosted runner that work is measured in minutes *per tool*, and it happens
+      # before any project test can run. The consequence was concrete: `linux-gates`
+      # declares `timeout-minutes: 30` and was still being killed inside G9 on three
+      # consecutive runs, dying with **zero** test results -- a lane that never reached the
+      # tests, not one that failed them.
       #
-      # To move a pin, change it here and re-run `./scripts/ci-gates.sh` locally. Do not
-      # widen a caret range -- the point is that a run is attributable to these versions.
-      - name: Install the gate tools
+      # `taiki-e/install-action` fetches the upstream release binaries instead. All four
+      # publish Linux musl artifacts, and each pinned artifact was confirmed to exist
+      # before this step was written:
+      #
+      #   cargo-deny          0.20.2   EmbarkStudios/cargo-deny        x86_64-unknown-linux-musl
+      #   cargo-audit          0.22.2   rustsec/rustsec                 x86_64-unknown-linux-musl
+      #   cargo-semver-checks 0.51.0   obi1kenobi/cargo-semver-checks  x86_64-unknown-linux-musl
+      #   cargo-nextest        0.9.148  nextest-rs/nextest              x86_64-unknown-linux-musl
+      #
+      # The versions are identical to the ones previously compiled, so this changes where
+      # the binary comes from and nothing about which version runs. Pinning that mattered is
+      # preserved; only the build cost is removed.
+      #
+      # **The action is pinned to a full commit SHA**, not to `@v2`. A major tag is a moving
+      # pointer -- the same objection that moved `rust-cache` off `@v2` -- and `v2` currently
+      # resolves to release 2.87.26. Recorded as a SHA so a future run is attributable to
+      # the action code that produced it.
+      #
+      # `fallback: none` on every step. The action's default is `cargo-binstall`, which for
+      # an unknown tool *compiles from source* -- precisely the cost this step exists to
+      # remove. All four tools are in the action's manifest, so the fallback is never needed;
+      # setting it to `none` makes that a guarantee rather than an assumption, and turns a
+      # future manifest regression into a hard step failure instead of a silently slow run.
+      #
+      # One step per tool rather than a comma-separated list, so each version is pinned
+      # individually and readable as such. The action does accept `tool: a,b` and per-tool
+      # `@version` suffixes, but a single comma-joined string makes it easy to move one
+      # version off its tool without noticing, and these four versions are the claim.
+      #
+      # To move a pin, change it here, confirm the artifact exists for the new version, and
+      # re-run `./scripts/ci-gates.sh` locally. Do not widen a caret range -- the point is
+      # that a run is attributable to these versions.
+      - name: Install cargo-deny (prebuilt 0.20.2)
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: Install cargo-audit (prebuilt 0.22.2)
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: Install cargo-semver-checks (prebuilt 0.51.0)
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-semver-checks@0.51.0
+          fallback: none
+
+      - name: Install cargo-nextest (prebuilt 0.9.148)
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.148
+          fallback: none
+
+      # The pins are enforced, not assumed. `ci-gates.sh` treats a *missing* tool as a hard
+      # failure under `CI=true`, so it cannot silently skip a gate; this asserts the
+      # *versions* too, which is the claim pinning exists to support. A tool that resolved to
+      # a different release fails here rather than letting the gates run under something else.
+      - name: Verify the gate tool versions
         run: |
-          cargo install cargo-deny --version 0.20.2 --locked
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo install cargo-semver-checks --version 0.51.0 --locked
-          cargo install cargo-nextest --version 0.9.148 --locked
+          cargo deny --version
+          cargo audit --version
+          cargo semver-checks --version
+          cargo nextest --version
 
       # What this runner can actually do, before anything is inferred from a red test.
       #
