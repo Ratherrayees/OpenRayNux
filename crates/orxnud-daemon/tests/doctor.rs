@@ -134,9 +134,28 @@ fn doctor_output_stays_line_separated() {
         .lines()
         .find(|l| l.starts_with("tier1_executable:"))
         .unwrap_or_else(|| panic!("no tier1 verdict line in:\n{out}"));
+    // Both verdict spellings must be accepted, because which one appears depends on the
+    // host and not on the code:
+    //
+    //   tier1_executable: yes
+    //   tier1_executable: no (Tier-1 capabilities are refused here; this is correct, not a fault)
+    //
+    // The negative form carries its reason *after* the verdict, in the shape `no (...)`.
+    //
+    // This assertion previously read `ends_with("yes") || contains("(no")`, and the
+    // negative form satisfies neither arm: it does not end in `yes`, and it contains
+    // `no (` rather than `(no`. So the test passed only where the host **can** create an
+    // unprivileged user namespace, and failed on every hosted Linux runner, where
+    // `tier1_executable` is legitimately `no`. It was never testing the line separation
+    // this function exists for -- on a CI runner it was asserting a host property.
+    let verdict_body = verdict
+        .trim_end()
+        .strip_prefix("tier1_executable:")
+        .expect("the line starts with the field name")
+        .trim();
     assert!(
-        verdict.trim_end().ends_with("yes") || verdict.contains("(no"),
-        "the verdict line must carry only the verdict: {verdict}"
+        verdict_body == "yes" || (verdict_body.starts_with("no (") && verdict_body.ends_with(')')),
+        "the verdict line must carry only the verdict, got {verdict_body:?} in: {verdict}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
