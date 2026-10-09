@@ -724,7 +724,7 @@ impl PolicyEngine {
     /// [`Self::authorise`] builds the invocation and drops it on the floor, because
     /// Phase 1 had no dispatcher to hand one to. The dispatcher cannot build one
     /// itself: `CapabilityInvocation::authorise` demands *this crate's*
-    /// [`PolicySeal`](orxnud_domain::PolicySeal), and gate G2 forbids any other crate
+    /// `PolicySeal`(orxnud_domain::PolicySeal), and gate G2 forbids any other crate
     /// from naming it. So the only way an invocation can reach the dispatcher is for
     /// policy to hand it out
     /// — which is exactly the shape the boundary is supposed to have.

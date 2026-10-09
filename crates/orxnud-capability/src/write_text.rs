@@ -220,7 +220,7 @@ pub fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
 /// # Why `invoke` refuses
 ///
 /// A Tier-1 adapter's `invoke` is never called: the dispatcher builds a contract from
-/// the bundle's [`AdapterBundle::sandbox_plan`] and hands that to the execution
+/// the bundle's `AdapterBundle::sandbox_plan` and hands that to the execution
 /// backend. So this body is unreachable in normal operation, and it refuses rather
 /// than writing anything for two reasons. If it wrote the file it would be a working
 /// in-process implementation of a Tier-1 capability, which is the exact bypass the

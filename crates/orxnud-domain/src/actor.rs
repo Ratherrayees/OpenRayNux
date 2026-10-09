@@ -100,7 +100,7 @@ impl ModelProvenance {
 
 /// Who is performing an action.
 ///
-/// Every [`crate::CapabilityInvocation`] carries one. The capability layer
+/// Every `orxnud_policy::CapabilityInvocation` carries one. The capability layer
 /// never sees it — authority is settled by policy *before* the invocation is
 /// dispatched — so a capability cannot learn its caller and become a confused
 /// deputy (ADR-0027, control S8).

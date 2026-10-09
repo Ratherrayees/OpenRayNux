@@ -11,7 +11,7 @@
 //!
 //! There is no capability invocation here, and no `Actor`. Phase 2 makes the
 //! deterministic task layer operational; the adapter that eventually performs work
-//! is Phase 4, and it will receive a [`CapabilityInvocation`](orxnud_domain::CapabilityInvocation),
+//! is Phase 4, and it will receive a `CapabilityInvocation`(orxnud_domain::CapabilityInvocation),
 //! which only `orxnud-policy` can construct. Putting one in the engine now would
 //! require either a policy call (a capability, and this crate may not enable one)
 //! or a bypass of the seal.

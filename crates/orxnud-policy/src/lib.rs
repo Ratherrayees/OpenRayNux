@@ -4,9 +4,9 @@
 //!
 //! docs-03 §1: policy is not a stage in a chain that a code path could route
 //! around. It is the *only* producer of
-//! [`AuthorisationProof`](orxnud_domain::AuthorisationProof), and that is the
+//! `AuthorisationProof`(orxnud_domain::AuthorisationProof), and that is the
 //! only way to obtain a
-//! [`CapabilityInvocation`](orxnud_domain::CapabilityInvocation) — whose fields
+//! `CapabilityInvocation`(orxnud_domain::CapabilityInvocation) — whose fields
 //! are private and which has no other public constructor. A compile-fail test
 //! (`orxnud-domain/tests/compile_fail/invocation_is_policy_sealed.rs`) proves
 //! the seal holds from outside that crate.
