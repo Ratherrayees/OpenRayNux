@@ -153,6 +153,12 @@ struct RecBundle {
 }
 
 impl AdapterBundle for RecBundle {
+    /// `false`: this is a test double whose `sandbox_plan` passes fixed
+    /// arguments, not user-supplied content. See V-67.
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         &self.adapter
     }
@@ -469,6 +475,12 @@ fn the_reentrancy_guard_is_not_left_set_after_a_panicking_adapter() {
     }
     struct PanicBundle;
     impl AdapterBundle for PanicBundle {
+        /// `false`: this is a test double whose `sandbox_plan` passes fixed
+        /// arguments, not user-supplied content. See V-67.
+        fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+            crate::dispatch::ArgvPayload::None
+        }
+
         fn adapter(&self) -> &dyn CapabilityAdapter {
             &Panicky
         }

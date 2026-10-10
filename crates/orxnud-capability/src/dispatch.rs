@@ -44,7 +44,7 @@
 //! says why the bounded alternative — permitting reentrancy under a depth limit — was
 //! not taken. There is no `Dispatcher::enter_guarded` method in this crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use orxnud_domain::Actor;
@@ -86,7 +86,12 @@ pub enum DispatchError {
     NoImplementation(CapabilityId),
 
     /// The implementation exists but is switched off.
-    Disabled(CapabilityId),
+    Disabled {
+        /// Which capability.
+        id: CapabilityId,
+        /// Why it is off.
+        reason: DisabledReason,
+    },
 
     /// The implementation's declared data class is below the invocation's.
     ///
@@ -171,7 +176,7 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "{capability} rejected the request: {detail}")
             }
             Self::NoImplementation(c) => write!(f, "{c} is declared but has no implementation"),
-            Self::Disabled(c) => write!(f, "{c} is disabled"),
+            Self::Disabled { id, reason } => write!(f, "{id} is disabled: {reason}"),
             Self::ClassEscalation {
                 id,
                 declared,
@@ -1133,6 +1138,35 @@ impl AdapterRegistry {
         }
         registry
     }
+
+    /// The registered bundles that place user-supplied content in `argv`, with the most
+    /// bytes each can put there.
+    ///
+    /// Composition state, so the disclosure surface can answer without constructing a
+    /// [`Dispatcher`] and borrowing the policy engine for the privilege.
+    #[must_use]
+    pub fn argv_payload_capabilities(&self) -> Vec<ArgvPayloadExposure> {
+        let mut out: Vec<ArgvPayloadExposure> = self
+            .bundles
+            .iter()
+            .filter_map(|(id, b)| {
+                let payload = b.argv_payload();
+                if !payload.exposes() {
+                    return None;
+                }
+                Some(ArgvPayloadExposure {
+                    id: id.clone(),
+                    payload,
+                    // Composition alone cannot answer this: it is a configuration
+                    // question, and reporting it here as permitted would be a claim the
+                    // registry cannot support.
+                    permitted: false,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        out
+    }
 }
 
 /// Verification strategy, looked up alongside the adapter.
@@ -1142,6 +1176,30 @@ impl AdapterRegistry {
 /// reach its child, so it is part of the execution surface rather than a description
 /// of one.
 pub(crate) trait AdapterBundle {
+    /// What this bundle's `sandbox_plan` places in a single `args` string.
+    ///
+    /// **No default.** A bundle that has not answered this cannot compile, which is
+    /// the point: the question has to be asked of every bundle rather than of the ones
+    /// whose author happened to think about it. An `ArgvPayload::None` default would
+    /// mean a new capability silently inherited "exposes nothing"; a
+    /// `Content` default would mean every bundle had to override to be usable. Neither
+    /// is a decision, so neither is offered.
+    ///
+    /// It matters because `args` reach the host process table: `bwrap` is spawned with
+    /// them, stays in the host PID namespace, and `/proc/<pid>/cmdline` is mode `0444`,
+    /// so anything in `args` is in the process table for the life of the execution.
+    /// **Whether another uid can read it is a property of the host's `/proc`
+    /// configuration, not of this code** — see V-67, where a cross-UID read was
+    /// *demonstrated* on the measured host with the default `hidepid=0`, and where
+    /// `hidepid>=1` is recorded as changing the answer.
+    ///
+    /// Answer [`ArgvPayload::Content`] only with a stated reason, and expect
+    /// [`Dispatcher::with_permitted_argv_payload`] to be needed before it can run. A
+    /// bundle that passes a workspace-relative path and no content answers
+    /// [`ArgvPayload::None`]; a bundle that passes user content — a file body, a
+    /// message, a recipient — answers [`ArgvPayload::Content`].
+    fn argv_payload(&self) -> ArgvPayload;
+
     /// The adapter.
     fn adapter(&self) -> &dyn CapabilityAdapter;
 
@@ -1209,6 +1267,120 @@ pub(crate) trait AdapterBundle {
     }
 }
 
+/// One registered bundle that puts user-supplied content in `argv`, and what is done
+/// about it.
+///
+/// The disclosure surface's unit. It carries the size as well as the decision, because a
+/// refusal without a magnitude is only half an answer to "how much of my data is in the
+/// process table".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgvPayloadExposure {
+    /// The capability.
+    pub id: CapabilityId,
+    /// The payload, including whether this implementation bounds it.
+    pub payload: ArgvPayload,
+    /// Whether an owner-approved exception currently permits it.
+    pub permitted: bool,
+}
+
+/// What a bundle places in a single `args` string.
+///
+/// Three states, not two, because "exposes nothing" and "exposes an amount this code
+/// cannot bound" are different facts and a two-state encoding has to lie about one of
+/// them. A boolean said only *whether*; `Option<usize>` said a number this
+/// implementation does not actually establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgvPayload {
+    /// No user-supplied content reaches `args`.
+    None,
+    /// User-supplied content reaches `args`.
+    Content {
+        /// The most bytes this implementation will place there, **if it bounds them
+        /// itself**.
+        ///
+        /// `None` is the honest answer for a caller-supplied payload: the bytes are
+        /// whatever the caller sent, and this code imposes no limit on them. It is not a
+        /// claim that no limit exists — the host kernel imposes one, at
+        /// `MAX_ARG_STRLEN` (`32 * PAGE_SIZE` minus the terminator), which is a
+        /// **host-dependent** kernel constant this crate cannot measure: it is portable
+        /// core, and reading the page size would mean a platform call. Reporting a fixed
+        /// number here would put a host-specific figure in a cross-platform disclosure
+        /// and call it a property of this implementation, which is exactly the kind of
+        /// claim this repository does not make.
+        implementation_bound: Option<usize>,
+    },
+}
+
+impl ArgvPayload {
+    /// Whether this bundle puts user-supplied content in `argv` at all.
+    #[must_use]
+    pub fn exposes(self) -> bool {
+        matches!(self, Self::Content { .. })
+    }
+
+    /// The bound this implementation places on a single `args` string, if any.
+    #[must_use]
+    pub fn implementation_bound(self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::Content {
+                implementation_bound,
+            } => implementation_bound,
+        }
+    }
+}
+
+/// Why an implementation is switched off.
+///
+/// A field rather than two variants of `DispatchError`, because the *class* of the
+/// refusal is what the recovery path and V-90's classification care about — `Denied`,
+/// `NotPerformed`, "the owner changes the configuration" — and that is the same for
+/// every cause. What differs is what the operator is told, and flattening that into
+/// `"capability-disabled"` is what made S-02's refusal unattributable: an operator
+/// seeing it could not tell a deliberate restriction from a capability someone forgot
+/// to register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisabledReason {
+    /// The operator switched it off.
+    Configured,
+    /// It places user-supplied content in `argv`, and the default posture refuses that
+    /// until the transport changes (S-17).
+    ///
+    /// Not a mitigation of the exposure. The refusal is what makes the exposure
+    /// unreachable by default; a payload in `argv` is still world-readable through
+    /// `/proc/<pid>/cmdline` for anything granted the owner-approved exception (V-67).
+    ArgvPayload,
+}
+
+impl DisabledReason {
+    /// The stable identifier for logs, tests and the status surface.
+    ///
+    /// Distinct codes, because the recovery differs: `configured` needs an operator to
+    /// change a switch, and `argv_payload_exposure_refused` needs the transport to
+    /// change. Reporting both as `"capability_disabled"` would leave an operator with a
+    /// refusal and no way to tell which one they are looking at.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Configured => "capability_disabled",
+            Self::ArgvPayload => "argv_payload_exposure_refused",
+        }
+    }
+}
+
+impl std::fmt::Display for DisabledReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Configured => "switched off by configuration",
+            Self::ArgvPayload => {
+                "places user-supplied content in argv, which the default posture refuses \
+                 until S-17 changes the transport (V-67); this is a refusal, not a \
+                 mitigation of the exposure"
+            }
+        })
+    }
+}
+
 /// Why a dispatch was refused, in one enum so callers match once.
 #[derive(Debug)]
 pub enum Refusal {
@@ -1217,7 +1389,12 @@ pub enum Refusal {
     /// No implementation.
     NoImplementation(CapabilityId),
     /// Switched off.
-    Disabled(CapabilityId),
+    Disabled {
+        /// Which capability.
+        id: CapabilityId,
+        /// Why it is off.
+        reason: DisabledReason,
+    },
     /// Data class too high for the implementation.
     ClassEscalation {
         /// Which capability.
@@ -1242,7 +1419,7 @@ impl Refusal {
         match self {
             Self::Policy(_) => "policy_refused",
             Self::NoImplementation(_) => "no_implementation",
-            Self::Disabled(_) => "capability_disabled",
+            Self::Disabled { reason, .. } => reason.code(),
             Self::ClassEscalation { .. } => "class_escalation",
             Self::Credential(_) => "credential_unavailable",
             Self::Reentrant(_) => "reentrant_dispatch",
@@ -1320,6 +1497,14 @@ pub struct Dispatcher<'p, S: SecretsContract> {
     /// **refused**. That is the fail-closed default: a missing sandbox must not become
     /// an in-process call, and must not become an unsandboxed subprocess (V-49, V-50).
     execution: Option<Arc<dyn ExecutionBackend>>,
+    /// Capabilities an owner has explicitly permitted to carry user-supplied content
+    /// in `argv`.
+    ///
+    /// **Empty is the safe default**, so a dispatcher that was never told about the
+    /// exposure refuses every bundle that declares it. This is not a denylist of the
+    /// one capability known today: it is an allowlist, so a bundle added later is
+    /// refused until someone decides otherwise on purpose.
+    permitted_argv_payload: BTreeSet<CapabilityId>,
 }
 
 impl<'p, S: SecretsContract> Dispatcher<'p, S> {
@@ -1335,7 +1520,52 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             bundles: registry.into_bundles(),
             reentrancy: ReentrancyGuard::default(),
             execution: None,
+            permitted_argv_payload: BTreeSet::new(),
         }
+    }
+
+    /// Permits the listed capabilities to carry user-supplied content in `argv`.
+    ///
+    /// The owner-approved exception named by the remediation plan's R-1. It is an
+    /// allowlist entry, not a general bypass: a capability not named here is still
+    /// refused at stage 5, and the refusal is still [`DispatchError::Disabled`].
+    ///
+    /// Prefer granting nothing. Each permitted id widens the window in which an
+    /// unprivileged local process on the same host can read user content.
+    #[must_use]
+    pub fn with_permitted_argv_payload<I>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = CapabilityId>,
+    {
+        self.permitted_argv_payload.extend(ids);
+        self
+    }
+
+    /// The capabilities registered here that would place user-supplied content in
+    /// `argv`, and which of them are permitted.
+    ///
+    /// For the disclosure surface: an operator must be able to learn which capabilities
+    /// expose payloads and whether the current configuration permits them, without
+    /// reading source.
+    #[must_use]
+    pub fn argv_payload_exposure(&self) -> Vec<ArgvPayloadExposure> {
+        let mut out: Vec<ArgvPayloadExposure> = self
+            .bundles
+            .iter()
+            .filter_map(|(id, b)| {
+                let payload = b.argv_payload();
+                if !payload.exposes() {
+                    return None;
+                }
+                Some(ArgvPayloadExposure {
+                    id: id.clone(),
+                    payload,
+                    permitted: self.permitted_argv_payload.contains(id),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        out
     }
 
     /// Installs the execution backend that Tier-1 capabilities will use.
@@ -1600,6 +1830,19 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             .get(&capability)
             .cloned()
             .ok_or_else(|| DispatchError::NoImplementation(capability.clone()))?;
+        // The argv-payload gate, first thing in this stage and therefore before
+        // credential resolution (stage 6) and before any process exists (stage 7).
+        //
+        // `Disabled` rather than a new variant: it is already classified as
+        // `NotPerformed` and `Denied` everywhere it is consumed, its recovery is
+        // "the owner changes the configuration", and a new variant would reopen the
+        // exhaustive error classification that V-90 closed on purpose.
+        if bundle.argv_payload().exposes() && !self.permitted_argv_payload.contains(&capability) {
+            return Err(DispatchError::Disabled {
+                id: capability,
+                reason: DisabledReason::ArgvPayload,
+            });
+        }
         let adapter = bundle.adapter();
         let declared = adapter.declared_class();
         let actual = invocation.data_class();
@@ -2011,7 +2254,10 @@ pub fn terminal_outcome_for_failure(
             OutcomeKind::Denied,
             Some(format!("no implementation is registered for {c}")),
         ),
-        DispatchError::Disabled(c) => (OutcomeKind::Denied, Some(format!("{c} is disabled"))),
+        DispatchError::Disabled { id, reason } => (
+            OutcomeKind::Denied,
+            Some(format!("{id} is disabled: {reason}")),
+        ),
         DispatchError::ClassEscalation { .. } => (
             OutcomeKind::Denied,
             Some("the data class exceeds what the implementation declares".to_owned()),

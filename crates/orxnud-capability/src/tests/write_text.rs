@@ -94,6 +94,20 @@ fn invocation(params: &serde_json::Value) -> orxnud_policy::authority::Capabilit
 }
 
 /// A fixed instant, so expiry is a fact about the inputs rather than about the clock.
+// The suite grants R-1's owner-approved exception, on purpose.
+//
+// `WriteTextBundle::argv_payload()` is `true` — it really does put `--contents` in
+// `argv` (V-67) — so under the shipped default this suite's capability would be
+// refused before it reached the sandbox, and every test here would be asserting a
+// refusal it did not come to test. Granting it here keeps these tests measuring the
+// capability, and keeps `governed_path`'s argv-payload tests measuring the gate.
+//
+// This is an exception, not a fix. The underlying exposure is unchanged and remains
+// open; see `docs/18-remediation-plan.md` S-17.
+fn permitted() -> [CapabilityId; 1] {
+    [CapabilityId::new("filesystem/write-text")]
+}
+
 const NOW: i64 = 1_767_225_600_000;
 
 fn cap() -> CapabilityId {
@@ -223,6 +237,7 @@ impl Fixture {
     ) -> Result<DispatchOutcome, crate::dispatch::DispatchError> {
         let secrets = FakeSecrets::new();
         let mut d = Dispatcher::new(engine, &secrets, self.bundles())
+            .with_permitted_argv_payload(permitted())
             .with_execution(Arc::new(crate::subprocess::SandboxExecutionBackend::new()));
         d.dispatch(
             request(path, contents),
@@ -510,6 +525,7 @@ fn object_key_order_does_not_change_what_an_approval_authorises() {
     let secrets = FakeSecrets::new();
     let mut engine = policy();
     let mut d = Dispatcher::new(&mut engine, &secrets, fixture.bundles())
+        .with_permitted_argv_payload(permitted())
         .with_execution(Arc::new(crate::subprocess::SandboxExecutionBackend::new()));
     let reversed: ActionRequest = ActionRequest::new(
         TaskId::new("t-1"),
@@ -987,8 +1003,9 @@ fn a_give_up_after_the_capability_started_is_not_recorded_as_a_disproof() {
         }));
     let secrets = FakeSecrets::new();
     let mut engine = policy();
-    let mut d =
-        Dispatcher::new(&mut engine, &secrets, fixture.bundles()).with_execution(Arc::new(backend));
+    let mut d = Dispatcher::new(&mut engine, &secrets, fixture.bundles())
+        .with_permitted_argv_payload(permitted())
+        .with_execution(Arc::new(backend));
 
     let err = d
         .dispatch(
@@ -1080,8 +1097,9 @@ fn a_refusal_before_anything_starts_is_a_denial_and_leaves_no_effect() {
     ));
     let secrets = FakeSecrets::new();
     let mut engine = policy();
-    let mut d =
-        Dispatcher::new(&mut engine, &secrets, fixture.bundles()).with_execution(Arc::new(backend));
+    let mut d = Dispatcher::new(&mut engine, &secrets, fixture.bundles())
+        .with_permitted_argv_payload(permitted())
+        .with_execution(Arc::new(backend));
 
     // `can_fulfil` is false on a host with no sandbox, so the refusal is decided before
     // the runner is even asked — the other pre-execution route to the same verdict.

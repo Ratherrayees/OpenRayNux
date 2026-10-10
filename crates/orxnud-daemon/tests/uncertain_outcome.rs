@@ -101,6 +101,17 @@ impl Daemon {
         if let Some(f) = fault {
             cmd.env("ORXNUD_FAULT", f);
         }
+        // R-1's exception, granted to the daemon this harness spawns.
+        //
+        // There is no configuration key and no environment variable for this -- see `Daemon`
+        // in `lib.rs` -- so the route is a flag that exists only in a debug build. A shipped
+        // release binary has no way to permit an argv payload at all. These suites measure the
+        // governed path (approval, single use, expiry, settlement, audit across restart) and
+        // need a capability that actually executes; this is how they get one.
+        //
+        // It does NOT satisfy R-1 option 2 (owner, bounded period, review date). See the open
+        // owner decision in `docs/18` section 12.
+        cmd.arg("--permit-argv-payload-exposure-for-tests");
         let child = cmd.spawn().expect("spawn orxnud");
         let me = Self { child, ep };
         me.await_ready();

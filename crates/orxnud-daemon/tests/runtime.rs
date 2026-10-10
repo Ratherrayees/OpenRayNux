@@ -888,3 +888,99 @@ fn the_endpoint_is_removed_when_the_runtime_finishes_serving() {
         let _ = std::fs::remove_dir_all(&d);
     });
 }
+
+/// `daemon/status` names the exposure, the capability, the magnitude, and the refusal.
+///
+/// A disclosure that lists a capability without saying how much of the user's data it
+/// can put in the process table answers an easier question than the one an operator is
+/// asking.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn daemon_status_discloses_the_exposure_with_its_size_and_its_refusal() {
+    rt().block_on(async {
+        with_runtime("argv-status", |endpoint| async move {
+            let reply = call_raw(&endpoint, status_request().as_bytes()).expect("a status reply");
+            let field = &reply["result"]["argv_payload_exposure"];
+            assert!(
+                !field.is_null(),
+                "a daemon whose shipped write-text bundle is registered must disclose \
+                 the exposure; got {reply}"
+            );
+            let refused: Vec<&str> = field["refused"]
+                .as_array()
+                .expect("refused list")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                refused.contains(&"filesystem/write-text"),
+                "the refused list must name the capability; got {field}"
+            );
+            let exposed = field["exposed"].as_array().expect("exposed list");
+            let entry = exposed
+                .iter()
+                .find(|e| e["capability"].as_str() == Some("filesystem/write-text"))
+                .unwrap_or_else(|| {
+                    panic!("write-text must appear in the exposed list; got {exposed:?}")
+                });
+
+            // **No fabricated magnitude.** The payload is caller-supplied and this
+            // implementation bounds it not at all, so the bound is `null`. A number here
+            // would be the host kernel's `MAX_ARG_STRLEN` (`32 * PAGE_SIZE`) -- 131072 on
+            // a 4 KiB page, 2097152 on a 64 KiB one. That is a host constant, not a
+            // property of this code, and not one portable core can read.
+            assert!(
+                entry["implementation_bound_bytes"].is_null(),
+                "the disclosure must not state a byte bound the implementation does not \
+                 enforce; got {entry}"
+            );
+
+            // The exposure class must be stated as host-dependent, not universal. A
+            // cross-UID read was demonstrated on the measured audit host with the
+            // default `hidepid=0`; `hidepid>=1` changes the answer, so a claim that
+            // omitted the condition would overstate what was actually measured.
+            let exposure_text = field["exposure"].as_str().expect("exposure text");
+            assert!(
+                exposure_text.contains("hidepid"),
+                "the exposure must state that cross-UID readability depends on the host's \
+                 /proc configuration; got {exposure_text:?}"
+            );
+            assert!(
+                exposure_text.contains("not of this program")
+                    || exposure_text.contains("not a claim"),
+                "the exposure must not read as a claim about every Linux host; got \
+                 {exposure_text:?}"
+            );
+
+            assert!(
+                field["exposure"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("cmdline")),
+                "the exposure class must be named; got {field}"
+            );
+            assert!(
+                field["status"].as_str().is_some_and(|s| s.contains("OPEN")),
+                "the disclosure must say the exposure is still open, so the refusal is \
+                 not mistaken for a fix; got {field}"
+            );
+        })
+        .await
+    });
+}
+
+fn status_request() -> String {
+    String::from_utf8(
+        Request::new(
+            RequestId::Text("s".to_owned()),
+            Method::DaemonStatus.as_str(),
+        )
+        .encode()
+        .expect("encode"),
+    )
+    .expect("a utf-8 frame")
+}

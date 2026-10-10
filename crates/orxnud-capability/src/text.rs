@@ -399,6 +399,13 @@ pub struct WordCountBundle {
 }
 
 impl AdapterBundle for WordCountBundle {
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        // `None`, because this bundle is Tier 0: it runs in-process and has no
+        // `sandbox_plan` at all, so there is no `args` vector and no host process
+        // table entry for anything to appear in.
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         &self.adapter
     }

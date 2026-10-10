@@ -120,10 +120,11 @@ struct Serving {
 
 impl Serving {
     async fn start_with(root: PathBuf, provider: Arc<dyn ProposalProvider>) -> Self {
-        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
-            .await
-            .expect("the runtime must start")
-            .with_proposer(provider);
+        let runtime =
+            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
+                .await
+                .expect("the runtime must start")
+                .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

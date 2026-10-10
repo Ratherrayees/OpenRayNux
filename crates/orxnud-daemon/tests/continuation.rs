@@ -115,10 +115,11 @@ impl Serving {
         root: PathBuf,
         provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
     ) -> Self {
-        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
-            .await
-            .expect("the runtime must start")
-            .with_proposer(provider);
+        let runtime =
+            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
+                .await
+                .expect("the runtime must start")
+                .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -860,7 +861,7 @@ fn prior_step_context_carries_status_and_names_but_never_content() {
 fn continuation_without_a_provider_is_refused_before_the_boundary_is_crossed() {
     rt().block_on(async {
         let d = dir("noprovider");
-        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+        let runtime = Runtime::start_permitting_argv_payload_exposure(Paths::under(&d), NoSecrets)
             .await
             .expect("start");
         let endpoint = runtime.endpoint().to_path_buf();

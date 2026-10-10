@@ -266,6 +266,15 @@ impl ReadTextBundle {
 }
 
 impl crate::dispatch::AdapterBundle for ReadTextBundle {
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        // `None`, and this is the whole argument: `sandbox_plan` passes `--path`, a
+        // workspace-relative name the caller already chose, and never the file's
+        // contents. The *result* travels back over the result channel, not in `args`.
+        // Were it to pass content this would have to become `Some(..)`, and the bytes
+        // would have to be stated.
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn crate::dispatch::CapabilityAdapter {
         &ReadTextAdapter
     }

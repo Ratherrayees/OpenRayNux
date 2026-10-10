@@ -198,6 +198,12 @@ struct Bundle {
 }
 
 impl AdapterBundle for Bundle {
+    /// `false`: this is a test double whose `sandbox_plan` passes fixed
+    /// arguments, not user-supplied content. See V-67.
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         &self.adapter
     }

@@ -115,10 +115,11 @@ impl Serving {
         // that is about configuration. `continue_task` checks the provider before it checks
         // whether there is a boundary to cross, so without one every continuation assertion
         // would be testing the wrong refusal.
-        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
-            .await
-            .expect("the runtime must start")
-            .with_proposer(orxnud_daemon::runtime::scripted_proposer());
+        let runtime =
+            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
+                .await
+                .expect("the runtime must start")
+                .with_proposer(orxnud_daemon::runtime::scripted_proposer());
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

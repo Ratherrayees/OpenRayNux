@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use orxnud_capability::dispatch::Dispatcher;
-use orxnud_domain::ids::TaskId;
+use orxnud_domain::ids::{CapabilityId, TaskId};
 use orxnud_domain::platform::SecretsContract;
 use orxnud_domain::task_state::{TaskKind, TaskState};
 use orxnud_platform_ipc::{IpcError, LocalStream, endpoint_for};
@@ -584,13 +584,52 @@ impl<S: SecretsContract> Runtime<S> {
         Self::build(paths, secrets, Some(proposer)).await
     }
 
+    /// Starts a runtime that **grants** the argv-payload exception for this process.
+    ///
+    /// The only way left to grant it. There is deliberately no configuration key and no
+    /// environment variable (see the note on `Daemon` in `lib.rs`), because R-1's
+    /// exception requires an owner decision with a bounded period, a named host model
+    /// and a review date, and a configuration value carries none of those while being
+    /// settable by anything running as the user.
+    ///
+    /// What this trades away, stated plainly: a code-level grant is reachable by an
+    /// embedder of this crate and by any test. That is the accepted cost of keeping the
+    /// governed-path suites real, and it is visible -- this name is greppable, the call
+    /// lands in review, and `no_configuration_key_or_environment_variable_can_permit_an_
+    /// argv_payload` in `lib.rs` fails if anyone adds the ambient route back.
+    ///
+    /// **Delete this when S-17 lands.** Until then it is a test affordance wearing a
+    /// production signature, and it should not outlive the reason it exists.
+    pub async fn start_permitting_argv_payload_exposure(
+        paths: Paths,
+        secrets: S,
+    ) -> Result<Self, RuntimeError> {
+        let daemon = Daemon::compose(paths.clone()).with_argv_payload_exception_for_this_process();
+        Self::finish(paths, secrets, daemon, None).await
+    }
+
     async fn build(
         paths: Paths,
         secrets: S,
         proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
     ) -> Result<Self, RuntimeError> {
+        Self::finish(paths.clone(), secrets, Daemon::compose(paths), proposer).await
+    }
+
+    /// Everything after the daemon is composed.
+    ///
+    /// Split out so [`Self::build`] and
+    /// [`Self::start_permitting_argv_payload_exposure`] share one sequence. They differ
+    /// only in how the daemon was composed, and the steps after that must not be able
+    /// to drift apart, because the order is load-bearing: security state, then the task
+    /// subsystem, then `start`, and only then is anything reachable.
+    async fn finish(
+        paths: Paths,
+        secrets: S,
+        mut daemon: Daemon,
+        proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
+    ) -> Result<Self, RuntimeError> {
         // 1 + 2 + 3. Durable security state, verified, attached.
-        let mut daemon = Daemon::compose(paths.clone());
         daemon
             .attach_durable_security_state(&paths.database)
             .map_err(|e| RuntimeError::SecurityState(e.to_string()))?;
@@ -626,6 +665,28 @@ impl<S: SecretsContract> Runtime<S> {
             proposer,
             installation,
         })
+    }
+
+    /// The argv exposure to disclose at startup, if this build has any.
+    ///
+    /// For the banner. Reads the same composed state `daemon/status` reads, so the two
+    /// cannot report different capabilities for the same daemon -- if they could, an
+    /// operator would have two answers and no way to choose between them.
+    ///
+    /// `None` means nothing is exposed, and the caller prints nothing rather than
+    /// printing a reassuring line that would read the same on an exposed build.
+    #[must_use]
+    pub fn argv_payload_disclosure(&self) -> Option<ArgvPayloadDisclosure> {
+        // `try_lock` rather than `lock`: this runs before the serve loop starts, on a
+        // runtime nothing else holds yet, and a startup banner must not be able to
+        // deadlock behind an in-flight request. If something did hold it, the
+        // composition is already fixed and re-reporting it is what the banner is for, so
+        // reading it later would be wrong too -- declining to report is the honest
+        // answer, and `daemon/status` still serves the same fact to a client that asks.
+        let Ok(governed) = self.governed.try_lock() else {
+            return None;
+        };
+        argv_payload_disclosure(&governed)
     }
 
     /// Returns this runtime with `proposer` as the proposer it asks.
@@ -952,6 +1013,166 @@ fn extract_id(bytes: &[u8]) -> Option<RequestId> {
 /// that reaches an adapter, and no path that constructs a
 /// `CapabilityInvocation` — that type is not nameable from this module without
 /// policy's seal, which is the point.
+/// The `argv_payload_exposure` block on `daemon/status`.
+///
+/// Returns `None` when no registered bundle exposes a payload, and the field is then
+/// omitted entirely. **Absence is the signal**: a constant string would be present on
+/// every build and would tell an operator nothing, and this is the field a reader
+/// The argv exposure an operator is told about, on `daemon/status` and the banner.
+///
+/// One type for both surfaces, so they cannot drift: a banner that named a different
+/// capability than `daemon/status`, or that described the exposure differently, would be
+/// two answers to "is this build exposed?" and an operator would have to know which one
+/// to believe.
+///
+/// Serialises with `exposed` / `permitted` / `refused`, and the caller inserts the whole
+/// object under `argv_payload_exposure` **only when this exists at all**.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArgvPayloadDisclosure {
+    /// The exposure class, in the words the reader needs: what is readable, by whom, and
+    /// for how long. Named here rather than as a bare string at the call site so that
+    /// `daemon/status` and the banner say the same thing by construction.
+    pub exposure: &'static str,
+    /// Every registered bundle that puts user content in `argv`, with the most bytes
+    /// each can place in a single argument string.
+    ///
+    /// A number per capability, not a boolean: "this build is exposed" and "up to
+    /// 128 KiB of a user's file is in the process table" are different facts, and an
+    /// operator deciding whether to accept the owner-approved exception needs the
+    /// second one.
+    pub exposed: Vec<ArgvExposureEntry>,
+    /// Of those, the ones an owner-approved exception currently permits.
+    pub permitted: Vec<String>,
+    /// Of those, the ones the default posture refuses.
+    pub refused: Vec<String>,
+    /// How the operator changes the decision.
+    pub control: &'static str,
+    /// That the refusal is not a fix.
+    pub status: &'static str,
+}
+
+/// One exposed capability, and what is known about the size of what it can leak.
+///
+/// The size is `null` whenever the implementation does not bound the payload itself,
+/// which is the case for every caller-supplied payload. That is the honest answer: the
+/// bytes are whatever the caller sent, and reporting a number here would state a host
+/// kernel constant (`MAX_ARG_STRLEN`, which is `32 * PAGE_SIZE` and therefore differs
+/// between a 4 KiB and a 64 KiB page) as though it were a property of this code.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ArgvExposureEntry {
+    /// Which capability.
+    pub capability: String,
+    /// The bytes this implementation will place there, **if it bounds them itself**.
+    /// `null` means it does not.
+    pub implementation_bound_bytes: Option<usize>,
+}
+
+/// What the operator is told when they have not asked for anything.
+///
+/// `None` when no registered bundle exposes a payload, and the caller must then leave the
+/// field **absent** rather than `null`: absence is the signal, and a constant string (or a
+/// constant `null`) would be a field that always reads the same and therefore says
+/// nothing about whether it applies here.
+fn argv_payload_disclosure<S: SecretsContract>(
+    governed: &(Daemon, S, TaskService),
+) -> Option<ArgvPayloadDisclosure> {
+    // The dispatcher's own permit set, not a configuration lookup: there is no
+    // configuration route any more, so the two cannot disagree.
+    let exposure = governed
+        .0
+        .components()
+        .dispatch
+        .argv_payload_exposure(&governed.0.components().permitted_argv_payload);
+    if exposure.is_empty() {
+        return None;
+    }
+    let name = |id: &CapabilityId| id.to_string();
+    let sized = |e: &orxnud_capability::dispatch::ArgvPayloadExposure| ArgvExposureEntry {
+        capability: e.id.to_string(),
+        implementation_bound_bytes: e.payload.implementation_bound(),
+    };
+    Some(ArgvPayloadDisclosure {
+        exposed: exposure.iter().map(sized).collect(),
+        exposure: "argv reaches the host process table, and /proc/<pid>/cmdline is \
+                   mode 0444 for the life of the execution. Whether another uid can \
+                   READ it is a property of this host's /proc, not of this program: \
+                   cross-UID readability was DEMONSTRATED on the measured audit host \
+                   with the default hidepid=0, and hidepid>=1 or a hardened kernel \
+                   changes the answer. Do not read this field as a claim about every \
+                   Linux host (V-67).",
+        permitted: exposure
+            .iter()
+            .filter(|e| e.permitted)
+            .map(|e| name(&e.id))
+            .collect(),
+        refused: exposure
+            .iter()
+            .filter(|e| !e.permitted)
+            .map(|e| name(&e.id))
+            .collect(),
+        control: "none a user can reach. No configuration key and no environment \
+                  variable can permit this, and a release build has no flag that does \
+                  either; the capability is refused until S-17 changes the transport. \
+                  That is the plan's refusal posture, not a degradation, and not a fix",
+        status: "OPEN -- the argv transport itself is unfixed until S-17. Refusing by \
+                 default limits reachability; it does not remove the exposure for any \
+                 execution that is permitted to run.",
+    })
+}
+
+/// Adds the disclosure to `status` only when there is one.
+///
+/// Separate from the disclosure itself so the absent case is testable: "the field is
+/// missing" is a property of the JSON, and asserting it needs a daemon with nothing
+/// exposed, which no shipped build is. This is the function production calls, so a test
+/// on it is a test of the shipped behaviour rather than of a copy of the logic.
+///
+/// The `None` branch must **remove** the key rather than leave it: a field set to
+/// `null` is still present, and a client asking "does this build expose argv payloads?"
+/// cannot answer yes-or-no from a `null` that does not distinguish "not applicable" from
+/// "no value".
+fn insert_argv_disclosure(status: &mut serde_json::Value, exposure: Option<ArgvPayloadDisclosure>) {
+    let Some(exposure) = exposure else {
+        return;
+    };
+    status["argv_payload_exposure"] =
+        serde_json::to_value(exposure).unwrap_or(serde_json::Value::Null);
+}
+
+/// Renders a capability list for the one-line banner, where an empty list must still read
+/// as empty rather than as a blank the reader has to notice is missing.
+pub fn join(ids: &[String]) -> String {
+    if ids.is_empty() {
+        "(none)".to_owned()
+    } else {
+        ids.join(", ")
+    }
+}
+
+/// The exposed list for the banner, with the size, because the size is the point.
+pub fn join_sized(entries: &[ArgvExposureEntry]) -> String {
+    if entries.is_empty() {
+        "(none)".to_owned()
+    } else {
+        entries
+            .iter()
+            .map(|e| match e.implementation_bound_bytes {
+                // Never a fabricated number: `null` says "this implementation bounds
+                // nothing", which is the truth for a caller-supplied payload.
+                Some(n) => format!(
+                    "{} (bounded at {n} bytes by this implementation)",
+                    e.capability
+                ),
+                None => format!(
+                    "{} (payload size not bounded by this implementation)",
+                    e.capability
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 async fn route<S: SecretsContract>(
     request: &Request,
     authenticated: AuthenticatedPrincipal,
@@ -977,7 +1198,7 @@ async fn route<S: SecretsContract>(
             // question a caller — including the end-to-end tests — actually needs, and
             // the one that explains a refusal instead of hiding behind the name.
             let sandbox = orxnud_platform_sandbox::host_capability();
-            Ok(json!({
+            let mut status = json!({
                 "status": "running",
                 "protocol": orxnud_protocol::version::PROTOCOL_VERSION.as_u16(),
                 "durable_audit": g.0.has_durable_audit(),
@@ -991,7 +1212,18 @@ async fn route<S: SecretsContract>(
                     "tier1_executable": sandbox.tier1_executable,
                 },
                 "capabilities_enabled": g.0.components().enabled_capabilities(),
-            }))
+            });
+            // Absent when no registered bundle exposes a payload, so its presence is
+            // itself the signal. A constant string here would be a field that always
+            // reads the same and therefore says nothing.
+            //
+            // Inserted rather than written as `"key": argv_payload_disclosure(..)`:
+            // `json!` turns a `None` into `null`, so the key would always be present and
+            // a client distinguishing "not applicable" from "the value is null" would
+            // have to know this implementation's internal type. The field has to be
+            // *absent*, so it is inserted only when it has something to say.
+            insert_argv_disclosure(&mut status, argv_payload_disclosure(&g));
+            Ok(status)
         }
         Method::DaemonVersion => Ok(json!({
             "current": orxnud_protocol::version::PROTOCOL_VERSION.as_u16(),
@@ -2059,7 +2291,7 @@ fn effect_status_for_dispatch_failure(
         // Demonstrably did not run. See the stage table above.
         DispatchError::Policy(_)
         | DispatchError::NoImplementation(_)
-        | DispatchError::Disabled(_)
+        | DispatchError::Disabled { .. }
         | DispatchError::ClassEscalation { .. }
         | DispatchError::Credential(_)
         | DispatchError::Reentrant(_)
@@ -2188,9 +2420,15 @@ fn dispatch_failure(e: &orxnud_capability::dispatch::DispatchError) -> RequestEr
         // it back -- which is "obtain authority", the same recovery `FORBIDDEN` names for
         // every other owner-controlled refusal. It is deliberately *not* environment: the
         // environment is working exactly as configured.
-        DispatchError::Disabled(c) => RequestError::Forbidden {
-            reason: "capability-disabled".to_owned(),
-            detail: Some(format!("{c} is switched off")),
+        //
+        // The reason travels with the refusal rather than being flattened here. When this
+        // arm reports `"capability-disabled"` for a capability the operator never switched
+        // off -- one refused because it puts file contents in `argv` -- the operator is
+        // told to go and flip a switch that does not exist. `DisabledReason::code()`
+        // keeps the two distinguishable all the way to the CLI.
+        DispatchError::Disabled { id, reason } => RequestError::Forbidden {
+            reason: reason.code().to_owned(),
+            detail: Some(format!("{id} is disabled: {reason}")),
         },
 
         // --- genuine internal faults ---
@@ -5174,7 +5412,9 @@ mod durable_output_tests {
 #[cfg(test)]
 mod effect_status_for_dispatch_failure_tests {
     use super::effect_status_for_dispatch_failure;
-    use orxnud_capability::dispatch::{DispatchError, ExecutionCertainty, SandboxRefusal};
+    use orxnud_capability::dispatch::{
+        DisabledReason, DispatchError, ExecutionCertainty, SandboxRefusal,
+    };
     use orxnud_domain::ids::CapabilityId;
     use orxnud_store::task_repo::EffectStatus;
 
@@ -5206,7 +5446,13 @@ mod effect_status_for_dispatch_failure_tests {
             ),
             ("sandbox refused", DispatchError::SandboxRefused(refusal())),
             ("no implementation", DispatchError::NoImplementation(cap())),
-            ("disabled", DispatchError::Disabled(cap())),
+            (
+                "disabled",
+                DispatchError::Disabled {
+                    id: cap(),
+                    reason: DisabledReason::Configured,
+                },
+            ),
             (
                 "class escalation",
                 DispatchError::ClassEscalation {
@@ -5709,7 +5955,7 @@ mod effect_status_for_dispatch_failure_tests {
     /// permission and `Unknown` withholds it.
     #[test]
     fn the_two_channels_never_contradict_on_execution_certainty() {
-        use orxnud_capability::dispatch::ExecutionCertainty;
+        use orxnud_capability::dispatch::{DisabledReason, ExecutionCertainty};
 
         /// One row per `DispatchError` variant: what each channel must answer.
         struct Row {
@@ -5752,7 +5998,10 @@ mod effect_status_for_dispatch_failure_tests {
             Row {
                 what: "disabled",
                 audit: orxnud_audit::OutcomeKind::Denied,
-                error: DispatchError::Disabled(cap()),
+                error: DispatchError::Disabled {
+                    id: cap(),
+                    reason: DisabledReason::Configured,
+                },
                 may_have_run: false,
                 effect: EffectStatus::NotPerformed,
             },
@@ -5926,4 +6175,58 @@ mod effect_status_for_dispatch_failure_tests {
             );
         }
     }
+}
+
+/// Negative control: the disclosure field is **absent**, not `null`, when nothing is
+/// exposed.
+///
+/// Without this the field could be a constant `null` and every positive test above would
+/// still pass -- `null` is not the disclosure it appears to be. A shipped daemon always
+/// has `write-text` registered, so the absent branch is exercised here against the
+/// function production calls rather than through a build that cannot be constructed.
+#[test]
+fn the_disclosure_field_is_absent_rather_than_null_when_nothing_is_exposed() {
+    let mut status = json!({"status": "running"});
+    assert!(
+        status.get("argv_payload_exposure").is_none(),
+        "precondition: the key must not already exist"
+    );
+    insert_argv_disclosure(&mut status, None);
+    assert!(
+        status.get("argv_payload_exposure").is_none(),
+        "with nothing exposed the key must be absent, not null; got {status}"
+    );
+    assert!(
+        !status
+            .as_object()
+            .expect("object")
+            .contains_key("argv_payload_exposure"),
+        "a null-valued key is still a key, and would be indistinguishable from a value; \
+         got {status}"
+    );
+}
+
+/// And when there *is* an exposure, the same function inserts it.
+#[test]
+fn the_disclosure_field_is_present_when_something_is_exposed() {
+    let mut status = json!({"status": "running"});
+    insert_argv_disclosure(
+        &mut status,
+        Some(ArgvPayloadDisclosure {
+            exposure: "e",
+            exposed: vec![ArgvExposureEntry {
+                capability: "c".to_owned(),
+                implementation_bound_bytes: Some(1),
+            }],
+            permitted: Vec::new(),
+            refused: vec!["c".to_owned()],
+            control: "k",
+            status: "OPEN",
+        }),
+    );
+    assert_eq!(
+        status["argv_payload_exposure"]["exposed"][0]["capability"].as_str(),
+        Some("c"),
+        "the inserted field must carry the exposure, not merely exist; got {status}"
+    );
 }

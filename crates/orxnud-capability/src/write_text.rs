@@ -298,6 +298,34 @@ impl WriteTextBundle {
 }
 
 impl AdapterBundle for WriteTextBundle {
+    /// `true`, and this bundle is the reason the gate exists.
+    ///
+    /// `sandbox_plan` puts the file's **contents** in `args` (`--contents <text>`),
+    /// because `SandboxSpec` has no stdin channel. Those arguments reach `bwrap`'s
+    /// command line, `bwrap` stays in the host PID namespace, and `/proc/<pid>/cmdline`
+    /// is world-readable — so any local uid can read the text for the life of the
+    /// execution (V-67, measured 2026-10-10).
+    ///
+    /// Because this answers [`crate::dispatch::ArgvPayload::Content`], the dispatcher **refuses** this capability unless
+    /// an owner has explicitly permitted it. That refusal is the interim control; the
+    /// exposure itself is unfixed until the transport carries content out of `argv`.
+    ///
+    /// **No bound is claimed.** The payload is the caller's `contents`, byte for byte,
+    /// and this implementation imposes no limit on it, so there is no number here that
+    /// would be a fact about this code.
+    ///
+    /// The host kernel does impose one — `MAX_ARG_STRLEN`, defined as
+    /// `32 * PAGE_SIZE` including the terminator — but that is a **per-host** constant
+    /// (131072 on a 4 KiB page, 2097152 on a 64 KiB one), and reporting one of those
+    /// figures from portable core would put a host-specific number in a disclosure that
+    /// reads as a property of the implementation. A caller who exceeds it gets an
+    /// `execve` failure, not a smaller write, so it bounds the exposure rather than
+    /// describing it.
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        crate::dispatch::ArgvPayload::Content {
+            implementation_bound: None,
+        }
+    }
     fn adapter(&self) -> &dyn CapabilityAdapter {
         &WriteTextAdapter
     }

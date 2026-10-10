@@ -826,6 +826,12 @@ impl RejectingParams {
 }
 
 impl AdapterBundle for RejectingParams {
+    /// `false`: this is a test double whose `sandbox_plan` passes fixed
+    /// arguments, not user-supplied content. See V-67.
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         self.inner.adapter()
     }
@@ -869,6 +875,12 @@ impl WithValidPlan {
 }
 
 impl AdapterBundle for WithValidPlan {
+    /// `false`: this is a test double whose `sandbox_plan` passes fixed
+    /// arguments, not user-supplied content. See V-67.
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         self.inner.adapter()
     }
@@ -1350,6 +1362,12 @@ impl PlanTier1 {
 }
 
 impl AdapterBundle for PlanTier1 {
+    /// `false`: this is a test double whose `sandbox_plan` passes fixed
+    /// arguments, not user-supplied content. See V-67.
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        crate::dispatch::ArgvPayload::None
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         self.inner.adapter()
     }

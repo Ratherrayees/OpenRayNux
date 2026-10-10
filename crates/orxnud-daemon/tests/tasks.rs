@@ -128,6 +128,34 @@ impl Serving {
         Self::start_with(root, orxnud_daemon::runtime::scripted_proposer()).await
     }
 
+    /// A daemon in the **shipped default posture**: no owner-approved argv-payload
+    /// exception granted.
+    ///
+    /// `start` grants it, because the rest of this file is measuring the governed path
+    /// around a capability the default posture refuses. This one does not, so a test can
+    /// observe what a user who installed the daemon and changed nothing actually gets.
+    async fn start_default_posture(root: PathBuf) -> Self {
+        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
+            .await
+            .expect("the runtime must start")
+            .with_proposer(orxnud_daemon::runtime::scripted_proposer());
+        let endpoint = runtime.endpoint().to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = runtime
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        await_ready(&endpoint);
+        Self {
+            endpoint,
+            shutdown: Some(tx),
+            task,
+        }
+    }
+
     /// A daemon that asks `provider`.
     ///
     /// The seam is per-daemon and constructor-supplied, so there is nothing to install,
@@ -136,10 +164,11 @@ impl Serving {
         root: PathBuf,
         provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
     ) -> Self {
-        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
-            .await
-            .expect("the runtime must start")
-            .with_proposer(provider);
+        let runtime =
+            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
+                .await
+                .expect("the runtime must start")
+                .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -2531,5 +2560,91 @@ fn an_ai_proposal_requires_the_lease_and_is_once_per_attempt() {
         );
         s.stop().await;
         let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+/// S-02 acceptance, at the production boundary and through the full governed path.
+///
+/// Every other test in this file grants the owner-approved argv-payload exception,
+/// because they are measuring the governed path *around* the capability. This one does
+/// not: `start_default_posture` composes the daemon exactly as a user's is -- shipped
+/// bundles, default configuration -- and then drives the complete governed sequence,
+/// propose, approve, execute.
+///
+/// The order matters and is the point of the test. The argv gate sits at stage 5,
+/// *after* governance. So an unapproved dispatch would be refused by policy and would
+/// prove nothing; the payload only reaches `argv` if a human approves the proposal and
+/// the capability then runs. This test supplies a real approval and observes that the
+/// capability is still refused, and that nothing was written.
+///
+/// That is the honest shape of the S-02 claim: not "an error came back", but "a fully
+/// authorised user, on the shipped build, cannot get their file contents into a
+/// world-readable command line".
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_fully_approved_write_is_refused_by_default_and_writes_nothing() {
+    rt().block_on(async {
+        let d = dir("argv-default-posture");
+        let s = Serving::start_default_posture(d.clone()).await;
+
+        const SENTINEL: &str = "SENTINEL-MUST-NOT-REACH-ARGV";
+        let pid = propose(&s, "g-argv", "w1", "leak.txt", SENTINEL);
+
+        // A real approval from the trusted human, with a generous TTL. If this test
+        // passed because the approval was refused or expired, the assertions below
+        // would be measuring the wrong refusal.
+        let approved = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({"proposal": pid, "ttl_ms": 60_000}),
+        );
+        assert_eq!(
+            approved["result"]["approval"]["approver"].as_str(),
+            Some("human"),
+            "the approval must be real, or this test measures the wrong refusal; \
+             got {approved}"
+        );
+
+        let executed = send(
+            &s.endpoint,
+            "x",
+            "task/execute",
+            json!({"proposal": pid, "worker": "w1"}),
+        );
+
+        // The refusal names argv specifically. A bare "capability-disabled" would send
+        // an operator looking for a switch they never flipped: the capability is
+        // enabled, and nothing about their configuration is wrong.
+        let reason = executed["error"]["data"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            reason, "argv_payload_exposure_refused",
+            "the refusal must name the argv exposure; got {executed}"
+        );
+
+        // The observable effect, which is what makes this a containment claim rather
+        // than a claim about an error string.
+        assert!(
+            !workspace(&d).join("leak.txt").exists(),
+            "the refused capability still wrote the file; the refusal must precede any \
+             process that could carry the payload"
+        );
+        // Nothing anywhere under the state root holds the payload, so it did not reach a
+        // file by another route either.
+        let leaked: Vec<_> = std::fs::read_dir(workspace(&d))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter(|c| c.contains(SENTINEL))
+            .collect();
+        assert!(leaked.is_empty(), "the payload reached {leaked:?}");
     });
 }

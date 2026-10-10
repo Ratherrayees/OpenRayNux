@@ -18,6 +18,7 @@
 // Declared once in `tests/mod.rs`, since a module path inside
 // `tests/` would otherwise resolve per-file.
 use super::{Registry, support};
+use crate::dispatch::{ArgvPayload, ArgvPayloadExposure, DisabledReason};
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -112,6 +113,14 @@ fn params() -> NormalizedParams {
 pub struct Tier1HelperAdapter {
     id: CapabilityId,
     env: BTreeMap<String, String>,
+    /// Answer for `AdapterBundle::argv_payload`.
+    ///
+    /// `false` by default, and that is the honest declaration rather than a convenient
+    /// one: `HelperBundle::sandbox_plan` passes four **constant** flags
+    /// (`--exact hostile_helper_entry_point --ignored --nocapture`) and carries the
+    /// hostile mode in `env`, so no user-supplied content reaches `argv`. A test that
+    /// wants to exercise the gate opts in with [`Self::with_argv_payload`].
+    argv_payload: bool,
 }
 
 impl Tier1HelperAdapter {
@@ -119,6 +128,7 @@ impl Tier1HelperAdapter {
         Self {
             id: CapabilityId::new(id),
             env: BTreeMap::new(),
+            argv_payload: false,
         }
     }
 
@@ -133,6 +143,15 @@ impl Tier1HelperAdapter {
 
     fn with_env(mut self, k: &str, v: &str) -> Self {
         self.env.insert(k.to_owned(), v.to_owned());
+        self
+    }
+
+    /// Declares that this bundle puts user-supplied content into `args`.
+    ///
+    /// The opt-*in* the shipped `write-text` bundle gets for free, because it really
+    /// does pass `--contents`. Here it lets a test place the gate in the way.
+    pub fn with_argv_payload(mut self) -> Self {
+        self.argv_payload = true;
         self
     }
 }
@@ -166,6 +185,18 @@ struct HelperBundle {
 }
 
 impl AdapterBundle for HelperBundle {
+    fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+        // A test helper. What the tests below depend on is that this is `Content` --
+        // that the bundle genuinely carries a payload -- not the bound, so it is left
+        // unbounded exactly as a caller-supplied payload is in production.
+        match self.adapter.argv_payload {
+            true => ArgvPayload::Content {
+                implementation_bound: None,
+            },
+            false => ArgvPayload::None,
+        }
+    }
+
     fn adapter(&self) -> &dyn CapabilityAdapter {
         &self.adapter
     }
@@ -567,6 +598,12 @@ fn a_tier0_capability_still_runs_in_process() {
     }
     struct B0;
     impl AdapterBundle for B0 {
+        /// `false`: this is a test double whose `sandbox_plan` passes fixed
+        /// arguments, not user-supplied content. See V-67.
+        fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+            crate::dispatch::ArgvPayload::None
+        }
+
         fn adapter(&self) -> &dyn CapabilityAdapter {
             &Tier0
         }
@@ -1245,6 +1282,12 @@ mod v46 {
     }
 
     impl AdapterBundle for PolicyBundle {
+        /// `false`: this is a test double whose `sandbox_plan` passes fixed
+        /// arguments, not user-supplied content. See V-67.
+        fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
+            crate::dispatch::ArgvPayload::None
+        }
+
         fn adapter(&self) -> &dyn CapabilityAdapter {
             &self.adapter
         }
@@ -2040,4 +2083,201 @@ mod v46 {
             ),
         ]
     }
+}
+
+// --- S-02 / F-10: the argv-payload exposure gate --------------------------------
+
+// The pre-fix demonstration: this compiles against the code as it stands today, so
+// its failure is a behavioural failure and not a build failure (V-94).
+
+#[test]
+fn an_argv_payload_capability_is_refused_by_default_and_spawns_nothing() {
+    let mut engine = policy(1000, 1000);
+    let secrets = FakeSecrets::new();
+    let backend = Arc::new(CountingBackend::new());
+    // Default posture: nothing is permitted.
+    let mut d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("sleep").with_argv_payload()),
+    )
+    .with_execution(backend.clone());
+
+    let err = d
+        .dispatch(
+            request(),
+            human(),
+            context(),
+            None,
+            params(),
+            None,
+            None,
+            NOW,
+        )
+        .expect_err("an argv-payload capability must be refused by default");
+
+    assert!(
+        matches!(&err, DispatchError::Disabled { id, reason }
+                if id.as_str() == CAP && *reason == DisabledReason::ArgvPayload),
+        "the refusal must be the named 'switched off' variant, not a generic fault: {err:?}"
+    );
+    assert_eq!(
+        backend.calls(),
+        0,
+        "the refusal must happen before any process is created, or the payload is \
+         still in the process table for the whole execution"
+    );
+}
+
+/// Negative control: the gate is a default, not a hard prohibition.
+///
+/// R-1's owner-approved exception has to remain reachable, or the plan's second option
+/// is fiction. If this stopped passing, the gate would be an unconditional ban.
+#[test]
+fn an_explicitly_permitted_argv_payload_capability_still_executes() {
+    let mut engine = policy(1000, 1000);
+    let secrets = FakeSecrets::new();
+    let backend = Arc::new(CountingBackend::new());
+    let mut d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("sleep").with_argv_payload()),
+    )
+    .with_execution(backend.clone())
+    .with_permitted_argv_payload([CapabilityId::new(CAP)]);
+
+    d.dispatch(
+        request(),
+        human(),
+        context(),
+        None,
+        params(),
+        None,
+        None,
+        NOW,
+    )
+    .expect("an owner-approved exception must still reach the sandbox");
+
+    assert_eq!(
+        backend.calls(),
+        1,
+        "the permitted capability ran in the sandbox"
+    );
+}
+
+/// Negative control: the gate must not refuse what it is not aimed at.
+///
+/// A gate that refused everything would pass the refusal test above while breaking
+/// `word-count` and `read-text`. This fails if that is what happened.
+#[test]
+fn a_tier1_capability_that_exposes_no_argv_payload_is_unaffected() {
+    let mut engine = policy(1000, 1000);
+    let secrets = FakeSecrets::new();
+    let backend = Arc::new(CountingBackend::new());
+    let mut d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("sleep")),
+    )
+    .with_execution(backend.clone());
+
+    d.dispatch(
+        request(),
+        human(),
+        context(),
+        None,
+        params(),
+        None,
+        None,
+        NOW,
+    )
+    .expect("a capability that puts nothing in argv must not be refused");
+
+    assert_eq!(
+        backend.calls(),
+        1,
+        "an unaffected capability still executes"
+    );
+}
+
+/// The refusal is decided before stage 6, so no credential is ever resolved.
+///
+/// A gate placed after credential resolution would resolve a secret and then discard
+/// it, and would report a credential error rather than its own reason. The store here
+/// has nothing configured, so a credential-first ordering would answer `Credential`.
+#[test]
+fn the_argv_payload_refusal_precedes_credential_resolution() {
+    let mut engine = policy(1000, 1000);
+    let secrets = FakeSecrets::new(); // nothing configured
+    let backend = Arc::new(CountingBackend::new());
+    let mut d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("sleep").with_argv_payload()),
+    )
+    .with_execution(backend.clone());
+
+    let err = d
+        .dispatch(
+            request(),
+            human(),
+            context(),
+            None,
+            params(),
+            None,
+            Some(&SecretRef::new("absent", "acct")),
+            NOW,
+        )
+        .expect_err("must be refused");
+
+    assert!(
+        matches!(&err, DispatchError::Disabled { id, reason }
+                if id.as_str() == CAP && *reason == DisabledReason::ArgvPayload),
+        "the argv-payload gate decides before stage 6, so the refusal is not a \\
+         credential error: {err:?}"
+    );
+    assert_eq!(backend.calls(), 0, "and nothing was executed");
+}
+
+/// The disclosure surface must be derived, not hard-coded.
+///
+/// An operator has to be able to learn which capabilities expose payloads, so the
+/// answer comes from the bundles themselves.
+#[test]
+fn the_exposure_surface_reports_exposed_and_permitted_capabilities() {
+    let mut engine = policy(1000, 1000);
+    let secrets = FakeSecrets::new();
+    let d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("sleep").with_argv_payload()),
+    )
+    .with_permitted_argv_payload([CapabilityId::new("something-else")]);
+
+    let exposure = d.argv_payload_exposure();
+    assert_eq!(
+        exposure,
+        vec![ArgvPayloadExposure {
+            id: CapabilityId::new(CAP),
+            payload: ArgvPayload::Content {
+                implementation_bound: None,
+            },
+            permitted: false,
+        }],
+        "the exposed bundle is reported as not permitted, and a permission for another \\
+         id must not leak into this one"
+    );
+
+    // And the opt-out removes it from the surface entirely, which is what makes the
+    // disclosure field absent when nothing exposes a payload.
+    let mut engine = policy(1000, 1000);
+    let d = crate::dispatch::Dispatcher::new(
+        &mut engine,
+        &secrets,
+        bundles(Tier1HelperAdapter::running("sleep")),
+    );
+    assert!(
+        d.argv_payload_exposure().is_empty(),
+        "a bundle that exposes nothing must not appear on the disclosure surface"
+    );
 }

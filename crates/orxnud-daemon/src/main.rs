@@ -52,6 +52,12 @@ OPTIONS:
                                 credentials; it answers one fixed proposal and records
                                 scripted/none in the audit record. Cannot be combined with
                                 the two options above.
+    --permit-argv-payload-       DEBUG BUILDS ONLY. Permits a capability that puts user
+    exposure-for-tests           content in argv, which the shipped posture refuses.
+                                Exists so the end-to-end suites can measure the
+                                governed path. It is NOT an owner approval and does not
+                                satisfy the plan's bounded-approval requirement; do not
+                                use it outside testing.
     --version                   Print the version and exit.
     --doctor                    Print a diagnosis of the configured paths and exit.
     --help                      Print this and exit.
@@ -89,6 +95,11 @@ fn parse_args() -> Result<Action, String> {
     // in `ps` output and in the shell history.
     let mut base_url: Option<String> = None;
     let mut model: Option<String> = None;
+    // Only ever set in a debug build. In a release build the match arm that writes it
+    // is compiled out, so this stays `false` and the flag is an unrecognised argument --
+    // `cargo check --release` warns about the unused `mut`, which is the proof.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut permit_argv_payload_for_tests = false;
     let mut scripted = false;
     let mut doctor = false;
     let mut args = std::env::args().skip(1);
@@ -136,6 +147,25 @@ fn parse_args() -> Result<Action, String> {
             other if other.starts_with("--provider-model=") => {
                 model = Some(other["--provider-model=".len()..].to_owned());
             }
+            // A test affordance, and deliberately not reachable in a shipped binary.
+            //
+            // `cfg(debug_assertions)` means the flag is an *unrecognised argument* in a
+            // release build, so a daemon a user installs has no route at all to permit an
+            // argv payload -- not a configuration key, not an environment variable, not
+            // a flag. That is the property this slice is buying.
+            //
+            // The suites that spawn this binary (cli_e2e, uncertain_outcome,
+            // v25_measure) measure the governed path -- approval, single use, expiry,
+            // settlement, audit across restart -- and need a capability that actually
+            // executes. They get it here rather than from an ambient value.
+            //
+            // **This does not satisfy R-1's option 2**, which requires an owner decision
+            // with a stated bounded period, a named host model and a review date. It is
+            // a test seam, and it is recorded as an open owner decision.
+            #[cfg(debug_assertions)]
+            "--permit-argv-payload-exposure-for-tests" => {
+                permit_argv_payload_for_tests = true;
+            }
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
@@ -150,6 +180,7 @@ fn parse_args() -> Result<Action, String> {
     Ok(Action::Serve {
         root,
         provider: ProviderChoice::new(base_url, model, scripted),
+        permit_argv_payload_for_tests,
     })
 }
 
@@ -171,6 +202,9 @@ enum Action {
         root: std::path::PathBuf,
         /// Which provider, if any.
         provider: ProviderChoice,
+        /// Grant the argv-payload exception. See [`Action::serve`]: only settable by a
+        /// debug build, and only by a flag whose name says what it is.
+        permit_argv_payload_for_tests: bool,
     },
 }
 
@@ -224,7 +258,9 @@ fn main() -> ExitCode {
         Action::Doctor { root } => root.clone(),
         Action::Version | Action::Help => orxnud_platform_ipc::default_state_root(),
     };
-    let provider = match &action {
+    // Handles the verbs that return here; the Serve arm falls through, and its
+    // provider and argv flag are read from `action` below.
+    match &action {
         Action::Version => {
             println!("orxnud {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -247,7 +283,15 @@ fn main() -> ExitCode {
             doctor(&Paths::under(&root));
             return ExitCode::SUCCESS;
         }
-        Action::Serve { provider, .. } => provider.clone(),
+        Action::Serve { .. } => {}
+    };
+    let (provider, permit_argv_payload_for_tests) = match &action {
+        Action::Serve {
+            provider,
+            permit_argv_payload_for_tests,
+            ..
+        } => (provider.clone(), *permit_argv_payload_for_tests),
+        _ => (ProviderChoice::None, false),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -261,7 +305,9 @@ fn main() -> ExitCode {
         }
     };
 
-    runtime.block_on(async move { serve(Paths::under(&root), provider).await })
+    runtime.block_on(async move {
+        serve(Paths::under(&root), provider, permit_argv_payload_for_tests).await
+    })
 }
 
 /// Serves, with a proposal provider when one was chosen.
@@ -270,7 +316,11 @@ fn main() -> ExitCode {
 /// refusal at startup rather than a guess here, because a default model name silently
 /// substituted for a missing one is a daemon that reports proposals from a model nobody
 /// chose.
-async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
+async fn serve(
+    paths: Paths,
+    choice: ProviderChoice,
+    permit_argv_payload_for_tests: bool,
+) -> ExitCode {
     let provider: Option<std::sync::Arc<dyn orxnud_daemon::proposer::ProposalProvider>> =
         match choice {
             ProviderChoice::None => {
@@ -328,7 +378,14 @@ async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
 
     // The ordering that matters is inside `Runtime::start`: durable security state is
     // attached before the endpoint exists. If it fails here, nothing was bound.
-    let mut runtime = match Runtime::start_unconfigured(paths.clone(), secrets.clone()).await {
+    // The two arms are different `async fn`s, so they are awaited separately rather
+    // than unified into one future: `bool::then` would give two distinct opaque types.
+    let started = if permit_argv_payload_for_tests {
+        Runtime::start_permitting_argv_payload_exposure(paths.clone(), secrets.clone()).await
+    } else {
+        Runtime::start_unconfigured(paths.clone(), secrets.clone()).await
+    };
+    let mut runtime = match started {
         Ok(r) => r,
         Err(e) => {
             eprintln!("orxnud: refusing to start: {e}");
@@ -342,6 +399,34 @@ async fn serve(paths: Paths, choice: ProviderChoice) -> ExitCode {
 
     if let Some(why) = secrets.stale_probe_entry() {
         eprintln!("orxnud: warning: {why}");
+    }
+
+    // S-02 operator disclosure, on the startup banner as well as `daemon/status`.
+    //
+    // Printed once, before the first request can arrive, because a field on `daemon/status`
+    // is only discoverable by someone who already knows to ask for it. The banner is the
+    // surface an operator reads without having asked for anything, so it is where "this
+    // build carries an open argv exposure" has to be unmissable.
+    //
+    // Absent when no registered bundle exposes a payload, for the same reason the status
+    // field is: a line that always prints says nothing.
+    if let Some(exposure) = runtime.argv_payload_disclosure() {
+        eprintln!(
+            "orxnud: argv payload exposure OPEN -- {}\
+             Exposed: {}. Refused: {}. Permitted: {}. \
+             This is interim containment for the default posture, not a mitigation: for \
+             any execution that does run, the payload sits in argv for the life of the \
+             execution, and whether another uid can read it depends on this host's /proc. \
+             The transport stays unfixed until S-17.",
+            exposure.exposure,
+            orxnud_daemon::runtime::join_sized(&exposure.exposed),
+            orxnud_daemon::runtime::join(&exposure.refused),
+            if exposure.permitted.is_empty() {
+                "(none)".to_owned()
+            } else {
+                orxnud_daemon::runtime::join(&exposure.permitted)
+            },
+        );
     }
 
     let endpoint = runtime.endpoint().to_path_buf();

@@ -396,6 +396,26 @@ impl DispatchWiring {
         self.bundles.len()
     }
 
+    /// Which registered capabilities expose `argv` payloads, how much, and which are
+    /// permitted.
+    ///
+    /// The disclosure answer, derived from the bundles rather than written down, so it
+    /// cannot drift from what the dispatcher will actually refuse.
+    #[must_use]
+    pub fn argv_payload_exposure(
+        &self,
+        permitted: &std::collections::BTreeSet<CapabilityId>,
+    ) -> Vec<orxnud_capability::dispatch::ArgvPayloadExposure> {
+        self.bundles
+            .argv_payload_capabilities()
+            .into_iter()
+            .map(|mut e| {
+                e.permitted = permitted.contains(&e.id);
+                e
+            })
+            .collect()
+    }
+
     /// Whether an execution backend is installed.
     ///
     /// Always `true`, and that is the useful part: it is a *structural* property,
@@ -538,6 +558,29 @@ fn shipped_budget() -> orxnud_policy::BudgetLedger {
     orxnud_policy::BudgetLedger::empty().with_global(1_000_000)
 }
 
+/// The one shipped capability that carries user content in `argv` (V-67).
+///
+/// Named in one place so the gate, the disclosure and the test seam cannot drift apart
+/// into three copies of the same string.
+const ARGV_PAYLOAD_EXPOSED_CAPABILITY_ID: &str = "filesystem/write-text";
+
+/// **There is no configuration key and no environment variable that permits an
+/// `argv` payload.** Not a missing feature -- a decision, recorded here so the next
+/// reader does not "fix" it.
+///
+/// The plan's R-1 names two postures: refuse, or continue the exposure under an owner
+/// decision **with a stated bounded period, a named host model, and a review date**
+/// (`docs/18` section 12). A configuration value is not that decision. It carries no
+/// approver, no expiry and no review date, and it is settable by *anything* running as
+/// the user -- a shell profile, a CI job, a compromised dependency -- none of which is
+/// an owner accepting a risk on the record. Shipping one would have meant describing an
+/// indefinite bypass as the plan's "bounded, owner-approved exception", which is the
+/// specific misreading R-1 exists to prevent.
+///
+/// So the exception is refused by configuration, permanently, until S-17 removes the
+/// need for one. The governed-path test suites grant it through a **named code seam**
+/// instead -- see `Runtime::start_permitting_argv_payload_exposure` -- which is a source
+/// change that lands in review, rather than a value that appears in an environment.
 /// Declares every shipped capability in the registry.
 ///
 /// The registry is the answer to "what does this build implement?", so it is populated
@@ -579,6 +622,13 @@ pub struct Components {
     pub dispatch: DispatchWiring,
     /// The resolved configuration. No schema is defined yet.
     pub config: LayeredConfig,
+    /// Capabilities permitted to carry user content in `argv`.
+    ///
+    /// Empty on every production path, and writable from exactly one place --
+    /// `Daemon::with_argv_payload_exception_for_this_process`. Deliberately **not**
+    /// read from `config`: a configuration value would be an unbounded, unattributed
+    /// bypass, which is the thing R-1 forbids.
+    pub permitted_argv_payload: std::collections::BTreeSet<CapabilityId>,
     /// The tracing description. No subscriber is installed.
     pub tracing: TracingPlan,
     /// The config schema version this build writes.
@@ -674,6 +724,24 @@ impl Daemon {
         daemon
     }
 
+    /// Grants the argv-payload exception to **this process only**.
+    ///
+    /// The code-level counterpart to the configuration route that was deliberately not
+    /// built. It exists so the governed-path suites can measure approval, single use,
+    /// expiry, settlement and the audit record against a capability that actually
+    /// executes, and it is the *only* way to grant it — see the note above.
+    ///
+    /// Deliberately not reachable from configuration, from the environment, or from
+    /// any command-line flag, so that the exception is a reviewable source change rather
+    /// than a value. **Remove with S-17.**
+    #[must_use]
+    pub fn with_argv_payload_exception_for_this_process(mut self) -> Self {
+        self.components
+            .permitted_argv_payload
+            .insert(CapabilityId::new(ARGV_PAYLOAD_EXPOSED_CAPABILITY_ID));
+        self
+    }
+
     fn compose_inner(paths: Paths) -> Self {
         // The registry and the bundles are *composition*: they say what this build
         // can do. `install_shipped_capabilities` separately says what policy permits,
@@ -691,7 +759,13 @@ impl Daemon {
             paths,
             registry,
             dispatch,
+            // No layer is seeded. The argv-payload exception is not reachable from
+            // configuration, so there is nothing to seed and nothing for a value in a
+            // file or an environment to widen.
             config: LayeredConfig::empty(),
+            // And nothing is permitted here. The only writer of this set is
+            // `with_argv_payload_exception_for_this_process`.
+            permitted_argv_payload: std::collections::BTreeSet::new(),
             tracing: TracingPlan::new(),
             config_version: ConfigSchemaVersion::INITIAL,
             instance,
@@ -769,6 +843,11 @@ impl Daemon {
             components.dispatch.bundles.clone(),
         )
         .with_execution(components.dispatch.execution.clone())
+        // Whatever the code seam granted. Empty on every production composition path,
+        // because the only writer of that set is
+        // `with_argv_payload_exception_for_this_process` -- never a config key, never
+        // an environment variable, never a release-build flag.
+        .with_permitted_argv_payload(components.permitted_argv_payload.clone())
     }
 
     /// How many records the audit chain policy writes to holds.
@@ -1394,5 +1473,126 @@ mod tests {
         assert!(LifecycleState::Stopping.is_transitioning());
         assert!(!LifecycleState::Running.is_transitioning());
         assert_eq!(LifecycleState::Running.to_string(), "running");
+    }
+}
+
+#[cfg(test)]
+mod argv_payload_tests {
+    use super::*;
+
+    /// The shipped daemon permits nothing that would expose an `argv` payload.
+    ///
+    /// The property that matters, stated where it can be checked: whatever the
+    /// configuration, a composed daemon refuses every bundle that declares a payload.
+    /// Before the exception was withdrawn this test would have been able to pass with a
+    /// config key present and unset, so it is paired with the source guard below.
+    #[test]
+    fn a_composed_daemon_permits_no_argv_payload() {
+        let d = Daemon::compose(Paths::under(std::path::Path::new("/nonexistent-workspace")));
+        let exposed = d
+            .components()
+            .dispatch
+            .argv_payload_exposure(&std::collections::BTreeSet::new());
+        for e in &exposed {
+            assert!(
+                !e.permitted,
+                "{} is exposed and reported as permitted on a shipped daemon",
+                e.id
+            );
+        }
+    }
+
+    /// **No configuration key and no environment variable can grant the exception.**
+    ///
+    /// A source-level guard, because a behavioural test cannot catch the reintroduction
+    /// of a switch: an unused key permits nothing, so every behavioural assertion stays
+    /// green while the bypass quietly comes back. This is the same shape as the
+    /// compile-time source checks the sandbox crate already uses, and it is the only
+    /// assertion that fails on the *code* rather than on its effect.
+    ///
+    /// If S-17 lands and this becomes wrong, delete it deliberately — do not quietly
+    /// widen it — because its existence is the decision.
+    #[test]
+    fn no_configuration_key_or_environment_variable_can_permit_an_argv_payload() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = [
+            root.join("src"),
+            root.parent()
+                .expect("crates dir")
+                .join("orxnud-capability/src"),
+        ];
+        let forbidden = [
+            "ORXNUD_PERMIT_ARGV_PAYLOAD",
+            "permit_argv_payload_capabilities",
+        ];
+        let mut checked = 0usize;
+        for dir in sources {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).expect("source is readable");
+                // This file names the identifiers in order to forbid them.
+                // This file names the identifiers in order to forbid them.
+                if p == root.join("src/lib.rs") {
+                    continue;
+                }
+                for needle in forbidden {
+                    assert!(
+                        !text.contains(needle),
+                        "{} reintroduces `{needle}`. The argv-payload exception is not \
+                         reachable from configuration by decision (docs/18 section 12, \
+                         R-1); see the note above.",
+                        p.display()
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 5,
+            "the source guard found only {checked} files; it is not looking at the tree \
+             it thinks it is"
+        );
+    }
+
+    /// The one ambient route to the exception is compiled out of release builds.
+    ///
+    /// `--permit-argv-payload-exposure-for-tests` exists so the suites that spawn the
+    /// real binary can measure the governed path. It is gated on
+    /// `cfg(debug_assertions)`, so a shipped release binary rejects it as an unrecognised
+    /// argument and a daemon a user installs has **no** way to permit an argv payload:
+    /// no config key, no environment variable, no flag.
+    ///
+    /// Pinned by reading the source, because the property is a property of the *build*:
+    /// a debug test binary cannot observe its own absence, and the release profile is
+    /// too expensive to build inside the suite.
+    #[test]
+    fn the_test_flag_is_compiled_out_of_release_builds() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("main.rs is readable");
+        let arm = src
+            .lines()
+            .position(|l| l.contains("\"--permit-argv-payload-exposure-for-tests\""))
+            .expect("the test flag exists");
+        // The attribute must be the line immediately above, or within the few lines of
+        // the comment that precedes the arm.
+        let window: String = src
+            .lines()
+            .skip(arm.saturating_sub(12))
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            window.contains("#[cfg(debug_assertions)]"),
+            "the test flag must be gated on debug_assertions, or a release binary gains \
+             a route to permit an argv payload; the 12 lines before it are:\n{window}"
+        );
     }
 }
