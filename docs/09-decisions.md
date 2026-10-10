@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**51 ADRs, numbered ADR-0001 … ADR-0053.** Two numbers in that range are
+**52 ADRs, numbered ADR-0001 … ADR-0054.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -26,6 +26,9 @@ existed while the header still claimed 47 ADRs through ADR-0049:
 * **ADR-0052** — two decisions the V-25 measurement had to make explicitly.
 * **ADR-0053** — an uncertain side effect is a durable state, not a delay before a retry
   (closes V-92).
+* **ADR-0054** — the Tier-1 payload travels on the child's stdin; credential-carrying
+  capabilities stay prohibited until a separate design lands. **Decided, not implemented**;
+  `docs/18` §6.3 gates the implementation phase on this record being merged.
 
 **Reading the dates.** ADR-0001 … ADR-0030 were written on 2026-09-30 against
 `Draft v0.1` of the architecture, and their *reasoning* is a point-in-time record
@@ -4823,3 +4826,358 @@ test now says so rather than letting the absence pass unnoticed.
 * Revisit if `NeedsVerification` ever becomes claimable for an *idempotent* capability. Today
   idempotency is decided before the state is chosen, so such a task never reaches
   `NeedsVerification`; changing that would be a change to Decision 3.
+
+---
+
+## ADR-0054 — The Tier-1 payload travels on the child's stdin; credential-carrying capabilities stay prohibited
+
+**Status.** **Decided and reviewed; not implemented.** Owner review 2026-10-10 approved the
+direction and the 1 MiB limit, and required the empty-vs-absent framing detail that Decision 4
+now specifies. `docs/18` §6.3 gates S-17's implementation phase on this record being **merged**;
+it is written and unmerged, so no S-17 code exists. Lifts nothing. F-10 stays open and R-1
+stands.
+
+**Context.** `filesystem/write-text` puts the file body in `argv`
+(`write_text.rs` → `SandboxPlan.args` → `subprocess.rs::spec_for` → `SandboxSpec.args` →
+`bwrap ... -- <program> <args>`). `/proc/<pid>/cmdline` is mode `0444`, so any local uid can
+read that payload for the life of the execution. V-67 records the cross-UID read as
+**demonstrated** on a `hidepid=0` host, not inferred from the file mode.
+
+S-02 landed the interim control: the shipped daemon **refuses** the capability by default,
+before credential resolution and before any process exists, with the reason
+`argv_payload_exposure_refused`. There is no configuration key and no environment variable
+that lifts it; granting it requires a source-level change. That refusal is the correct posture
+until this decision is implemented and its evidence is produced.
+
+Two properties of the existing code shaped every option below, and both are easy to
+underestimate:
+
+* **The payload appears on two command lines, not one.** When a cgroup is delegated,
+  `spawn_supervisor` (`linux.rs`) launches `/bin/sh -c 'printf %s "$$" > "$1" || exit 97;
+  shift; exec "$@"' … BWRAP <argv>`. The joiner shell therefore carries the whole argument
+  vector too, and then `exec`s `bwrap`. R-1 names both surfaces. A fix that only cleaned
+  `bwrap`'s command line would leave the payload fully exposed on any host with cgroup
+  delegation — which is every host where the resource tests mean anything.
+* **Credentials are a separate channel, and it is not stdin.** `spawn_supervisor` calls
+  `.env_clear()` on **both** branches, with the stated reason *"it is the single most
+  effective way for a parent secret to reach a child"*. `bwrap`'s only mechanism for setting
+  the child's environment is `--setenv K V`, and `--setenv` is rendered into `argv`. So
+  `SandboxSpec.env` is a credential channel that is world-readable by construction. Fixing
+  stdin does not touch it, and pretending otherwise would leave the larger half of the
+  problem exactly where it is.
+
+**Problem.** How does user-supplied content reach a Tier-1 helper without appearing in
+host-readable process arguments — and what happens to the credential channel, which is a
+different problem with a different answer?
+
+**Evidence.** Measured on the development host, 2026-10-10, before any edit.
+
+```
+$ printf 'PAYLOAD-VIA-STDIN-OK' | bwrap --unshare-pid --unshare-ipc --unshare-uts \
+      --die-with-parent --tmpfs /tmp --ro-bind /usr /usr --ro-bind /lib /lib \
+      --ro-bind /lib64 /lib64 --ro-bind /bin /bin --proc /proc --dev /dev \
+      --clearenv -- /bin/cat
+PAYLOAD-VIA-STDIN-OK                                                       [exit=0]
+
+$ head -c 262144 /dev/zero | bwrap <same> -- /bin/cat | wc -c
+262144                                                                    [exit=0]
+```
+
+`bwrap` forwards its own stdin to the sandboxed child, and 256 KiB completes without
+deadlock **when the child reads**. No launcher process is required for this channel. The
+"when the child reads" clause is the whole of the remaining risk and is what Decisions 3 and
+4 exist to bound.
+
+Cross-uid visibility, same host, container in the host PID namespace running as uid 4242
+against a uid-1000 target:
+
+```
+target pid=1564696 (uid 1000)   cmdline mode: 444   environ mode: 400
+/proc/1564696/cmdline  -> /tmp/sleeper --contents CROSSUID-SENTINEL-abc123   (read SUCCEEDED)
+/proc/1564696/environ  -> cat: Permission denied
+```
+
+This reproduces V-67 and supplies the harness for R-1's evidence. It is a property of *this*
+host's `/proc`: `hidepid=0` and no ptrace hardening. It is not a claim about every Linux
+host, and the acceptance evidence must be reported with its host conditions attached.
+
+**Decision 1 — the payload travels on the sandboxed child's stdin, and never in `argv`.**
+
+`SandboxSpec` gains a bounded stdin payload. `write_text` passes `--path` in `args` and the
+file body through it. The helper reads the body from stdin. The payload then appears in no
+`cmdline` and no `environ` — which clears both R-1 payload surfaces, including the joiner
+shell, because stdin is inherited through the `exec` rather than spelled out as an argument.
+
+**Decision 2 — the transport is bounded, and exceeding the bound is a refusal.**
+
+An unbounded channel is a denial-of-service surface, so the size is part of the contract and
+is checked **before** the supervisor is spawned. A payload over the limit is a
+`SandboxRefusal`, not a truncation: a silently shortened body would be a wrong write, and a
+write that reports success having written something else is the exact failure class this
+repository treats as worst.
+
+**The limit is exactly 1,048,576 UTF-8 bytes of the normalised `contents` string, and the
+unit is load-bearing.** Three units are confusable here and only one of them is what the bound
+means:
+
+| Candidate | Why it is not the limit |
+|---|---|
+| **UTF-8 bytes of the normalised `contents`** (`contents.len()`) | **This is it.** The bytes that will be written, counted by the value itself. |
+| Characters (`contents.chars().count()`) | Smaller than the byte count for any non-ASCII text, so it would admit payloads that exceed the bound. A 1 MiB limit on characters is up to 4 MiB of bytes. |
+| Bytes of a serialised envelope | The envelope is a *transport* concern. A bound on it would drift every time the framing changes, and would silently admit a payload that fits the envelope but not the bound. |
+
+"Normalised" means the exact `String` `write_text::parse` produces — after parsing, after
+UTF-8 validation, after any normalisation the parser applies — and therefore the exact byte
+sequence the helper will write. Anything above 1,048,576 bytes is refused before any process
+exists; nothing between the limit and the wire is trimmed.
+
+The number remains a **policy input, not a measurement**, and is the one figure in this record
+the owner sets. It is approved at **1 MiB**, chosen because it is four times the largest payload
+measured above with no deadlock and far below anything that strains a pipe or `ARG_MAX`.
+
+**Decision 3 — the writer cannot deadlock the supervisor, and a failed write is never a
+successful write.**
+
+The body is written from a **dedicated thread** while the caller waits on the child, because a
+pipe fills and the parent would otherwise block before the child ever starts reading. Five
+consequences are consequences, not options:
+
+* the child's exit is never held hostage by an unwritten payload — if the child exits, the
+  write thread is abandoned, not joined indefinitely;
+* a write error (EPIPE because the child died, ENOSPC, cancellation) makes the execution
+  **fail**. It may not be reported as `verified`, because a partially written file and a
+  refused write are different outcomes and only the verifier may settle that;
+* cancellation and the dispatch deadline must be able to interrupt the write, so the thread
+  takes a cancellation token rather than running to completion regardless;
+* **after the complete frame is written, the sender closes the child's stdin**, and does so
+  *before* it waits for the child to exit;
+* **cancellation unblocks both sides**, and leaves no untracked writer thread.
+
+**Decision 3a — the sender closes the channel, because Decision 4's EOF rule is only
+provable if it does.**
+
+Decision 4 requires the receiver to read the declared payload length and then confirm EOF
+before it allows the write to proceed. That check is only meaningful if the sender actually
+terminates the stream, and the failure mode of getting this wrong is silent and severe: a
+sender that holds the write end open while waiting for the child leaves the receiver blocked
+in its "read to EOF" step **forever**, with the parent simultaneously blocked in `wait`. No
+error is raised, no timeout on the read fires if the deadline is not plumbed into it, and the
+result is a dispatch that hangs rather than one that fails — the one outcome worse than a
+wrong write, because nothing reports it.
+
+So the sender's obligations are, in order and all of them required:
+
+1. write the header and exactly `contents-length` body bytes;
+2. **close the child's stdin** — drop the write end, do not merely stop writing;
+3. only then wait for the child.
+
+A sender that **cannot complete the write or cannot close the channel** fails the execution.
+It may never be reported as `verified`: the receiver is entitled to treat a still-open stream
+as an unbounded send, and "the payload probably arrived" is not evidence. Under ADR-0053 an
+interrupted send is a partially performed effect, so it settles as `Undetermined`.
+
+**Cancellation has to reach both sides of the same pipe.** Cancelling must interrupt the
+writer *and* make the child observe a closed or broken channel, and the writer thread must
+end up accounted for — joined, or explicitly abandoned with its state recorded. A detached
+thread still holding the write end is what turns a cancellation into a hang, so
+"untracked writer thread" is a failure mode here, not a tidiness matter. This is why the
+cancellation obligation is stated twice, once in each decision: Decision 3 constrains the
+sender's bookkeeping, Decision 4 constrains the receiver's refusal.
+
+**Pinned by a regression test**, which must fail against a sender that does not close: a
+helper whose peer keeps the pipe open after sending the declared bytes never completes, and
+the test observes the dispatch reaching a deadline rather than a result. A test that asserts
+only "the payload arrived" would pass against exactly the bug this rule exists to catch.
+
+**Decision 4 — the transport is framed, and the framing is what makes "empty" and "absent"
+distinguishable.**
+
+A helper that receives `--path`, no `--contents`, and a stdin that is empty, closed early, or
+short must **refuse**. It must not write an empty file and exit `0`. This is the failure the
+existing helper's own comment already names — *"a missing flag and a missing value are
+different mistakes … so a truncated invocation cannot silently write an empty file"* — and
+moving the value off `argv` makes that invariant load-bearing rather than incidental.
+
+On a bare stdin the requirement is **not satisfiable**: "the caller sent an empty file" and
+"the caller sent nothing" are the same bytes, and the receiver cannot tell them apart. So the
+transport carries explicit, **non-sensitive** framing metadata. The wire form is a bounded
+ASCII header, then exactly the declared number of raw bytes, then EOF:
+
+```
+ORXNUD-STDIN/1\n
+contents-length: <decimal>\n
+\n
+<contents-length bytes of raw UTF-8, nothing else>
+```
+
+The four rules this buys, each of which is a test:
+
+* **`contents-length: 0` is a valid, successful write of an empty file.** Declared length zero
+  followed by immediate EOF is the one case where "no body" means what it says.
+* **Missing or unparseable metadata is refused.** No magic first line, an unknown version, a
+  missing or duplicated `contents-length`, a non-decimal value, a sign, whitespace padding, or
+  a header exceeding its own cap — each is a refusal by name, never a default.
+* **Unexpected EOF or a length mismatch must not produce a successful write.** Fewer bytes than
+  declared is a refusal; the receiver does not pad, and does not write what it managed to read.
+  Under ADR-0053's classification this is a partially performed effect, so it must settle as
+  `Undetermined`, not as `verified`.
+* **The receiver does not silently truncate excess data.** After the declared bytes it reads to
+  EOF and requires zero further bytes. Anything more is a protocol violation and a refusal.
+  Silently dropping the tail would be the same wrong-write defect as truncation, arriving from
+  the other direction. This rule has a sender half — the stream must actually be closed — and
+  it is Decision 3a; read together, because the receiver's EOF check is unprovable without it
+  and the sender's close is untestable without this.
+
+Three properties of the frame are deliberate:
+
+* **The header is capped** (512 bytes) and the declared length is range-checked against
+  Decision 2's bound *before* a single body byte is read. Without both, "framed" would still be
+  an unbounded read, and the cap is what stops a malformed peer from turning the frame into the
+  denial-of-service surface Decision 2 exists to remove.
+* **A raw length prefix, not JSON.** JSON would make "length" ambiguous between characters and
+  serialised bytes — the exact ambiguity Decision 2 has to reject — and would require buffering
+  the whole payload to compute it. A declared byte count *is* the count.
+* **The metadata is non-sensitive, and only because this channel carries payloads.** A version
+  string and a decimal length disclose nothing about content. The same frame would **not** be
+  non-sensitive for a credential, because the length alone leaks the secret's size. This is a
+  second, independent reason for Decision 5 and a further argument against sharing one stdin
+  channel between the two.
+
+The transport version is the one in Decision 6. It is part of the frame rather than a flag,
+because the receiver cannot know what protocol it is speaking until it has read something, and
+an unknown first line is exactly the case that must fail closed.
+
+**Decision 5 — credential-carrying Tier-1 capabilities remain prohibited.**
+
+`SandboxSpec.env` renders as `--setenv K V`, which is `argv`, which V-67 demonstrates is
+cross-uid readable on a `hidepid=0` host. **This ADR does not change that rendering**, and
+Decision 1 must not be read as having improved it: stdin carries the payload; it carries
+nothing else.
+
+There is no available channel that is safe *and* cheap:
+
+* `--setenv` is argv — rejected, that is the defect.
+* the child's real `environ` is `0400` and therefore **not** cross-uid readable — but
+  restoring it means undoing `.env_clear()`, whose stated purpose is to stop a parent secret
+  reaching a child. That is a security trade with an owner attached, not an implementation
+  detail, and it is not this record's to make.
+* sharing stdin with the payload needs a framing protocol that keeps two channels apart;
+  sending credentials to a helper that has not asked for a credential protocol is how they
+  end up logged.
+
+So the honest outcome is that **no Tier-1 capability carrying a credential may ship** until a
+separate design lands. R-1 already prohibits them as a release restriction; this makes the
+reason structural rather than advisory.
+
+**Decision 6 — transport compatibility is explicit, and a mismatch is refused.**
+
+`docs/18` §929 requires that an old helper with a new daemon be **refused, not silently
+mismatched**. Removing `--contents` from `argv` would otherwise produce a *refusal by
+accident*: today's helper errors on a missing `--contents`, which is the right outcome reached
+for the wrong reason, and which a later edit could quietly remove. The daemon and helper
+therefore agree a transport version explicitly, and a helper that does not implement the stdin
+transport is refused by name.
+
+**Decision 7 — S-02's default refusal stays until R-1's four conditions pass.**
+
+This record changes what the daemon is *built* to do; it does not change what it is *allowed*
+to do. `filesystem/write-text` remains refused by default after the transport change lands,
+until the evidence R-1 requires exists: the payload **and** credential sentinels absent from
+all four host-readable surfaces, every existing `write_text`/`read_text`/`governed_path` test
+passing unmodified, a green run on a user-namespace-capable host, and V-67 updated with that
+evidence. Note that condition 1 is not reachable while Decision 5 stands and no
+credential-carrying capability exists — the credential sentinel must be tested against a
+capability that actually carries one, or the check is vacuous. That tension is a known
+consequence of Decision 5, recorded rather than papered over.
+
+**What is settled and what is still open.** Settled and approved: the payload channel, the
+1 MiB bound with its exact unit, refuse-don't-truncate, the writer-thread obligation and the
+sender's close-after-frame obligation (Decision 3a), the framed wire format and its four
+receiver rules, the credential prohibition, the handshake, and the retention of S-02's refusal. **Still open, and deliberately not decided here:** the
+credential channel's design (three candidates are recorded, none chosen), any owner decision on
+F-20's `sandbox-integration` coverage state, and the four R-1 evidence conditions themselves.
+
+**Why.** The payload and the credential are the same *shape* of problem and are not the same
+problem: one is user data the user has already handed the daemon, the other is a secret whose
+whole purpose is to be confined. One has a cheap correct answer, measured on this host; the
+other has three candidate answers, each with a cost, and choosing between them is a policy
+call. Merging them into a single "we fixed argv" claim would be how a real exposure gets
+recorded as mitigated.
+
+**Trade-offs.**
+
+* stdin is a single-use channel, and Decision 4 spends what little generality it had on one
+  payload. A capability needing several distinct inputs cannot use this frame as it stands;
+  that is a real limit and means this is not a general input bus. A generalised
+  name/length/value frame is the obvious successor and is deliberately **not** built now,
+  because a multi-field frame is where "which field did this secret belong to" starts.
+* The frame's declared length is itself observable by the receiver, which is free for a
+  payload the user handed over and is not free for a secret. That asymmetry is load-bearing for
+  Decision 5 and is the reason the channel is not proposed for reuse.
+* Half-closing is easy to get subtly wrong: a sender that closes too early truncates the frame
+  (Decision 4 refuses it), and one that closes too late hangs the receiver (Decision 3a).
+  Both directions are silent, so both need a test that observes the *other* side rather than
+  the sender's own success.
+* The writer thread adds concurrency to the execution path, which is the part of the codebase
+  where "uncertain side effect" already forced a durable state (ADR-0053). A kill between
+  *write starts* and *write completes* is an uncertain effect and must settle as
+  `Undetermined`, exactly as any other partial effect.
+* The 1 MiB bound rejects payloads that previously worked, since `MAX_ARG_STRLEN` allowed
+  roughly 128 KiB per string on a 4 KiB-page host. Raising the bound later is cheap; the bound
+  existing at all is the point.
+* Not lifting the refusal means the capability is still unusable by default after this lands.
+  That is the intended cost.
+
+**Consequences.**
+
+* `SandboxSpec`, `SandboxPlan`, `spec_for`, the Linux supervisor, `write_text`, and
+  `orxnud-fswrite` all change shape. The rollback hazard is real: an old daemon with a new
+  helper, or the reverse, must refuse rather than write something wrong — hence Decision 6.
+* V-67 remains **open** until the four conditions pass, whatever this record's status is.
+* The cross-uid harness measured above becomes a required test, reported with its host
+  conditions, and is not a general statement about Linux.
+
+**Rejected alternatives.**
+
+* **Keep `argv` and rely on the S-02 refusal.** Rejected: it leaves one capability switch
+  away from a live exposure and leaves the mechanism intact for every future bundle. A
+  restriction that depends on nothing being added is not a fix.
+* **A temp file in the sandbox `tmpfs`.** Rejected: moves user content onto a filesystem
+  surface and reintroduces cleanup and leak questions in exchange for a channel that was
+  already available and needs no disk.
+* **A launcher process** that receives the payload and forwards it over an inherited file
+  descriptor. Rejected *for the payload* only: `bwrap` already forwards stdin, so a launcher
+  would add a process, a second failure domain and a second protocol for no gain. It remains
+  a live candidate for the **credential** channel, which is why Decision 5 defers rather than
+  forecloses.
+* **Read the payload to EOF with no framing.** Rejected, and this is the one that looks
+  cheapest: it needs no version line, no length, and no protocol. It cannot distinguish an
+  empty file from a truncated send, cannot detect a short write, and gives the receiver no way
+  to know whether more was coming — so a partial delivery would be written as the file and
+  reported as a success. That is precisely the failure Decision 4 exists to make impossible.
+* **Put credentials in the child's real `environ`.** Rejected for now, and this is the one
+  most likely to be proposed again: it is cross-uid safe (`0400`, demonstrated above) and it
+  removes `--setenv` from `argv` entirely. It is rejected because it requires reverting a
+  deliberate hardening whose comment names exactly this threat. It should be decided
+  deliberately, with its own record, not inherited silently from this one.
+
+**Revisit conditions.**
+
+* Revisit Decision 1 if a capability needs more than one input, or inputs larger than the
+  bound: stdin is a single-use channel carrying one framed payload, and generalising it
+  changes the frame's shape.
+* Revisit Decision 4 if the frame ever needs a second field, or if the 512-byte header cap is
+  ever raised: both change what a receiver must accept, and the receiver's refusals are the
+  contract. In particular, revisit before any frame is reused for a credential — its length
+  field is a size side channel (Decision 5).
+* Revisit Decision 3a if the child ever needs to keep writing on its own stdin — for a duplex
+  conversation rather than a delivered payload. A delivered payload closes; a conversation
+  does not, and that would reopen the EOF rule rather than merely adjust it.
+* Revisit Decision 2 if a real workload is refused for size; the number is policy and should
+  move on evidence of what the bound costs.
+* Revisit Decision 5 when a credential-carrying Tier-1 capability is actually required. The
+  three candidates above are the ones on the table, and the choice needs its own record.
+* Revisit Decision 6 if the transport version is ever allowed to drift between a daemon and a
+  helper; the refusal is the point, so a change there is a change to Decision 6.
+* Revisit Decision 7 the moment any one of R-1's four conditions gains evidence, and not
+  before — including if only the payload condition passes, which is *not* sufficient.
