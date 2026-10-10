@@ -60,9 +60,33 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Pinned by tag rather than `latest`, for the reason run-resource-tests.sh gives: a test
-# should not change because a tag moved.
-IMAGE="${ORXNUD_SANDBOX_IMAGE:-rust:1-bookworm}"
+# Pinned by **registry manifest digest**, not by tag and not by `latest`, for the reason
+# run-resource-tests.sh gives: a test should not change because a tag moved. S-24 makes
+# that stricter, because `rust:1-bookworm` is mutable -- it is re-pointed when the Rust
+# project publishes a new 1.x tag on that base, and this lane would then build and run
+# under a toolchain nobody pinned.
+#
+# The digest below is the OCI **index** digest for `library/rust:1-bookworm`, read from the
+# Docker Hub registry API (`Docker-Content-Digest` on the manifest request) and then
+# re-fetched *by digest* to confirm it resolves:
+#
+#   sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6   index
+#   sha256:b36c246742b4d323472588f789601be34eb4af053255e2af53969078ee8dcec7   linux/amd64 manifest
+#
+# Pinning the **index** rather than the linux/amd64 manifest is deliberate. `sandbox-integration`
+# runs on `ubuntu-24.04` (linux/amd64) and would resolve to the second digest, but this
+# script is also run by developers, including on arm64 hosts; an amd64-only pin would break
+# them at pull time. An index digest is immutable *and* still resolves per platform, which
+# is the property wanted. The amd64 digest is recorded above so the resolution this lane
+# performs is checkable.
+#
+# This is a registry manifest digest, not a local `docker images` ID: those are content
+# hashes of a locally-unpacked image and mean nothing to a fresh pull.
+#
+# To move it deliberately, re-read both digests from the registry API and update this line
+# -- and note the toolchain change in the same commit, because a new base moves the Rust
+# version this lane compiles with.
+IMAGE="${ORXNUD_SANDBOX_IMAGE:-rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6}"
 
 if [ "${1:-}" = "--host" ]; then
   echo "== sandbox tests, host, reporting what was found =="
@@ -110,6 +134,7 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_HOME=/usr/local/cargo \
   -v "$PWD/scripts/run-sandbox-tests-inner.sh":/inner.sh:ro \
+  -v "$PWD/scripts/install-nextest-verified.sh":/install-nextest.sh:ro \
   "$IMAGE" \
   bash -lc '
     set -euo pipefail
@@ -118,16 +143,31 @@ docker run --rm \
     apt-get update -qq
     apt-get install -y -qq bubblewrap util-linux curl ca-certificates
 
-    # cargo-nextest is not in the image and the suites are selected with its filters. The
-    # prebuilt binary is a download rather than a `cargo install`, which would add minutes
-    # of compilation to every uncached run.
-    if ! cargo nextest --version >/dev/null 2>&1; then
-      curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
-    fi
-
     useradd --create-home --uid 1000 orxnud
     chown -R orxnud /usr/local/cargo/registry
     chmod -R a+rX /usr/local/cargo
+
+    # cargo-nextest is not in the image and the suites are selected with its filters. The
+    # prebuilt binary is a download rather than a `cargo install`, which would add minutes
+    # of compilation to every uncached run.
+    #
+    # S-24: it is a *pinned, checksum-verified* download, and it is installed and executed
+    # as uid 1000 into a directory that uid owns. It used to be an unversioned
+    # `curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin`,
+    # executed as root into a system path on every push -- see
+    # `scripts/install-nextest-verified.sh` for what was wrong with that and what replaced
+    # each part of it.
+    #
+    # This runs BEFORE `cargo test --workspace --no-run` below, and `set -euo pipefail` is
+    # already in force, so a checksum mismatch fails the lane before any build step starts.
+    install -d -m 0755 -o 1000 -g 1000 /home/orxnud/.local/bin /home/orxnud/.local/tmp
+    setpriv --reuid=1000 --regid=1000 --clear-groups \
+            --inh-caps=-all --bounding-set=-all -- \
+      env HOME=/home/orxnud TMPDIR=/home/orxnud/.local/tmp \
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+      bash /install-nextest.sh /home/orxnud/.local/bin
+
+    export PATH="/home/orxnud/.local/bin:$PATH"
 
     # Build as root so the caches stay warm, and *run* as the unprivileged user. The
     # security-relevant process is the one that spawns bwrap, and that must be

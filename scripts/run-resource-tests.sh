@@ -61,9 +61,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# `rust:1-bookworm` rather than `rust:latest`, so the toolchain a resource test
-# runs against is pinned by tag rather than by whatever is newest that week.
-IMAGE="${ORXNUD_RESOURCE_IMAGE:-rust:1-bookworm}"
+# Pinned by **registry manifest digest**, not by tag (S-24). `rust:1-bookworm` is mutable:
+# it is re-pointed when the Rust project publishes a new 1.x tag on that base, so a tag pin
+# still lets the toolchain underneath this lane change without a diff here to review.
+#
+#   sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6   OCI index
+#   sha256:b36c246742b4d323472588f789601be34eb4af053255e2af53969078ee8dcec7   linux/amd64 manifest
+#
+# Read from the Docker Hub registry API (`Docker-Content-Digest`) and re-fetched by digest
+# to confirm it resolves. The index digest is pinned rather than the amd64 manifest so the
+# pin stays immutable *and* still resolves on arm64 developer hosts. This is a registry
+# manifest digest, not a local `docker images` ID. Same digest as `run-sandbox-tests.sh`,
+# deliberately: one toolchain for the container lanes.
+IMAGE="${ORXNUD_RESOURCE_IMAGE:-rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6}"
 MOUNT_CGROUP="${ORXNUD_MOUNT_CGROUP:-/sys/fs/cgroup}"
 
 if [ "${1:-}" = "--native" ]; then

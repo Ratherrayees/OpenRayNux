@@ -98,6 +98,7 @@ declare -A NAMES=(
   [G11]="vulnerabilities"
   [G12]="semver"
   [G13]="boundary gate self-tests"
+  [G14]="CI toolchain pinning (S-24)"
 )
 
 banner() { printf '\n\033[1m== %s: %s\033[0m\n' "$1" "${NAMES[$1]}"; }
@@ -797,14 +798,38 @@ gate_G13() {
   fi
 }
 
-ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13)
+# G14 -- the CI toolchain is pinned and verified, and the check is negative-tested.
+#
+# S-24 / F-20: the sandbox lane installed cargo-nextest on every push with
+#
+#     curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
+#
+# as root -- mutable version, no integrity check, piped straight into a system path. A gate
+# that only asserted "the script mentions a checksum" would be satisfied by a comment, so
+# this runs `scripts/test-ci-toolchain-pinning.sh`, which drives the real installer with a
+# deliberately wrong artifact and requires it to fail *before* installing anything, and
+# reads the URL the installer actually requested rather than the text it contains.
+#
+# The two mutations that matter were both caught: disabling the checksum comparison, and
+# reverting the release-asset URL to one that 404s.
+gate_G14() {
+  banner G14
+  if bash scripts/test-ci-toolchain-pinning.sh; then
+    ok "CI toolchain download is pinned, verified and negative-tested"
+  else
+    fail_gate "a CI toolchain pinning check failed: the download path is not verified"
+  fi
+}
+
+ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14)
 
 run() {
   case "$1" in
 G1) gate_G1 ;;  G2) gate_G2 ;;  G2d) gate_G2d ;;  G3) gate_G3 ;;  G4) gate_G4 ;;
     G5) gate_G5 ;;  G6) gate_G6 ;;  G7) gate_G7 ;;  G8) gate_G8 ;;  G9) gate_G9 ;;
     G10) gate_G10 ;;  G11) gate_G11 ;;  G12) gate_G12 ;;  G13) gate_G13 ;;
-    *) printf 'unknown gate: %s (expected G1..G13)\n' "$1" >&2; exit 2 ;;
+    G14) gate_G14 ;;
+    *) printf 'unknown gate: %s (expected G1..G14)\n' "$1" >&2; exit 2 ;;
   esac
 }
 
