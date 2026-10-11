@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**53 ADRs, numbered ADR-0001 … ADR-0055.** Two numbers in that range are
+**54 ADRs, numbered ADR-0001 … ADR-0056.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -5829,3 +5829,180 @@ claim the gate would open once items 10 and 11 are written: meeting them would m
   against measurements rather than carried forward as an assumption.
 * Revisit if any capability proposes a credential channel of its own. The prohibition is on the
   capability class, and a capability that invents a channel has found a way around it.
+
+## ADR-0056 — A refuted postcondition is not proof of non-execution; `not-performed` is issued only on pre-execution evidence
+
+**Status.** **Decided. Not implemented.** Design-only; S-04 implements it and depends on S-29 for
+the exit. Ships no code, and nothing here authorises a schema change. **Uncommitted draft.**
+
+**Context.** S-03 in the remediation plan (F-17). ADR-0053 made an uncertain effect a durable
+state. K.1 then scoped `not-performed` correctly: it is not a neutral record, it is the one
+status `recover()` excludes from its "may already have happened" test, and therefore **a retry
+permission**. Two producers of that warrant were closed at their source; `admit_verification`
+refuses a `Refuted` finding against a capability that did not report success. What was never
+examined is the remaining admissible cell.
+
+**Problem.** `admit_verification` (`crates/orxnud-capability/src/dispatch.rs:2111`) admits
+`(Succeeded, Refuted)` on purpose — the comment says that cell is "exactly where
+`Succeeded + Refuted` earns its retry permission." Admission was the right question. **The
+defect is that the verdict it admits carries no warrant.**
+
+`WriteTextVerifier` re-reads the filesystem (`crates/orxnud-capability/src/write_text.rs:517`
+for different contents, `:528` for absent). It reports evidence about **the postcondition**. It
+cannot report whether a process ran. A `write-text` that genuinely succeeded, whose file a
+second task or an editor then changed, is byte-for-byte indistinguishable from one that never
+wrote — and both produce `Refuted`. That verdict maps `Refuted → Certainty::Disproved`
+(`crates/orxnud-daemon/src/runtime.rs:2857`) `→ EffectStatus::NotPerformed` (`runtime.rs:3227`),
+and recovery's predicate (`crates/orxnud-store/src/task_repo.rs:3316-3321`) excludes only that
+one row value when `e.idempotent = 0`. So a non-idempotent effect that **did** happen is
+automatically repeated.
+
+**Evidence.**
+
+```
+cargo test -p orxnud-capability --lib write_text::tests::a_write_that
+  1 failed, 1 passed
+  FAILED  a_write_that_occurred_and_was_later_overwritten_does_not_authorise_a_retry
+          Observed verdict: Refuted { evidence: "…exists but holds 24 bytes,
+                                     not the 6 requested" }
+
+cargo test -p orxnud-store --lib
+  291 passed, 0 failed
+```
+
+The failing test asserts the **safe** outcome and is the pre-fix regression S-04 requires. The
+consequence is demonstrated rather than inferred by
+`a_not_performed_row_hands_a_non_idempotent_task_back_to_a_worker`, which drives the real
+`recover`/`claim` predicates and shows the task handed back to a worker.
+
+**Three controls, none weakened to obtain a green result.**
+
+* `an_unknown_row_stops_a_non_idempotent_task_from_being_retried` — **passes.** An unresolved
+  row does stop the retry. Without it the demonstration above could be passing because nothing
+  was ever retryable.
+* `a_refusal_before_execution_is_recorded_as_not_performed` (`runtime.rs:5437`),
+  `a_definite_pre_execution_refusal_is_not_performed_and_denied` (`runtime.rs:5544`) and
+  `a_refusal_that_reports_nothing_attempted_leaves_no_effect_and_is_a_denial`
+  (`capability/src/tests/settlement.rs:1024`) — **all pass.** The genuine non-execution path is
+  already distinguishable, already covered, and is not touched by this record.
+* `a_write_that_never_happened_still_proves_absence` — **passes today**, and this record
+  **supersedes it**. See Decision 7; the supersession is named there rather than performed
+  quietly.
+
+**Scope of the finding — probable exposure, not a proven live-daemon defect.** The racing write
+is staged directly in the workspace between the adapter's write and the verifier's re-read. No
+end-to-end run through a live daemon was performed; doing so needs a second write to land inside
+the verification window, which is timing-dependent. The unit-level demonstration is deterministic
+and the chain is real, but no document may describe F-17 as reproduced end to end until a live
+run exists.
+
+**The distinction this record turns on.** A verification result is evidence about a
+**postcondition**. Whether a process ran and whether an effect occurred are facts about
+**execution**. The two are different questions with different evidence, and the codebase already
+carries the vocabulary: `ExecutionCertainty::NothingAttempted` is set only where a refusal is
+decided **before a process exists**, and it is the field that makes such a refusal trustworthy.
+That is execution evidence. A file's contents are postcondition evidence. Only the first can
+issue a retry permission.
+
+**Options evaluated.**
+
+| Option | Verdict |
+|---|---|
+| **A. Stop routing verification evidence into `not-performed`.** A refuted postcondition after a possible execution becomes `Undetermined` → `Unknown`, and `not-performed` is reachable only from pre-execution refusal. Uses the existing `EffectStatus::Unknown`, the existing `TaskState::NeedsVerification` and the existing admission table. | **Chosen.** No schema change; the verdict is simply not allowed to issue a warrant it has no evidence for. |
+| **B. Persist a verification strength or provenance the task layer reads** — a new `Refuted` variant carrying "ran" vs "may not have run", or a new `EffectStatus`. | **Rejected, and gated on S-11 if ever revisited.** It would give the task layer a distinction the verifier does not actually have: no re-read can tell a genuine write-then-overwrite from a write that never happened. It would persist a fact the system cannot establish, and it would trade a bounded uncertainty for a permanent schema obligation. |
+
+**Decision 1 — `not-performed` requires positive evidence of non-execution, and postcondition
+evidence is never that evidence.** A verifier observing an absent or changed file reports the
+state of a postcondition. It does not, and cannot, report that the effect did not occur, unless
+the capability's contract explicitly establishes that fact — and no current contract does.
+
+**Decision 2 — the warrant must be pre-execution.** `not-performed` is issued from
+`ExecutionCertainty::NothingAttempted` and from a `Policy` refusal decided before a process
+exists, and from nowhere else. Both are decisions made while no process could have run.
+
+**Decision 3 — `(Succeeded, Refuted)` becomes unresolved.** A successful execution with a
+failed postcondition is `Undetermined`, giving `Certainty::Unknown`, `EffectStatus::Unknown`,
+and `TaskState::NeedsVerification`. The task stops, a human or S-29's adjudication exits it, and
+no worker picks it up.
+
+**Decision 4 — no route from verification to `not-performed` survives.** This includes the
+dispatch-error arm at `runtime.rs:2299` (`VerificationRefuted → NotPerformed`), which is a
+second door into the same unsafe status and is closed by the same reasoning.
+
+**Decision 5 — a non-idempotent effect is never automatically retried on refutation.** Not
+because retry is always wrong, but because a refutation is evidence of difference, and
+difference is not permission.
+
+**Decision 6 — the pre-execution refusal path is unchanged.** Its semantics were correct, are
+covered by three passing tests, and are explicitly out of scope. This record must not be
+implemented as "downgrade everything refuted into one bucket" — the failure mode that would
+turn every uncertain refusal into an adjudication queue.
+
+**Decision 7 — an absent file is also not proof of non-execution, and this supersedes a passing
+test.** "The file is not there" is the same inference as "the file is different": a write that
+happened and whose output was subsequently deleted looks identical. Under Decisions 1–3 it also
+becomes `Undetermined`. This is stated plainly because `a_write_that_never_happened_still_proves_absence`
+currently **passes** and asserts the opposite, so implementing this record will turn that test
+red. That is the intended consequence and it is **not** a weakening of a control: the control
+that matters is Decision 6, and it stays green. The superseded test is S-04's job to rewrite
+into an assertion that an absent postcondition no longer grants a retry. It has been left
+untouched here because this record is design-only and the ADR is not yet approved.
+
+**Decision 8 — Option A is selected; no schema change; S-11 is not on this path.** Nothing in
+Decisions 1–7 adds a variant, a column or a table. `EffectStatus::Unknown`,
+`TaskState::NeedsVerification` and the admission table all exist.
+
+**Decision 9 — the consequence for S-04 is that it is no longer gated on S-11.** The plan's
+S-04 carries `Risks: If S-03 chooses (b), this needs a migration → gated on S-11`. Option A is
+chosen, so **that gate does not apply**. S-04 remains blocked on **S-29** alone, because
+routing a refutation to `NeedsVerification` is only safe once that state has an exit; S-04's own
+acceptance sentence already says so. S-04's negative controls (a), (b) and (c) survive unchanged
+except that (a)'s "may still be admitted" is now answered by Decision 6 rather than by an
+absent file — a **may** that this record declines to exercise.
+
+**What this record does not establish.** That the exposure is reachable end to end in a running
+daemon (probable exposure only). That `NeedsVerification` is a good place to stop — S-29 owns
+that argument, and a state with no exit is a stranding risk, which is precisely why S-04 is
+blocked on it. That the timing window is wide; it may be narrow, and a narrow window reduces
+frequency without changing the class of defect.
+
+**Trade-offs.** A contended `write-text` now stops for adjudication instead of silently
+retrying, which trades automation for a human queue. That cost is real, is the same trade
+ADR-0053 made for `Undetermined`, and is the correct direction: the alternative is an
+occasional duplicate non-idempotent effect with no human involved. Some refusals that are
+genuinely safe to repeat are now re-driven through the full path rather than short-circuited.
+
+**Rejected alternatives, with the reason each was not chosen.**
+
+* **Option B (persist verification strength)** — as above; it persists a fact no re-read can
+  establish, and needs a migration.
+* **Keep the verdict and narrow it to `Verified` only** — that is Option A without the
+  distinction, and it would forbid `admit_verification`'s existing `Succeeded` cells wholesale.
+  Over-broad, and it discards a correct `Undetermined` as collateral.
+* **Compare mtime, inode or ctime to detect the overwrite** — inference dressed as measurement.
+  A same-nanosecond rewrite, a restored file, or a clock adjustment defeats it, and it would be
+  a weaker warrant than the one ADR-0053 already provides for `Undetermined`.
+* **Detect the race inside the verifier** by re-reading twice and diffing — proves a change
+  occurred, not that *this* capability did not write. It cannot close the hole, and it can
+  produce a confident wrong answer in the case that matters.
+
+**Owner decisions this record does not make.**
+
+* **Which capability is the first to need adjudication rather than a retry** — a product
+  question, and answering it does not change any decision above.
+* **Whether S-29's adjudication path should resolve a refutation as `Observed` or as a new
+  status.** Out of scope here; S-29 owns it.
+* **Whether history is rewritten.** It is not: rows already written as `not-performed` from a
+  refutation cannot be told apart from genuine ones, for the same reason the verifier could not
+  tell them apart. Left standing, as K.1 decided.
+
+**Revisit conditions.**
+
+* Revisit if a capability's contract is extended so that a postcondition *can* prove
+  non-execution — a write that carries its own receipt which no later actor could forge. That
+  would make the distinction real and might justify narrowing Decision 3 for that capability
+  alone.
+* Revisit if a live-daemon reproduction shows the timing window is closed in practice. That
+  would lower the frequency and change nothing else: the warrant would still be absent.
+* Revisit if `NeedsVerification` gains its exit (S-29) and the adjudication queue proves
+  unworkable in volume. Then the pressure lands on S-29, not on this rule.
