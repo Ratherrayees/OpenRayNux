@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**52 ADRs, numbered ADR-0001 … ADR-0054.** Two numbers in that range are
+**53 ADRs, numbered ADR-0001 … ADR-0055.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -29,6 +29,9 @@ existed while the header still claimed 47 ADRs through ADR-0049:
 * **ADR-0054** — the Tier-1 payload travels on the child's stdin; credential-carrying
   capabilities stay prohibited until a separate design lands. **Decided, not implemented**;
   `docs/18` §6.3 gates the implementation phase on this record being merged.
+* **ADR-0055** — the credential channel: an inherited file descriptor carried by
+  `bwrap --sync-fd`, opt-in per capability, with the prohibition kept until the evidence exists.
+  **Decided, not implemented**; ships no code and enables no capability.
 
 **Reading the dates.** ADR-0001 … ADR-0030 were written on 2026-09-30 against
 `Draft v0.1` of the architecture, and their *reasoning* is a point-in-time record
@@ -5181,3 +5184,648 @@ recorded as mitigated.
   helper; the refusal is the point, so a change there is a change to Decision 6.
 * Revisit Decision 7 the moment any one of R-1's four conditions gains evidence, and not
   before — including if only the payload condition passes, which is *not* sufficient.
+
+---
+
+## ADR-0055 — Credential-bearing Tier-1 capabilities stay prohibited; the descriptor transport is documented, not approved
+
+**Status.** Two separate things, stated separately so neither is read as the other:
+
+> **POLICY — decided and approved: credential-bearing Tier-1 capabilities are prohibited. This
+> is the record's operative decision and it does not depend on anything below.**
+>
+> **TRANSPORT — documented, not approved for implementation: the descriptor channel below is a
+> design study. No code is to be written for it, and nothing in this document authorises writing
+> any.**
+
+Acceptance items 10 and 11 are **prerequisites for reconsidering the transport**, not a checklist
+whose completion authorises building it. Completing every item would make the channel eligible
+for a *new* decision, not satisfy this one — and this document must never be cited as though
+the transport were approved and merely awaiting tests.
+
+**Uncommitted draft.** The policy decision is approved; the commit is not authorised. Ships no
+code: `SandboxSpec.env` still renders
+`--setenv K V`, credential-bearing Tier-1 capabilities remain prohibited, F-10 remains open and
+R-1 stands.
+
+This record does two things, and they are separable. It **decides the policy** — credential-
+bearing Tier-1 capabilities are prohibited — which needs no further evidence and is not
+reopened by anything below. And it **documents a transport design** for the day that policy is
+reconsidered, recording what would have to be measured first. What follows is therefore a
+**design study under a closed gate**, not a plan in progress. The channel is not authorised, no
+code is to be written for it, and meeting every acceptance item would open a new discussion
+rather than close this one.
+
+**Context.** ADR-0054 removed the payload from `argv` and, in Decision 5, prohibited
+credential-bearing Tier-1 capabilities because their channel was never fixed. That channel is
+`SandboxSpec.env`, rendered by `linux.rs` as `--setenv KEY VALUE` — which is `argv`.
+
+**The channel is dormant by reachability, not by absence of code — and this record first got
+that wrong.** An earlier draft of this section claimed `CREDENTIAL_ENV` "appears in exactly
+three places: its own definition, `stdin_credential`'s lookup, and one redaction test." Checking
+that against the tree at review time: it appears in **seven**. The four the draft missed include
+the one that matters most:
+
+```
+subprocess.rs:261   spec = spec.env(CREDENTIAL_ENV, secret);      <- producer, on the hot path
+subprocess.rs:225   .filter(|(k, _)| k.as_str() != CREDENTIAL_ENV) <- redaction at the far end
+subprocess.rs:257   // "added to the *spec* here and nowhere else"   <- contradicted by :338
+subprocess.rs:338   contract.env.get(CREDENTIAL_ENV)                <- the lookup
+```
+
+So there is a **live producer** that renders the credential into `spec.env`, which `linux.rs`
+turns into `--setenv KEY VALUE` — `argv`. It is gated only by whether `contract.env` carries
+the key, and on that gate the conclusion the draft reached still stands: no production
+`SandboxPlan` populates it, so **R-1's credential half of condition 1 remains vacuous** — there
+is no capability to carry a sentinel.
+
+What changes is the reason. The channel is not dormant because the code to use it is absent;
+it is dormant because **nothing sets the key**. Those are different failure modes. The first is
+fixed by writing code; the second is fixed by removing a capability, and it would survive a
+complete and correct implementation of this ADR's channel. It is therefore a weaker property
+than "the channel is unused", and the revision gate should rely on it only alongside the
+prohibition rather than in place of it.
+
+**Therefore the prohibition must not rest on the pathway being unreachable.** An unreached
+producer that renders a secret into `argv` is one populated `SandboxPlan` away from putting a
+credential in `/proc/<pid>/cmdline`, and the argument against that would then be "but nothing
+populates it" — which is an accident waiting for a feature, not a control. Anyone reading this
+record must be able to state the prohibition's actual basis, which is two independent reasons
+and neither of them is dormancy:
+
+* **The channel is unacceptable as it stands.** `SandboxSpec.env` is `argv`. ADR-0054 Decision 5
+  already prohibited credential-bearing Tier-1 capabilities because of that, and nothing here
+  retracts it. A producer exists on the hot path, so the refusal is load-bearing rather than
+  theoretical.
+* **No capability needs a credential.** Not "the capability is unsafe today" — simply that there
+  is no concrete capability for which a secret is required. Building the channel would be
+  infrastructure ahead of a need, and its first consumer would arrive *after* the security
+  argument was written rather than before it.
+
+If a future reviewer finds the pathway reachable, the prohibition does not weaken; it is
+restated on these grounds and the reachability is fixed as a separate defect. **A control that
+disappears when its precondition disappears is not a control.**
+
+**A documentation contradiction found while writing this, recorded because it will mislead the
+next reader — and it is worse than it first looked.** `dispatch.rs::contract_for` states that
+"the credential is deliberately absent" from the contract and that "even its reference in it
+would create three new leak paths". Far from that, `subprocess.rs::stdin_credential` reads the
+credential **out of `contract.env`**:
+
+```rust
+// subprocess.rs:257 -  (82 lines above the code that does it)
+// The credential, if any, is added to the *spec* here and nowhere else. It is
+// not in `contract`, so it cannot be logged or audited from the contract.
+
+subprocess.rs:337
+fn stdin_credential(contract: &ExecutionContract) -> Option<&String> {
+    contract.env.get(CREDENTIAL_ENV)          // <- it is read from contract.env
+}
+```
+
+The reviewer's first reading of this contradiction put the two comments "twelve hundred lines
+away in the same crate", as though they were in different files. They are **82 lines apart in
+the same file**, and one of them describes the function sitting directly beneath it. Both
+comments are confident and they cannot both be true, and the "cannot be logged or audited from
+the contract" claim is the load-bearing one: if the credential really is in `contract.env`, it
+is in the structure that `contract_for` says is serialised, and that is a claim about
+durability and audit, not only about runtime reachability.
+
+Which one is wrong is not decided here. But until it is reconciled, the credential path's shape
+is genuinely ambiguous, and an ADR that described it as "absent from the contract" would be
+describing an intention rather than the code. This is also why the producer at
+`subprocess.rs:261` is the line to read first: it is where the claim is cashed out.
+
+**Evidence, measured on the development host before any edit — 2026-10-11 for the cross-uid
+readings and the version and handoff checks, 2026-10-12 for Findings 3 and 4.** The dates
+differ because the two later findings were added by review after the first pass, and a single
+undated date would overstate how much was known when. A process holding an
+inherited read fd open, read from a container at uid 4242 sharing the host PID namespace:
+
+```
+/proc/<pid>/cmdline   mode 444   read cross-uid  SUCCEEDED   (V-67, reproduced)
+/proc/<pid>/environ   mode 400   read cross-uid  Permission denied
+/proc/<pid>/fd        mode 500   ls   cross-uid  Permission denied
+/proc/<pid>/fd/3      readlink cross-uid  exit 1, no output
+/proc/<pid>/fd/3      open   cross-uid  Permission denied
+```
+
+**An inherited descriptor is not cross-uid observable here, and that is the property `argv`
+lacks.** That part survives measurement. The *handoff*, however, was then validated with a
+**non-secret proof of concept**, because the first version of this record cited
+`bubblewrap 0.12.0 --help` — the **development host's** version — while the lane OpenRayNux
+actually ships in installs **0.8.0** (`bubblewrap 0.8.0-2+deb12u1`, Debian bookworm). Both
+expose the flags, but quoting the wrong one is a claim about a binary CI never runs:
+
+```
+bubblewrap 0.12.0                      # host
+bubblewrap 0.8.0-2+deb12u1             # the pinned rust:1-bookworm lane
+--args FD      Parse NUL-separated args from FD
+--sync-fd FD   Keep this fd open while sandbox is running
+--as-pid-1     Do not install a reaper process with PID=1
+```
+
+A synthetic sentinel — `FD-POC-SENTINEL-4b7e21d9`, never placed in `argv` or the environment —
+was written to a pipe, carried in as descriptor 3, and read by the sandboxed executable:
+
+```
+--sync-fd 3 --as-pid-1      fd present in the child; frame read exactly
+--sync-fd 3 (no --as-pid-1) fd absent from the child (fcntl returns -1 / EBADF)
+```
+
+**Four findings, three of which falsify what this record previously said.**
+
+**Finding 1 — `--sync-fd` only reaches the child together with `--as-pid-1`.** Reproduced on
+both 0.8.0 and 0.12.0: without the flag, `fcntl(3, F_GETFD)` inside the child returns `-1`, so
+the descriptor is not open there at all. OpenRayNux's `linux.rs` does **not** pass
+`--as-pid-1` today, so **the channel does not exist in the shipped supervisor and would have
+to be added**. `--as-pid-1` means *do not install a reaper process with PID 1*: a change to the
+PID-namespace and reaper lifecycle, and not a detail to be slipped in.
+
+**Finding 2 — the descriptor IS inherited by descendants.** The earlier version of Decision 6
+claimed "a descriptor is not inherited". That is **wrong**:
+
+```
+inside the sandbox:   fd3_getfd=0   FD_CLOEXEC=CLEAR
+child       /bin/sh :  fd3 PRESENT   (read the framed sentinel)
+grandchild /bin/sh :  fd3 PRESENT   (read the framed sentinel)
+```
+
+`--sync-fd` leaves the descriptor **inheritable**. An earlier attempt at this measurement
+appeared to show the opposite and was itself wrong: the probe used `std::process::Command`, whose
+runtime closes non-standard descriptors before `exec`, so it was measuring Rust's descriptor
+hygiene rather than kernel inheritance. Re-measured with a shell child — no runtime hygiene,
+kernel semantics only — the inheritance is unambiguous on 0.8.0 as well as 0.12.0.
+
+**Finding 3 — `FD_CLOEXEC` stops inheritance across `execve()`, and nothing else.**
+
+```
+receiver first line      : PRESENT+INHERITABLE
+after fcntl(FD_CLOEXEC)  : PRESENT+cloexec
+descendant after exec    : fd3 ABSENT
+```
+
+That first measurement used a shell child, which necessarily `exec`s. Re-running it with the
+two cases separated — both from the same receiver, after it had set the flag — shows what the
+first one could not:
+
+```
+fork() only        : READ THE CREDENTIAL
+fork+execve() child saw fd3: no
+```
+
+`FD_CLOEXEC` is consulted by the kernel during `execve`, not at `fork`. A child created by
+`fork()` alone inherits the descriptor regardless of its flags. The earlier result was true and
+was measured over too narrow a case to support the conclusion drawn from it.
+
+**Finding 4 — and this one is worse: closing the descriptor does not remove the secret from
+memory.**
+
+Descriptor lifetime and secret lifetime are different things, and the rules that govern them do
+not overlap. `fork(2)` gives the child a **copy of the parent's address space**; a secret that
+was read into any buffer is in that copy regardless of what happened to the descriptor. So the
+obligation "close the descriptor before spawning" is necessary and is **not sufficient**:
+
+```
+1. receiver read 59 bytes from the descriptor
+2. descriptor CLOSED (fd 3 no longer exists)
+3. forked AFTER closing the descriptor
+   -> fork-only child: RECOVERED THE SECRET FROM INHERITED MEMORY
+```
+
+The child in that run had **no descriptor at all** — `close(3)` had already run, and
+`FD_CLOEXEC` was set besides. It recovered the credential anyway, from a page its own `fork`
+copied. No descriptor rule reaches this, because by then the secret is no longer *in* a
+descriptor; it is in an ordinary heap allocation that happens to hold it.
+
+The first run of this measurement reported the opposite, because the probe read 48 bytes of a
+59-byte frame and truncated the sentinel mid-string. A measurement can be wrong in both
+directions, and this one was wrong in the direction that made the design look better than it is.
+
+**Finding 4 is the reason the no-descendants rule is not a belt-and-braces addition to
+`FD_CLOEXEC`, and the reason it cannot be discharged after the descriptor is closed.** It is
+also the finding that decides the alternatives below: a launcher does not help, because the
+launcher that reads the credential is itself a process holding the secret in memory when it
+forks the helper.
+
+**Lifecycle cost of `--as-pid-1`, measured rather than assumed.** A main command that exits at
+once while leaving a descendant alive: `bwrap` returned in **0s with and without** the reaper,
+and in both cases the surviving descendant was killed with the namespace and never wrote its
+marker. So the flag did **not** weaken tree-lifetime containment in the cases exercised. That is
+two cases rather than a proof, and applying it to *every* Tier-1 dispatch would change behaviour
+for every capability — so Decision 1a confines it to dispatches that declare a credential, which
+limits the blast radius and makes the divergence itself something that must be measured rather
+than assumed.
+
+**Every cross-uid reading above is host-dependent, not a property of this code.** It holds on a
+host whose `/proc` is `hidepid=0` with an ordinary `ptrace_scope`; a hardened kernel may differ,
+and the evidence must always be reported with the `/proc` configuration it was gathered under.
+
+**The question.** Which channel, if any, may carry a credential to a Tier-1 child.
+
+**Options evaluated.**
+
+| Option | Verdict |
+|---|---|
+| **A. Inherited fd**, opened by the daemon, carried through `bwrap --sync-fd`, read by a helper that asked for one | **Chosen as the design of record — not approved for implementation.** Not cross-uid observable (measured); absent from `cmdline`, `environ` and the filesystem; **inheritable by default and closable by the receiver** (Decision 6); needs `--as-pid-1`, which the shipped supervisor does not pass (Decision 1a). |
+| **B. A distinct framed credential channel on stdin**, multiplexed with the payload | **Rejected.** Every helper that reads stdin — including ones with no credential to receive — would see credential bytes on the wire. ADR-0054 already recorded the principle: *sending credentials to a helper that has not asked for a credential protocol is how they end up logged.* A dedicated descriptor inverts that: only a helper that declared it gets one. |
+| **C. The child's real `environ`** (`--setenv` replaced by a non-`argv` mechanism) | **Rejected, and this is the one most likely to be proposed again.** The *exposure* is safe: `environ` is `0400` and measured denied cross-uid. It is rejected on a different and stronger ground — **`environ` is inherited by every descendant.** A helper that spawns a child hands it the secret for free, with no opt-in and no audit. A descriptor **is** inherited too — but it is inheritable *by default and closable*, whereas `environ` propagates with nothing to close. Reversing `.env_clear()` — whose stated rationale is *"the single most effective way for a parent secret to reach a child"* — to adopt a channel that propagates automatically is the opposite of that rationale. |
+| **D. Keep the prohibition** | **Rejected as a *permanent* answer; adopted as the current state.** It is correct today and by itself it is not a resolution — it leaves the one mechanism that could satisfy R-1 condition 1 unexamined. That examination is what this record is; the prohibition is then kept anyway, conditioned on a demonstrated requirement. So D is not rejected for lack of examination but despite it, and it is revisited rather than abandoned. |
+
+**Decision 1 — the credential travels on an inherited read descriptor, never on `argv`,
+`environ`, stdin, a file, or a command line.**
+
+The daemon creates the pipe. The read end is carried into the sandbox by
+`bwrap --sync-fd N` and lands at a **fixed, non-negotiable descriptor number** in the child.
+The write end is used once, on a dedicated thread, and closed — ADR-0054 Decision 3a's rule
+applies unchanged, and for the same reason: a sender that holds the write end open leaves the
+receiver blocked forever while the parent is blocked in `wait`.
+
+**Decision 1a — `--as-pid-1` is required, and is applied only to dispatches that declare a
+credential.**
+
+Finding 1 makes this non-optional: without the flag the descriptor never reaches the child, so
+the channel does not exist. It is scoped rather than global because it removes a reaper, and
+applying that to every Tier-1 dispatch would change the process-lifetime behaviour of every
+capability on the strength of a credential feature. A credentialless dispatch keeps exactly the
+behaviour it has today.
+
+The cost of scoping is a divergence: credentialed and credential-free dispatches will differ in
+reaper handling, and that divergence is itself something to measure rather than assume away.
+
+The two lifecycle experiments in the evidence are **evidence, not proof**. They covered a
+surviving descendant after the main command exited, and descriptor delivery; they did not cover
+orphan reaping under load, cancellation races, or every ordering between the reaper, the
+cgroup kill and `--die-with-parent`. So a host or a `bubblewrap` where `--as-pid-1` cannot
+provide the descriptor safely **must refuse** the credential-bearing capability — which is the
+same fail-closed posture as `can_fulfil`, and is the default until the missing cases are
+measured rather than assumed.
+
+**Decision 2 — the sandbox contract carries the descriptor, never the value.**
+
+The shape mirrors what ADR-0054 did for the payload, and the parallel is deliberate: the
+contract is data that is logged, audited and serialised (as `contract_for` itself says), so a
+value in it is a leak by construction. `SandboxSpec` gains something that names *which
+descriptor* and *how many bytes to expect*, and the daemon holds the bytes.
+
+**Decision 3 — a capability receives a credential only by declaring one at plan time, and the
+default is none.**
+
+This is the security boundary, and it is where most of the safety comes from. `SandboxPlan`
+gains an optional credential requirement; **absent means no descriptor is created at all**, and
+a helper that finds no descriptor is not handed one, cannot ask for one at runtime, and has no
+way to reach the store. A capability cannot escalate from "no credential" to "a credential" by
+anything short of a source change.
+
+**Decision 4 — a helper that does not implement the credential protocol is refused, by name.**
+
+The same rule as ADR-0054 Decision 6, on a separate magic. The descriptor begins with
+`ORXNUD-CRED/1` and a declared length; an unknown magic, a missing or duplicate length, a
+non-decimal length, a header over the cap, an unexpected EOF, or trailing bytes are each refused
+by name and **never yield a partial credential**. The framing is deliberately a *separate*
+implementation from `stdin_frame`, not a shared one: a shared parser is a shared bug surface
+between the payload channel and the secret channel, and the two have opposite failure costs.
+
+**Decision 5 — the size limit is small and fixed, and it is a limit rather than a hint.**
+
+A credential is not user content, so ADR-0054's 1 MiB is the wrong order of magnitude
+entirely. The bound is a fixed maximum for a secret, and a request that exceeds it is refused
+before the descriptor exists — never truncated, for the same reason a payload is not truncated.
+
+**Decision 6 — corrected three times. Two different lifetimes, and the rule is about the
+longer one: no child process may be created while credential material is reachable in this
+process's address space, whether or not the descriptor is still open.**
+
+The rule has moved three times as the measurements moved, and each move was in the direction of
+finding a hole rather than closing one:
+
+* first it claimed descriptors are not inherited (false — Finding 2);
+* then that `FD_CLOEXEC` stops inheritance (true only across `execve`, not `fork` — Finding 3);
+* then that closing the descriptor before spawning is sufficient (false — Finding 4).
+
+**Descriptor lifetime and secret-memory lifetime are different things.** `FD_CLOEXEC` governs a
+descriptor across `execve`. A credential that has been read into a buffer is in the process's
+address space, and `fork` copies that space. Closing the descriptor, setting the flag, and
+waiting for an exec all leave the secret sitting in an ordinary heap allocation, and a
+`fork()`-only child receives a copy of it — measured, with the descriptor already closed and the
+flag already set.
+
+The obligations are therefore:
+
+1. **The daemon creates the write end with `FD_CLOEXEC` already set**, so nothing the daemon
+   spawns can *write* the credential.
+2. **The receiver sets `FD_CLOEXEC` on descriptor 3 as its first action**, before reading a byte
+   and before any application-controlled code runs. This closes the descriptor across `execve`.
+3. **No child process may be created while credential material remains accessible in this
+   process's address space — regardless of whether the descriptor has already been closed.**
+   Credential-bearing execution must not invoke process creation, directly **or indirectly**,
+   until credential material has been cleared from all relevant buffers and representations.
+   "Indirectly" is not a hedge: it covers libraries that spawn on our behalf and other threads
+   in the same process, not only an explicit `fork()` in the capability's own source.
+4. **Credential material is wiped as early as possible**, so the window in which obligation 3
+   applies is as short as the implementation can make it. Every copy matters: the framing buffer
+   the daemon wrote, the receiver's read buffer, and any derived form.
+
+**Obligation 3 is a trust-boundary restriction, not a guarantee.** Nothing in this design
+enforces it. `FD_CLOEXEC` enforces obligations 1 and 2; obligation 3 is enforced by review and
+by testing, and it is the obligation that Finding 4 shows cannot be reduced to anything the
+kernel provides. It is stated that way so that no later reader mistakes it for a mechanism.
+
+**What a launcher does and does not buy.** A launcher that reads the credential and then starts
+the helper **still holds the secret in its own address space at the moment it forks**, which is
+exactly Finding 4's case. The launcher relocates the boundary; it does not remove it. Any design
+that has a process read a credential and then create a child has this exposure, so "add a
+launcher" is not a fix for it.
+
+**Decision 7 — after the helper has used the credential, the bytes are released.**
+
+The value lives in a `zeroize::Zeroizing` buffer that is wiped on drop, exactly as
+`CredentialHandle` already does today; the read buffer is likewise wiped after the declared
+length is consumed, rather than being left in a `Vec` that survives until the allocator reuses
+it. Neither the daemon's nor the helper's copy is ever formatted, and the audit record carries
+the `SecretRef` — which credential — and never the value.
+
+This decision is a **hygiene measure, not an erasure guarantee.** Wiping the live buffer does
+not reach the copies an allocator may have abandoned, nor a representation another component
+derived; those are enumerated under acceptance item 10, and the honest scope of what a wipe test
+establishes is stated there. Decision 7 should not be cited as though wiping closed the
+question. It narrows the window in which Decision 6's obligation 3 applies; it does not
+discharge it.
+
+**Decision 8 — failure is reported as uncertainty, never as success.**
+
+A partial delivery, a cancellation, a timeout, a child that exits before reading, or an
+unexpected EOF all produce an execution whose outcome is **not established**. Under ADR-0053 that
+is `Undetermined`, not `Failed`: the capability may have used the credential before dying, and
+`Failed` would claim nothing happened while inviting a repeat that reuses a possibly-spent
+secret.
+
+**Decision 9 — concurrency isolation is per-invocation by construction.**
+
+Each invocation creates its own pipe and its own descriptor. There is no shared channel, no
+registry, and no ordering between invocations, so one invocation's credential cannot appear in
+another's — the property the S-17 concurrency tests establish for the payload channel, obtained
+the same way here.
+
+**Decision 10 — the prohibition on credential-bearing Tier-1 capabilities stays in force. The
+evidence below is a precondition for *considering* it, not a condition that lifts it.**
+
+This record decides the channel; it does not authorise a capability. Nothing here enables one,
+and the existing prohibition is unchanged by it.
+
+An earlier draft of this decision said the prohibition lasts "until Decision 11's evidence
+exists", which was both under-specified and wrong in kind. The evidence is the whole numbered
+list below, and **meeting all of it would not lift the prohibition by itself** — it would make
+the channel *eligible to be considered*. The owner has recorded that decision separately, and
+the two must not be confused: items are a floor for a conversation, not a key that opens the
+gate.
+
+**Decision 11 — a non-vacuous sentinel strategy, and why the obvious one fails.**
+
+R-1 condition 1 needs a credential sentinel on all four surfaces. A sentinel that comes from a
+production capability requires that capability to exist, and enabling one to produce test
+evidence is precisely what the prohibition forbids. The strategy that avoids the trap:
+
+* the sentinel comes from a **synthetic `SecretsContract`** whose value is generated inside the
+  test process, so no real secret is ever involved and nothing needs protecting;
+* it is delivered by a **test-only adapter bundle** that declares a credential, exercised
+  through the **real** `SandboxExecutionBackend` and a **real** `bwrap` — not a mock, because a
+  mock would not traverse `--sync-fd` and would prove nothing about the transport;
+* the negative control is the one that matters: **the same bundle with its credential
+  declaration removed must produce no descriptor at all**, asserted by the helper failing to
+  read one. Without that, a test proving "the sentinel is absent everywhere" would also pass
+  against a build that never delivered it;
+* the four surfaces are read as V-67 reads them, with the measured `/proc` configuration
+  recorded alongside, and **an FD check added** — `/proc/<pid>/fd/N` — because that is the new
+  surface and leaving it unchecked would be the exact gap this record exists to close.
+
+**Evidence required before the transport is reconsidered — all of it.**
+
+Note what this list is and is not. It is **not** a work list to be discharged in order to build
+the channel, and completing it is not approval to build it. These are the conditions under which
+the topic may be **opened again**, and until they are met there is nothing to implement. The
+policy decision above stands independently of every line of this list.
+
+1. A credential sentinel absent from `bwrap`'s and the joiner shell's `cmdline`, from both
+   `environ`, **and** from `/proc/<pid>/fd/N`, read cross-uid on a user-namespace-capable host,
+   with the host's `/proc` configuration recorded.
+2. The negative control of Decision 11: no declaration, no descriptor.
+3. Every Decision 4 refusal exercised against the **real** transport: unknown magic, missing and
+   duplicated length, non-decimal, over-cap header, short body, trailing bytes.
+4. Concurrency: N invocations with distinct synthetic credentials, each receiving its own.
+5. Cancellation and timeout producing `Undetermined`, never `verified`.
+6. The dedicated sandbox lane green end to end, and the workspace suite green.
+7. The documentation contradiction above reconciled, so the code says one thing about where the
+   credential lives.
+8. **`--as-pid-1` costs measured, not argued.** With the flag applied only to credentialed
+   dispatches, evidence that a credentialless Tier-1 dispatch behaves exactly as it does today,
+   and that a credentialed one does not lose tree-lifetime containment, orphan reaping or the
+   bounded-join property `linux.rs` documents.
+9. **The receiver's `FD_CLOEXEC` rule proven for both child kinds**, not just the one a
+   shell produces: an `exec`ing grandchild must find the descriptor closed, **and** the
+   `fork()`-only case must be shown to be unreachable by construction — because a test
+   asserting only the first would pass against the fork leak Finding 3 exposed.
+10. **Secret-memory lifetime discharged, which is a different and harder obligation than item
+    9.** Evidence that, at every point where process creation could occur — including creation
+    by a library, by a runtime, or by another thread — no buffer, slice, `String`, frame copy or
+    derived representation still holds credential material. Concretely: an inventory of every
+    buffer the credential passes through, a wipe strategy for each, and a test that forks after
+    the wipe and asserts the child **cannot** recover the sentinel from its own memory. The
+    assertion is made against the **memory** case specifically, because an assertion that only
+    checks the descriptor is closed would pass against Finding 4 exactly as item 9's first draft
+    did.
+11. **An argument, per credential-bearing capability, that no code path — ours or a dependency's
+    — can create a process while the credential is reachable.** If a dependency can spawn and we
+    cannot bound when it will, that dependency is incompatible with a credential-bearing
+    capability unless the credential is provably unreachable at that point.
+
+**What item 10's test does and does not establish.** A fork-after-wipe sentinel test validates
+**one implementation's wipe strategy for the buffers that implementation knows about.** It is
+not a proof that every copy of a secret has been erased from the address space, and it must not
+be cited as one. Three specific gaps, named so they are not discovered later as surprises:
+
+* **Allocator copies.** Growing a `Vec` or `String` reallocates and abandons the old block in
+  the allocator's free space; a wipe of the live buffer leaves the abandoned copy intact.
+  Wiping a `String` likewise leaves any earlier, smaller allocation behind. Freed blocks may sit
+  in an arena unzeroed until reused.
+* **Representation copies.** Anything that made a second representation — a derived string, a
+  formatted error message, a `Debug` rendering, a hex or base64 form, a swapped page, a
+  register — holds a copy that wiping the original does not touch. §2's credential rules
+  already forbid several of these; this item does not make them safe, it makes them checked.
+* **Dependency behaviour.** Item 10 can only inventory buffers this repository controls. A
+  dependency that copies, caches, or spills a buffer into its own state is invisible to a test
+  of our code, which is why item 11 exists as a separate obligation and why "we wiped it" is
+  never a sufficient answer on its own.
+
+So the honest claim item 10 can support is: *at the points this implementation controls, and
+for the buffers it enumerates, a fork cannot recover the sentinel.* Anything stronger needs
+mechanism beyond a test — and, for a general claim about the whole address space, needs a
+mechanism that does not currently exist here.
+
+Items 10 and 11 are the substance of the gate. Items 1–9 can be satisfied by a channel that is
+correct about descriptors and still loses the secret to a `fork()` that happens after the
+descriptor was closed — which is Finding 4, measured. Until 10 and 11 are met, the prohibition
+stands and the implementation gate stays closed.
+
+**Decision 12 — a host whose `/proc` does not exhibit the measured descriptor protections
+refuses the capability, rather than being trusted to behave.**
+
+The ranking of the options above rests on cross-uid readings taken from **one** host. A host
+that does not reproduce them has not been shown to be unsafe, and has not been shown to be safe
+either. The fail-closed answer is to refuse: a capability whose credential channel cannot be
+shown to be protected on this host is refused on this host. That is the same posture as
+`can_fulfil`, and it has the same cost — on such a host the capability simply does not run.
+
+This is a **default chosen to be wrong in the safe direction**, and it is recorded as such
+because nobody has reviewed it. See the owner decisions below.
+
+**What this record does not establish.** The handoff has been **validated** — the PoC above is
+real and its results are quoted. What has **not** happened is any of it being built into the
+product: `SandboxSpec` still has no descriptor, no helper implements a credential protocol, and
+`linux.rs` does not pass `--as-pid-1`. So the transport is proven to *work* and entirely
+unproven as part of this system.
+
+The readings it leans on come from **one** host, and the `/proc` findings are
+`hidepid=0`-specific. The two most load-bearing claims — that a descriptor is not cross-uid
+readable, and that a receiver can close it across `execve` — have not been reproduced on a
+hardened kernel, and the design should be revisited rather than carried forward if they do not
+hold there. Finding 4 is **not** host-dependent and needs no reproduction: it follows from
+`fork(2)` copying the address space, and it will hold on every host this system runs on. `--as-pid-1`'s lifecycle cost was measured in **two** cases, which is evidence, not a
+proof.
+
+**Four claims this record previously made are withdrawn.** That a descriptor is not inherited
+by descendants (false — Finding 2); that `FD_CLOEXEC` is what stops inheritance (true only
+across `execve`, not `fork` — Finding 3); that closing the descriptor before spawning is
+therefore sufficient (**false — Finding 4**, the child recovered the secret from inherited
+memory with the descriptor already closed); and that `bubblewrap 0.12.0` is the relevant version
+(the shipped lane runs 0.8.0).
+
+Every one was caught by running the thing rather than reasoning about it, and the first three
+share one shape worth recording, because it is the most transferable thing here. **Each was a
+measurement narrower than the claim it was supporting, read as covering the broader case.** A
+shell child always `exec`s, so it could never have shown the `fork()` hole; a descriptor-absence
+test can never show a memory leak, because the descriptor is not where the secret ends up.
+
+The fourth correction is the same failure in the opposite direction, and it is recorded because
+it is the easy one to repeat. The Finding 4 probe initially reported that the child **could
+not** recover the secret — because it read 48 bytes of a 59-byte frame and truncated the
+sentinel mid-string. A bad measurement does not only fail to catch a hole; it can manufacture
+evidence that the hole is absent. The corrected probe reports the opposite, and that is the
+result the record relies on.
+
+**Trade-offs.**
+
+* A descriptor is a capability the helper can be tricked into using. The mitigation is
+  Decision 3's opt-in declaration and Decision 6's no-descendants rule, not a technical barrier
+  — and, after correction, the isolation also rests on the receiver setting `FD_CLOEXEC` itself.
+* **The channel requires `--as-pid-1`, which removes a reaper.** Scoping it to credentialed
+  dispatches keeps the blast radius down and creates a divergence between dispatch kinds that
+  has to be measured rather than assumed.
+* **The `fork()` path is covered by review, not by a mechanism, and the exposure is larger than
+  the descriptor.** `FD_CLOEXEC` closes the descriptor across `execve`; nothing closes it
+  across `fork`. Worse, closing the descriptor does not remove the secret from memory, so a
+  capability that forks at any point after reading the credential hands the child the credential
+  itself. Every mitigation here is a review-time rule, and the boundary is weaker than a
+  kernel-enforced one. That is the honest shape of this design, and it is why the alternatives
+  below are stated as alternatives rather than refinements.
+* **The mitigation and the hole are hard to tell apart by inspection.** A rule that says "do not
+  fork while holding the secret" looks the same as a rule that has been mechanically enforced,
+  and nothing in a diff distinguishes them. That is why acceptance items 10 and 11 demand a
+  test that forks and asserts recovery fails, rather than a statement in a design document.
+* `--sync-fd` is a `bubblewrap` feature, so this channel is available only where `bwrap` is the
+  backend. A host without it must refuse a credential-bearing capability rather than fall back.
+* Two channels means two framings, two sets of refusals, and two chances to get it wrong. That
+  is the price of not multiplexing secrets onto the payload pipe.
+* The synthetic-sentinel strategy means the *first* real credential will be delivered by code
+  that has only ever seen a synthetic one. That gap is real and is named here rather than
+  glossed; it is a reason for caution, not for confidence.
+
+**Consequences.** `SandboxSpec`, `SandboxPlan` and the Linux supervisor each gain a descriptor
+path; `orxnud-fswrite` (and any future credential-bearing helper) gains a receiver; the dormant
+`CREDENTIAL_ENV` path is either deleted or made unreachable, and leaving it *and* a new channel
+in place would be two credential mechanisms, one of which is argv.
+
+**Rejected alternatives, with the reason each was not chosen.**
+
+* **Option B (multiplexed stdin)** — rejected above; the blast radius is every stdin reader.
+* **Option C (real `environ`)** — rejected above; it propagates to descendants, which is the
+  one property a credential channel must not have.
+* **`bwrap --args FD`** — it parses arguments from a descriptor, which does remove them from
+  `bwrap`'s own command line, but the arguments then become the **child's** `argv` and are
+  therefore still in `/proc/<child>/cmdline`. It relocates the exposure rather than removing it.
+* **A temporary file**, in the workspace or a tmpfs — rejected in ADR-0054 for the payload and
+  rejected again here with more force: a secret on a filesystem acquires persistence, cleanup
+  obligations and a second reader, none of which an in-memory pipe has.
+* **Writing the credential into the audit record** — the record is durable, retained and
+  readable by anyone who can read state; V-50 already separates reference from value.
+* **A launcher or trusted startup shim** — worth naming explicitly, because it reads like the
+  answer to Finding 4 and is not. A launcher that reads the credential and then starts the
+  helper holds the secret in its own address space **at the moment it forks**, which is Finding
+  4's case verbatim. If instead the launcher passes the credential down on a descriptor, the
+  receiving helper inherits Finding 4's obligation unchanged. The launcher relocates the
+  boundary; it does not shorten the memory lifetime, and it is not a mitigation for this
+  finding.
+
+**Owner decisions this record does not make.**
+
+* **Whether to permit the first credential-bearing Tier-1 capability at all**, and which. The
+  transport being available is not an argument for needing it.
+* **What a credential is allowed to authenticate** and how it is scoped, rotated and revoked.
+  A transport that delivers a secret reliably does not make a long-lived, unscoped secret
+  acceptable.
+* **Whether Decision 6's no-descendants rule is permanent** or merely the first release's
+  boundary. If a future capability must spawn a child, this record does not authorise it.
+* **Whether a generic credential channel is introduced without a concrete capability needing
+  it.** This is now decided; see the owner decision below.
+* **Whether a host where the FD readings differ** may run a credential-bearing capability at
+  all, or must refuse it. Decision 12 takes the conservative side of that question, and it does
+  so as a **default nobody has reviewed** — which is why it is listed here rather than buried
+  in the decisions.
+
+**Owner decision taken: keep the credential prohibition.**
+
+Recorded here because the review of this ADR reached it, and because the alternative — leaving
+it as an open question — is how a closed gate quietly becomes an open one.
+
+> **Keep credential-bearing Tier-1 capabilities prohibited. Do not introduce a generic
+> credential channel without a concrete capability that needs it. Preserve S-02's default
+> refusal, keep F-10 open and R-1 in force. Revisit stronger isolation when there is a
+> demonstrated product requirement and a testable threat model.**
+
+The reasoning that produced it, so the decision can be re-examined rather than inherited:
+
+* Acceptance items 10 and 11 ask for assurances about **secret memory, process creation,
+  dependencies and concurrent threads** that a descriptor test alone cannot establish. Item 10's
+  scope paragraph above is the clearest statement of why: our tests can cover our buffers and
+  cannot cover an allocator's abandoned blocks or a dependency's internal copies.
+* A generic channel built ahead of a need would be speculative infrastructure, and this
+  repository's rules do not admit speculative infrastructure. Its first consumer would arrive
+  after the security argument was written, not before it.
+* Revisit is not refused — it is **conditioned** on a demonstrated requirement and a testable
+  threat model, so that the next attempt starts from a real capability rather than from an
+  available mechanism.
+
+**What this decision does not claim.** It does not claim the descriptor design is wrong; the
+measurements in this record are largely favourable to it, and Finding 4's exposure is about
+secret lifetime rather than the transport. It does not claim the prohibition is free — some
+capabilities may genuinely need a secret, and that cost is real and recorded. And it does not
+claim the gate would open once items 10 and 11 are written: meeting them would make the channel
+**eligible for approval**, which is a different and later decision than building one.
+
+**Revisit conditions.**
+
+* Revisit if `bwrap` drops or changes `--sync-fd`, or if the host backend stops being `bwrap` —
+  the channel would not exist and the prohibition would have to be reinstated rather than
+  worked around.
+* Revisit if `bubblewrap` changes what `--sync-fd` does about `FD_CLOEXEC`. The whole corrected
+  rule in Decision 6 assumes the descriptor arrives inheritable and that closing it is the
+  receiver's job; a version that delivered it already closed would move that work.
+* Revisit if `--as-pid-1` turns out to cost something tree-lifetime related that two cases did
+  not expose, since adopting it for credentialed dispatches changes that lifecycle.
+* Revisit if a capability needs a credential **and** descendants. That is the case `environ`
+  would serve and this design will not.
+* Revisit if the `/proc/<pid>/fd` cross-uid denial is ever found not to hold on a supported
+  host. The whole ranking of options above depends on it, and the ranking should be redone
+  against measurements rather than carried forward as an assumption.
+* Revisit if any capability proposes a credential channel of its own. The prohibition is on the
+  capability class, and a capability that invents a channel has found a way around it.
