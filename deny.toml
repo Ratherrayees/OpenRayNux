@@ -109,10 +109,37 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 
-# Both remaining duplicates are inside the `zbus` -> `secret-service` subtree that
-# `keyring` pulls in for Linux Secret Service support. Neither is reachable from
-# our code and neither can be resolved without a patch to `zbus` or `keyring`,
-# which is a worse trade than carrying two copies of a proc-macro.
+# The entry below is the one duplicate we have explicitly **accepted**. It is not
+# all the duplicates cargo reports, and the distinction matters: an entry here means
+# "reviewed and kept", while a duplicate with no entry is one nobody has looked at.
+#
+# `multiple-versions = "warn"` also reports `getrandom`, deliberately left
+# **un-skipped** so it stays visible instead of disappearing into a suppression:
+#
+#   getrandom 0.2.17  production -- via ring <- rustls (TLS)
+#   getrandom 0.3.4   dev only   -- via rand <- proptest
+#   getrandom 0.4.3   production -- via secret-service <- keyring; also dev via tempfile
+#
+# None of these is a security finding -- cargo resolves them. Whether they *could*
+# be unified is a separate question, and the answer is that they cannot be here:
+#
+#   * getrandom 0.2 vs 0.4: `ring` (via rustls) pins 0.2 while `secret-service`
+#     pins 0.4, so unifying needs an upstream change in one of them rather than a
+#     change to our manifests.
+#   * getrandom 0.3 is dev-only and would follow a proptest/rand bump.
+#
+# A `winnow` 0.7 duplicate used to appear in that list too, arriving via
+# `toml 0.9` <- orxnud-config. That crate declared `toml` and never referenced it,
+# so the unused dependency was removed rather than migrated: `toml`, `winnow` and
+# `toml_datetime` are now single-version, and the `toml_datetime` skip that
+# accompanied the old split was deleted with it. `toml` returns when a config
+# *schema* exists to parse, which the crate header records as Phase 2 (docs-13 §8).
+#
+# An older version of this comment claimed the remaining duplicates were "both
+# inside the `zbus` -> `secret-service` subtree" and that "neither is reachable from
+# our code". Both claims were wrong. Those two skips were `syn` -- genuinely inside
+# the zbus build path, via `darling` -- and `toml_datetime`, and the latter *was*
+# reachable from our code, through `toml 0.9` <- orxnud-config.
 #
 # Listed explicitly, with reasons, because "multiple-versions = warn" with no
 # notes would leave a reviewer unable to tell an accepted duplicate from a new one.
@@ -120,9 +147,6 @@ skip = [
     # `zbus` 5.19 uses `syn` 3 through `async-trait`, and `darling` (via
     # `zbus_macros`) still uses `syn` 2. Upstream's problem.
     { crate = "syn@2.0.119", reason = "zbus 5.19 pulls syn 2 via darling and syn 3 via async-trait; not resolvable without patching zbus" },
-    # `toml_edit` (via `proc-macro-crate`) uses `toml_datetime` 1.x while `toml`
-    # itself uses 0.7.x. Both are pulled by the same subtree.
-    { crate = "toml_datetime@0.7.5+spec-1.1.0", reason = "toml 0.9 uses toml_datetime 0.7 while toml_edit 0.25 (via proc-macro-crate) uses 1.x" },
 ]
 skip-tree = []
 

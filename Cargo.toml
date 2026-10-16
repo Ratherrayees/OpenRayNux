@@ -64,7 +64,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry",
 clap = { version = "4.6.7", features = ["derive"] }
 blake3 = "1.8.7"
 zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
-toml = "0.9.8"
+# `toml` was removed from `[workspace.dependencies]`: `orxnud-config` was its only
+# consumer and never referenced it, while carrying `toml 0.9` -> `winnow 0.7` ->
+# `toml_datetime 0.7` into the production graph and duplicating versions that
+# `toml 1.1` (via proc-macro-crate and trybuild) already supplies. It returns when a
+# TOML config *schema* actually exists to parse — the crate header already records
+# that as Phase 2 (docs-13 §8). Re-add it then, at the version in use, rather than
+# by reverting this removal.
 croner = { version = "4.0.0", default-features = false, features = ["jiff"] }
 jiff = "0.2.37"
 # TLS for the single outbound provider connection (ADR-0040). `ring` rather than the
