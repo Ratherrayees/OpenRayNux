@@ -3,10 +3,15 @@
 Status: **Stages 1–4c delivered. Both 4c wirings are in production: the continuation loop
 (`task/continue`, ADR-0047) and the observation/disclosure path (ADR-0048).**
 
-Reconciled **2026-10-09** against `HEAD` (`c5934970`). Workspace suite: **1655 passed,
-0 failed**. All five CI lanes pass on run `37919194011` — but the same commit also has a
-failing run, so `linux-gates` is **not** reliably green: an intermittent `v95_concurrency`
-failure under load is open and undiagnosed. See
+Reconciled **2026-10-09** against `HEAD` (`c5934970`); §7 re-verified **2026-10-16**
+against the working tree containing S-03, S-17, S-30 and S-31. Workspace suite,
+re-measured on 2026-10-16: **1732 run, 1732 passed, 0 failed, 6 skipped, 2 leaky**
+(`cargo nextest run --workspace`, 25 s on a warm target, as run by gate G9).
+`cargo test --workspace` agrees: **1735 passed, 0 failed, 7 ignored**. The previously
+recorded "1652" and "1655" figures are stale. All five CI
+lanes pass on run `37919194011` — but the same commit also has a failing run, so
+`linux-gates` is **not** reliably green: an intermittent `v95_concurrency` failure under
+load is open and undiagnosed. See
 [§8](#-8-ci-state-the-tool-install-problem-is-resolved-one-test-flake-is-not).
 
 OpenRayNux is a local-first personal AI operating layer: one long-lived Rust process owning
@@ -27,7 +32,7 @@ capability set. One surface ships today.
 | | |
 |---|---|
 | Workspace | 16 Rust crates, 1.98.1, gate-enforced dependency direction |
-| Storage | SQLite (bundled, ≥ 3.51.3), schema at **v10**, snapshot-protected migrations |
+| Storage | SQLite (bundled, ≥ 3.51.3), schema at **v14** (`CURRENT_VERSION`, `migration.rs:237`), snapshot-protected migrations |
 | Task engine | Durable, hand-rolled; passes all 12 ADR-0029 properties from a second test binary |
 | Governance | 9-stage dispatcher; `CapabilityInvocation` cannot be constructed outside `orxnud-policy` |
 | Audit | Append-only, hash-chained, durable, survives restart |
@@ -144,12 +149,22 @@ the surfaces listed last, and nothing else.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**1655 tests, 1655 passed, 0 failed** locally, with 1–2 *leaky* results depending on
-scheduling — both are pre-existing `cgroup.kill` tests that pass and are named in
-[`08`](08-testing-engineering-standards.md) §19. On the hosted runner, gate G9 runs fewer
+**1732 tests run, 1732 passed, 0 failed, 6 skipped** locally (re-measured 2026-10-16),
+with 2 *leaky* results — both are pre-existing `cgroup.kill` tests that pass and
+are named in [`08`](08-testing-engineering-standards.md) §19. All 6 skips are `#[ignore]`d
+child-process entry points, not tests. On the hosted runner, gate G9 runs fewer
 and all of those pass — the difference is the Tier-1 sandbox-evidence suites, which the
 runner cannot execute, and the gate prints which it excluded and why. The hosted figure is
 read from the run rather than recorded here, because it moves with the suite list.
+
+**Two caveats that a green run does not carry, found 2026-10-10.** The enforcement and
+resource suites `println!` and `return` when the host cannot delegate cgroups
+(`crates/orxnud-platform-sandbox/tests/enforcement.rs:119-126`), which is a *pass* to
+nextest and to gate G9, and no gate reads the reason. One isolation test,
+`a_socket_bound_in_the_namespace_is_unreachable_from_the_host`
+(`tests/isolation.rs:374`), returns early and skips its own assertion when the helper's
+`bind` succeeds inside the netns — which it does on a host that can create a user
+namespace. On the host this repository was measured on, that is exactly what happened.
 
 **A green CI run proves:** twelve gates on Linux; every crate compiles for MSVC; the
 platform-neutral suites behave on real Windows; the portable core is portable; and on the
@@ -170,28 +185,42 @@ Two claims that look like guarantees and are not:
 
 ## 7. Current next milestone
 
-**The next milestone is deliberately undecided, and that is the finding rather than an
-omission.** Verification work has been carried out under the identifiers V-93, V-94, V-95
-and V-97 — all of them now in `main`, all of them recorded in
-[`12`](12-verification-register.md) as of this reconciliation. There is a **gap at V-96**,
-and no definition of V-96 exists anywhere in the repository: not in `docs/`, not in the
-register, not in the commit history, not in the tree.
+**V-96 is recovered, not missing. This section previously said otherwise, and it was
+wrong.** Verification work was carried out under V-93, V-94, V-95 and V-97, all in `main`.
+This document then reported a **gap at V-96** and stated that "no definition of V-96 exists
+anywhere in the repository: not in `docs/`, not in the register, not in the commit history,
+not in the tree." **All four of those loci were checkable, and all four were wrong.**
 
-So V-96 is **not** something this document will define by guessing. Inventing a plausible
-defeating for an unknown ID would put a fabricated requirement into a normative document,
-which is the exact failure mode
-[`12`](12-verification-register.md)'s freshness policy exists to prevent. The next
-engineering milestone therefore has two steps in order:
+A definition existed the whole time, in
+[`08`](08-testing-engineering-standards.md) §"Platform boundary", row `cfg(target_os)` gate:
+**V-96** is that gate G3 matched raw text, so a comment could switch it off and seven of
+nine `cfg` spellings — every nested one — were invisible. The fix is implemented: commit
+`7bf9da8` *"test(ci): drive the boundary gates against adversarial rewrites"* added
+`scripts/rustscan.py`'s lexical classifier and `scripts/gate-selftest.py`, which drives the
+real `scripts/ci-gates.sh` over temporary fixture trees. Commit `b73246d` cites it again.
 
-1. **Recover or define V-96 explicitly** — decide whether it was a planned slice that was
-   skipped (in which case define its scope and evidence) or a numbering artefact (in which
-   case record the gap the way V-44 and ADR-0041/0042 are recorded: named, not renumbered).
-2. **Then** implement and verify it.
+The register and this section both asserted an absence that was contradicted by the file
+they were describing. That is the failure mode the register's own freshness policy exists
+to catch, produced *by* a reconciliation. The register row is now rewritten from recovered
+evidence and is marked **`partially fixed`**, because G3 still matches platform-API paths
+literally and is defeated by `use std::env::consts as host; … host::OS` — a real residual
+bypass, recorded rather than closed over.
 
-Standing candidates already named in this document, offered as input to that decision and
-not as its answer: the actor model beyond one local human (V-70), where positive Tier-1
-isolation evidence should live given that hosted runners cannot supply it, and the
-`linux-gates` timeout defect in §8.
+**So the next engineering milestone is no longer "define V-96".** Standing candidates, in
+the register's own terms:
+
+1. **Close G3 properly** — resolve platform API paths through imports rather than matching
+   them literally, so the aliasing bypass above cannot pass. Small, bounded, and the
+   remaining half of an already-defined milestone.
+2. **The actor model beyond one local human** (V-70), which is the largest unanswered
+   question about who may authorise what.
+3. **Positive Tier-1 isolation evidence on a machine that can produce it.** Hosted runners
+   cannot, and this repository currently has no lane that distinguishes "sandbox proven"
+   from "environment measured" — see §6 and §8.
+4. **The `linux-gates` timeout defect in §8**, and the interrupted `v95_concurrency` flake.
+
+None of these is decided here. The point of this section is that the previous four-step
+plan was built on a false premise and has been withdrawn.
 
 ## 8. CI state: the tool-install problem is resolved, one test flake is not
 
@@ -305,7 +334,7 @@ seconds on a warm target directory.
 | Disclosure | **One approval, two acts**, bound to `(endpoint, model)` | [0045](09-decisions.md#adr-0045) |
 | CI boundary | **A missing guarantee is a refusal to assert, not a skip** | [0046](09-decisions.md#adr-0046) |
 
-The full table of all 44 is in [09-decisions.md](09-decisions.md).
+The full table of all 51 is in [09-decisions.md](09-decisions.md).
 
 ## Open before implementation
 

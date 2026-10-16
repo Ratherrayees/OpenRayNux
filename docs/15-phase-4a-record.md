@@ -176,7 +176,8 @@ the threads are abandoned and the output reported as truncated.
 | Network isolation (unreachability) | **PROVEN** |
 | Network isolation (`bind` denial) | **NOT PROVIDED** — documented, not claimed |
 | Output bounds | **PROVEN** |
-| Timeout cannot hang the daemon | **PROVEN** |
+| Timeout cannot hang the **supervisor** | **PROVEN** |
+| Timeout cannot hang the **daemon's request loop** | **NOT PROVEN** — qualified 2026-10-10; see §6a |
 | Descriptor hygiene | **PROVEN (weak)** — teeth inconclusive, V-47 |
 | Process visibility | **PROVEN** |
 | Process-tree containment | **PROVEN** |
@@ -184,6 +185,43 @@ the threads are abandoned and the output reported as truncated.
 | Credential non-leakage | **PROVEN** |
 | Windows isolation | **NOT PROVEN** — no backend written; a Tier-1 execution is *refused* on Windows rather than degraded, V-29 |
 | Cloud sandboxing | **NOT IMPLEMENTED** — documented only |
+
+### 6a. Qualification of the timeout row, added 2026-10-10
+
+The original row read **"Timeout cannot hang the daemon — PROVEN"**. That conflated two
+different subjects, and only the first is proven.
+
+**Proven, and still true.** The *supervisor* cannot hang. The wall-clock deadline kills
+`bwrap` and the cgroup, the stdout/stderr reader threads are joined with a bounded wait
+rather than waited on indefinitely (`crates/orxnud-platform-sandbox/src/linux.rs:585-586`),
+and a surviving descendant cannot keep the daemon in that join.
+
+**Not proven, and not previously disclosed.** The *daemon's request loop* is blocked
+synchronously for the duration of a Tier-1 execution:
+
+* `execute_proposal` holds the single `governed` mutex across the whole operation
+  (`crates/orxnud-daemon/src/runtime.rs:2682`, `let mut g = governed.lock().await;`), and
+  that mutex serialises **all** state.
+* Inside it, `Dispatcher::dispatch` is an ordinary synchronous `fn`
+  (`crates/orxnud-capability/src/dispatch.rs:1443`), not an `async fn`.
+* `BwrapRunner::run` blocks the calling thread on a `std::thread::sleep(5ms)` poll loop
+  bounded by `wall_clock` (`linux.rs:505-574`), preceded by a cgroup-membership poll
+  (up to 2 s, `linux.rs:444`) and followed by two 2 s bounded joins.
+* The accept loop is single-threaded by design (`runtime.rs:788-791`: *"One connection at
+  a time, in the accept loop rather than in a spawned task."*).
+
+Worst case for one Tier-1 `filesystem/write-text` is therefore roughly **16 s of blocked
+tokio worker thread, under the global lock, on the loop that serves every client** — not a
+hang, but not "cannot hang" either. `EngineLimits::deadline_timeout_ms = 300_000`, documented
+at `crates/orxnud-task/src/limits.rs:21` as *"a wedged task is bounded"*, is **read nowhere
+outside `limits.rs` and its tests**, so it does not provide the outer bound the comment
+implies.
+
+This is a documentation correction only. The runtime behaviour is unchanged, and the
+correctness of the *effect ledger* is unaffected — a blocked dispatch is an unfinished
+dispatch, which the reservation/`recover()` machinery already treats conservatively. What
+was wrong was the claim, and the operational consequence that an operator reading §6 would
+not know a Tier-1 execution stalls unrelated clients.
 
 ---
 

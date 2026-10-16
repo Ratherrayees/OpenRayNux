@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**54 ADRs, numbered ADR-0001 … ADR-0056.** Two numbers in that range are
+**56 ADRs, numbered ADR-0001 … ADR-0058.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -6006,3 +6006,815 @@ genuinely safe to repeat are now re-driven through the full path rather than sho
   would lower the frequency and change nothing else: the warrant would still be absent.
 * Revisit if `NeedsVerification` gains its exit (S-29) and the adjudication queue proves
   unworkable in volume. Then the pressure lands on S-29, not on this rule.
+
+## ADR-0057 — Every production schema change holds a verified snapshot, the trusting mode becomes unselectable, and a restore may not be reopened against stale WAL sidecars
+
+**Status.** **D-S11-a and D-S11-b APPROVED (b in principle). D-S11-c MEASURED and the invariant
+S-11-RESTORE derived from it. Nothing implemented, nothing merged.** S-11 is **specified and
+unbuilt**; F-26 is **open**. This ADR must not be cited as though the snapshot invariant holds —
+approving the shape is not the same as building it.
+
+| Decision | Status |
+|---|---|
+| D-S11-a — remove public `run(bool)`; one snapshot-owning coordinator | **Approved 2026-10-14** |
+| D-S11-b — make `migrate(conn)` helpers private; no path parameter | **Approved in principle 2026-10-14** |
+| D-S11-c — WAL sidecars on restore | **Measured 2026-10-14; S-11-RESTORE derived; scope decided — tracked separately as S-30, a hard prerequisite for S-11.** |
+
+**Context.** S-11 exists because `MigrationRunner` has two entry points whose names do not
+describe them. `migrate(db_path, claimed)` verifies-or-takes a snapshot, returns early when
+nothing is pending, and restores on failure — it is correct. `run(snapshot_verified: bool)`
+**trusts** the boolean: it returns `NoSnapshot` only when the caller passes `false`, and
+`true` asserts nothing. Four production entry points in `security_state.rs` pass `true`, and
+`open_and_migrate` forwards an unverified caller boolean into it. The task-service path already
+uses `migrate`. So one path is right and five are not, and nothing in the type system, the
+naming, or the tests distinguishes them.
+
+The full specification is §7-S11 in the remediation plan. This record covers only what that
+specification cannot settle.
+
+**Decision D-S11-a — APPROVED 2026-10-14: remove the public caller-controlled `run(bool)` mode.
+All production schema changes pass through a snapshot-owning coordinator.**
+
+Options were:
+
+* **(i) Remove `run` from the public surface**, keeping it `pub(crate)` or `#[cfg(test)]` for
+  the tests that legitimately want a no-snapshot apply (in-memory and fixture databases).
+  *Smallest change that makes the failure unrepresentable rather than merely discouraged.*
+  Cost: an API break for embedders, and every test call site changes.
+* **(ii) Replace `bool` with a token** constructible only by `migrate` after verification, so
+  the compiler enforces it. *Strongest.* Cost: a new public type for one bit of state, and the
+  token still has to be obtained from somewhere.
+* **(iii) Rename for honesty** — e.g. `run_unverified_snapshot_asserted` — and rely on review.
+  **Rejected as the primary control**: it is documentation, and F-26 is the documented
+  consequence of trusting documentation.
+
+**APPROVED: option (i).** The defect is that a safe-looking call exists at all, and the fix is
+to remove it rather than to discourage it. (ii) was rejected because a token type keeps the
+two-mode design alive and still has to be obtained from somewhere, which is another thing a
+caller can get wrong; (iii) was rejected because it is documentation, which is precisely what
+F-26 is the consequence of trusting.
+
+**What approval obliges.** `run(bool)` leaves the crate's public surface. Every production
+schema change routes through one coordinator that owns the snapshot. A test-only or
+`pub(crate)` apply path may remain for in-memory and fixture databases — those have nothing to
+lose and are not the production shape — but it must not be reachable from another crate's
+production code.
+
+**Decision D-S11-b — APPROVED IN PRINCIPLE 2026-10-14: make the connection-only migration
+helpers private and invoke them only from the coordinator. Do not add a path parameter.**
+
+`SecurityState::migrate(conn)` and
+`Ledger::migrate(conn)` receive only a `&Connection` and `Store` does not retain its path, so
+neither can snapshot. Options:
+
+* **(i) Delete both helpers** and require every caller to use `migrate(path, _)`. *Removes two
+  doors rather than repairing them.* Cost: API break.
+* **(ii) Add a `path` parameter** to both. Keeps the entry points, fixes them. Cost: every
+  caller gains an argument that can disagree with the connection's actual file.
+* **(iii) Derive the path** via `PRAGMA database_list`. No signature change. Cost: it makes a
+  connection's identity depend on a pragma and is meaningless for `:memory:`, where
+  `Backup::take` would write to a file that has no counterpart.
+
+**APPROVED IN PRINCIPLE: option (i)** — *delete the two doors rather than repair them.*
+Option (ii), adding a `path` parameter, is **rejected**: it preserves a way for the path and the
+connection to disagree, which is a quieter version of the same bug — a caller passing the wrong
+path would snapshot one database and migrate another, and the mismatch would be invisible.
+Option (iii), `PRAGMA database_list`, is **rejected**: it makes a connection's identity depend on
+a pragma and is meaningless for `:memory:`, which is exactly the case tests use most.
+
+**"In principle" is load-bearing and is not a hedge.** Approval is for the *shape*: the helpers
+become private and are reached only through the coordinator. It is **not yet approval to
+implement**, because approval of D-S11-a obliges a coordinator whose API is itself part of
+D-S11-a's blast radius, and no coordinator exists yet. **Required public functionality must be
+preserved through safe APIs** — `SecurityState::open(path)` and `Ledger::open(path)` both keep
+working exactly as they do today; only the *unsafe* variants disappear. No path argument is
+added to anything.
+
+**Decision D-S11-c — MEASURED 2026-10-14. The unsafe outcome is real, deterministic, and
+silent. Restore must not permit a stale sidecar, and integrity checking cannot detect it.**
+
+Run against the **real** `Backup::take` / `Backup::restore` (a temporary example, since
+removed; reproducible from this record). Each case seeds a WAL database with
+`PRE-SNAPSHOT-ONLY`, snapshots it, commits `POST-SNAPSHOT-IN-WAL`, then restores and reopens.
+
+```
+CASE 1  production path: restore while the runner's connection is still OPEN
+        -> integrity=ok  meta=1   VERDICT: safe: readable and exactly the pre-snapshot state
+CASE 2  control: clean close, no stale sidecar
+        -> integrity=ok  meta=1   VERDICT: safe: readable and exactly the pre-snapshot state
+CASE 3  stale -wal replayed beside the restored main file   (repeats 1,2,3)
+        -> integrity=ok  meta=1   VERDICT: UNSAFE: POST-SNAPSHOT DATA RESURFACED
+CASE 4  stale -wal AND stale -shm replayed
+        -> integrity=ok  meta=1   VERDICT: UNSAFE: POST-SNAPSHOT DATA RESURFACED
+```
+
+**Three findings, and the third is the one that matters.**
+
+1. **The production path is safe.** `migrate()` restores on failure while the runner's
+   connection is still open, and SQLite's own locking serialises the copy. Case 1 is the shape
+   S-11 actually exercises, and it does not need a sidecar fix to be correct.
+2. **A stale `-wal` resurfaces post-snapshot data, deterministically.** 3/3 repeats plus the
+   `-shm` variant. `Backup::restore` rewrites the main file (`backup.rs:351`) and returns `Ok`;
+   the stale WAL is then replayed over it on the next open. **A restore that returned `Ok` did
+   not undo what it claims to have undone.**
+3. **Nothing detects it.** In every unsafe case `PRAGMA integrity_check` returns **`ok`**,
+   `schema_meta` reads **`1`**, and `Backup::verify` passes. **SQLite's salt check does not
+   save us** — this was the specific thing the question turned on, and the answer is
+   measured, not assumed. It also means an integrity-based post-restore check would be
+   worthless here: the database is *internally consistent* and *semantically wrong*.
+
+**A note on the measurement's own history, because it nearly produced a false negative.** A
+first version of the probe judged only "did the post-snapshot row return?", and reported
+Case 3 as **safe**. It was not: that run produced `disk I/O error` on every query because the
+probe left a stale `-shm` beside a replayed `-wal`, making the database *unreadable* — which
+passes a "did the row come back?" check trivially. The corrected probe treats **unreadable as
+unsafe** and re-runs all cases. Recorded because it is the same class of error as this
+repository's other silently-passing tests: a check that cannot fail for a class of outcomes
+will be read as covering it.
+
+**S-11-RESTORE — the recovery invariant this forces.**
+
+> **A restored database must never be opened while a `-wal` or `-shm` from the pre-restore
+> database can still be replayed against it. Removing or superseding those sidecars is a
+> *precondition of the restore*, not a cleanup that happens to follow it. A restore that
+> cannot establish this does not return `Ok`.**
+
+Three obligations, none of which is "rely on SQLite":
+
+1. **`Backup::restore` establishes the precondition itself** — it must remove or supersede
+   `-wal` and `-shm` for `db_path` as part of restoring, rather than assuming they are absent.
+   Checkpoint-then-restore is insufficient as stated, because a *later* crashed run can leave a
+   fresh `-wal` with no live connection to checkpoint through.
+2. **Silence is the failure mode to design against.** Because `integrity_check` says `ok` in
+   the unsafe case, the post-restore guarantee must be **logical, not structural**: compare the
+   restored database's content against what the snapshot was verified to contain. Structural
+   checking is proven insufficient by Case 3.
+3. **The invariant is stated over restore and open together**, because the hazard is the
+   *pairing*. A restore that is correct in isolation and an open that is correct in isolation
+   still produce Case 3. Nothing in the current code asserts the pairing.
+
+**What is now decided.** The *mechanism* — explicit sidecar removal inside `restore`, plus a
+logical post-restore comparison — is settled by measurement. The **scope** was an open question
+and is now **decided on review (2026-10-14): S-11-RESTORE is a separately tracked slice, S-30,
+and a hard prerequisite for S-11.**
+
+**Scope decision.** The reason is scope, not lower severity. S-11 establishes one safe,
+snapshot-owning path for schema mutation across six production entry points; S-30 establishes
+that restoring a snapshot actually restores its logical state. Related contracts, distinct
+boundaries. **The hard dependency is the point**: a coordinator whose rollback primitive can
+report `Ok(())` while post-snapshot data resurfaces would make S-11's own safety claim false, so
+splitting must not become a reason to proceed with an unsafe rollback. **S-11 must not claim
+safety until both contracts hold.**
+
+**Case 1 is not a general guarantee and is not recorded as one.** It shows the current
+production sequence behaved safely in this experiment. It does not establish safety under
+concurrent access, file replacement, or any ordering in which a sidecar outlives the main file
+it belongs to. The repeatable Case 3/4 results are a **separate failure mode** with their own
+acceptance criteria (§7-S30), not a footnote on the happy path.
+
+**Implementation caution, recorded because it is the obvious wrong first attempt.** Sidecar
+removal **cannot** be an unconditional filesystem cleanup while SQLite connections may still be
+using the database — deleting a live `-wal`/`-shm` under an open connection is its own
+corruption, and SQLite's documentation is explicit that the WAL is part of the database's
+persistent state rather than an unrelated temporary file. The restore/open lifecycle therefore
+needs a **defined ownership and coordination contract**: who may hold a connection, when sidecars
+may be touched, and how "no connection is live" is established. That contract is part of S-30 and
+is **not assumed** — it is the piece most likely to be got wrong, and getting it wrong converts a
+recoverable rollback into a corrupted database.
+
+**Deleting sidecars is not the mechanism.** S-30's deliverable is a named ownership rule plus
+whatever enforces it, and **sidecar deletion on its own does not satisfy the criterion** — it is
+the obvious first attempt precisely because it looks sufficient. The test suite must show both
+that the mechanism prevents stale state from being replayed **and** that it remains safe when
+connections are live or a restore fails partway through.
+
+**S-30's five acceptance criteria.** None is satisfied by the happy path alone, and each is
+carried in §7-S30: (1) stale-sidecar regression, repeated with stale `-wal` and stale `-shm`;
+(2) **unreadable is failure** — an unreadable database must never count as evidence that the
+unwanted row is absent, which is the mistake the first version of this experiment's probe made;
+(3) logical-state verification against the snapshot's expected state, because `integrity_check`,
+`schema_meta` and `Backup::verify` were all measured to pass while the database was unsafe;
+(4) restore/open coordination enforced explicitly, not emergent from the salt check;
+(5) failure and interruption paths that **return an error rather than `Ok(())`** when the
+invariant cannot be established.
+
+**Why this is a draft and not a decision.** D-S11-c is a correctness question with no answer in
+the tree; D-S11-a and D-S11-b are API-shape choices with real downstream costs. Taking them
+silently here would be the same class of error ADR-0055 made four times: a plausible-sounding
+answer chosen without evidence and recorded as though it were established.
+
+**The gap S-30's implementation exposed: the ownership is in-process and instantaneous.**
+S-30 is implemented (2026-10-14) and its acceptance criteria are met. Writing it surfaced a
+limit the specification did not reach, recorded here rather than folded into S-30's scope:
+
+* `RestoreGuard::acquire` runs `PRAGMA wal_checkpoint(TRUNCATE)` and refuses on `busy != 0`.
+  That is an **instantaneous** check, not a lease. Between the checkpoint and the copy there
+  is a window in which another **process** may open and write the database.
+* A second daemon is not in this process's connection set, so its presence does not make *our*
+  checkpoint report busy. The independent-handle tests are, by construction, incapable of
+  detecting this — which is why S-30's evidence is sound for what it covers and silent here.
+* The online backup API's destination lock covers the **backup operation**, not the preceding
+  checkpoint or the surrounding lifecycle.
+
+Some interleavings SQLite refuses on its own. **Refusing by accident is not a guarantee**, and
+it is not treated as one. This was tracked as **S-31 (F-26c)** and **implemented on 2026-10-14**: a stable per-database
+lock file holding shared ownership for ordinary opens and exclusive ownership for the whole
+restore lifecycle, taken before the checkpoint, with two-process evidence including a
+deterministic interleaving inside the checkpoint-to-restore window. A-008 records it.
+
+**One consequence is worth recording here rather than only in A-008.** The recommended
+"ownership lasts for the connection lifetime" is *not* compatible with restoring from inside
+`MigrationRunner::migrate`: that method borrows a connection whose owning `Store` holds a
+shared lease, and `flock` conflicts between open file descriptions **even within one
+process**, so the restore would deadlock against its own coordinator. `migrate` therefore no
+longer restores — it returns `MigrationError::RecoveryRequired { source, snapshot }` and
+`TaskService::open` drops the store before recovering. This is the restructuring the design
+discussion anticipated, and it reached further into the migration flow than "add a lock".
+
+**F-26c REMAINS OPEN**: a hard-linked alias still produces a second lock file and bypasses
+ownership entirely, which is measured and unfixed. **F-26b stays open** on its narrower
+remaining point, and **F-26 stays open**; S-11 remains blocked.
+
+**What this record does not establish.** That any of the three options is correct on this
+codebase — two are argued from shape and one is explicitly unmeasured. That F-26 or F-26b is
+fixed. That S-30 is closed. That S-11 is implemented. That S-29 may begin.
+
+## ADR-0058 — RESEARCH CANDIDATE, NOT APPROVED FOR INTEGRATION — a filesystem-identity capability `orxnud-store` can require, so a hard-link alias cannot bypass ownership
+
+**Status.** **The three open decisions are APPROVED (2026-10-14). Nothing is implemented.**
+The boundary, the enforcement points and the test plan below are settled; the code is not
+written. F-26c, F-26b and F-26 all remain open, and S-31 is **implemented but not complete**.
+
+| Decision | Disposition |
+|---|---|
+| 1 — unknown link count | **Approved: refuse.** Portability qualification below. |
+| 2 — residual TOCTOU window | **Approved: do not call it closed.** Stronger enforcement to be investigated before any descriptor-backed opening is committed to. |
+| 3 — S-31 completion | **Approved: remains open** while a known bypass or an unaccepted residual window remains. |
+
+**The distinction that governs both acceptance and closure.** *Hard-link **detection**
+implemented* is not *hard-link **bypass** eliminated*. The two-sided check in Decision 3 detects
+many unsafe cases; it does not prove that SQLite's already-open connection refers to the inode
+those checks observed. Every acceptance claim and every closure decision must be stated against
+the second, not the first.
+
+**Problem, measured.** `lock_path_for` normalises relative paths and resolves symlinks. A hard
+link defeats both: `state.db` and `alias.db` are one inode but produce **two** `<db>.lock`
+files, so a competitor opening the alias participates in nothing. Keying the lock by inode does
+not fix it — `link(2)` permits a hard link in a different directory on the same filesystem, so an
+inode-keyed name would still need a parent directory, and the two parents can differ. SQLite
+separately warns that one database reached through multiple names can acquire different WAL or
+rollback-journal files, so this is a journaling hazard as well as a locking one.
+
+**Why the obvious fix is blocked.** Rejecting a database with more than one name needs the
+file's link count. That is unreachable from `orxnud-store` for two independent gate reasons, both
+hit concretely rather than assumed: **G3** forbids a platform `cfg` or `std::os::unix` path
+outside `orxnud-platform-*`, and **G2**'s layering forbids `orxnud-store` from depending on a
+platform crate — it may depend only on `orxnud-domain`. `orxnud_platform_fs::hard_link_count`
+exists and is correctly placed, but the crate that takes the lease cannot reach it.
+
+**Decision 1 — the capability is a trait in `orxnud-domain`, implemented by the platform
+layer, injected into the store.** `orxnud-domain` is the one crate every layer may depend on,
+so defining the capability there inverts the problem: `orxnud-store` depends on the **trait**,
+and the platform layer supplies the **implementation**. The dependency direction the gates
+enforce is preserved, and the platform-specific `cfg` stays in `orxnud-platform-fs` where G3
+allows it.
+
+The capability is not "link count" alone; the identity question is what makes the TOCTOU point
+below checkable:
+
+```rust
+// orxnud-domain
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+pub trait FilesystemIdentity {
+    /// How many names the file at `path` is reachable by, or `None` when unknowable.
+    fn name_count(&self, path: &Path) -> Option<u64>;
+    /// What the path currently resolves to, for continuity checks.
+    fn identity(&self, path: &Path) -> Option<FileId>;
+}
+```
+
+**Decision 2 — the capability is REQUIRED, and "unknowable" is a refusal.** This is the part
+the current draft gets wrong and the part that matters most. Today a platform that cannot report
+a count yields `None`, which is treated as "no problem" — a **permissive default**, and a
+default is exactly what a security control must not have. Under this decision:
+
+* `None` from `name_count` or `identity` means **refuse**, naming the platform as the reason.
+* There is no public `Store::open` that runs without a capability. Every production open passes
+  one; test opens pass a test capability that reports a single name.
+
+The consequence is deliberate: a platform that cannot answer the question cannot run this
+system's databases, rather than running them unprotected. That is the same fail-closed posture as
+`can_fulfil` and as S-30's restore refusal, and it is the direction the gates have pushed every
+other time.
+
+**Portability qualification — verified against this toolchain, not assumed.** On Windows, with
+stable Rust 1.98.1, `std::os::windows::fs::MetadataExt::number_of_links` is
+**nightly-only experimental** (`windows_by_handle #63010`), per this toolchain's own `std`
+documentation. So is `file_index`, and so is `volume_serial_number` — which matters more than
+the link count alone, because **`identity` needs both of those**. On stable Windows the
+capability is therefore unavailable *in full*, and Decision 1's fail-closed rule means the
+platform implementation must either call native Win32 (`GetFileInformationByHandle`) or
+**refuse every open on Windows**. That is a support decision, not a detail, and it is recorded
+here rather than discovered at the next Windows build.
+
+**Decision 3 — the check is tied to the file SQLite opens, checked twice with continuity.**
+A path-only check made before the open can be invalidated before it. The design therefore:
+
+1. Before opening, require `name_count(path) == Some(1)` and record `identity(path)`.
+2. Open the database.
+3. **After** opening, require `identity(path)` to equal the recorded identity and
+   `name_count(path)` to still be `Some(1)`. Any difference refuses and drops the connection.
+
+**This does not eliminate the window, and it is not to be described as doing so.**
+`orxnud-store` cannot hand SQLite a file descriptor: SQLite opens through `sqlite3_open_v2` by
+filename, and rusqlite's documented opening APIs likewise accept paths. `SQLITE_OPEN_NOFOLLOW`
+rejects **symlinks** and is not a hard-link defence. SQLite itself warns that opening one
+database through multiple names can create separate WAL or journal files.
+
+So the two checks observe a path before and after SQLite opened it, and **do not independently
+prove that SQLite's open connection refers to the inode they observed**. What they do buy is
+narrower and worth stating exactly: the ordinary cases — a path that is legitimately aliased, or
+a file replaced by an ordinary restart — are refused, and the residual window is named rather
+than assumed away.
+
+**Stronger enforcement is to be investigated before any descriptor-backed opening is committed
+to.** Closing this properly may require a custom SQLite VFS or another platform-specific
+mechanism, and its feasibility **and its interaction with WAL files** need evidence first. A
+design adopted on plausibility is how this ADR reached four wrong corrections earlier in the
+session. No such mechanism is proposed here.
+
+**Decision 4 — the safety contract is stated as what it is.** With Decision 3 in place the
+claim is: *a database reached through more than one name is refused, and a file replaced during
+the open is detected unless it is replaced and restored inside the window.* That is weaker than
+"ownership is alias-safe" and is the wording the register and plan must carry.
+
+**Test plan.** The two-process and controlled-interleaving tests are **preserved unchanged**;
+this work adds to them.
+
+| # | Test | What it proves |
+|---|---|---|
+| 1 | `an_ordinary_single_name_database_opens_normally` | The new check does not break the common path. |
+| 2 | `a_database_reachable_through_two_names_is_refused` | Two names for one inode; **both** names refuse with a typed ownership error naming the count. |
+| 3 | `the_two_names_would_have_had_two_locks` | Pins the bypass being closed: `lock_path_for` differs for the two names, so the rejection is the only thing standing between them and a bypass. |
+| 4 | `an_unknowable_filesystem_is_refused_not_assumed_safe` | A capability returning `None` must refuse. Without this, Decision 2 is untested and the permissive default could return. |
+| 5 | `a_file_replaced_during_the_open_is_detected` | The identity changes between the pre- and post-open checks; the open must refuse and drop the connection. **What it proves:** that a *detectable* change between the two observations is refused. **What it does not prove:** that every possible replacement during SQLite's own open is impossible — it cannot, and it must not be described as if it did. |
+| 6 | existing `a_…` / `b_…` / `c_two_processes…` | Preserved: competing process excluded, interleaving blocked, two daemons may share. |
+
+Test 5 uses a **scripted capability** whose answer changes between calls, so the swap is
+deterministic rather than raced. Tests 2 and 4 are the two that a permissive default would
+satisfy by accident; they are the ones that must not be weakened.
+
+**What this does not decide.** Whether a hard-linked database should be *refused* or
+*resolved to a single canonical identity* (the latter needs a directory-level registry, which is
+a much larger design). This record chooses refusal because it is bounded and fails closed.
+
+**Owner decisions this record does not make.**
+
+* Whether "unknowable refuses" is too strict for a platform that legitimately cannot report
+  link counts — a policy choice about which platforms this system supports.
+* Whether the residual TOCTOU window is acceptable, or whether closing it justifies opening
+  SQLite through a file descriptor and the dependency work that entails.
+* Whether S-31 is considered complete with the window narrowed and named, or stays open until
+  the window is closed.
+
+### Proof of concept — isolated Linux build, executed (2026-10-14)
+
+**Authorised as "the isolated Linux VFS proof only".** Built outside this repository, in
+`/tmp/opencode/vfsproof`, as a standalone crate pinning `rusqlite =0.40.2` and
+`libsqlite3-sys =0.38.2` so the bundled SQLite is the **3.53.2** this record reasons about
+(asserted by a test, not assumed). **Nothing in the OpenRayNux working tree was touched.**
+
+**Shape used: delegate, then judge the descriptor.** The gate registers a VFS whose `xOpen`
+calls the parent unix VFS, which opens the file and installs *its own* method table; the gate
+then `fstat`s the descriptor that resulted and refuses before returning. Because the parent
+installs the real method table, **no `io_methods` trampolines were needed at all** — WAL,
+locking and recovery are SQLite's own code throughout, which is the single reason this shape is
+tractable.
+
+**Reaching the descriptor required an unsafe layout cast, so the cast was made self-checking.**
+`unixFile::h` sits at offset 24 on LP64, in an unconditional prefix ahead of every `#if`.
+Registration refuses to proceed unless a live probe proves the offset against a real file; a
+wrong layout would produce a loud refusal, never a silent pass. `check_identity` additionally
+re-derives the identity from the path and refuses on disagreement.
+
+**Result: 11 proof tests plus a version test pass; 10 consecutive full runs all green.**
+
+| Point | Demonstrated |
+|---|---|
+| 1 — validates the exact native file, rejects hard links | Gate observes the parent's real descriptor and its identity matches the file. The alias is refused with `SQLITE_CANTOPEN` **at open**, not warned about. |
+| 2 — WAL and shared memory keep SQLite's semantics | `state.db-wal` and `state.db-shm` appear under exactly the names SQLite derives; no `-journal` appears in WAL mode; the WAL grows 8272 → 12392 bytes on write; `wal_checkpoint(TRUNCATE)` returns it to 0 bytes and the rows survive; rollback-journal mode also still works. |
+| 3 — real two-process behaviour | A writer's rows are read by a separate process; **4 concurrent writer processes yield exactly 12 rows**; a writer killed via `process::exit(9)` leaves recoverable state that a later process reads and checkpoints; once aliased, **both** names are refused out of process. |
+
+**The control that makes the refusals mean something.** Without it, every refusal above could
+be a damaged database or a bad path. So it is tested directly: **ungated, the alias opens and
+reads the same data; gated, it is refused.** The gate is the only difference.
+
+**A behavioural finding that corrects the design's implicit assumption.** The link count is a
+property of the **inode**, not of the name. Once any alias exists, *every* path to that file has
+`nlink == 2`, so this gate refuses **all** of them — including the original, legitimate name.
+Decision 3's wording ("reject a link count other than one") reads as if refusal were per-name;
+enforcement is **all-or-nothing per inode**. An earlier draft of the test expected the original
+name to keep working, and was wrong. This is a real operational consequence: introducing one
+alias makes the database unopenable through *every* name, which is safe but must be surfaced as
+a diagnostic rather than a bare "unable to open".
+
+**A second finding: do not build on the checkpoint pragma's counters.** Measured here, a
+`wal_checkpoint(TRUNCATE)` that demonstrably ran and truncated the WAL to 0 bytes returned
+`busy=0 log=0 ckpt=0`. The counters are advisory; the proof asserts observable state (WAL size,
+row counts) instead.
+
+**What the proof does NOT establish.**
+
+* **Not production-ready.** It depends on an undocumented private struct layout. That is fine for
+  a proof and disqualifying for production without a supported mechanism.
+* **It does not close S-31.** The non-participating-process boundary is unchanged: a process not
+  using this VFS can still add or remove links, and its opens are ungated.
+* **It does not cover the sidecars.** `verifyDbFile` covers the main database only, and this gate
+  inherits that limit — a `-wal`/`-shm` name is gated the same way, but the multi-name WAL hazard
+  across *ungated* processes is untouched.
+* **Linux only**, on glibc, LP64, SQLite 3.53.2. No other platform was built or run.
+* **Concurrent modification during the gate is untested.** The window between the parent opening
+  and the gate's `fstat` was not adversarially exercised.
+
+### Shape A proof of concept — isolated Linux build, executed (2026-10-14)
+
+**Authorised as "the isolated Shape A Linux VFS proof only".** Same isolated crate, same pinned
+SQLite **3.53.2**. **14 Shape A tests, plus the 11 Shape B tests and a version test — 26 total,
+all passing; 12 consecutive full runs with zero failures.** Zero rustc warnings. **Nothing in the
+OpenRayNux working tree was touched.**
+
+**Shape A removes the private-layout dependency outright.** It performs the `open(2)` itself and
+serves every SQLite I/O method from a descriptor it owns. The identity check and the open are
+therefore the *same event* — there is no interval in which a name could be resolved a second
+time. A test asserts structurally that the Shape A source contains none of Shape B's mechanism.
+
+| Requirement | Demonstrated |
+|---|---|
+| Descriptor binding | Identity is read from the descriptor the VFS opened and hands to SQLite; no `unixFile` layout is consulted. Enforced by a structural test, not just a comment. |
+| Path continuity | A sidecar whose base path has been replaced by a **different inode** is refused, so WAL and shared-memory work cannot attach to the wrong database. |
+| Hard-link behaviour | An existing alias is refused at open. A link created **after** the open fails the **commit**, because identity is re-verified at sync time. |
+| WAL correctness | `-wal`/`-shm` under exactly SQLite's names; rollback-journal mode works and persists across reopen; two-process writer/reader agree; **4 concurrent writers yield exactly 12 rows**; a writer killed with `process::exit(9)` leaves state a later process recovers and checkpoints; checkpoint verified on observable state. |
+| Failure safety | An absent file is refused with no CREATE fallback; Shape A is verified to be a distinct VFS registration from Shape B, so no Shape A result is a Shape B result renamed. |
+
+**Control.** Ungated, the hard-link alias opens and reads the same data. Gated, it is refused.
+
+**What the tests caught — the most useful output of this exercise.** Each of these was a real
+defect that produced a plausible-looking failure rather than a compile error:
+
+* **`SQLITE_SHM_NLOCK` and `SQLITE_SHM_EXCLUSIVE` are the same value (8).** The discriminator is
+  `SQLITE_SHM_LOCK`. Conflating them means either taking no OS lock where one is required, or
+  taking one where none is wanted — and either way cross-process WAL exclusion stops working
+  while single-process use still looks fine.
+* **Mapping a shared region past end-of-file raises SIGBUS** the moment SQLite touches it.
+  SQLite's own VFS skips mapping entirely when the file is short and extension was not
+  authorised, answering `SQLITE_OK` with a null region. An earlier draft errored instead, and
+  another errored later with SIGBUS once it mapped anyway.
+* **EXCLUSIVE must take a *write* lock on the shared range.** A read lock there lets two
+  processes both believe they hold it.
+* **EXCLUSIVE must *release* the PENDING and RESERVED bytes.** Retaining PENDING starves every
+  other process; this surfaced as `disk I/O error` from concurrent writers.
+* **`PENDING_BYTE` is the runtime global `sqlite3PendingByte`, not a constant.** Hardcoding
+  `0x40000000` would silently break locking for any build that moves it. The proof reads it via
+  `sqlite3_test_control(SQLITE_TESTCTRL_PENDING_BYTE, 0)` — a pure read, since the setter only
+  fires on a non-zero argument — and asserts the value it got.
+* **`xShmUnmap` takes a `deleteFlag`**, which SQLite uses to request removal of the `-shm` file.
+
+**What Shape A still does NOT establish.**
+
+* **Not production-ready.** It is roughly 400 lines of unsafe FFI reimplementing SQLite's I/O,
+  byte-range locking and WAL-index mapping. Correctness here is demonstrated, not established.
+* **The residual threats are unchanged in kind.** A non-participating process is still ungated and
+  can still manipulate links; multi-name sidecar behaviour across ungated processes is untouched.
+* **Link creation after the open is caught, not prevented.** The sync re-check fails the commit;
+  it cannot stop the link.
+* **`xSectorSize` is a claimed 4096, not measured**, and `xFileControl` is minimal — `PRAGMA`
+  returns `SQLITE_NOTFOUND`. Some pragmas may not behave as under the default VFS.
+* **Linux/glibc/LP64/3.53.2 only.** No other platform was built or run. No fuzzing, no SQLite
+  regression suite, no long-running stress.
+* **S-31 is still open.** Feasibility is not completion, and the threat boundary is unchanged.
+
+### Stock-VFS patch — design and feasibility analysis (2026-10-14, no code written)
+
+**Decision taken:** Shape A is **not** integrated into production. The recommendation is to
+investigate a narrow patch to SQLite's stock Unix VFS instead. This section is that
+investigation, at the design stage. Nothing was implemented and no OpenRayNux file was touched.
+
+**Where the patch goes, exactly.** `verifyDbFile()` is already called from `unixOpen`'s own
+success path, immediately after `robust_open()` has produced the descriptor, in the same
+function:
+
+```c
+if( rc!=SQLITE_OK ){
+  if( h>=0 ) robust_close(pNew, h, __LINE__);
+}else{
+  pId->pMethods = pLockingStyle;
+  OpenCounter(+1);
+  verifyDbFile(pNew);          /* <- the existing call */
+}
+return rc;
+```
+
+**Why this gives the property Shape A gave, without reimplementing anything.** `verifyDbFile`
+already `osFstat`s `pFile->h` — the real descriptor this very function just opened. Converting
+its three `sqlite3_log` warnings into a return code that sends `unixOpen` down its existing
+teardown path makes the refusal **inseparable from the open**. That is exactly the binding
+Shape B failed to achieve and Shape A achieved by owning the whole I/O layer. Here it is
+~25 changed lines against a function that already computes the answer.
+
+**It also disposes of the strongest objection to Shape A.** The three reasons for not integrating
+Shape A were the `sqlite3_test_control()` dependency, the breadth of replaced infrastructure, and
+insufficient verification. A stock-VFS patch **eliminates the first two entirely**:
+
+* **No lock offsets are ever computed by us.** `PENDING_BYTE` is `sqlite3PendingByte`, an internal
+  SQLite global, and Shape A had to read it through a test-only interface because it was
+  reimplementing locking. Here SQLite's own `unixLock` uses the same macro, so the question does
+  not arise.
+* **No infrastructure is replaced.** Locking, sync, WAL-index mapping and recovery remain
+  upstream code that upstream tests cover.
+
+**A property worth stating explicitly, because it closes more than it first appears to.**
+`verifyDbFile` runs for the **main database only** and skips `UNIXFILE_NOLOCK`, so sidecars are
+never checked directly. The multi-name *WAL* hazard is nonetheless closed, for a reason that is
+not obvious: **a hard link count is a property of the inode, not the name.** Refusing any open
+whose descriptor has `nlink > 1` therefore refuses **every** name for that inode, which is what
+both prototypes demonstrated empirically. No second name can be opened, so no second WAL domain
+can exist for the same database. The sidecar gap stops mattering.
+
+**What it would cost.** This is a maintained change to SQLite internals, and the packaging is the
+real obstacle:
+
+* The amalgamation ships **inside** `libsqlite3-sys 0.38.2` (9.5 MB). A patch therefore means a
+  forked or vendored SQLite.
+* `deny.toml` sets `allow-git = []` and `unknown-git = "deny"`, so `[patch.crates-io]` against a
+  git-hosted fork **hard-fails G8**. Vendoring in-tree is the alternative; a `deny.toml` change is
+  a deliberate gate change and, per ADR practice, would need a `gate-selftest.py` case pinning it
+  in both directions.
+* **Every SQLite upgrade must re-apply the patch**, and a botched re-application would silently
+  remove a security control on a routine dependency bump. This is the sharpest risk in the
+  approach and it is mitigable, but only if it is designed for: apply the patch **in the build
+  step** and fail the build if it does not apply cleanly, so a lost patch is a build failure
+  rather than a silent regression.
+* Blast radius: the change affects every database opened by that SQLite build, not only the store.
+
+**Optional second hunk.** `verifyDbFile` also runs at close, where it can only warn. Shape A
+improved on this by re-verifying identity in `unixSync`, on the commit path, so a link created
+*after* the open fails the commit. The same re-check in `unixSync` would recover that behaviour
+without owning the I/O layer.
+
+**Residual, unchanged in kind.** A process not linking the patched SQLite can still create and
+remove links; that boundary is not closable from inside the library.
+
+**Not established by this analysis.** Feasibility is argued from source, not demonstrated — a
+patched build has not been compiled or exercised. That is the obvious next experiment, in the
+isolated crate, and is **not** authorised.
+
+### Stock-VFS patch — validated against the upstream suite (2026-10-16)
+
+Evidence directory: `~/.local/share/opencode/sqlite-3.53.2-validation/run-20261016T090048Z-c1d13381/`
+(btrfs, persistent). Nothing from that experiment is in this repository, and **no SQLite patch has
+been integrated here.**
+
+**Provenance.** Canonical SQLite `version-3.53.2`, revision `ccc132c5be20ab5c755c97a08d06b1b592fef330`.
+The amalgamation it generates is **byte-identical** (SHA-256 `0a409f16…`) to the `sqlite3.c` that
+`libsqlite3-sys 0.38.2` bundles, so the build under test is the one this tree links.
+
+**Candidate patch.** SHA-256 `243ee4eaa53500472303a577e2f542a520ec1b936b87087e5abc0630f76128ef`,
+103 lines (+45/−13). It applies cleanly to the canonical source, round-trips byte-identically,
+regenerates deterministically, and the generated amalgamation differs from stock by **exactly the
+patch plus three provenance lines** (`SQLITE_SOURCE_ID` twice, `src/os_unix.c` banner), with no
+patch line missing.
+
+**A defect was found and corrected, not waived.** The first candidate refused the link-count check
+against *any* inode. A directory's link count is 2 or more by construction on POSIX, so upstream
+`backup2-10` — which restores onto a directory and expects `disk I/O error` — failed with
+`unable to open database file`. Restricting the link-count rules to `S_ISREG(buf.st_mode)` restores
+the stock error behaviour while keeping hard-link refusal for regular files. That is the patch
+whose hash is recorded above. The earlier 92-line version is **not** the candidate.
+
+**Upstream suite, complete.** 1,188 `.test` files exist in the source tree; 1,186 are test cases
+and two (`all.test`, `permutations.test`) are harness drivers — both contain zero `do_test` cases,
+both call `finish_test`, `all.test` standalone re-runs the whole suite. Both builds classified
+all 1,186 files **identically**: **1,171 PASS, 6 PASS without a summary line, 3 FAIL, 3 TIMEOUT,
+3 INFRA**. There were **zero class divergences**.
+
+* `memleak.test` stays INFRA-classified because `memleak_check` is not defined anywhere in the
+  3.53.2 source tree. The malloc/leak suite is **substitute evidence, not a completed run** of that
+  test.
+* `sysfault.test` ran 12 more cases on the patched build, all passing. The loop terminates when an
+  injected fault index exceeds the number of VFS operations the body performs, and the patch adds
+  an `osFstat` per sync, so the loop iterates further. This is source-grounded, **not directly
+  syscall-counted** — `strace` was unavailable and `test_syscall` exposes no operation counter.
+* `crash.test` differs run to run on a single binary, so its count difference is noise.
+
+**Post-open hard-link behaviour differs by journal mode — this is the material finding.** Over five
+iterations per cell, perfectly consistent:
+
+| Mode | Stock | Patched |
+|---|---|---|
+| WAL | commit succeeds | **commit succeeds; checkpoint refused** (`disk I/O error`) |
+| DELETE (rollback journal) | commit succeeds | **commit refused** (`disk I/O error`), marker does not persist |
+
+A WAL commit syncs the `-wal` file, which carries `UNIXFILE_NOLOCK` and is skipped; a **checkpoint**
+syncs the main database, and that is where the check fires. So in WAL mode the transaction becomes
+durable in the WAL while checkpointing stalls until the link is removed. Open-time refusal applies
+in **both** modes. Durability was determined by closing, removing the link and **reopening** — never
+by trusting the error. Integrity was `ok` in every case, no descriptor leak across 300 refusals
+(descriptors 7 → 7), and writes resumed after the link was removed.
+
+**What is therefore not claimed.** Commit-time enforcement is **not** universal — it does not fire
+in WAL mode. The database is **not** protected against a non-participating process. Availability is
+**unresolved**: in DELETE mode commits are denied outright; in WAL mode checkpointing starves while
+the link exists. Verification is Linux/glibc/LP64 only, with no macOS or BSD build.
+
+### Stock-VFS patch — executed as an isolated experiment (2026-10-14)
+
+**Authorised as "the isolated patched-SQLite experiment".** Built in `/tmp/opencode/patchtest`
+against a patched copy of `libsqlite3-sys 0.38.2` (SQLite **3.53.2**), outside this repository.
+**No OpenRayNux file was touched.** Shape A and Shape B remain in `/tmp/opencode/vfsproof`,
+untouched, so their evidence is unaffected.
+
+**The patch: 92 lines, 35 additions, 9 deletions, four hunks.** Applies cleanly with `patch -p1`
+and round-trips (generated, reverted, re-applied, byte-identical).
+
+1. `verifyDbFile()` returns an `int` instead of `void`, and each of its three conditions returns a
+   code: `SQLITE_IOERR_FSTAT`, `SQLITE_CANTOPEN` (unlinked), `SQLITE_CANTOPEN` (`nlink > 1`),
+   `SQLITE_CANTOPEN` (renamed).
+2. The `unixClose` call site discards the verdict, which at close can only be reported.
+3. `fillInUnixFile()` — which `unixOpen()` calls at `open_finished` — refuses the open on a
+   non-`SQLITE_OK` verdict, giving back the inode reference (`releaseInodeInfo` under the unix
+   mutex, which `findInodeInfo` released) and closing the descriptor before returning the code.
+4. `unixSync()` re-verifies `nlink` before syncing, so a link created *after* the open fails the
+   commit instead of passing unnoticed.
+
+**A measured differential, which is the result's whole value.** The hard-link refusal test was run
+against **stock** SQLite 3.53.2 and **failed** — stock opens the alias and only logs
+`multiple links to file`. Against the patched amalgamation the same test **passes**. The refusal
+is attributable to the patch alone, not to a damaged database, a bad path, or anything else.
+
+**11 tests pass; 12 consecutive full runs, zero failures.** Zero Rust warnings; the patched C
+compiles clean.
+
+| Property | Evidence |
+|---|---|
+| Refusal at open, not first use | `Connection::open()` itself fails; if only a later statement failed, the patch would be a check rather than an enforcement point. |
+| Every name refused | Link count belongs to the inode, so both names are refused — confirmed, as in both prototypes. |
+| No sidecar escape | `-wal`/`-shm` are never created for a refused alias. Sidecars skip the check, but no second name can reach the file. |
+| Post-open link fails the commit | `unixSync` re-check; the insert errors rather than landing quietly. |
+| SQLite's own machinery intact | WAL sidecars, `wal_checkpoint(TRUNCATE)` emptying the WAL, rollback-journal mode persisting across reopen, crash recovery and post-recovery checkpoint all pass. |
+| Cross-process | Writer/reader agree across processes; **4 concurrent writers yield exactly 12 rows**; a writer killed with `exit(9)` is recovered by a later process. |
+| No leak on refusal | 200 consecutive refused opens, then the alias is removed and the database opens cleanly — a refusal that leaked a descriptor or inode reference would show up here. |
+
+**Against Shape A: 92 lines replace roughly 400.** No `sqlite3_test_control`, no private
+`unixFile` layout, no reimplemented locking, no reimplemented WAL-index mapping, no
+`synthetic sector-size claim. And a property Shape A could not have: because the I/O layer is not
+ours, **SQLite's own regression suite remains applicable to the patched build**, which is the only
+route to answering the verification-breadth objection honestly.
+
+**A new risk the patch introduces, which Shape A shares.** Refusing a commit because a link
+appeared converts an integrity control into an **availability** hazard: anyone able to create a
+hard link to the database can make every subsequent commit fail. That is fail-closed and arguably
+correct, but it is a denial-of-service vector that must be assessed explicitly rather than
+discovered. It is not present in stock SQLite, which merely logs.
+
+**What this experiment does NOT establish.**
+
+* **It is still a maintained fork of SQLite.** Every packaging cost stands: `deny.toml` sets
+  `allow-git = []`, so a git-hosted fork fails G8; vendoring 9.5 MB in-tree, or a deliberate
+  `deny.toml` change with a `gate-selftest.py` case, is required.
+* **Every SQLite upgrade must re-apply the patch.** The refusal test is the canary — if the patch
+  is lost, it fails loudly rather than silently reverting — but it must actually be run.
+* **SQLite's own regression suite has not been run against this build.** That is now feasible and
+  is the most valuable remaining check.
+* Linux/glibc/LP64 only. No macOS or BSD build was attempted. The patch changes behaviour for
+  every database opened by that SQLite build.
+* The residual is unchanged in kind: a **non-participating** process remains ungated.
+* **S-31 remains open.** This is feasibility evidence, not an accepted design.
+
+### Evidence gathered on the enforcement mechanism (research only; no code written)
+
+All findings below are read from the **pinned dependencies in this tree**, not from general
+knowledge: `rusqlite 0.40.2`, `libsqlite3-sys 0.38.2`, bundled **SQLite 3.53.2**
+(`features = ["bundled", "backup"]`).
+
+**Finding 1 — the custom-VFS route cannot be done safely through rusqlite.** `rusqlite 0.40.2`
+has **no `vfs` module and no `vfs` feature**; it was removed. Registering a VFS would mean
+hand-building `sqlite3_vfs` and `sqlite3_io_methods` through raw `libsqlite3_sys` FFI. The
+symbols exist and `libsqlite3-sys` re-exports its bindings publicly, and rusqlite *can* select a
+VFS by name (`open_with_flags_and_vfs`) — so it is mechanically possible. It is not a small thing.
+
+**Finding 2 — a delegating VFS closes nothing.** The unix VFS entry point is
+`unixOpen(sqlite3_vfs*, const char *zPath, sqlite3_file*, int flags, int*)`: it takes a
+**pathname** and resolves it itself. A VFS that checks identity in `xOpen` and then delegates
+leaves the parent to re-resolve the same name, so the descriptor SQLite ends up with is still
+whatever the name resolves to at that instant. Only a *binding* VFS — one that opens the
+descriptor itself and serves every method from it — would help, and that means implementing all
+**17** members of `sqlite3_io_methods`, including the four WAL shared-memory methods
+(`xShmMap`, `xShmLock`, `xShmBarrier`, `xShmUnmap`) and POSIX advisory locking. The struct layout
+is version-coupled to the bundled 3.53.2.
+
+**Finding 3 — WAL and SHM names are string-derived from the database name. CORRECTED SCOPE.**
+The underlying fact is verified: sidecar names are produced by concatenation —
+`zWal = sqlite3_mprintf("%s-wal", zMove)`. A descriptor-backed path such as `/proc/self/fd/12`
+therefore asks for the sidecar `/proc/self/fd/12-wal`, which is not a valid sidecar.
+
+**An earlier draft of this record over-generalised that into "WAL is broken for the VFS route".
+That was wrong and is withdrawn.** The descriptor-path trick is broken; a **custom VFS is not**.
+`xOpen` is handed *every* filename SQLite opens, including the derived `-wal` and `-shm` names, so
+a VFS can serve the sidecars itself. WAL is therefore a substantial **implementation cost** on
+this route, not an inherent blocker. The distinction matters: one reading says the route is
+closed, the other says it is expensive. The second is what the evidence supports.
+
+**Finding 4 — the option the review did not consider, and it is far smaller.** SQLite's own unix
+VFS **already performs** the hard-link and moved-file checks. `verifyDbFile` is called
+**unconditionally** from `unixOpen` on success and from `unixClose`, and it `osFstat`s the
+**actual descriptor** `pFile->h` — not a re-resolved path:
+
+* `st_nlink > 1` → `sqlite3_log(SQLITE_WARNING, "multiple links to file: %s", ...)`
+* `st_nlink == 0` → `"file unlinked while open"`
+* `fileHasMoved()` → `"file renamed while open"`
+
+That is ADR-0058's Decision 3 check, performed by SQLite on the descriptor it really opened. For
+the hard-link case it is **stronger** than the pre/post path check designed above, because there
+is no second name resolution in between. The sole gap is that `sqlite3_log` **warns and
+continues**. Turning the warning into a refusal is small: enable rusqlite's `trace` feature and
+call `trace::config_log` once. Two hard constraints must be recorded rather than discovered:
+`sqlite3_config` must run **before any SQLite connection exists**, and the callback **must not
+call back into SQLite** — so it can only *flag*, and the store must refuse **after** the open
+returns.
+
+**Finding 5 — the limits of that cheaper route, stated plainly.** `verifyDbFile` returns early
+when `UNIXFILE_NOLOCK` is set, and its comment is explicit: *"These verifications occurs for the
+main database only."* **The WAL and SHM sidecars are not covered.** So the log-handler route
+closes the hard-link bypass on the database file and leaves the multi-name WAL hazard standing.
+It is also **process-global**, not per-connection, and remains detect-then-refuse rather than
+atomic.
+
+**Finding 6 — the existing public file-control interface does not reach a native handle.**
+Verified against the bundled 3.53.2 header: `SQLITE_FCNTL_FILE_POINTER` (7) returns the
+`sqlite3_file`, not an OS descriptor; `SQLITE_FCNTL_HAS_MOVED` (20) reports a moved, renamed or
+deleted file and is **not** a link-count check; `SQLITE_FCNTL_WIN32_GET_HANDLE` (29) is
+Windows-only. So there is no portable public control that hands out the native handle, which is
+precisely why the enforcement point has to be `xOpen` inside a VFS.
+
+**Finding 7 — the two Rust candidates, checked against their published sources.**
+
+| Candidate | What the source actually says | Consequence |
+|---|---|---|
+| `sqlite-vfs` | `DatabaseHandle` carries `type WalIndex: WalIndex` — a WAL-index implementation is **required**, and the trait is declared inside a `mod wip`. The bundled `WalDisabled` explicitly disables it. | Required work, not a ready-made backend. |
+| `rsqlite-vfs` | `SQLiteIoMethods::VERSION` **defaults to 1** (basic file I/O); the default table installed by `xOpen` has the shared-memory methods **absent** and fetch/unfetch declining mmap. Its own docs state that *raising the version alone does not implement those capabilities*. | Real infrastructure; the WAL shm layer is still yours to write. |
+
+The predecessor commit history for the same lineage shows the shm callbacks landing as stubs
+returning `SQLITE_IOERR_SHMMAP` / `SQLITE_IOERR_SHMLOCK` — which is the honest shape of the work,
+and sits exactly where a subtle bug corrupts data rather than failing loudly.
+
+**Conclusion — feasible in principle; not a drop-in fix.**
+
+* **VFS feasibility: technically viable in principle.** A VFS controls `xOpen`, can open the
+  native handle, inspect *that handle's* identity and link count, and refuse before SQLite ever
+  sees the file. Binding the expected identity to the open, rather than trusting a separate path
+  check, is the property the current design lacks.
+* **Portable descriptor access via existing public controls: not established** (Finding 6).
+* **A ready-made Rust solution preserving existing WAL semantics: not found** in the two
+  candidates examined (Finding 7).
+* **Cost and risk: significant.** It requires a focused technical proof before the architecture
+  is committed to — not a plausibility argument.
+* **S-31 remains open.** None of this is evidence that the bypass has been eliminated.
+
+**The contract a technical proof would have to satisfy**, before any of this becomes a design:
+
+1. Open the main database through the VFS's own native open.
+2. Inspect identity and link count **on that exact handle**; reject an unexpected identity or a
+   link count other than one.
+3. Bind the expected identity **to the open operation**, not to a separate path check.
+4. Preserve handle and ownership lifetime so no participating connection can reach the database
+   by a bypass.
+5. Keep WAL, shared-memory and journal behaviour compatible with SQLite's locking and recovery
+   semantics.
+
+**What even a successful proof would not cover:** it would not stop a **non-participating**
+process from manipulating filesystem links. That threat boundary stays explicit either way.
+
+**Windows — disposition decided (2026-10-14): fail closed, defer native.** Stable Windows cannot
+supply `name_count` or `identity` (see the portability qualification above), so the Decision 1
+fail-closed rule means the platform implementation **refuses every open on Windows** until a
+native `GetFileInformationByHandle` implementation exists. Windows is unsupported on this path by
+decision, not by accident, and it is recorded as such.
+
+**Decision 3 — S-31 remains implemented but NOT complete.** While a known bypass or an
+unaccepted residual window remains, S-31 does not close, and S-30 is not declared fully closed.
+A narrower, explicitly documented guarantee can be a legitimate engineering decision — **but
+documenting weaker behaviour is not evidence that the stronger guarantee holds.** Closing on that
+basis requires an explicit decision accepting the narrowed threat model, including what happens
+if database paths or hard links change concurrently.
+
+**The architectural goal** is to either eliminate the remaining bypass within the supported
+threat model, or obtain explicit approval for a narrower guarantee. Not to argue that the
+narrower guarantee is sufficient.
+
+**Stop.** The boundary, the enforcement points, the honest scope of the guarantee, the three
+approved dispositions and the six tests are settled. Implementation follows only on a further
+authorisation, and it will not close S-31 on its own.

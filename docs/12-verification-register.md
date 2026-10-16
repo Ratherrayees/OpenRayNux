@@ -1,24 +1,62 @@
 # 12 — Verification Register & Freshness Policy
 
-Status: **Draft v0.5** · Adopted 2026-09-30 · last reconciled **2026-10-08** against
-`HEAD` (`c5934970`).
+Status: **Draft v0.5** · Adopted 2026-09-30 · last reconciled **2026-10-10** against
+`HEAD` (`1fa2d0b`); previously reconciled 2026-10-08 against `c5934970`.
 
-96 rows, V-01 … V-97, with V-44 deliberately unused. Every V-ID cited anywhere in `docs/` exists here, and no V-ID
-appears twice.
+96 V-rows (V-01 … V-97, V-44 deliberately unused) plus one non-V row, `K.1`, so 97 bolded
+table rows in total. **`F-26` was added to §2 on 2026-10-14, taking that total to 98.** (The
+pre-existing discrepancy between "96" and the rows actually present in §2 is left as found; it
+is not this row's business to reconcile, and guessing a corrected total would be a second
+unsourced number in a register whose whole purpose is that its numbers are sourced.) No V-ID appears twice. V-96 was reclassified from `*(undefined)*` to a
+recovered definition on 2026-10-10; see the note below. Every V-ID cited anywhere in `docs/`
+is present here, with the single exception of **V-44**, which is cited in `09-decisions.md`
+and `README.md` *as* the deliberately-unused identifier.
 
-**Four numbering gaps.** Three are deliberate and are recorded rather than renumbered,
-because renumbering would break every existing citation and because a silent gap is
+**Three numbering gaps, all deliberate**, recorded rather than renumbered because
+renumbering would break every existing citation, and because a silent gap is
 indistinguishable from an omission — which is precisely the failure this register exists to
 catch: **V-44** is unused, and **ADR-0041** and **ADR-0042** are unused. A future entry that
-needs V-44 or ADR-0041 should take it rather than skip past it.
+needs V-44 or ADR-0041 should take it rather than skip past it. A fourth, **V-96**, was
+until 2026-10-10 recorded in this file as a fourth, *undeliberate* gap; that record was
+wrong and is corrected below.
 
-**The fourth gap, V-96, is not deliberate and is not yet explained.** V-93, V-94, V-95 and
-V-97 were carried out and are recorded below as of this reconciliation. **No definition of
-V-96 exists anywhere in this repository** — not in `docs/`, not in the commit history, not in
-the tree — so it has no entry describing a defect, and none has been invented for it.
-Inventing a plausible subject for an unknown ID would put a fabricated requirement into a
-normative document. It is left as an open gap on purpose: the next engineering milestone is
-to recover or define V-96 explicitly, and only then implement it.
+**The fourth gap, V-96, is now closed, and it was closed here by recovery rather than by
+invention.** V-93, V-94, V-95 and V-97 were carried out and are recorded below as of this
+reconciliation. This register, until 2026-10-10, also recorded V-96 as `(undefined)` and
+asserted that *no definition of V-96 exists anywhere in this repository — not in `docs/`,
+not in the commit history, not in the tree*. **That assertion was false**, and it was false
+in a way this register exists to prevent, because the evidence was in this repository the
+whole time.
+
+V-96 was defined, implemented and cited:
+
+* **Defined** — `08-testing-engineering-standards.md` §"Platform boundary", row
+  `cfg(target_os)` gate: *"**V-96:** it matched raw text, so a comment could switch it off
+  and seven of nine `cfg` spellings -- every nested one -- were invisible; G3 now classifies
+  source lexically and reads predicates at any depth. Self-tested against fixtures by gate
+  G13."*
+* **Implemented** — commit `7bf9da8` *"test(ci): drive the boundary gates against adversarial
+  rewrites"*, which added the fixture-driven self-tests and the lexical classifier
+  (`scripts/rustscan.py:58-176` `code_mask`, a real Rust lexer for nested block comments,
+  raw strings, escapes and the char-literal/lifetime ambiguity;
+  `scripts/gate_policy.py` predicate reading at any depth;
+  `scripts/gate-selftest.py:126-135`, which drives the **real** `scripts/ci-gates.sh` over
+  temporary fixture trees and reads the process exit code as the verdict).
+* **Cited** — the same `08` row, and commit `b73246d` *"refactor(gates): anchor G2d on the
+  authority surface policy now owns"*.
+
+**How the false claim survived.** It was written during a reconciliation that correctly
+found V-93/V-94/V-95/V-97 *missing* from this file, and the search that established "V-96 is
+undefined" looked for a row here rather than for the identifier across `docs/`. An
+identifier that is defined in one document and numbered in another is exactly the
+cross-document drift this file is supposed to make visible; asserting its absence, in the
+document whose job is to be complete, turned a reconciliation into a fabrication. The row
+has been rewritten below from recovered evidence. **Nothing was renamed and no identifier
+was invented.**
+
+**What this does not claim.** The recovered row records the fix that exists, and it names
+the residual gap found on 2026-10-10 rather than closing over it: gate G3 still matches
+platform API paths *literally*, so importing the path once under an alias defeats it.
 
 > **What was stale before this reconciliation, recorded because the drift is the lesson.**
 > The header claimed 86 entries / V-01…V-87 while the file already contained V-88 through
@@ -69,6 +107,20 @@ Legend — **Cadence**: `event` (re-checked on a named trigger) · `quarterly` �
 phase gate).
 
 | ID | Claim | Verification source | Cadence / trigger | Last verified | Consequence of silent drift |
+| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
+§7-S30) owns the restore defect; S-11 (§7-S11) owns the six entry points. **S-11 is blocked on
+S-30** and must not claim safety until S-30's five acceptance criteria hold — a coordinator whose
+rollback can return `Ok(())` while restoring the wrong state would make its own safety claim
+false. Both are P1; the split is scope and test boundary, not severity. D-S11-a is approved,
+D-S11-b approved in principle, D-S11-c measured.
+
+**Update 2026-10-14: S-30 is now implemented and its five acceptance criteria are met — see
+A-007. F-26b is nonetheless recorded as still open**, on the grounds A-007 sets out: the
+invariant is enforced within one process only, and a failed restore after a stale log was
+folded in leaves post-snapshot data absorbed rather than discarded. It fails closed rather than
+reporting success, but that is not a clean rollback and this row does not claim it is.
+**S-11 is not unblocked by this**, and S-29 remains blocked behind S-11 (§6.4). | **event:** any change to `MigrationRunner`, `Backup`, `Store::open`, `open_and_migrate`, or any function that calls `.run(true)` or `.migrate(`; and on any change adding a persisted table, column, `CHECK` constraint or task-state value, which is gated on S-11 (§6.4) | 2026-10-14 (**confirmed still open**) | **High.** A migration failure on a production upgrade leaves a half-applied schema and the only copy of the user's data with no verified way back. Four of six entry points cannot produce one even on request. |
+
 |----|-------|--------------------|-------------------|---------------|---------------------------|
 | **V-01** | **MCP spec revision is `2026-07-28`; the protocol is stateless; Sampling/Roots/Logging are deprecated with a ≥12-month window; Tasks is an extension** | `https://modelcontextprotocol.io/specification/latest` and the versioned changelog at `/specification/2026-07-28/changelog` | **event:** any new revision date on the latest page; plus quarterly | 2026-09-30 | **High.** A new revision may reintroduce sessions, change the Tasks extension, or move a deprecation to removal. Our MRTR mapping and our stateless-safety argument (ADR-0010) both depend on it. |
 | **V-02** | **SQLite minimum bundled version is ≥ 3.51.3** (WAL-reset corruption fix) | `https://www3.sqlite.org/releaselog/3_51_3.html`; WAL semantics at `https://sqlite.org/wal.html` | **release:** verify the bundled `SQLITE_VERSION_NUMBER` at build time; **event:** any new SQLite release note mentioning corruption | 2026-09-30 | **Critical.** Below 3.51.3 the task table can corrupt under our exact multi-connection write workload. Enforced by a build-time assertion (ADR-0006). |
@@ -175,6 +227,105 @@ Linux `MAX_ARG_STRLEN` (`32 * PAGE_SIZE`, including the terminator), which is **
 this implementation enforces — `write-text` puts the caller's `contents` there verbatim and
 imposes no limit. The disclosure reports `implementation_bound_bytes: null`.
 
+**ADR-0054 implemented 2026-10-10 — the payload half is fixed and measured; F-10 stays open.**
+The Tier-1 payload no longer travels in `argv`. `write_text`'s plan carries only `--path` and a
+transport-version flag; the body is a **framed** payload on the child's stdin
+(`ORXNUD-STDIN/1` + `contents-length` + a bounded header cap), the supervisor writes it on a
+dedicated thread and **closes stdin before waiting** (Decision 3a), and the helper refuses every
+deviation. Verified on the production path, not on a copy of the rendering:
+`the_payload_does_not_appear_in_the_bwrap_argument_vector` drives the shipped bundle through a
+real policy engine and `dispatcher.dispatch`, renders the spec and the exact `bwrap` argv with
+`BwrapRunner::argv_for`, and asserts the sentinel is absent — **that one assertion covers both of
+R-1's command-line surfaces**, because the cgroup branch launches
+`/bin/sh -c '… exec "$@"' … BWRAP <argv>` and the joiner shell carries the same vector.
+
+**R-1's four conditions, checked individually rather than in aggregate.**
+
+**The real sandbox lane was run end to end for the first time on 2026-10-11, and it is
+green: 120 tests, 0 failures, exit 0.** `scripts/run-sandbox-tests.sh` inside the pinned
+`rust:1-bookworm@sha256:114c7a44…` image, on the unprivileged uid with every capability
+dropped. Per suite: `governed_path` 31/31, `read_text_real` 10/10, `write_text` **17/17**,
+`orxnud-platform-sandbox --test isolation` 26/26, `cli_e2e` 36/36. The container's own
+preflight is affirmative and is the positive Tier-1 evidence this lane exists to produce:
+
+    RESULT: a Tier-1 capability can be sandboxed and executed here.
+    shape:  NESTED user namespace -- the production configuration
+    guarantees: visibility=true tree_lifetime=true resources=false
+    tier1_executable: yes
+
+`resources=false` is honest and load-bearing: cgroups are **not** delegated inside this
+container, so resource-ceiling enforcement is not established here. That is what
+`scripts/run-resource-tests.sh` is for, and it is why it is a separate lane.
+
+`write_text` 17/17 is the end-to-end result for S-17: the framed payload was written,
+closed and consumed by a real `orxnud-fswrite` inside a real `bwrap` sandbox — including
+`bytes_arrive_exactly_with_nothing_interpreted`, `an_empty_file_is_the_requested_effect_not_a_
+missing_one`, and `an_approved_write_reaches_the_sandbox_and_verifies_from_the_filesystem`.
+
+**Running that lane for the first time exposed three real defects, none of them in S-17.**
+1. `setpriv` changes the uid but not the environment, so the unprivileged run inherited
+   `HOME=/root` and `cargo-nextest` died with `Permission denied` on
+   `/root/.config/nextest/config.toml` — the lane aborted **before a single Tier-1 test ran**.
+   `HOME` and the XDG directories are now set on the `setpriv` line.
+2. `run-sandbox-tests-inner.sh` still selected `governed_path`, `read_text_real` and
+   `write_text` with `--test`, but those are **modules inside `src/tests/`**, not integration
+   binaries, so the build failed with `no test target named 'governed_path'`. They are now
+   nextest **filters** on the module path. The same stale spelling had already been corrected
+   once in `ci.yml`; this script was missed, and only an end-to-end run could find it.
+3. `governed_path::v46::an_unexpressible_budget_is_refused_before_any_cgroup_or_process_exists`
+   asserted that the refusal comes from *budget validation*, but on a host that cannot make
+   cgroups `can_fulfil` refuses **first**, with a different message. It passed on a developer
+   machine and failed in the container: it was measuring the environment, not the code. It now
+   asserts the property both branches share — *refused before any cgroup or process exists* —
+   and additionally that neither refusal reports a cgroup path.
+
+1. **NOT MET.** The *payload* sentinel is absent from every readable `/proc` surface, measured
+   live while a real sandboxed execution ran: `/proc` mount options
+   `"rw,nosuid,nodev,noexec,relatime"` (no `hidepid` option), `cmdline` mode `444`, `environ`
+   mode `400`, observed `cmdline = false`, `environ = false`. **The credential half is vacuous**:
+   credential-bearing Tier-1 capabilities remain prohibited (ADR-0054 Decision 5), so there is
+   no credential to carry a sentinel. The condition is **not satisfied** and must not be reported
+   as if it were.
+2. **MET.** `write_text`, `read_text` and `governed_path`: 65 tests, 65 passed — and now also
+   inside the container, where `write_text` is 17/17 against the real sandbox.
+3. **MET, with the recorded qualification.** `scripts/run-sandbox-tests.sh` completed end to
+   end on a user-namespace-capable host: 120 tests, 0 failures, exit 0, with an affirmative
+   preflight. This is the dedicated lane R-1 names, not a substitute for it. It was not run on
+   a GitHub-hosted runner, which cannot create a user namespace and therefore cannot produce
+   this evidence; the lane's own reporting on such a host would be `reduced coverage`, not
+   isolation.
+4. **NOT MET**, and cannot be while (1) is open.
+
+**What the framing rules are worth, demonstrated.** A declared zero is a valid empty write; an
+empty *stream* is refused and writes nothing (`an_empty_stream_is_refused_rather_than_writing_an_
+empty_file`); a short body, trailing bytes, a duplicate or malformed length, an unknown protocol
+and an over-cap header are each refused **with no file created**; 1,048,576 bytes exactly is
+accepted and one more is refused before any process exists; the bound is counted in UTF-8 bytes,
+proven by a payload that is under the limit in *characters* and over it in *bytes*. The
+close-after-frame requirement is a negative test against a reader that never reaches EOF, and it
+is shown to still complete once the stream closes, so it is measuring the missing EOF rather than a
+reader that simply never terminates. 16 concurrent helper processes each receive their own body.
+
+**Credential handling is unchanged and still open.** `SandboxSpec.env` renders as `--setenv K V`,
+which is `argv`. ADR-0054 explicitly did **not** change this, and a stdin fix does not touch it.
+
+**Design record, 2026-10-10 — no fix has landed.** The permanent correction is decided and written
+as **ADR-0054**: the payload travels on the sandboxed child's stdin and never in `argv`, with a
+1 MiB bound measured in UTF-8 bytes of the normalised `contents` that refuses rather than
+truncates, a writer thread so the parent cannot deadlock, and a **versioned frame carrying the
+expected payload length** so that a declared length of zero is a valid empty write while
+missing metadata, an unexpected EOF, a length mismatch or excess trailing data are each
+refused rather than written. Daemon/helper transport versioning is explicit, so an old helper
+with a new daemon is refused rather than silently mismatched. Feasibility was **measured** on the development host before any edit — `bwrap`
+forwards its own stdin to the sandboxed child, and 262144 bytes complete with no deadlock when
+the child reads — and the cross-uid harness above was reproduced on that same host (`cmdline` read
+by uid 4242 succeeded; `environ` denied). **ADR-0054 is written and not yet merged, and
+`docs/18` §6.3 gates the implementation phase on that, so no S-17 code exists.** Two consequences
+recorded rather than smoothed over: `SandboxSpec.env` still renders as `--setenv K V`, so the
+**credential** channel is unaffected by any stdin fix and credential-carrying Tier-1 capabilities
+remain prohibited; and R-1's first condition requires a credential sentinel, which is not
+reachable while no credential-carrying capability exists — so a payload-only pass would leave that
+condition **vacuous**, not satisfied.
 
 **What this is not.** The argv transport is unchanged. Any execution permitted to run still
 places its payload in the host process table for the life of the execution — **F-10 stays open
@@ -249,6 +400,7 @@ classified `INTERNAL_ERROR` sink. |
 
 | **V-88** | ****Only the verified output of an approved `filesystem/read-text`, released once, across one step boundary, to the `(endpoint, model)` identity that asked for it, can leave this machine for a provider**** | `Observation::step_no` and `ObservationStore::take_for` (eligibility is `step_no + 1 == requesting step_no`, plus task and `ProviderIdentity::matches`); `ProposalProvider::destination` defaults to `None`; `retain_read_observation` requires `output_is_ephemeral && is_verified()` and an `Actor::Ai` naming the configured model; `DisclosureBatch` has a private field; `release_observations` appends a `DisclosureRecord` before the request and refuses on append failure. Evidence: `crates/orxnud-daemon/tests/disclosure.rs` (10), `runtime.rs::read_retention_gate` (9), `observation.rs` store tests (5), `http_provider::disclosure_rendering_tests` (2), `proposer::tests` destination (1). **Mutation-checked** — breaking the task check, the step check, the identity check, single-use consumption, the size limit, the verification requirement, or the audit append each fails the suite. | **release:** any change to `ObservationStore::take_for`, `ProviderIdentity::matches`, `ProposalProvider::destination`, `retain_read_observation`, `release_observations`, or `render_disclosures`; any capability that declares ephemeral output | 2026-10-06 | **High, because this is the first data-release boundary in the build, and it is the claim ADR-0045 was written to make enforceable.** Scope is deliberately one capability's output, one proposal, one destination. What is **not** claimed: no memory subsystem, no retrieval across proposals, no semantic search, no unrestricted export — an observation informs one explicitly authorised proposal and is then gone. Single-use is enforced by **erasure** rather than by a durable consumed flag, because the store is process memory (ADR-0045 D4); a crash therefore loses content rather than restoring it. Enabling `filesystem/read-text` in `SHIPPED_POLICY` is part of this claim and was a **defect fix**: the capability menu already advertised it and policy refused it as `unknown-capability`, so the whole subsystem was unreachable for a reason unrelated to leaving it unwired. **Evidence boundary:** every test in `disclosure.rs` needs a verified sandboxed read, so it is excluded from the hosted G9 scope and runs in the ADR-0046 container, which per V-87 cannot itself obtain positive Tier-1 evidence on a GitHub runner. The gate-level controls that do not need a sandbox (renderer delimiters, the `destination` default, store eligibility, the retention gates) run everywhere. |
 | **V-98** | **CLOSED — every CI lane installed an unauthenticated, mutable, root-owned executable on every push** | `scripts/run-sandbox-tests.sh:125` ran `curl -LsSf https://get.nexte.st/latest/linux \| tar zxf - -C /usr/local/cargo/bin` inside the container bootstrap, as root, before any build step: a mutable tag, no integrity check, and network content piped into a root-owned system path | **release:** any change to `scripts/install-nextest-verified.sh`, the pins in `scripts/run-sandbox-tests.sh` / `scripts/run-resource-tests.sh`, or the CI toolchain install path — re-read 2026-10-10 | 2026-10-10 | **Closed on verification, and the three defects were independent.** **(1) Mutable:** `/latest/linux` resolved to whatever upstream last published, so the lane's behaviour changed with no diff here. Replaced by an exact release, **cargo-nextest 0.9.146**, `x86_64-unknown-linux-gnu` — the version `.github/workflows/ci.yml` already pins and documents, so the project keeps *one* cargo-nextest and a container pass cannot disagree with a gate pass. **(2) Unauthenticated:** the pin is `sha256` **`682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428`**, read from the `.sha256` asset published *with* release `cargo-nextest-0.9.146`, and then **confirmed against the artifact itself** — downloaded from the release and hashed locally — so the two agreeing is evidence, not an assumption. It is a **literal**: `test-ci-toolchain-pinning.sh` fails if it becomes `${...}`, because an overrideable checksum is a suggestion. A `ORXNUD_NEXTEST_BASE_URL` mirror override **is** allowed and is safe precisely because the pin still governs — the mirror may change where bytes come from, never what they must be. **(3) Root, into a system path, from a pipe:** the download now lands in a file, is verified **before** extraction, and is installed and executed as **uid 1000** into `/home/orxnud/.local/bin`, owned by that uid — demonstrated in the real container (`orxnud 755 /home/orxnud/.local/bin/cargo-nextest`, run under `setpriv --reuid=1000 --bounding-set=-all`). **Images pinned by registry digest**, not tag: `rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6` (OCI **index**, so it stays immutable *and* resolves on arm64 developer hosts), read from the Docker Hub registry API and re-fetched **by digest** to confirm it resolves; the `linux/amd64` manifest it resolves to is `sha256:b36c246742b4d323472588f789601be34eb4af053255e2af53969078ee8dcec7`. **This is a registry manifest digest, not a local `docker images` ID**, which is the confusion the slice names. **Negative-tested, twice.** `scripts/test-ci-toolchain-pinning.sh` drives the **real** installer with a locally-built artifact that does not match the pin and requires nonzero exit **and** no installed binary **and** no execution; mutating the production checksum comparison to `if false` makes it report `rc=0` and *installs the bad artifact*. A second mutation -- reverting the release-asset URL to the form that 404s -- was also caught, and that one existed because the **positive** run found it: an earlier check ("does the URL mention the version?") passed against a 404, so the check now reads the URL the installer **actually requested**. Enforced as **gate G14**. **In the real pinned container**, a refusing install left no binary and the following build step never ran (container exit 1, build marker never printed), which is the ordering the criterion asks for. **Not claimed:** this closes the *supply-chain* defect only. It produces **no** Tier-1 isolation evidence, and `sandbox-integration` still reports that the environment was measured rather than that the sandbox was proven. The unauthenticated path is not merely relabelled — it no longer exists. |
+
 Recorded per operating rule 5: wrongness is worth recording, because it is how
 this register improves.
 
@@ -317,6 +469,37 @@ retry unclaimable without moving a clock the harness does not own. The conforman
 path passes `Some(0)`; production passes `None`, which uses
 `EngineLimits::retry_backoff_ms`.
 
+### A-005 — an unexplained intermittent G9 failure, recorded because it is unexplained
+
+**Observed:** 2026-10-10, during the S-17 design pass. A single `scripts/ci-gates.sh` run
+reported `1 failed: G9` (the test gate). The test binaries were **unchanged** by that pass —
+it touched `docs/09-decisions.md`, `docs/12` and `docs/18` only — so the failure is not
+attributable to any edit in it.
+
+**What is known.** Re-running `scripts/ci-gates.sh G9` in isolation gave
+`1664 tests run: 1664 passed, 0 failed, 6 skipped`, and three further consecutive full gate
+runs reported `all selected gates passed`. The failure was **not captured**: its test name,
+failure message and exit status were not recorded at the time, because the output was
+filtered to the summary line. **It therefore cannot be diagnosed from what was kept.**
+
+**Why it is recorded rather than dismissed.** Three green runs afterwards are evidence that it
+did not recur *in those three runs*. They are not evidence that it was harmless, and the
+difference matters: an intermittent red gate is a gate whose colour does not mean what it
+appears to mean. The honest position is that one unexplained failure exists in the record, its
+cause is unknown, and no attempt was made to attribute it to V-68's known load-sensitive
+flakiness — V-68 records a *different, named* test and understanding it, whereas this failure
+has no identity at all. Claiming it is "probably V-68" would be a guess recorded as a finding,
+which this register does not do.
+
+**The lesson, which is the actionable part.** The failure was filtered out of the log by a
+`grep` that kept only the summary. That is the whole mechanism by which a real signal was
+discarded: the run was being read for its verdict, not for its evidence. **Next time, capture
+`FAIL` lines before filtering.** Any future occurrence should record the test name, the
+assertion, and whether it reproduces in isolation.
+
+**Milestone:** before a future intermittent is treated as a known-bad gate, or before this is
+closed as unreproducible, produce a reproduction. **Status: OPEN, undiagnosed.**
+
 ### A-001 — `orxnud-domain`'s dependency list
 
 **What the contract said:** `serde` and `thiserror` only.
@@ -344,6 +527,543 @@ by rejecting any of `tokio`, `rusqlite`, `keyring`, `clap`, `reqwest`, `walkdir`
 Recorded here first so the discrepancy is not silent.
 
 ---
+
+### A-008 — S-31: cross-process database ownership for the whole restore lifecycle
+
+**F-26c REMAINS OPEN.** The cross-process evidence below is sound for the paths it tests, but
+a follow-up review found a **real ownership bypass that is not fixed**: a database reachable
+through more than one hard link gets a lock file per name, so a competitor opening the alias
+participates in nothing. Until that is rejected, or the safety contract is explicitly narrowed
+and enforced, cross-process ownership is **not fully proven** and the finding stays open.
+
+**F-26 and F-26b also remain open.** All three are open; none is closed by this work.
+
+**The race S-31 closes.** S-30's guard takes exclusive authority **instantaneously and in
+one process**. Between its checkpoint and its copy, a second daemon could open and write the
+database; a second process is not in this process's connection set, so its presence never
+made our checkpoint report busy. The online backup API's destination lock covers the backup
+operation, not the surrounding lifecycle.
+
+**Mechanism, and why it fits.** A stable per-database lock file, `<db>.lock`, held with the
+standard library's advisory file locking (`File::try_lock` for exclusive,
+`try_lock_shared` for shared). **No new dependency**, and no MSRV change: the API stabilised
+in Rust 1.89 and the workspace declares `rust-version = "1.98.1"`. SQLite's own locking is
+deliberately *not* used for this — a transaction lock says "I am writing now", not "I am
+restoring and nobody may open this for the next fifty milliseconds".
+
+**Ownership semantics.** Ordinary opens take a **shared** lease held for the connection's
+lifetime (a field on `Store`, `SqliteAuditJournal`, `SqliteApprovalLedger`, so it survives
+`open()` returning). A restore takes an **exclusive** lease before the checkpoint and holds
+it through the copy, the logical verification, and the outcome. Contention **fails fast** with
+a typed `OwnershipError::Conflicted`; nothing waits.
+
+**How migration recovery releases its own connection.** This required restructuring, and it
+is the substantive change. `MigrationRunner` borrows a `&Connection` whose owning `Store`
+holds a shared lease — and `flock` conflicts between open file descriptions **even within
+one process**, so a restore from inside `migrate()` would deadlock against our own lease.
+`migrate` therefore no longer restores: it returns `MigrationError::RecoveryRequired
+{ source, snapshot }`, and `TaskService::open` drops the store (closing the connection and
+releasing the lease) before calling `Backup::restore_coordinated`. `Store::into_parts`
+returns the connection **and** its lease so the lease follows the connection when the store
+is consumed by the engine.
+
+**Lock identity.** `lock_path_for` canonicalises, resolves symlinks where the target exists,
+and for a not-yet-created database canonicalises the *parent* and joins the file name — so
+identity is absolute and stable rather than derived from the caller's string. The lock file
+is created with `create(true)` and never unlinked or replaced, so two processes racing to
+create it end on the same inode rather than on two lock files.
+
+**Evidence.**
+
+| Requirement | Result | Test |
+|---|---|---|
+| A — competing process excluded | **pass** | `a_competing_process_is_excluded_during_the_restore_lifecycle` |
+| B — controlled checkpoint-to-restore interleaving | **pass** | `b_a_competitor_cannot_act_inside_the_checkpoint_to_restore_window` |
+| C — every entry point participates | **pass** | `c_every_entry_point_participates_in_the_ownership_rule`, `c_task_service_open_refuses_through_its_own_opener` |
+| D — no coordination bypass | **pass** | `d_restore_refuses_without_exclusive_ownership_and_recovers_when_free`, plus S-30's `restoring_from_outside_the_crate_does_not_compile` |
+| Lock identity, shared/exclusive, path aliases, unusable lock path | **pass** | `ownership::tests::*` (4 tests) |
+
+Both two-process tests use a **real restore paused inside the window** as the exclusive
+holder, not a synthetic lock holder, so they exercise the same exclusive window production
+uses.
+
+**Mutation-checked.** Removing the lock from `acquire_exclusive` **and** from
+`acquire_shared` each made both two-process tests **fail**; restoring the code made them
+pass. Without this they could have been passing for an unrelated reason.
+
+```
+cargo test -p orxnud-store            307 + 7 + 3 + 3 + 1 + 3 + 3 passed, 0 failed, 2 ignored
+cargo test -p orxnud-task             20 suites, 0 failed
+cargo test --workspace                1734 passed, 0 failed, 7 ignored
+cargo fmt --all --check               clean
+cargo clippy --workspace --all-targets -- -D warnings   clean, exit 0
+CI=deny ./scripts/ci-gates.sh         all selected gates passed (G12 skipped, no tag)
+```
+
+**Entry-point coverage is structural, not incidental.** `Store::open`, `open_and_migrate`,
+`SqliteAuditJournal::open` and `SqliteApprovalLedger::open` are each asserted to refuse while
+exclusive ownership is held, and each asserted to *work* once released — so the refusals are
+about ownership rather than a broken database. `TaskService::open` is covered through the
+opener it uses. No other file-backed open path exists in production: a sweep of every
+`Connection::open`, `Store::open`, `open_and_migrate` and `open_in_memory` outside
+`#[cfg(test)]` found the sites instrumented here plus the internal connections inside
+`Backup` itself.
+
+**Failures that cannot succeed.** An unusable lock path returns `OwnershipError::Unavailable`,
+tested. Two exclusive requests conflict, tested. A restore attempted while another owner holds
+the database returns a typed ownership refusal and leaves the data untouched, tested twice
+(in-process and cross-process).
+
+**Test-side seams, disclosed.** `Backup::restore_coordinated` is the public restore and
+acquires ownership itself. `ownership::acquire_exclusive_for_tests` is `pub` so integration
+tests can stand where a restore stands; it grants no capability a restore does not already
+require. One environment-variable seam in `RestoreGuard::acquire` pauses the restore between
+checkpoint and copy so Test B's interleaving is **deterministic** rather than a timing race;
+it is outside any public API and has its own unit test.
+
+**A-008 follow-up — review found three boundaries. Two were real defects and are fixed; one is
+an open blocker and is NOT fixed.**
+
+1. **Hard-linked aliases bypass ownership. REAL, and NOT FIXED.** Measured:
+   `state.db` and `alias.db` are one inode (20445) but `lock_path_for` produces
+   `state.db.lock` and `alias.db.lock` — **two locks for one database**, so a competitor
+   opening the alias participates in nothing. Keying locks by inode does not fix it:
+   `link(2)` permits a hard link in a different directory on the same filesystem, so an
+   inode-keyed name would still need a parent directory and the two parents can differ. The
+   correct fix is to **refuse** a database with more than one name, which needs the link count —
+   and that is unreachable from `orxnud-store`: gate **G3** forbids a platform `cfg` outside
+   `orxnud-platform-*`, and gate **G2**'s layering forbids `orxnud-store` from depending on a
+   platform crate (it may depend only on `orxnud-domain`).
+   `orxnud_platform_fs::hard_link_count` now exists, correctly placed and G3-compliant, but is
+   **unreachable from the crate that takes the lease**. Resolving it needs a design decision —
+   an ownership API moved to a platform crate, or a link count carried across the boundary.
+   **Until then ownership is not alias-safe**, and this row does not claim otherwise.
+
+2. **The production restore seam was reachable. REAL, and FIXED.** The first seam triggered on
+   `ORXNUD_S31_RESTORE_WINDOW` alone and was gated on `#[cfg(not(test))]`, which means it was
+   compiled **into** a production binary: any ambient variable could pause a real restore for
+   sixty seconds. A second attempt gated it on an inherited descriptor; it was better but needed
+   `pre_exec`, which is `unsafe` and so barred by gate **G4**, and its negative test read the
+   ambient `/dev/fd/9` so it passed alone and failed in the full suite. **All of it is gone.**
+   `grep` over the library source finds no seam. Test B now works by taking the exclusive lease
+   through `acquire_exclusive_for_tests` and restoring under it via
+   `Backup::restore_with_lease_for_tests`, which demands an exclusive lease — exactly what the
+   restore already demands — so it grants no capability production does not have.
+
+3. **Two ordinary daemons must both be able to run. CONFIRMED, not a defect.** The review asked
+   whether the implementation had over-corrected into refusing concurrent opens. It has not:
+   `ordinary_opens_share_rather_than_excluding_each_other` (in-process) and
+   `c_two_processes_may_both_hold_the_database_open_normally` (two real processes) both assert
+   that shared ownership **coexists**. The intended protocol holds exactly as specified:
+
+   | Situation | Result |
+   |---|---|
+   | Two daemons open normally (shared) | **Both may open** — proven cross-process |
+   | A restore holds exclusive | A competing open is **refused** — proven cross-process |
+   | A restore starts while shared owners remain | The restore is **refused** — proven in-process |
+   | Two processes attempt competing restores | **At most one** acquires exclusive — implied by the above and by the single-flight lock |
+
+   The availability change is therefore **narrower than earlier reported**: only a *restore*
+   excludes, never an ordinary open. A second daemon starts normally.
+
+**Addendum — the three open decisions on the hard-link fix were approved (ADR-0058), and one
+further portability fact was established by measurement.**
+
+* *Detection is not elimination.* The distinction now governs acceptance and closure: a
+  hard-link **detector** does not establish that the **bypass** is eliminated. The two-sided
+  identity check observes a path before and after SQLite opened it; it does not prove that
+  SQLite's connection refers to the inode those checks saw, because SQLite opens by filename
+  through `sqlite3_open_v2` and rusqlite's API likewise takes paths. `SQLITE_OPEN_NOFOLLOW`
+  rejects symlinks and is **not** a hard-link defence.
+* **Decision 1 approved — refuse on unknown, with a portability consequence.** Verified
+  against this toolchain's own `std` documentation (1.98.1): on Windows,
+  `MetadataExt::number_of_links`, `file_index` and `volume_serial_number` are **nightly-only
+  experimental** (`windows_by_handle #63010`). `identity` needs the latter two, so on stable
+  Windows the capability is unavailable *in full* and the fail-closed rule means the platform
+  implementation must either call native Win32 or **refuse every open on Windows**. That is a
+  support decision and is not this record's to make.
+* **Decision 2 approved — the residual window is not to be called closed.** Stronger enforcement
+  (a custom VFS or equivalent) is to be *investigated*, with feasibility **and WAL interaction**
+  evidenced, before any descriptor-backed opening is committed to. Nothing is proposed.
+* **Decision 3 approved — S-31 remains implemented but NOT complete**, and S-30 is not declared
+  fully closed. Documenting a narrower guarantee is not evidence that the stronger one holds.
+* **The scripted identity-change test is scope-limited**, as recorded in ADR-0058: it proves a
+  *detectable* change between observations is refused. It does not prove every replacement during
+  SQLite's own open is impossible, and is not to be described as though it did.
+
+**Feasibility evidence, gathered from the pinned dependencies (ADR-0058).** Read from
+`rusqlite 0.40.2`, `libsqlite3-sys 0.38.2` and bundled **SQLite 3.53.2**, not from recollection:
+
+* **VFS feasibility: technically viable in principle, not a drop-in fix.** `rusqlite 0.40.2`
+  has no `vfs` module and no `vfs` feature, so registration means hand-building `sqlite3_vfs` and
+  `sqlite3_io_methods` in raw FFI. A **delegating** VFS closes nothing — `unixOpen` takes a
+  pathname and re-resolves it. A **binding** VFS must serve all **17** members including the four
+  WAL shm methods.
+* **Sidecar names are string-derived** — `zWal = sqlite3_mprintf("%s-wal", zMove)` — so the
+  `/proc/self/fd/12` descriptor-path trick asks for `/proc/self/fd/12-wal`, which is not a valid
+  sidecar. **An earlier claim here that this "breaks WAL for the VFS route" was over-generalised
+  and is withdrawn:** `xOpen` receives every name SQLite opens, including derived sidecars, so a
+  VFS can serve them. WAL is a cost on this route, not a blocker.
+* **No portable public control reaches a native handle.** `SQLITE_FCNTL_FILE_POINTER` returns the
+  `sqlite3_file`, `SQLITE_FCNTL_HAS_MOVED` is not a link-count check, and
+  `SQLITE_FCNTL_WIN32_GET_HANDLE` is Windows-only — so `xOpen` is the only real enforcement point.
+* **No ready-made Rust solution was found.** `sqlite-vfs` requires a `WalIndex` implementation
+  (declared in a `wip` module) and ships `WalDisabled`; `rsqlite-vfs` defaults `iVersion` to 1 with
+  the shm callbacks absent, and its own docs state raising the version alone does not implement
+  them.
+* **A much smaller route exists and was not previously considered.** SQLite's unix VFS
+  **already** does this check: `verifyDbFile` runs unconditionally at open and close and
+  `osFstat`s the **real descriptor**, warning `"multiple links to file"` when `st_nlink > 1`.
+  It is stronger than a path-based pre/post check because there is no second name resolution.
+  The only gap is that `sqlite3_log` **warns and continues**; enforcement means enabling
+  rusqlite's `trace` feature and calling `config_log` before any connection exists, with the
+  callback flagging rather than acting (it must not re-enter SQLite).
+* **Its limits are recorded, not glossed:** `verifyDbFile` returns early on `UNIXFILE_NOLOCK` and
+  covers **the main database only** — **WAL/SHM sidecars are not covered** — and it is
+  process-global and non-atomic. It closes the measured database-file bypass; it does not close
+  the multi-name WAL hazard.
+* **A bounded Linux proof of concept was built and executed** (authorised as "the isolated Linux
+  VFS proof only"), outside this repository at `/tmp/opencode/vfsproof`, pinning
+  `libsqlite3-sys =0.38.2` so the bundled SQLite is the **3.53.2** under analysis — asserted by a
+  test, not assumed. **11 proof tests plus a version test pass; 10 consecutive runs all green.**
+  The gate delegates `xOpen` to the unix VFS, then `fstat`s the descriptor that resulted and
+  refuses with `SQLITE_CANTOPEN` before returning; because the parent installs its own method
+  table, WAL and locking remain SQLite's own code and **no `io_methods` trampolines were needed**.
+  WAL/shm keep the exact names SQLite derives, the WAL grows and truncates around a checkpoint,
+  rollback-journal mode still works, 4 concurrent writer processes yield exactly 12 rows, and a
+  writer killed with `process::exit(9)` leaves state a later process recovers and checkpoints.
+  **Control:** ungated, the hard-link alias opens and reads the same data — so the refusals are
+  attributable to the gate and nothing else.
+* **Finding that corrects the design's wording.** The link count belongs to the **inode**, not
+  the name: once an alias exists every path has `nlink == 2`, so enforcement is
+  **all-or-nothing per inode** and the original legitimate name is refused too. A first draft of
+  the test expected otherwise and was wrong. Safe, but it must present as a diagnostic rather
+  than a bare "unable to open".
+* **Finding: the checkpoint pragma's counters are advisory.** A `wal_checkpoint(TRUNCATE)` that
+  demonstrably ran and truncated the WAL to 0 bytes returned `busy=0 log=0 ckpt=0`. Assert
+  observable state instead.
+* **A Shape A proof of concept was then built and executed** (authorised as "the isolated Shape A
+  Linux VFS proof only"), same isolated crate, same SQLite **3.53.2**. The VFS performs `open(2)`
+  itself and serves every method from a descriptor it owns, so the identity check and the open
+  are one event and **no private `unixFile` layout is consulted** — asserted structurally, not
+  merely documented. **26 tests pass (14 Shape A, 11 Shape B, 1 version); 12 consecutive full
+  runs, zero failures.** Demonstrated: descriptor binding; refusal of a sidecar whose base path
+  was replaced by a different inode (path continuity); refusal of an existing alias; **failure of
+  the commit when a link appears after the open**; WAL sidecar names, rollback-journal mode,
+  two-process agreement, 4 concurrent writers yielding exactly 12 rows, crash recovery and
+  checkpointing; and refusal with no silent fall back.
+* **Defects the multi-process tests caught** — recorded because each failed plausibly rather than
+  loudly: `SQLITE_SHM_NLOCK` and `SQLITE_SHM_EXCLUSIVE` are the **same value (8)** and only
+  `SQLITE_SHM_LOCK` discriminates them; mapping a shared region **past EOF raises SIGBUS**;
+  EXCLUSIVE must take a **write** lock on the shared range; EXCLUSIVE must **release** the
+  PENDING and RESERVED bytes or it starves other processes; and **`PENDING_BYTE` is the runtime
+  global `sqlite3PendingByte`**, read here via `sqlite3_test_control(..., 0)` rather than
+  hardcoded.
+* **A stock-VFS patch was then built and executed** (authorised as "the isolated patched-SQLite
+  experiment") against a patched copy of `libsqlite3-sys 0.38.2`, outside this repository.
+  **92 lines, 35 additions, 9 deletions, four hunks**; applies cleanly with `patch -p1` and
+  round-trips byte-identically. `verifyDbFile` returns a verdict instead of logging, `fillInUnixFile`
+  refuses the open (releasing the inode reference under the unix mutex), and `unixSync` re-checks
+  the link count on the commit path.
+* **Measured differential — the result's whole value.** The hard-link refusal test **fails against
+  stock SQLite 3.53.2** (stock opens the alias and only logs `multiple links to file`) and
+  **passes against the patched build**. The refusal is attributable to the patch alone.
+  **11 tests pass; 12 consecutive runs, zero failures.** Covered: refusal at open rather than first
+  use; every name refused; no `-wal`/`-shm` created for a refused alias; a link appearing after the
+  open failing the commit; WAL sidecars, `TRUNCATE` checkpointing, rollback-journal persistence,
+  cross-process writer/reader agreement, 4 concurrent writers yielding exactly 12 rows, crash
+  recovery, and 200 consecutive refusals leaving no leaked descriptor or inode reference.
+* **New risk introduced, recorded rather than discovered:** refusing a commit when a link appears
+  converts an integrity control into an **availability** hazard — anyone who can create a hard link
+  can make every commit fail. Fail-closed, but a denial-of-service vector absent from stock SQLite
+  that needs explicit assessment.
+* **Still not established:** a maintained fork of SQLite (`deny.toml` `allow-git = []` fails G8 for
+  a git-hosted fork; vendoring 9.5 MB in-tree or a deliberate `deny.toml` change is required);
+  the patch must be re-applied on every SQLite upgrade, with the refusal test as its canary;
+  **SQLite's own regression suite has not been run against this build** — now feasible and the most
+  valuable remaining check; Linux/glibc/LP64 only; the non-participating-process residual is
+  unchanged.
+* **Neither proof closes S-31.** Shape A removes the post-open window and the private-layout
+  dependency, but it is ~400 lines of unsafe FFI reimplementing SQLite's I/O, locking and
+  WAL-index mapping — correctness **demonstrated, not established**. A non-participating process
+  remains ungated; sidecar multi-name behaviour across ungated processes is untouched; link
+  creation after the open is caught at sync but not prevented; `xSectorSize` is claimed rather
+  than measured and `xFileControl` is minimal. Linux/glibc/LP64/3.53.2 only — no fuzzing, no
+  SQLite regression suite, no stress run. **Nothing has been implemented in this repository.**
+
+* **Follow-up validation, 2026-10-16** (evidence in
+  `~/.local/share/opencode/sqlite-3.53.2-validation/run-20261016T090048Z-c1d13381/`, nothing copied
+  into this repository). Canonical `version-3.53.2 @ ccc132c5`; the amalgamation it generates is
+  byte-identical to the `sqlite3.c` `libsqlite3-sys 0.38.2` bundles. Candidate patch SHA-256
+  `243ee4eaa53500472303a577e2f542a520ec1b936b87087e5abc0630f76128ef` (103 lines, +45/-13). A defect
+  was found and corrected, not waived: the first candidate's link-count check also caught
+  **directories**, whose link count is 2 or more by POSIX construction, breaking upstream
+  `backup2-10`; restricting it to `S_ISREG(buf.st_mode)` restores the stock `disk I/O error` and
+  keeps hard-link refusal. The earlier 92-line patch is **not** the candidate.
+* **Upstream suite completed, not partial.** 1,188 `.test` files exist; 1,186 are test cases and
+  `all.test` / `permutations.test` are harness drivers (zero `do_test` cases, both call
+  `finish_test`, `all.test` standalone re-runs the suite). Both builds classified all 1,186
+  **identically**: 1,171 PASS, 6 PASS without summary, 3 FAIL, 3 TIMEOUT, 3 INFRA, with **zero class
+  divergences**. `memleak.test` remains INFRA-classified because `memleak_check` is absent from the
+  3.53.2 tree, so the malloc/leak suite is **substitute evidence and not a completed run of that
+  test**. `sysfault.test` ran 12 more passing cases on the patched build; the mechanism (an extra
+  `osFstat` per sync lengthening the fault-injection loop) is source-grounded but **not directly
+  syscall-counted**, as `strace` was unavailable.
+* **Post-open hard-link behaviour is journal-mode dependent, over five consistent iterations per
+  cell.** In **DELETE** mode the patched build **refused the commit** and the marker did not persist.
+  In **WAL** mode it **allowed the commit**, so the transaction became durable in the WAL, and
+  refused the **checkpoint** with a disk I/O error; removing the link made the retry succeed.
+  Open-time refusal applies in **both** modes. Durability was established by closing, unlinking and
+  **reopening**, not by trusting the error; integrity was `ok` throughout, with no descriptor leak
+  across 300 refusals.
+* **Not claimed.** Commit-time enforcement is **not** universal — it does not fire in WAL mode. The
+  database is **not** protected against every non-participating process. Availability is
+  **unresolved** and differs by mode. Verification is Linux/glibc/LP64 only. **No SQLite patch has
+  been integrated into OpenRayNux**; Shape A and Shape B remain prototypes and this patch remains a
+  research candidate requiring a deliberate production-design and availability decision.
+
+**Windows (decided 2026-10-14): fail closed, defer native.** Stable Windows supplies neither
+`name_count` nor `identity`, so Decision 1 means **every open is refused on Windows** until a
+native `GetFileInformationByHandle` path exists. Recorded as a support decision, not an omission.
+
+**Limitations, stated rather than smoothed over.**
+* **Advisory locks coordinate only participants that follow the protocol.** A process opening
+  the database by some other route participates in nothing. Every application-managed open is
+  instrumented, which is what makes the claim hold here — and it is a property of this
+  codebase, not of the filesystem.
+* **Filesystem support is unverified.** The behaviour is measured on this host's local
+  filesystem. Network filesystems may implement advisory locking weakly or not at all, and no
+  evidence is claimed for them. A silently non-locking filesystem would reintroduce the
+  exact gap S-31 closes, and detecting that would need a runtime probe this change does not
+  contain.
+* **Linux only.** The locking call is cross-platform in `std`, but only Linux was exercised.
+  Windows was not tested and no claim is made for it.
+* **Hard links are not detected** — see the follow-up above. This is the most significant
+  remaining limitation: it is a real ownership bypass, it is measured, and it is unresolved
+  for the gate reasons given.
+* **Only a *restore* excludes.** Two ordinary daemons both run (proven cross-process); a
+  restore refuses rather than waiting, and is refused while any shared owner remains.
+* **S-30's residual gap is unchanged by this work**: if a stale log is present when `acquire`
+  runs, the checkpoint folds it into the main file before the copy overwrites it, so a
+  *failed* restore leaves post-snapshot data absorbed rather than discarded. It fails closed
+  rather than reporting success, which is the required behaviour, but it is not a clean
+  rollback.
+
+### A-007 — S-30 (`S-11-RESTORE`): the restore path is now coordinated and logically verified
+
+**F-26b remains OPEN.** This amendment records what was built and proven; it does **not**
+close the finding. F-26 also remains open. S-11 and S-29 remain blocked.
+
+**The ownership and coordination rule that was chosen.** `Backup::restore` is now
+`pub(crate)` and takes a `&RestoreGuard`. The guard is `pub(crate)` with a private field, so
+it cannot be constructed outside the crate. The only public entry point,
+`Backup::restore_coordinated(db_path)`, acquires authority internally — the capability
+survives, the unsafe primitive does not, and there is no step for a caller to skip. The guard
+reads the target path from **itself**, not from a caller's argument, so a permit taken for one
+database cannot authorise restoring another.
+
+**What authority means, and what it deliberately does not claim.** `RestoreGuard::acquire`
+runs `PRAGMA wal_checkpoint(TRUNCATE)` and **refuses** (`BackupError::Busy`) when SQLite
+reports `busy != 0`, which is its signal that another connection holds a read transaction.
+Measured first: `PRAGMA locking_mode = EXCLUSIVE` does **not** exclude a second handle (it
+opened and read successfully), so it was not used and is not sufficient.
+
+**Two design decisions were forced by measurement, not chosen.**
+
+* **The copy is in place, not a rename.** `fs::rename` over a database file another
+  connection has open **strands** that connection on the old inode: measured, the handle kept
+  reading pre-restore rows while the writer saw the restored ones. The online backup API
+  writes through the existing file and an open handle observes the restored state.
+* **Sidecars are not deleted.** The first implementation removed `-wal` and `-shm` after the
+  checkpoint as "belt and braces", and criterion 4(b) caught it: with an independent connection
+  open, deleting the memory-mapped `-shm` left that connection failing with `disk I/O error`.
+  That is exactly the hazard S-30's specification warned about, and it is why sidecar deletion
+  is not the mechanism. An empty write-ahead log replays nothing, which is the property that
+  matters; the in-place copy overwrites whatever the checkpoint folded in.
+
+**What prevents a restore without coordination:** `restore` being `pub(crate)`. Verified
+mechanically, not asserted — `crates/orxnud-store/tests/s30_restore_not_public.rs` compiles a
+probe against the crate as an external consumer and requires it to fail on the mechanism.
+
+**Acceptance results.**
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| 1 — stale `-wal`; stale `-wal` + `-shm` | **pass** | `criterion1_a_*`, `criterion1_b_*` |
+| 2 — unreadable is failure | **pass** | `criterion2_an_unreadable_restored_database_is_a_failure_not_an_absence` |
+| 3 — logical-state verification | **pass** | `criterion3_logical_comparison_detects_what_structural_checks_cannot` |
+| 4(a) — mechanism prevents replay | **pass** | `criterion4a_the_guard_prevents_replay_before_the_copy` |
+| 4(b) — independent handle | **pass** | `criterion4b_an_independent_open_handle_is_either_safe_or_refused` |
+| 4(b) — coordination bypass | **pass** | `criterion4b_restore_cannot_be_reached_without_a_permit`, `criterion4b_the_public_entry_point_refuses_while_a_reader_holds_the_database`, `restoring_from_outside_the_crate_does_not_compile` |
+| 5 — failure/interruption | **pass** | `criterion5_an_interrupted_restore_reports_an_error_and_keeps_the_snapshot`, `criterion5_a_snapshot_that_fails_verification_is_refused_outright` |
+
+**Commands and outcomes.**
+
+```
+cargo test -p orxnud-store --lib -- criterion      11 passed, 0 failed
+cargo test -p orxnud-store                         301 + 7 + 3 + 3 + 1 + 0 passed, 0 failed, 2 ignored
+cargo test --workspace                             1723 passed, 0 failed, 7 ignored
+cargo fmt --all --check                            clean
+cargo clippy --workspace --all-targets -- -D warnings   clean, exit 0
+CI=deny ./scripts/ci-gates.sh                      all selected gates passed (G12 skipped, no tag)
+```
+
+**Two tests were wrong before they were right, and both are recorded because the wrongness is
+the evidence.** The compile-fail probe originally called `restore(&Path)` when the method takes
+`&RestoreGuard`, so it failed on a **type mismatch** and would have reported success whether or
+not the method was public — it proved nothing. It was rewritten to the real bypass shape and
+then **mutation-checked**: with `restore`, `RestoreGuard` and `acquire` all made `pub`, the
+probe compiles and the test **fails**, as it must. Separately, criterion 5's "interruption" first
+deleted the target file, which is not an interruption at all — SQLite creates a fresh database
+at the path and the restore succeeds — so the test would have passed without testing anything.
+It now makes the target read-only, which is a real failure.
+
+**Update 2026-10-14, after S-31: the cross-process gap recorded here is enforced by a stable
+per-database lock file held across the whole restore lifecycle, with two-process evidence —
+but F-26c REMAINS OPEN**, because a hard-linked alias still bypasses ownership (A-008
+follow-up). **F-26b remains open** on the narrower point below; **F-26 remains open** and
+belongs to S-11.
+
+**F-26b stays open on a *different* ground, now F-26c.** The
+in-process evidence above is sound and is not discounted: it establishes that a stale log no
+longer resurfaces, that a live idle handle observes the restored state, that an active reader
+is refused, and that the restore is compared logically before `Ok`. What none of it can reach is
+a writer in **another process**. `RestoreGuard::acquire`'s checkpoint is an instantaneous check,
+not a lease; a second daemon is not in this process's connection set, so its presence does not
+make our checkpoint report busy; and the online backup API's destination lock covers the backup
+operation, not the surrounding lifecycle. Some interleavings SQLite refuses on its own —
+**refusing by accident is not a guarantee** and is not treated as one. Tracked as **S-31
+(F-26c)**; the chain is **S-31 → S-30 closure → S-11**.
+
+**What remains outstanding.** The invariant is enforced **within one
+process**. Nothing coordinates a second *daemon process* against a first: `TaskService::open`
+can run concurrently against the same database, and the guard would observe a reader and refuse
+— safely — but there is no inter-process ownership. `Backup::take` and `Backup::verify` are
+unchanged. And the underlying staleness question is unchanged: if a stale log is present when
+`acquire` runs, the checkpoint folds it into the main file before the copy overwrites it, so a
+**failed** restore could leave post-snapshot data absorbed rather than discarded. That path
+returns an error rather than `Ok(())`, which is the required fail-closed behaviour, but it is
+not a clean rollback and S-30 does not claim it is.
+
+### A-006 — K.1's second half: a refuted *postcondition* was also a retry permission (F-17)
+
+**This amends K.1, which is now half superseded.** K.1 closed the case "a verifier returns
+`Refuted` for an execution that did not report success", and it closed it well. It stated, as
+its own scope boundary, that "after admission, a `Succeeded + Refuted` is trusted, exactly as
+V-92 chose to trust it". **That is the half that was wrong, and ADR-0056 withdraws it.**
+
+K.1 also recorded "`Certainty`, `EffectStatus`, `TaskState`, `recover()` and its predicate are
+all unchanged". `Certainty` and the certainty-to-status mapping are now changed; `EffectStatus`,
+`TaskState` and `recover()`'s predicate are **not**.
+
+**What changed.** Three routes issued the retry permission from postcondition evidence:
+
+1. `certainty_of` mapped `Refuted` to `Certainty::Disproved`, which mapped to
+   `EffectStatus::NotPerformed`. **The producer was removed, not the meaning.**
+2. `effect_status_for_dispatch_failure` grouped `DispatchError::VerificationRefuted` with six
+   genuine pre-execution refusals and answered `NotPerformed`. That grouping was the defect in
+   one line: a post-execution finding sat beside `Policy` and `ClassEscalation`, which *are*
+   decided before a process exists. Split out, now `Unknown`.
+3. The audit journal recorded `VerificationRefuted` as `Failed`. Moving only the ledger would
+   have produced `Failed` beside `Unknown` — the exact channel contradiction the conformance
+   table exists to prevent. It caught this; the journal is now `Uncertain`.
+
+`Certainty::Disproved` was deleted rather than left unconstructed. It encoded "the verifier
+established that the effect did not occur", which no verifier in this repository can establish:
+`WriteTextVerifier` re-reads bytes and cannot tell a genuine write-then-overwrite from a write
+that never ran. Deleting the variant makes the invariant structural, and `clippy -D warnings`
+(gate G6) requires it — an unconstructed variant is a `dead_code` failure. The arms that
+consumed it kept their meaning for a future producer that *can* warrant it.
+
+**Evidence.**
+
+| Command | Result |
+|---|---|
+| `cargo test -p orxnud-daemon --lib` (pre-fix) | 1 failed — the F-17 regression, `Refuted { evidence: "…exists but holds 24 bytes, not the 6 requested" }` |
+| `cargo test -p orxnud-daemon --lib` | **173 passed, 0 failed** |
+| `cargo test -p orxnud-capability --lib write_text::tests::` | **8 passed, 0 failed** |
+| `cargo test --workspace` | **1711 passed, 0 failed, 7 ignored** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean, exit 0 |
+| `CI=deny ./scripts/ci-gates.sh` | G8 and G11 fail — see below |
+
+Four mutations, each reverted after observation, **all caught**:
+
+| Mutation | Caught by |
+|---|---|
+| M1 `effect_status_for_certainty`: `Unknown` → `NotPerformed` | the F-17 regression, the pre-existing `a_refuted_claim_from_a_silent_capability_can_never_become_a_disproof`, and one duplicate listing — 3 failures |
+| M2 journal: `VerificationRefuted` → `Failed` | `the_two_channels_never_contradict_on_execution_certainty` |
+| M3 `effect_status_for_dispatch_failure`: → `NotPerformed` | `a_refuted_verification_is_recorded_as_unknown_not_as_not_performed` + the two-channel table |
+| M4 `certainty_of`: `Refuted` → `Established` | the F-17 regression + the silent-capability test — 3 failures |
+
+**M1 survived its first run, and that is the most useful result here.** The regression originally
+re-implemented the certainty-to-status `match` locally, so it tested its own copy: the production
+mapping was mutated and 173 tests passed. The `match` was extracted to
+`effect_status_for_certainty` and both the regression and K.1's existing chain test now call it.
+A test that mints the answer it is checking passes against the defect; the extraction is what
+made the seam real.
+
+**Controls, none weakened to obtain a green suite.** `a_refusal_before_execution_still_earns_its_retry_permission`
+is new and asserts `NothingAttempted` → `NotPerformed` survives. `an_unknown_row_stops_a_non_idempotent_task_from_being_retried`
+(the `orxnud-store` control) and the three pre-existing refusal tests are unchanged and green.
+`a_write_that_never_happened_still_proves_absence` was **renamed and re-justified** per ADR-0056
+Decision 7: it still asserts `Refuted`, because the verifier's observation remains true — what
+changed is what the consumer may do with it. A capability-side test
+(`a_write_that_occurred_and_was_later_overwritten_is_refuted_and_survives_admission`) stops anyone
+"fixing" F-17 by suppressing a true observation.
+
+**Scope: F-17 remains PROBABLE EXPOSURE.** The competing write is staged in the workspace
+between the adapter's write and the verifier's re-read, not raced. **No live-daemon reproduction
+has been performed**; it needs a second write to land inside the verification window, which is
+timing-dependent. What is proven is the mapping and its consequence through real admission, real
+settlement, a real migrated database, and the real `recover`/`claim_specific` predicates — not
+the reachability of the timing window.
+
+**Known limitation, recorded rather than invented around.** A refuted non-idempotent effect now
+settles to `NeedsVerification`, which is terminal and has **no exit** until S-29 supplies an
+adjudication path. That is a stranding risk taken deliberately: the alternative was an
+occasional duplicate non-idempotent effect with no human involved. S-04 remains blocked on S-29
+and was **not** implemented here. No schema change was made; Option B remains unbuilt.
+
+**Gate failures at the time of this slice, and what became of them.** G8 and G11 both failed on
+four `rustls` 0.23.45 advisories (RUSTSEC-2026-0346/0347/0348/0349, all dated 2026-10-14).
+Neither failure was caused by this slice, which modifies no dependency file.
+
+Both were remediated afterwards by a lockfile-only bump, `rustls 0.23.45 -> 0.23.46`
+(`cargo update -p rustls --precise 0.23.46`): a two-line delta — version and checksum — with
+no transitive churn and no `Cargo.toml` edit, because `rustls = "0.23"` is a caret requirement
+that already admits 0.23.46 and `tokio-rustls 0.26.6` requires `>= 0.23.27`. `CI=deny
+./scripts/ci-gates.sh` now reports **all selected gates passed** (G12 skipped, no release tag).
+
+**A correction to this row's earlier text.** The previous version of this entry attributed G8's
+failure to `getrandom` being duplicated in `Cargo.lock`. That was wrong. G8 runs
+`cargo deny check bans sources advisories`, which **includes advisories**; it was the `rustls`
+advisories that failed it. The `getrandom` duplicate is a `warning[duplicate]`, not an error —
+`cargo deny check bans sources` exits 0 with it present — and it has never failed a gate. It
+remains in the lockfile (0.2.17 via `ring 0.17.14`, plus 0.3.4 and 0.4.3), was untouched by this
+bump, and is left alone rather than suppressed.
+
+**Reachability of the four advisories, assessed rather than assumed.** At `rustls 0.23.45` with
+this repository's configuration — `default-features = false`, features `ring`, `std`, `tls12`,
+`logging`, no `aws-lc-rs` — none of the four vulnerable paths is reachable:
+
+| Advisory | Precondition | This repository |
+|---|---|---|
+| -0346 `Debug` leaks session secrets | a **custom** `ClientSessionStore` formatting session values with `Debug` | **Not applicable.** `transport.rs:269` uses `ClientConfig::builder().with_root_certificates(..).with_no_client_auth()`, i.e. the built-in store, whose `Debug` the advisory states is redacted. No `ClientSessionStore` impl in the tree. |
+| -0347 ECH rejection leaks buffered data | `EchMode::Enable` | **Not applicable.** `EchMode` is never configured anywhere in the tree. |
+| -0348 Brotli cert decompression 1 GiB alloc | the non-default `brotli` feature | **Not applicable.** Enabled features are `ring`, `std`, `tls12`, `logging`. |
+| -0349 PQ downgrade via stored kx group | a PQ hybrid in `supported_groups`, with resumption storing it | **Not applicable.** The **`ring`** provider's `DEFAULT_KX_GROUPS` is `[X25519, SECP256R1, SECP384R1]` (`rustls-0.23.45/src/crypto/ring/mod.rs:181`) — `X25519MLKEM768` exists only in the `aws_lc_rs` provider, which this repository does not enable. There is no post-quantum preference to lose. |
+
+The bump was made anyway: the fix is a patch release inside an already-permitted range, it costs
+nothing, and "no advisory is currently reachable" is a statement about today's configuration
+rather than a property that survives someone enabling `brotli`, adding a custom session store, or
+switching crypto provider. The analysis is recorded so that a future change in any of those three
+directions can be checked against this row.
+
+| | |
+|---|---|
+| **event** | any change to `certainty_of`, `effect_status_for_certainty`, `effect_status_for_dispatch_failure`, the audit classifier for `VerificationRefuted`, or the `Certainty` enum |
+| **date** | 2026-10-14 |
+| **severity** | **High.** Silent drift re-opens an automatic repeat of a possibly-performed non-idempotent effect, with no human involved. |
 
 ## 3. The three highest-risk claims
 
@@ -391,6 +1111,6 @@ Not by severity of consequence alone, but by **(likelihood of silent drift) ×
 | **V-93** | **A reservation outcome could not be distinguished from a failure, so a refused dispatch and an already-done dispatch shared one representation** | `TaskRepository::reserve_effect` used `INSERT OR IGNORE`, which resolves a primary-key collision, a NOT NULL failure and a CHECK failure identically: the row is skipped and the statement reports zero rows. `Ok(None)` therefore meant both "this key is already reserved" (the caller's signal *not* to dispatch) and "this reservation was invalid". An invalid reservation reported as a duplicate looks like work already done. The production operation also accepted a zero-row state change as success. | **fixed** | 2026-10-08 | Replaced with a plain `INSERT`, identifying the duplicate by SQLite extended code `SQLITE_CONSTRAINT_PRIMARYKEY` rather than by substring-matching a message, and refusing a zero-row state change in the production path too, so `None` is now unambiguously "already reserved". **Evidence:** `crates/orxnud-task/tests/v94_reproduction.rs` — the assertions are about *observable durable state* (a row that exists, an event that was or was not written) rather than about an error variant, so each compiles and **fails** against the defective implementation. Also pinned there: absence of a task or of an approval is a refusal and not an empty proposal or an execution; a spent approval is a refusal and not a second execution; the reservation outcomes are exactly two and neither is an error; and every `execution_begun` and `action_proposed` event is cross-checked against the durable state it claims. |
 | **V-94** | **The five audited defects had no reproduction, so each fix was argued rather than demonstrated** | The Phase 0 discipline requires every finding to be reproducible against the unmodified code before it is fixed, and the reproductions did not exist in the tree. A defect argued from reading is a defect that can be argued away the same way. | **fixed** | 2026-10-08 | Phase 0 reproductions exist in `crates/orxnud-task/tests/v94_reproduction.rs`, written against **observable durable state** specifically so that each one compiles and fails pre-fix rather than failing to build. This entry records the *discipline*, and the five findings it covers are recorded under V-93, V-95 and V-97; what V-94 guarantees is that each of those has a test that fails without the fix. |
 | **V-95** | **`TaskRepository::tx` was documented as beginning an IMMEDIATE transaction while behaving otherwise, so two writers could both decide and only one write** | The docs claimed `IMMEDIATE` and explained, correctly, why it is required; the implementation took the lock *after* reading the state it was deciding on, so a decision could be made against state another writer was in the middle of changing. That is the classic read-then-decide race, and its visible symptom was a competing state change surfacing as an unclassifiable SQLite busy error instead of a refusal. | **fixed** | 2026-10-08 | The write lock is now taken **before** the deciding read, and `DEFERRED` versus `IMMEDIATE` is asserted to differ in exactly that way. **Evidence, in two files separated by subject.** `v95_atomicity.rs` proves the atomicity boundary *by what survives a failure*: the window baseline commits state, authority and event together; a failure at the first write, after the state mutation, or after the event leaves no mutation and no event; a task refused by a failed attempt is still fully retryable; a failure inside `propose_action` leaves neither proposal nor state change. `v95_concurrency.rs` proves what happens when two writers *meet*: a competing state change is a classified refusal on both the lease path and the proposal path; two workers racing one approval never both execute, verified over many runs; two and then four recoveries racing settle each orphan exactly once; recovery racing a claim leaves exactly one owner; a competing cancellation makes the contender wait and then see the new state. |
-| **V-96** | *(undefined)* | — | — | — | — | **No definition of V-96 exists in this repository.** V-93, V-94, V-95 and V-97 are recorded above and are all present in `main`. V-96 was never defined, never cited, and no test artifact carries the identifier. It is recorded here as an **open gap** rather than filled in with an invented subject: the next engineering milestone is to recover or define it explicitly, and only then implement it. |
+| **V-96** | **The platform-boundary gate G3 matched raw text, so a comment could switch it off and seven of nine `cfg` spellings — every nested one — were invisible** | G3 originally classified source by pattern-matching the raw file. That has three consequences, all demonstrated by the reproductions in `scripts/gate-selftest.py`: (1) a `//` comment containing a platform key satisfied the gate, because the matcher did not know what a comment was; (2) `cfg(all(unix, target_os = "linux"))`, `cfg(any(test, unix))` and predicates split across lines were not recognised as platform predicates at all, because only the outermost key was read; (3) the gate was therefore satisfiable by text that did not compile as a platform branch at all — the definition of a gate that gives false confidence. | **partially fixed** | 2026-10-10 | Gate G3 now reads source lexically before classifying it: `scripts/rustscan.py:58-176` (`code_mask`) is a Rust lexer covering nested block comments, `r#"…"#`/`br`/`cr` raw strings, escaped strings, and the char-literal-vs-lifetime ambiguity; `:317-344` (`predicate_keys`) blanks string values and extracts keys at any nesting depth; `:419-453` (`_eval_test_only`) evaluates `not`/`all`/`any` structurally, so `cfg(any(test, unix))` is correctly *not* test-only. The gate is now self-tested by **G13** (`scripts/gate-selftest.py`), which invokes the real `scripts/ci-gates.sh` over temporary fixture trees and asserts the process exit code — including must-fail adversarial rewrites (comment moved, test module renamed, attribute reformatted across lines, predicate split one key per line and nested three deep, fully qualified paths, re-exported aliases, associated-function import used bare, a minting call in a nested production module) and four must-pass cases in the other direction (a local variable named `target_os`, a parameter named `windows`, a field named `target_arch`, a block comment describing a platform predicate). Introduced by commit `7bf9da8`. **Evidence:** 60+ self-test cases across `G2D_CASES`, `G3_CASES`, `DRIFT_CASES`, `G2D_TRANSFORMS`, `G3_TRANSFORMS`, `G3_LEGITIMATE_TRANSFORMS`. **Not fully closed, recorded here rather than hidden:** the platform-API half of G3 still matches paths *literally* (`rustscan.py:387-400`), so importing the path once under an alias defeats it — `use std::env::consts as host; … host::OS` and `use std::os; … os::unix::fs::PermissionsExt` both pass G3 today. G3 also does not scan `include!`d or `OUT_DIR`-generated files, and exempts every crate whose path matches `orxnud-platform-*` (`gate_policy.py:410,418`) and all code outside `crates/` (`production_sources`, `gate_policy.py:52-57`). **Reconciliation note:** this row previously read `*(undefined)*` and asserted that no definition of V-96 existed in `docs/`, the commit history, or the tree. That was incorrect; the definition is `08-testing-engineering-standards.md` (row `cfg(target_os)` gate) and the implementation is `7bf9da8`. The row was rewritten from recovered evidence on 2026-10-10. **Status is `partially fixed`, not `fixed`,** because the aliasing bypass above is open. |
 | **V-97** | **Two identity defects let one execution identity produce two governed proposals, and let an unresolved side effect be invisible to recovery** | (1) `task_proposals` carried no uniqueness on the execution identity — only the surrogate `proposal_id`, minted as `p-{task_id}-{milliseconds}` — so two proposals for one identity could exist and an approval would then choose between work that should have been one. (2) `execute_proposal` reserves the effect *before* dispatching, because a record made afterwards cannot describe a crash; but a `dispatch()` that returned `Err` left that reservation behind, and no row in the table exposed it, so recovery could not see an effect that might already exist. | **fixed** | 2026-10-08 | (1) A unique key on the execution identity, kept distinct from the existing approval-consumption key so the two produce two *different* refusals rather than colliding — the two-unique-keys case is itself a test. A retry of the same step on a new attempt is still representable; concurrent proposals for one identity produce exactly one winner; equivalent pre-existing duplicates reconcile to one and are recorded, while conflicting ones stop the migration without touching anything; distinct identities are never conflicts. (2) No row in any state table hides an unresolved effect from recovery: re-proposal cannot release the lease under an unresolved effect, recovery settles an interrupted execution the worker could not re-propose, a resolved effect is no longer what refuses the next proposal, and a stale row from an earlier attempt does not block the retry. **Evidence:** `crates/orxnud-task/tests/v97_proposal_identity.rs` and `crates/orxnud-task/tests/v97_effect_visibility.rs`. Migration 12 preserves approval-consumption state across the change. |
 | **V-89** | **Every expected refusal on every task route was reported as `INTERNAL_ERROR` or as `INVALID_REQUEST`, so a client could only string-match English to work out what had happened** | Four independent breaks in one chain. (1) `From<TaskRepoError> for EngineError` collapsed `NotFound`, `NoSuchProposal`, `AlreadyExists`, `ProposalNotInState` and `InvalidComposition` into `EngineErrorKind::InvalidInput`, discarding the store's distinctions at the crate boundary. (2) `TaskService` turned an `EngineError` into `TaskFault::Engine(String)`, dropping the kind, so `task_fault()` had nothing to classify with. (3) `task_fault()` mapped `TaskFault::Engine` *and* `TaskFault::Stopped` to `RequestError::Refused`, which maps to `INTERNAL_ERROR`. (4) Separately, all ~26 direct `RequestError::Declined` sites mapped to `INVALID_REQUEST`, conflating absent / taken / unauthorised / unconfigured, and `RequestError::Invalid` put prose in the machine-readable `data.reason`. Reproduced against a real daemon over a real socket: a wrong-state `task/propose` answered `-32603` / `reason: "internal"`, and a missing provider the same — pointing the reader at a bug report when the remedy was `doctor` or `configure`. A fifth defect surfaced during the fix: `TaskRepository::propose_action()` read the schema-nullable `lease_holder` as `String`, so for any task holding no lease the read failed `Invalid column type Null at index: 1` and the state check beneath it never ran — silently converting a conflict into a storage failure. It survived because every existing test proposed while holding a lease, where the column is non-null: the suite's *shape*, not its assertions, was the reason. | **fixed** | 2026-10-06 | Introduces `TaskCause` (store → engine), `TaskFault::Engine { cause, detail }` (engine → service) and `RequestError::{NotFound, Conflict, Forbidden, Unavailable, InvalidInput}`, mapping to four codes in the server-reserved band: `-32040` not found, `-32041` conflict, `-32042` forbidden, `-32043` environment unavailable. The property asserted is one sentence — **INTERNAL_ERROR means nothing the caller did can change the outcome** — and `task_fault()` has no fallback arm that dumps an unrecognised fault there, so an unclassifiable path now fails the tests rather than the reader's log. Codes are grouped by *recovery*, so all wrong-state refusals share `-32041` and the actionable distinctions travel in `data.reason`, which is now always a stable word with the sentence in `data.detail` (and `None` where the reason already is the refusal). `ClaimRefusal` is the case that makes this load-bearing: coarse `not-claimable` versus specific `not-found`, same code, different recovery. **Evidence:** `crates/orxnud-daemon/tests/taxonomy.rs`, 10 tests over a real socket — each class, the reason-word shape, redaction, a claim race and an approval race. Each defect reproduced against the real store before any edit; the full before/after table is in ADR-0050. **Mutation-checked: 11 of 13 mutations fail at least one test** -- every reachable `TaskCause` → class mapping, the `ProviderRefused` code, the `Stopped` mapping, the specific-claim-reason, the reason/detail split, and both halves of the `lease_holder` fix (the nullability *and* the comparison). **Two mutations are not caught, and the reason is worth more than the count:** `TaskRepoError::{NotFound, NoSuchProposal}` and `AlreadyExists` reach `TaskCause` **zero times across the whole workspace suite**, measured with an instrumented `From` rather than assumed -- every route that could observe them checks existence first and answers `RESOURCE_NOT_FOUND` or `CONFLICT` directly. They are kept because a `From` impl should be total and correct, and the same measurement is why `TaskCause::NotFound` is pinned by a unit test rather than a socket test. Recorded as unobserved rather than omitted. **Boundary, pinned:** `task/continue` and `task/ai-propose` check for a provider before they look at the task, so a providerless daemon answers `ENVIRONMENT_UNAVAILABLE` even for a task that does not exist — deliberate, since the dependency is missing either way and the alternative would imply the task exists. **Not claimed:** no task-state, approval, continuation, observation, disclosure, authorization, sandbox or provider semantics changed, successes are byte-identical, and no new dependency, cross-crate error enum, or string matching on error text was introduced; `no_refusal_carries_content_a_host_path_or_a_credential` checks that no SQL text, host path, credential or content reaches a refusal. The `propose_action` nullability fix is a **defect fix in its own right** and would have been worth doing alone. |
