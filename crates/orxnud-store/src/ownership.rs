@@ -2,7 +2,7 @@
 //!
 //! # What this is for
 //!
-//! S-30's [`crate::backup::RestoreGuard`] establishes that a restore may proceed: it
+//! S-30's crate-private restore guard establishes that a restore may proceed: it
 //! checkpoints the target's write-ahead log and refuses if a reader is inside a
 //! transaction. That is an **instantaneous, in-process** check. It is not a lease, and
 //! it cannot see another daemon. Between the checkpoint and the copy, a second

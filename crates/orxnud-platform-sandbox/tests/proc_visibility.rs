@@ -17,6 +17,16 @@
 //! asserted where they are invariant (the modes) and reported where they are not (the
 //! mount options).
 
+// This is a measurement of **Linux** `/proc` behaviour: the modes it reports, and
+// the mount options that decide whether a neighbouring uid can read them. Neither
+// exists on Windows, macOS or any other target, so the whole test is gated at the
+// crate level rather than gating only the import and leaving Linux-only assertions
+// to fail at compile time elsewhere.
+//
+// The gate is on `target_os = "linux"` rather than `unix` on purpose: `PermissionsExt`
+// is portable across Unix, but `/proc` is not.
+#![cfg(target_os = "linux")]
+
 use std::os::unix::fs::PermissionsExt;
 
 /// The mode of `/proc/<pid>/<file>`, in octal.

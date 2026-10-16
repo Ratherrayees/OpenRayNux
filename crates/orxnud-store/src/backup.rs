@@ -23,8 +23,10 @@
 //!    `PRAGMA integrity_check`, the schema version, and a row count. A snapshot
 //!    that cannot be opened is not a snapshot.
 //! 2. Only after verification does [`crate::migration`] run.
-//! 3. On failure, [`Backup::restore`] puts it back and the previous binary keeps
-//!    working.
+//! 3. On failure, [`Backup::restore_coordinated`] puts it back and the previous binary
+//!    keeps working. That is the public entry point; the restore primitive it delegates
+//!    to is crate-private, because restoring without ownership is the thing this crate
+//!    exists to prevent.
 //!
 //! # What a snapshot is not
 //!
@@ -504,13 +506,13 @@ impl Backup {
     /// It takes no authority argument because it cannot be given a wrong one — the
     /// authority is acquired here, from `db_path`, and the restore is then performed
     /// against the same path. A caller cannot skip the coordination step, because
-    /// there is no step for it to skip; the raw [`Self::restore`] that does is
-    /// `pub(crate)`.
+    /// there is no step for it to skip; the raw restore primitive that does is
+    /// `pub(crate)`, and is reachable only by holding its crate-private guard.
     ///
     /// # Errors
     ///
-    /// Everything [`Self::restore`] can return, plus [`BackupError::Busy`] when
-    /// another connection is reading the target.
+    /// Everything the crate-private restore primitive can return, plus
+    /// [`BackupError::Busy`] when another connection is reading the target.
     pub fn restore_coordinated(&self, db_path: &Path) -> Result<(), BackupError> {
         let guard = RestoreGuard::acquire(db_path)?;
         self.restore(&guard)

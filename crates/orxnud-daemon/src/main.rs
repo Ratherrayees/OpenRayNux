@@ -202,7 +202,7 @@ enum Action {
         root: std::path::PathBuf,
         /// Which provider, if any.
         provider: ProviderChoice,
-        /// Grant the argv-payload exception. See [`Action::serve`]: only settable by a
+        /// Grant the argv-payload exception. See [`Action::Serve`]: only settable by a
         /// debug build, and only by a flag whose name says what it is.
         permit_argv_payload_for_tests: bool,
     },
