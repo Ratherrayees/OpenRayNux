@@ -5698,6 +5698,92 @@ mod tests {
         }
     }
 
+    /// F-17 (S-03): `not-performed` is a **retry permission**, and this pins the mechanism
+    /// end to end so the verdict-level defect in `WriteTextVerifier` has a demonstrated
+    /// consequence rather than an inferred one.
+    ///
+    /// This test is expected to PASS. The store is not what is wrong: `not-performed` is a
+    /// warrant, and K.1 is explicit that the warrant must be honoured rather than
+    /// second-guessed in recovery. The defect is upstream -- `Refuted` is issued for a write
+    /// that did occur and was later overwritten. What this test establishes is that such a
+    /// verdict is sufficient, on its own, to hand the task back to a worker.
+    #[test]
+    fn a_not_performed_row_hands_a_non_idempotent_task_back_to_a_worker() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t", TaskKind::Workflow);
+
+        // Attempt 1 runs and its lease expires (a crash).
+        let ClaimOutcome::Claimed(_) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected the task to be claimable to begin with");
+        };
+
+        // A non-idempotent effect on that attempt, resolved `not-performed`.
+        let _ = repo
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .expect("reserve");
+        assert!(
+            repo.resolve_effect("k", EffectStatus::NotPerformed, None, NOW + 1)
+                .expect("resolve")
+        );
+        assert_eq!(
+            repo.effect("k").expect("read").expect("present").status,
+            EffectStatus::NotPerformed.as_str(),
+            "the row is persisted as not-performed"
+        );
+
+        // Recovery reclaims the expired lease.
+        repo.recover(NOW + LEASE + 1).expect("recover");
+
+        // And the task is immediately claimable again: the effect will not stop a repeat.
+        let outcome = repo
+            .claim("w2", NOW + LEASE + 2, LEASE)
+            .expect("second claim");
+        assert!(
+            matches!(outcome, ClaimOutcome::Claimed(_)),
+            "THIS IS THE EXPOSURE, NOT A DEFECT IN THIS FUNCTION. `not-performed` is the \
+             one status recovery excludes, so a task carrying it is handed straight back to \
+             a worker. Combined with the F-17 verdict defect, a write-text that DID happen \
+             -- and whose file was later changed by someone else -- is retried automatically. \
+             If this assertion ever fails, the exposure has been closed and ADR-0056 must \
+             be reconciled with the new behaviour."
+        );
+    }
+
+    /// The control: a row that is *not* `not-performed` on a non-idempotent effect does stop
+    /// an automatic repeat. Without this, the test above would pass for the wrong reason --
+    /// because nothing was ever retryable -- rather than because the warrant is what grants it.
+    #[test]
+    fn an_unknown_row_stops_a_non_idempotent_task_from_being_retried() {
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t", TaskKind::Workflow);
+
+        let ClaimOutcome::Claimed(_) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected the task to be claimable to begin with");
+        };
+
+        let _ = repo
+            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .expect("reserve");
+        assert!(
+            repo.resolve_effect("k", EffectStatus::Unknown, None, NOW + 1)
+                .expect("resolve")
+        );
+
+        repo.recover(NOW + LEASE + 1).expect("recover");
+
+        let outcome = repo
+            .claim("w2", NOW + LEASE + 2, LEASE)
+            .expect("second claim");
+        assert!(
+            !matches!(outcome, ClaimOutcome::Claimed(_)),
+            "an unresolved effect on a non-idempotent capability must NOT be retried \
+             automatically -- this is the fail-closed reading, and it is the control that \
+             proves the test above is exercising the warrant rather than general claimability"
+        );
+    }
+
     #[test]
     fn an_effect_cannot_be_resolved_to_pending() {
         let mut c = mem();

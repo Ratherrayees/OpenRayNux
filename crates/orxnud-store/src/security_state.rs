@@ -53,6 +53,8 @@ use crate::pragma::Pragma;
 #[derive(Debug)]
 pub struct SqliteAuditJournal {
     conn: Connection,
+    /// Shared ownership, held for the journal's lifetime (S-31).
+    _ownership: crate::ownership::SharedOwnership,
 }
 
 impl SqliteAuditJournal {
@@ -78,6 +80,11 @@ impl SqliteAuditJournal {
         {
             std::fs::create_dir_all(parent).map_err(|e| unavailable(e.to_string()))?;
         }
+        // S-31: ownership before the connection. The audit journal is the record of
+        // what the system did; it is exactly the thing that must not be writable
+        // behind a restore's back.
+        let ownership =
+            crate::ownership::acquire_shared(path).map_err(|e| unavailable(e.to_string()))?;
         let conn = Connection::open(path).map_err(|e| unavailable(e.to_string()))?;
         // `critical`, not `derived`: a lost audit record is a lost record, and
         // this table is the `critical` region ADR-0028 names for exactly this.
@@ -91,7 +98,10 @@ impl SqliteAuditJournal {
         MigrationRunner::new(&conn)
             .run(true)
             .map_err(|e| unavailable(e.to_string()))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _ownership: ownership,
+        })
     }
 
     /// An in-memory journal, migrated. **Tests only** — a real install must not
@@ -100,7 +110,11 @@ impl SqliteAuditJournal {
     pub fn open_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("in-memory connection");
         Self::migrate(&conn).expect("migrate the in-memory journal");
-        Self { conn }
+        Self {
+            conn,
+            // No file, so nothing to coordinate across processes.
+            _ownership: crate::ownership::SharedOwnership::in_memory(),
+        }
     }
 
     /// Applies the schema to an existing connection without owning it.
@@ -228,6 +242,12 @@ impl AuditJournal for SqliteAuditJournal {
 /// implementation would leave open.
 pub struct SqliteApprovalLedger {
     conn: Connection,
+    /// Shared ownership, held for the ledger's lifetime (S-31).
+    ///
+    /// The approval ledger decides what may execute. A restore that ran while another
+    /// process could write it would be restoring a record of decisions that had
+    /// already moved on, so it participates like every other open.
+    _ownership: crate::ownership::SharedOwnership,
 }
 
 impl std::fmt::Debug for SqliteApprovalLedger {
@@ -258,6 +278,8 @@ impl SqliteApprovalLedger {
         {
             std::fs::create_dir_all(parent).map_err(|e| unavailable(e.to_string()))?;
         }
+        let ownership =
+            crate::ownership::acquire_shared(path).map_err(|e| unavailable(e.to_string()))?;
         let conn = Connection::open(path).map_err(|e| unavailable(e.to_string()))?;
         let pragma = Pragma::critical();
         pragma
@@ -269,7 +291,10 @@ impl SqliteApprovalLedger {
         MigrationRunner::new(&conn)
             .run(true)
             .map_err(|e| unavailable(e.to_string()))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _ownership: ownership,
+        })
     }
 
     /// An in-memory ledger, migrated. **Tests only.**
@@ -277,7 +302,11 @@ impl SqliteApprovalLedger {
     pub fn open_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("in-memory connection");
         Self::migrate(&conn).expect("migrate the in-memory ledger");
-        Self { conn }
+        Self {
+            conn,
+            // No file, so nothing to coordinate across processes.
+            _ownership: crate::ownership::SharedOwnership::in_memory(),
+        }
     }
 
     /// Applies the schema to an existing connection without owning it.

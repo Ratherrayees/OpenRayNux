@@ -477,7 +477,9 @@ fn a_failed_migration_leaves_the_database_readable_and_restores_the_snapshot() {
                 || orxnud_store::backup::Backup::verify(&path).is_ok(),
             "the damaged database may still be structurally valid"
         );
-        snapshot.restore(&path).expect("restore");
+        // S-30: the raw `restore` is crate-private so the coordination step cannot be
+        // skipped. The public entry point acquires authority itself.
+        snapshot.restore_coordinated(&path).expect("restore");
     }
     let conn = rusqlite::Connection::open(&path).expect("reopen");
     let half: i64 = conn

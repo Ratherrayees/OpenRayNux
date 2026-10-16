@@ -33,7 +33,7 @@ use orxnud_domain::Actor;
 use orxnud_domain::ids::{CapabilityId, TaskId};
 use orxnud_domain::task_state::TaskState;
 use orxnud_store::StoreError;
-use orxnud_store::migration::MigrationRunner;
+use orxnud_store::migration::{MigrationError, MigrationRunner};
 use orxnud_store::sqlite::Store;
 use orxnud_store::task_repo::{
     ClaimRefusal, ClaimedTask, NewTask, ProposalRow, TargetedClaimOutcome, TaskRow,
@@ -159,16 +159,51 @@ impl TaskService {
     ) -> Result<Self, StartupError> {
         // `critical = true`: the task database is the one region ADR-0006 marks
         // critical, so its pragmas are verified rather than merely applied.
-        let store = Store::open(path, true).map_err(StartupError::Store)?;
-        let runner = MigrationRunner::new(store.conn());
-
-        // Always migrate, never `run()` alone. `migrate` snapshots first and
-        // restores on failure; `run` trusts the caller to have done that. The
-        // difference is the difference between "a failed migration is rolled back"
-        // and "the schema is now half-applied and nobody can say which half".
-        let applied = runner
-            .migrate(path, false)
-            .map_err(|e| StartupError::Migration(e.to_string()))?;
+        //
+        // Always migrate, never `run()` alone. `migrate` snapshots first; `run`
+        // trusts the caller to have done that. The difference is the difference
+        // between "a failed migration is rolled back" and "the schema is now
+        // half-applied and nobody can say which half".
+        //
+        // S-31: the migration happens in its own scope so the `Store` -- and with it
+        // the shared ownership lease it holds for the database -- is **dropped** before
+        // anything asks for exclusive ownership. A restore cannot take an exclusive
+        // lease while a shared one is outstanding, and `flock` reports that even
+        // within one process because the lock belongs to the open file description.
+        let (applied, conn, ownership) = {
+            let store = Store::open(path, true).map_err(StartupError::Store)?;
+            let runner = MigrationRunner::new(store.conn());
+            match runner.migrate(path, false) {
+                Ok(applied) => {
+                    // Carry the connection *and* its lease onward. `into_connection`
+                    // would drop both, unprotecting a connection that is still in use.
+                    let (conn, ownership) = store.into_parts();
+                    (applied, conn, ownership)
+                }
+                Err(e) => {
+                    // Drop the store (closing the connection and releasing the shared
+                    // lease) before recovering, then reopen under a fresh lease.
+                    let (snapshot, source) = match e {
+                        MigrationError::RecoveryRequired { source, snapshot } => {
+                            (Some(snapshot), *source)
+                        }
+                        other => (None, other),
+                    };
+                    drop(store);
+                    if let Some(snapshot) = snapshot {
+                        orxnud_store::backup::Backup::existing(snapshot.clone())
+                            .restore_coordinated(path)
+                            .map_err(|e| {
+                                StartupError::Migration(format!(
+                                    "the migration failed and its snapshot could not be restored: {e}"
+                                ))
+                            })?;
+                    }
+                    return Err(StartupError::Migration(source.to_string()));
+                }
+            }
+        };
+        let _keep_ownership_alive = ownership;
         if !applied.is_empty() {
             info!(
                 migrations = applied.len(),
@@ -177,8 +212,7 @@ impl TaskService {
             );
         }
 
-        let mut engine =
-            DurableEngine::new(store.into_connection(), limits).map_err(StartupError::Engine)?;
+        let mut engine = DurableEngine::new(conn, limits).map_err(StartupError::Engine)?;
 
         // Before any claim. A lease orphaned by a dead process is unexpired, so
         // this is the only thing that will ever reclaim it.

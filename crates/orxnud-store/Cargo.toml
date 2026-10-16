@@ -38,3 +38,7 @@ libsqlite3-sys = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# S-31's two-process tests seed a real database before handing it to the role child.
+# Already a dependency of this crate; listed here because integration tests do not
+# inherit regular dependencies.
+rusqlite = { workspace = true }

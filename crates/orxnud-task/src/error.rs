@@ -409,6 +409,11 @@ impl From<orxnud_store::migration::MigrationError> for EngineError {
             // A failed migration is not retryable: the schema is in an unknown
             // state and retrying could compound the damage.
             M::Failed { .. } | M::RestoreFailed(_) | M::Snapshot(_) => EngineErrorKind::Invariant,
+            // S-31: a pending recovery is the same shape -- the schema is in an
+            // unknown state until the snapshot is restored, so it is equally not
+            // retryable. Routing it anywhere else would let a caller treat an
+            // unrecovered schema as recoverable.
+            M::RecoveryRequired { .. } => EngineErrorKind::Invariant,
             M::NoSnapshot => EngineErrorKind::InvalidInput,
         };
         Self::new(kind, e.to_string())

@@ -40,6 +40,29 @@ pub enum MigrationError {
         source: rusqlite::Error,
     },
 
+    /// The migration failed and a snapshot is waiting to be restored (S-31).
+    ///
+    /// A distinct variant rather than `Failed` because the required response is
+    /// different and doing the wrong thing is silent. The caller must **drop every
+    /// connection and shared lease on this database first**, then restore under
+    /// exclusive ownership via [`crate::backup::Backup::restore_coordinated`].
+    ///
+    /// Restoring from inside [`MigrationRunner::migrate`] is no longer possible: this
+    /// type borrows a connection whose owning `Store` holds a shared lease, and
+    /// exclusive ownership conflicts with a shared lease even in the same process,
+    /// because the lock is per open file description. Recovering here would mean
+    /// either deadlocking against our own lease or releasing it through a `&self`
+    /// borrow, which Rust does not permit.
+    #[error(
+        "migration failed; a snapshot at {snapshot} must be restored after releasing the database"
+    )]
+    RecoveryRequired {
+        /// The migration failure that caused this.
+        source: Box<MigrationError>,
+        /// The verified snapshot to restore.
+        snapshot: std::path::PathBuf,
+    },
+
     /// The runner was asked to migrate without a verified snapshot.
     ///
     /// Refused rather than warned: this is the one write path where a mistake is
@@ -428,20 +451,24 @@ impl<'a> MigrationRunner<'a> {
                 // A partial migration must not be left in place: the recorded
                 // version and the actual tables would disagree, and nothing could
                 // say which is authoritative.
-                if let Some(s) = &snapshot {
-                    if let Err(restore_err) = s.restore(db_path) {
-                        return Err(MigrationError::RestoreFailed(Box::new(RestoreFailure {
-                            version: current + 1,
-                            snapshot: s.path().display().to_string(),
-                            source: restore_err,
-                        })));
-                    }
-                    // The snapshot has served its purpose *and* the restore has
-                    // been verified by `restore` succeeding, so remove it rather
-                    // than leaving a stale copy to be mistaken for current.
-                    s.discard();
+                //
+                // S-31: the restore itself **cannot happen here**. It needs exclusive
+                // ownership of the database across processes, and this runner holds a
+                // borrow of a connection whose owning `Store` holds a *shared* lease --
+                // which `flock` treats as conflicting even within one process, because
+                // the lock is per open file description. Restoring from here would
+                // either deadlock against our own lease or require releasing it, which
+                // a `&self` borrow cannot do.
+                //
+                // So the recovery is handed back to the caller, which must drop its
+                // store first. See `MigrationError::RecoveryRequired`.
+                match snapshot {
+                    Some(s) => Err(MigrationError::RecoveryRequired {
+                        source: Box::new(err),
+                        snapshot: s.path().to_path_buf(),
+                    }),
+                    None => Err(err),
                 }
-                Err(err)
             }
         }
     }
@@ -465,8 +492,28 @@ pub fn open_and_migrate(
     snapshot_verified: bool,
 ) -> Result<crate::sqlite::Store, StoreError> {
     let store = crate::sqlite::Store::open(path, true)?;
-    MigrationRunner::new(store.conn()).run(snapshot_verified)?;
-    Ok(store)
+    // S-31: the store holds shared ownership for as long as it lives, so a restore
+    // on this path could not take exclusive ownership. Hand the recovery back rather
+    // than attempting it under our own lease.
+    match MigrationRunner::new(store.conn()).migrate(path, snapshot_verified) {
+        Ok(_) => Ok(store),
+        Err(MigrationError::RecoveryRequired { source, snapshot }) => {
+            drop(store);
+            crate::backup::Backup::existing(snapshot.clone())
+                .restore_coordinated(path)
+                .map_err(|e| {
+                    StoreError::Migration(Box::new(MigrationError::RestoreFailed(Box::new(
+                        RestoreFailure {
+                            version: 0,
+                            snapshot: snapshot.display().to_string(),
+                            source: e,
+                        },
+                    ))))
+                })?;
+            Err(StoreError::Migration(source))
+        }
+        Err(e) => Err(StoreError::Migration(Box::new(e))),
+    }
 }
 
 #[cfg(test)]

@@ -77,6 +77,7 @@
 pub mod backup;
 pub mod faults;
 pub mod migration;
+pub mod ownership;
 pub mod pragma;
 pub mod region;
 pub mod repository;

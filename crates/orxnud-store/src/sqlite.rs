@@ -125,6 +125,17 @@ pub enum StoreError {
     #[error(transparent)]
     SqliteTooOld(#[from] SqliteTooOld),
 
+    /// Database ownership could not be established (S-31).
+    ///
+    /// Distinct from [`StoreError::Io`] on purpose: this means another process holds
+    /// the database, which is expected under concurrency, whereas `Io` means the file
+    /// could not be used at all. They must not be flattened.
+    #[error("database ownership: {source}")]
+    Ownership {
+        /// The underlying refusal.
+        source: Box<crate::ownership::OwnershipError>,
+    },
+
     /// A pragma could not be applied or verified.
     #[error(transparent)]
     Pragma(#[from] PragmaError),
@@ -233,6 +244,27 @@ const _: () = const_assert_min_sqlite();
 pub struct Store {
     conn: Connection,
     version: SqliteVersion,
+    /// Shared ownership of this database's lock file, held for as long as `conn` is
+    /// usable (S-31).
+    ///
+    /// It is a field rather than something `open` acquires and drops: the lease must
+    /// follow the **connection lifetime**, and a lease released when `open` returned
+    /// would protect nothing. Dropping the `Store` drops both, in that order, so the
+    /// connection is closed before the lock is released — the order matters, because a
+    /// released lock with a live connection is exactly the window S-31 exists to close.
+    _ownership: crate::ownership::SharedOwnership,
+}
+
+/// Maps an ownership refusal into the store's error vocabulary.
+///
+/// It gets its own variant rather than becoming `StoreError::Io`, because "another
+/// process owns this database" and "the file could not be read" call for different
+/// responses, and a caller that cannot tell them apart will eventually retry the
+/// second as if it were the first.
+pub(crate) fn ownership_error(e: crate::ownership::OwnershipError) -> StoreError {
+    StoreError::Ownership {
+        source: Box::new(e),
+    }
 }
 
 impl From<crate::migration::MigrationError> for StoreError {
@@ -264,15 +296,25 @@ impl Store {
                 source,
             })?;
         }
+        // Ownership first. If it cannot be taken we must not open the database at
+        // all: a connection opened without a lease is one that participates in
+        // nothing and can be modified behind a restore's back.
+        let ownership = crate::ownership::acquire_shared(path).map_err(ownership_error)?;
         let conn = Connection::open(path)?;
         let pragma = if critical {
             Pragma::critical()
         } else {
             Pragma::derived()
         };
+        // On any failure after this point the connection is dropped here and the
+        // lease with it. No path returns a connection without its lease.
         pragma.apply(&conn)?;
         pragma.verify(&conn)?;
-        Ok(Self { conn, version })
+        Ok(Self {
+            conn,
+            version,
+            _ownership: ownership,
+        })
     }
 
     /// Opens an in-memory store. **Tests only.**
@@ -290,7 +332,20 @@ impl Store {
         let pragma = Pragma::in_memory();
         pragma.apply(&conn)?;
         pragma.verify(&conn)?;
-        Ok(Self { conn, version })
+        Ok(Self {
+            conn,
+            version,
+            // An in-memory database has no file, so there is nothing for a second
+            // process to open and nothing to coordinate. The lease is a no-op rather
+            // than absent, so the type of `Store` does not change between the two.
+            _ownership: crate::ownership::SharedOwnership::in_memory(),
+        })
+    }
+
+    /// The database path this store holds shared ownership of.
+    #[must_use]
+    pub fn ownership_path(&self) -> &std::path::Path {
+        self._ownership.path()
     }
 
     /// The SQLite version this store is running on.
@@ -315,6 +370,19 @@ impl Store {
     #[must_use]
     pub fn into_connection(self) -> Connection {
         self.conn
+    }
+
+    /// The ownership lease, taken back from the store.
+    ///
+    /// Added by S-31 so a caller can hand a bare connection to another component
+    /// while **keeping** the database's shared lease alive. `into_connection` drops the
+    /// `Store` and with it the lease, which would silently unprotect a connection that
+    /// is still in use -- the exact "lease does not follow the connection lifetime"
+    /// failure S-31 exists to prevent. The `Store` cannot implement `Drop` to retain it,
+    /// so ownership is returned explicitly and the caller is required to carry it.
+    #[must_use]
+    pub fn into_parts(self) -> (Connection, crate::ownership::SharedOwnership) {
+        (self.conn, self._ownership)
     }
 }
 
