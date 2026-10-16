@@ -242,6 +242,24 @@ pub struct SandboxSpec {
     pub program: PathBuf,
     /// Arguments. Passed as a vector, never a shell string.
     pub args: Vec<String>,
+    /// Bytes delivered to the child on **stdin**, or `None` for no stdin at all.
+    ///
+    /// The transport for anything a user supplied, because `args` reach the host
+    /// process table: `bwrap` is executed with them, stays in the host PID namespace,
+    /// and `/proc/<pid>/cmdline` is mode `0444`, so a payload in `args` is readable by
+    /// any local uid for the life of the execution (V-67).
+    ///
+    /// **Opaque to this crate.** The bytes are whatever the caller framed; this crate
+    /// writes them and closes the stream, and knows nothing about the protocol inside.
+    /// That is deliberate: the wire contract lives with the capability that speaks it,
+    /// so a sandbox change cannot silently alter it and a framing change cannot
+    /// require a sandbox change.
+    ///
+    /// `Some(vec![])` and `None` differ: an empty stdin is a stream that is opened and
+    /// immediately closed, which a receiver may treat as an empty delivery. `None` is
+    /// `/dev/null`. A receiver that needs to tell those apart has to frame them, which
+    /// is what the caller does.
+    pub stdin_payload: Option<Vec<u8>>,
     /// The complete environment. **Empty means no environment**, not the parent's.
     pub env: BTreeMap<String, String>,
     /// Working directory inside the sandbox.
@@ -278,6 +296,7 @@ impl SandboxSpec {
         Self {
             program: program.into(),
             args: Vec::new(),
+            stdin_payload: None,
             env: BTreeMap::new(),
             working_dir: PathBuf::from(std::path::MAIN_SEPARATOR_STR),
             fs: FsPolicy::default(),
@@ -292,6 +311,13 @@ impl SandboxSpec {
     #[must_use]
     pub fn arg(mut self, a: impl Into<String>) -> Self {
         self.args.push(a.into());
+        self
+    }
+
+    /// Delivers `bytes` to the child on stdin. The only way to add a stdin payload.
+    #[must_use]
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin_payload = Some(bytes.into());
         self
     }
 

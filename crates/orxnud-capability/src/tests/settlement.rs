@@ -890,6 +890,7 @@ impl AdapterBundle for WithValidPlan {
         _invocation: &orxnud_policy::authority::CapabilityInvocation,
     ) -> Result<Option<SandboxPlan>, PlanError> {
         Ok(Some(SandboxPlan {
+            stdin_payload: None,
             program: "/nonexistent/test-helper".to_owned(),
             args: Vec::new(),
             env: Default::default(),
@@ -1377,6 +1378,7 @@ impl AdapterBundle for PlanTier1 {
         _invocation: &orxnud_policy::authority::CapabilityInvocation,
     ) -> Result<Option<SandboxPlan>, PlanError> {
         Ok(Some(SandboxPlan {
+            stdin_payload: None,
             program: "/nonexistent/test-helper".to_owned(),
             args: Vec::new(),
             env: Default::default(),

@@ -138,7 +138,10 @@ impl Default for SandboxExecutionBackend {
 ///
 /// A refusal when the contract cannot be expressed — a relative program path, or a
 /// grant set the backend cannot build.
-fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal> {
+/// `pub(crate)` so the S-17 transport tests can render the spec this produces and
+/// assert on the real `bwrap` argv, rather than on a copy of the rendering. It stays
+/// out of the public surface: nothing outside this crate should hand-roll a spec.
+pub(crate) fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal> {
     let refuse =
         |why: &str| SandboxRefusal::nothing_attempted(contract.capability.clone(), why, Vec::new());
 
@@ -162,6 +165,9 @@ fn spec_for(contract: &ExecutionContract) -> Result<SandboxSpec, SandboxRefusal>
     let mut spec = SandboxSpec::new(&contract.program);
     for a in &contract.args {
         spec = spec.arg(a);
+    }
+    if let Some(payload) = &contract.stdin_payload {
+        spec = spec.stdin(payload.clone());
     }
     for (k, v) in &contract.env {
         spec = spec.env(k, v);
@@ -377,6 +383,7 @@ mod tests {
             capability: CapabilityId::new("t1"),
             program: "/bin/true".into(),
             args: vec![],
+            stdin_payload: None,
             env: BTreeMap::new(),
             working_dir: "/".into(),
             grant_rw: vec![],

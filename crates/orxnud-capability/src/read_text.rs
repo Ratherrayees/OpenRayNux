@@ -302,6 +302,10 @@ impl crate::dispatch::AdapterBundle for ReadTextBundle {
             .map_err(crate::dispatch::PlanError::InvalidParams)?;
 
         Ok(Some(crate::dispatch::SandboxPlan {
+            // No payload: `read-text` passes a workspace-relative path and reads the file
+            // inside the sandbox. The bytes travel back over the result channel, never in
+            // `args` and never on stdin.
+            stdin_payload: None,
             program: self.helper.display().to_string(),
             // The path travels in argv because `SandboxSpec` has no stdin channel, recorded
             // as a known limitation of the existing contract rather than worked around by

@@ -209,6 +209,7 @@ impl AdapterBundle for HelperBundle {
     ) -> Result<Option<SandboxPlan>, crate::dispatch::PlanError> {
         let (ro, rw) = self.grants.clone();
         Ok(Some(SandboxPlan {
+            stdin_payload: None,
             program: helper_path().display().to_string(),
             args: vec![
                 "--exact".into(),
@@ -1299,6 +1300,7 @@ mod v46 {
             _invocation: &orxnud_policy::authority::CapabilityInvocation,
         ) -> Result<Option<SandboxPlan>, crate::dispatch::PlanError> {
             Ok(Some(SandboxPlan {
+                stdin_payload: None,
                 program: helper_path().display().to_string(),
                 args: vec![
                     "--exact".into(),
@@ -1996,6 +1998,36 @@ mod v46 {
                 NOW,
             ) {
                 Err(DispatchError::SandboxRefused(r)) => {
+                    // Two layers can refuse here, and **both** satisfy the property this
+                    // test is named for -- "refused before any cgroup or process exists".
+                    //
+                    // On a host that can make cgroups, `can_fulfil` succeeds and the
+                    // refusal comes from the *validation* of the budget against what the
+                    // kernel accepts. That is the branch that also proves the refusal
+                    // names the offending value.
+                    //
+                    // On a host that cannot (the `sandbox-integration` container, where
+                    // cgroups are not delegated), `can_fulfil` refuses first with
+                    // "cannot establish the required sandbox guarantees". That is still
+                    // fail-closed and still before any cgroup exists -- it is simply a
+                    // different layer.
+                    //
+                    // This test used to assert only the first branch, so it passed on a
+                    // developer machine and failed inside the container, measuring the
+                    // environment rather than the code. Found by running that lane end to
+                    // end for the first time.
+                    if r.reason
+                        .contains("cannot establish the required sandbox guarantees")
+                    {
+                        assert!(
+                            !r.reason.contains("/sys/fs/cgroup"),
+                            "{label}: a guarantee refusal must not report a cgroup path, \
+                             which would mean one existed; got: {}",
+                            r.reason
+                        );
+                        continue;
+                    }
+
                     // The refusal must come from *validation*, which is what proves it
                     // happened before any cgroup existed. A validation refusal names the
                     // offending value and the range the kernel accepts. A refusal that

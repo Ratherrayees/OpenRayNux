@@ -23,10 +23,26 @@ export PATH="/usr/local/cargo/bin:$PATH"
 # CAP_SYS_ADMIN -- the configuration ADR-0046 rejects as evidence about the sandbox. Their
 # home is `scripts/run-resource-tests.sh`, which explains why delegation is not a
 # sandbox-privilege question.
+#
+# # Why some of these are module filters and not `--test` targets
+#
+# `governed_path`, `read_text_real` and `write_text` are **modules inside
+# `orxnud-capability/src/tests/`**, not integration binaries. `orxnud-capability`'s only
+# `tests/` targets are `compile_fail` and `s17_helper_process`. Selecting them with
+# `--test` therefore fails before a single Tier-1 test runs:
+#
+#     error: no test target named `governed_path` in `orxnud-capability` package
+#
+# These selectors are nextest **filters** on the test path instead, which is how they
+# actually live. Found by running this lane end to end for the first time; the same
+# stale spelling was already corrected once in `ci.yml`, and this script was missed.
+#
+# `--test isolation` and `--test cli_e2e` stay as they are: those crates do have real
+# integration binaries with those names.
 SUITES=(
-  "-p orxnud-capability --test governed_path"
-  "-p orxnud-capability --test read_text_real"
-  "-p orxnud-capability --test write_text"
+  "-p orxnud-capability -E test(suites::governed_path)"
+  "-p orxnud-capability -E test(suites::read_text_real)"
+  "-p orxnud-capability -E test(suites::write_text)"
   "-p orxnud-platform-sandbox --test isolation"
   "-p orxnuctl --test cli_e2e"
 )

@@ -80,7 +80,7 @@
 //! `setuid` restoration, which is easy to get subtly wrong.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -412,22 +412,23 @@ impl SandboxRunner for BwrapRunner {
         };
 
         let started = Instant::now();
-        let mut child = match spawn_supervisor(&argv, owned.as_ref()) {
-            Ok(c) => c,
-            Err(e) => {
-                // `owned` drops here, removing the dedicated child. A spawn failure must
-                // not leave a cgroup behind, and must never fall back to running without
-                // the required ceilings.
-                drop(owned);
-                return Ok(ExecutionResult {
-                    status: ExecutionStatus::SpawnFailed(e.to_string()),
-                    stdout: CapturedStream::empty(),
-                    stderr: CapturedStream::empty(),
-                    elapsed: started.elapsed(),
-                    unproven: Vec::new(),
-                });
-            }
-        };
+        let (mut child, stdin_writer) =
+            match spawn_supervisor(&argv, owned.as_ref(), spec.stdin_payload.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    // `owned` drops here, removing the dedicated child. A spawn failure must
+                    // not leave a cgroup behind, and must never fall back to running without
+                    // the required ceilings.
+                    drop(owned);
+                    return Ok(ExecutionResult {
+                        status: ExecutionStatus::SpawnFailed(e.to_string()),
+                        stdout: CapturedStream::empty(),
+                        stderr: CapturedStream::empty(),
+                        elapsed: started.elapsed(),
+                        unproven: Vec::new(),
+                    });
+                }
+            };
 
         // Membership is verified, not assumed. Writing limits to a cgroup says nothing
         // about who is inside it, so the only admissible evidence that this execution is
@@ -472,6 +473,8 @@ impl SandboxRunner for BwrapRunner {
             }
             let _ = child.kill();
             let _ = child.wait();
+            // The child is reaped, so the writer is unblocked and this join is bounded.
+            let _ = finish_stdin_writer(stdin_writer);
             drop(owned);
             return Ok(ExecutionResult {
                 // `Abandoned`, not `Refused`, and this is the site the distinction exists
@@ -537,6 +540,15 @@ impl SandboxRunner for BwrapRunner {
                     // The two reader threads are left running: they are bounded, they hold
                     // no authority, and joining them here would mean blocking in the one
                     // branch whose whole point is that we have already lost the thread.
+                    //
+                    // The stdin writer is different, and deliberately so: this branch has
+                    // lost track of the supervisor, so it cannot know the pipe has closed,
+                    // and ADR-0054 Decision 3a forbids leaving it untracked. It is detached
+                    // rather than joined for the same reason the readers are -- and the
+                    // outcome here is already `Killed`, which reaches the capability layer
+                    // as `Unknown`, so an interrupted send settles as an uncertain effect
+                    // rather than a verified one.
+                    drop(stdin_writer);
                     return Ok(ExecutionResult {
                         status: ExecutionStatus::Killed,
                         stdout: CapturedStream::empty(),
@@ -584,6 +596,20 @@ impl SandboxRunner for BwrapRunner {
         // produced output we could not vouch for.
         let stdout = join_bounded(out_handle, Duration::from_millis(2_000));
         let stderr = join_bounded(err_handle, Duration::from_millis(2_000));
+
+        // The stdin writer, unlike the readers, is joined outright rather than bounded
+        // and abandoned. Every path that reaches here has already killed and reaped the
+        // supervisor -- normal exit, deadline, or cancellation all fall out of the loop
+        // above after `child.kill(); child.wait();` -- so the pipe's read end is closed
+        // and a writer blocked in `write` returns `EPIPE` immediately. The join is
+        // therefore bounded by the child's own teardown, not by the payload's size.
+        //
+        // ADR-0054 Decision 3a: leaving this thread untracked is what turns a cancelled
+        // send into a hang, so it is joined on every path where the child's fate is
+        // known. A write error here means the child never received the payload, which the
+        // capability layer must not report as a successful effect -- the verifier settles
+        // that, and an incomplete delivery produces no verifiable write.
+        let stdin_write = finish_stdin_writer(stdin_writer);
 
         // Record what was *not* provided. Non-empty only when the caller explicitly
         // accepted best-effort containment, and the audit record must carry it.
@@ -633,6 +659,25 @@ impl SandboxRunner for BwrapRunner {
             ExecutionStatus::TimedOut
         } else if cancelled {
             ExecutionStatus::Cancelled
+        } else if stdin_write
+            .as_ref()
+            .is_some_and(std::result::Result::is_err)
+        {
+            // ADR-0054 Decision 3: a failed write makes the execution **fail**, and it
+            // may not be reported as a verified effect. The child demonstrably did not
+            // receive the payload it was sent, so `Exited(0)` would be a lie about work
+            // that never arrived.
+            //
+            // `Killed` is the right label here and not a guess: it means "a process
+            // existed and its outcome is not established", which reaches the capability
+            // layer as `Unknown` and therefore settles as `Undetermined` under ADR-0053 --
+            // the classification for an effect that may or may not have occurred. Using
+            // `Failed` instead would claim nothing happened, and every consumer downstream
+            // reads that claim as permission to repeat the effect.
+            //
+            // Ordered after `timed_out` and `cancelled` because those are more specific
+            // about *why*, and both already refuse to report success.
+            ExecutionStatus::Killed
         } else if stdout.truncated || stderr.truncated {
             ExecutionStatus::OutputExceeded {
                 stream: if stdout.truncated { "stdout" } else { "stderr" },
@@ -769,33 +814,86 @@ fn read_capped<R: Read>(r: &mut Option<R>, cap: u64) -> CapturedStream {
 fn spawn_supervisor(
     argv: &[String],
     cgroup: Option<&CgroupV2>,
-) -> std::io::Result<std::process::Child> {
-    let Some(cg) = cgroup else {
-        return Command::new(BWRAP)
+    stdin_payload: Option<&[u8]>,
+) -> std::io::Result<(std::process::Child, Option<StdinWriter>)> {
+    let mut child = match cgroup {
+        None => Command::new(BWRAP)
             .args(argv)
-            .stdin(Stdio::null())
+            .stdin(stdin_mode(stdin_payload))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // `bwrap` must not inherit our environment: it is the single most
             // effective way for a parent secret to reach a child. The child's own
             // environment is set explicitly by `--setenv` below.
             .env_clear()
-            .spawn();
+            .spawn()?,
+        Some(cg) => {
+            let procs = cg.path.join("cgroup.procs");
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("printf %s \"$$\" > \"$1\" || exit 97; shift; exec \"$@\"")
+                .arg("orxnud-join-cgroup")
+                .arg(&procs)
+                .arg(BWRAP)
+                .args(argv)
+                .stdin(stdin_mode(stdin_payload))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env_clear()
+                .spawn()?
+        }
     };
 
-    let procs = cg.path.join("cgroup.procs");
-    Command::new("/bin/sh")
-        .arg("-c")
-        .arg("printf %s \"$$\" > \"$1\" || exit 97; shift; exec \"$@\"")
-        .arg("orxnud-join-cgroup")
-        .arg(&procs)
-        .arg(BWRAP)
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .spawn()
+    // ADR-0054 Decision 3: the write happens on a dedicated thread, because a pipe fills
+    // and the parent would otherwise block in `write` before the child ever starts
+    // reading.
+    //
+    // Decision 3a: the thread **closes** stdin after writing, rather than merely stopping.
+    // A sender that holds the write end open leaves the receiver blocked in its
+    // "read to EOF" step forever while the parent is simultaneously blocked in `wait` --
+    // a hang, not a failure, and nothing reports it.
+    //
+    // Both branches inherit the same pipe through `exec`, so the joiner shell's stdin is
+    // `bwrap`'s stdin is the child's stdin.
+    let writer = stdin_payload.and_then(|payload| {
+        let mut pipe = child.stdin.take()?;
+        let bytes = payload.to_vec();
+        Some(std::thread::spawn(move || {
+            let result = pipe.write_all(&bytes);
+            // Explicit close, then report. Dropping `pipe` would close it too, but the
+            // ordering is stated rather than left to a destructor.
+            drop(pipe);
+            result
+        }))
+    });
+    Ok((child, writer))
+}
+
+/// `Stdio::piped` when there is a payload, `Stdio::null` when there is not.
+///
+/// Not merged: `None` means `/dev/null`, and a receiver can tell that from a stream
+/// that opened and closed immediately. The capability layer frames that difference.
+fn stdin_mode(payload: Option<&[u8]>) -> Stdio {
+    if payload.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    }
+}
+
+/// The thread writing the child's stdin, and how to finish with it.
+type StdinWriter = std::thread::JoinHandle<std::io::Result<()>>;
+
+/// Joins the stdin writer after the child is gone.
+///
+/// Called only once the supervisor has been reaped or killed, which is what makes the
+/// join bounded: the read end of the pipe is closed, so a writer blocked in `write`
+/// unblocks with `EPIPE` rather than waiting for a reader that will never come.
+///
+/// ADR-0054 Decision 3a forbids an untracked writer thread. Every exit path in `run`
+/// kills and reaps the child before returning, so joining here is safe on all of them.
+fn finish_stdin_writer(writer: Option<StdinWriter>) -> Option<std::io::Result<()>> {
+    writer.and_then(|w| w.join().ok())
 }
 
 /// The cgroup v2 control file that expresses each limit this module can enforce.

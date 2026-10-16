@@ -50,6 +50,11 @@ fn contract(plan: SandboxPlan) -> crate::dispatch::ExecutionContract {
         capability: cap(),
         program: plan.program,
         args: plan.args,
+        // Carried, not defaulted. A helper that expected this to be `None` would run
+        // against an empty stdin and refuse -- which is correct behaviour and would make
+        // every test in this file fail for a reason that has nothing to do with what they
+        // are testing.
+        stdin_payload: plan.stdin_payload,
         env: plan.env,
         working_dir: plan.working_dir,
         grant_rw: plan.grant_rw,
@@ -427,6 +432,7 @@ fn an_escaping_path_cannot_reach_the_host_filesystem() {
     // produce — that refusal is (1), and this is the layer beneath it.
     let helper = write_text::resolve_helper().expect("helper built");
     let plan = SandboxPlan {
+        stdin_payload: None,
         program: helper.display().to_string(),
         args: vec![
             "--path".to_owned(),
@@ -938,19 +944,33 @@ impl orxnud_platform_sandbox::contract::SandboxRunner for GivesUpAfterStarting {
         orxnud_platform_sandbox::contract::SandboxUnavailable,
     > {
         // The plan is the real one, built by `WriteTextBundle` from the dispatcher's own
-        // parameters, so `--path` and `--contents` are the real values and the effect is
-        // the real effect.
+        // parameters, so `--path` is the real value and the effect is the real effect.
+        //
+        // The contents no longer come from `argv` (ADR-0054): they arrive as the framed
+        // stdin payload. Reading them back out of the frame here also exercises the
+        // encoder/decoder pair on every test in this file, so a framing regression would
+        // surface as this suite failing rather than only in the transport's own tests.
         let mut path = String::new();
-        let mut contents = String::new();
         let mut rest = spec.args.iter();
         while let Some(flag) = rest.next() {
-            match (flag.as_str(), rest.next().map(String::as_str)) {
-                ("--path", Some(v)) => path = v.to_owned(),
-                ("--contents", Some(v)) => contents = v.to_owned(),
-                _ => {}
+            if flag == "--path" {
+                path = rest.next().cloned().unwrap_or_default();
             }
         }
         assert!(!path.is_empty(), "the real plan must name a path to write");
+        assert!(
+            !spec.args.iter().any(|a| a == "--contents"),
+            "the payload must not be in argv; that is the whole point of ADR-0054"
+        );
+        let payload = spec
+            .stdin_payload
+            .as_ref()
+            .expect("the plan must carry the framed payload");
+        let contents = String::from_utf8(
+            crate::stdin_frame::read_frame(&mut payload.as_slice())
+                .expect("the frame the daemon wrote decodes"),
+        )
+        .expect("the payload is utf-8");
         let target = self.workspace.join(
             std::path::Path::new(&path)
                 .file_name()

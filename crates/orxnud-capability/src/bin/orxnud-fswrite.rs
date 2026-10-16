@@ -24,14 +24,25 @@
 //! the escape test asserts on the *effect* — the file does not appear outside —
 //! rather than on this program's exit code.
 //!
-//! # Why the contents travel in argv
+//! # Why the contents travel on stdin, not in argv
 //!
-//! `SandboxSpec` has no stdin channel, and adding one would mean changing the sandbox
-//! contract, which this slice does not do. So the bytes are arguments. That makes
-//! them visible to anything that can read the host process table for the duration of
-//! the call, which is a real limitation of the existing contract rather than a
-//! property of this program. It is acceptable for a workspace-scoped text write and
-//! is recorded as such; it would not be acceptable for a credential.
+//! `SandboxSpec` gained a stdin channel (ADR-0054). The contents used to be passed as
+//! `--contents <text>` in `argv`, and `argv` is the host process table: `bwrap` is
+//! executed with it, stays in the host PID namespace, and `/proc/<pid>/cmdline` is mode
+//! `0444`, so any local uid could read the user's file for the life of the execution
+//! (V-67). On the cgroup branch the joiner shell carried the same vector before it
+//! `exec`ed `bwrap`, so there were two surfaces and fixing one would have fixed neither.
+//!
+//! The transport is framed, and that is not decoration: on a bare stdin "the caller sent
+//! an empty file" and "the caller sent nothing" are the same zero bytes. The frame's
+//! declared length makes them decidable, and every deviation from it is a refusal --
+//! see `crate::stdin_frame`.
+//!
+//! # The version handshake
+//!
+//! `--stdin-transport=1` is **required**. This program refuses without it, and so does
+//! an older helper that finds no `--contents` (ADR-0054, Decision 6). Both directions
+//! fail closed by name rather than one silently misreading the other.
 
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -55,12 +66,37 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("usage: orxnud-fswrite --path <path> --contents <text>");
+        println!(
+            "usage: orxnud-fswrite --path <path> {}\n\n\
+             The file body is read from stdin as a framed payload; see \
+             `orxnud_capability::stdin_frame`.",
+            orxnud_capability::stdin_frame::VERSION_ARG
+        );
         return Ok(());
     }
 
+    // ADR-0054 Decision 6. Checked first and by exact match, so an incompatible pair
+    // fails here rather than at some later point where the failure would look like a
+    // corrupt payload.
+    let transport =
+        flag(&args, "--stdin-transport").or_else(|_| single(&args, "--stdin-transport"))?;
+    if transport != "1" {
+        return Err(format!(
+            "unsupported stdin transport {transport:?}; this helper speaks \
+             transport 1 ({}), and refuses rather than guessing",
+            orxnud_capability::stdin_frame::VERSION_ARG
+        ));
+    }
+
     let path = flag(&args, "--path")?;
-    let contents = flag(&args, "--contents")?;
+
+    // The frame decides what the body is. A declared zero is a valid empty write; a
+    // short stream, a malformed header or trailing bytes are refusals, and none of them
+    // may produce a file -- an empty file written from an empty stream is exactly the
+    // "silently wrote something other than what was asked for" this refuses.
+    let mut stdin = std::io::stdin().lock();
+    let contents = orxnud_capability::stdin_frame::read_frame(&mut stdin)
+        .map_err(|e| format!("refusing the stdin frame: {e}"))?;
 
     // Absolute only. A relative path would resolve against `working_dir`, which the
     // sandbox sets inside its own tree — correct, but it makes the write depend on a
@@ -85,15 +121,31 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // Everything above this line can refuse with nothing written. The write itself is
+    // last, so there is no path that creates a file and then decides it had the wrong
+    // input.
     let mut file = std::fs::File::create(&normalised)
         .map_err(|e| format!("could not create {}: {e}", normalised.display()))?;
-    file.write_all(contents.as_bytes())
+    file.write_all(&contents)
         .map_err(|e| format!("could not write {}: {e}", normalised.display()))?;
     file.flush()
         .map_err(|e| format!("could not flush {}: {e}", normalised.display()))?;
     // No "created N bytes" on stdout: the verifier re-reads the file rather than
     // believing a number the writer produced.
     Ok(())
+}
+
+/// Reads `--flag=value` for a flag written in that form.
+///
+/// `flag` handles the two-argument form; the transport version is conventionally
+/// single-token so it is unmistakably metadata rather than a value that could be
+/// confused with user content.
+fn single(args: &[String], name: &str) -> Result<String, String> {
+    let prefix = format!("{name}=");
+    args.iter()
+        .find_map(|a| a.strip_prefix(&prefix))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{name} is required"))
 }
 
 /// Reads `--flag value`.

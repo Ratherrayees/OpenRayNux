@@ -37,6 +37,7 @@ pub mod credential;
 pub mod dispatch;
 pub mod read_text;
 pub mod schema;
+pub mod stdin_frame;
 pub mod subprocess;
 pub mod text;
 pub mod verification;

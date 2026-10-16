@@ -309,7 +309,13 @@ pub struct ExecutionContract {
     /// The program to execute. Absolute; never a shell string.
     pub program: String,
     /// Arguments, passed as a vector.
+    ///
+    /// **Never user-supplied content** -- see [`SandboxPlan::args`].
     pub args: Vec<String>,
+    /// The framed payload for the child's stdin, or `None`.
+    ///
+    /// Opaque to the transport: the sandbox writes these bytes and closes the stream.
+    pub stdin_payload: Option<Vec<u8>>,
     /// Environment variables the child may see. **Empty means none.**
     ///
     /// A credential is never placed here. Credentials travel through the
@@ -995,7 +1001,16 @@ pub struct SandboxPlan {
     /// Absolute path to the executable.
     pub program: String,
     /// Arguments.
+    ///
+    /// **Never user-supplied content.** Anything the user supplied travels in
+    /// `stdin_payload`, because `args` are world-readable through
+    /// `/proc/<pid>/cmdline` (V-67).
     pub args: Vec<String>,
+    /// The framed payload for the child's stdin, or `None`.
+    ///
+    /// Already framed by the capability that built this plan; the sandbox transports
+    /// these bytes opaquely and closes the stream after writing them.
+    pub stdin_payload: Option<Vec<u8>>,
     /// Environment the child may see. Empty means none.
     pub env: BTreeMap<String, String>,
     /// Working directory.

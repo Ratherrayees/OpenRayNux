@@ -179,7 +179,30 @@ docker run --rm \
     cargo test --workspace --no-run >/dev/null
     chown -R orxnud /target
 
+    # HOME and the XDG directories are set for the unprivileged run. This is not
+    # tidiness -- it is what makes the lane run at all.
+    #
+    # `setpriv` changes the uid but does not touch the environment, so the child
+    # inherited HOME=/root from the root shell that started it. cargo-nextest then
+    # looked for its user config under /root/.config and died:
+    #
+    #     error: failed to read user config at /root/.config/nextest/config.toml
+    #     Caused by: Permission denied (os error 13)
+    #
+    # which aborted the lane before a single Tier-1 test ran. Found by running this lane
+    # end to end for the first time; the defect predates S-17 and S-24.
+    #
+    # No apostrophes in this comment: the whole bootstrap is a single-quoted string
+    # passed to `bash -lc`, so one would terminate it. That is not a style preference --
+    # it is a syntax error, and the script would fail to run at all.
+    #
+    # The variables are set on the setpriv line rather than exported globally, so the
+    # root build above still sees the root environment.
     exec setpriv --reuid=1000 --regid=1000 --clear-groups \
                  --inh-caps=-all --bounding-set=-all -- \
+      env HOME=/home/orxnud \
+          XDG_CONFIG_HOME=/home/orxnud/.config \
+          XDG_CACHE_HOME=/home/orxnud/.cache \
+          XDG_DATA_HOME=/home/orxnud/.local/share \
       /bin/bash /inner.sh
   '

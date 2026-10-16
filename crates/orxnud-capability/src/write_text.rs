@@ -298,29 +298,37 @@ impl WriteTextBundle {
 }
 
 impl AdapterBundle for WriteTextBundle {
-    /// `true`, and this bundle is the reason the gate exists.
+    /// Still [`crate::dispatch::ArgvPayload::Content`] — and **no longer because of
+    /// `argv`**.
     ///
-    /// `sandbox_plan` puts the file's **contents** in `args` (`--contents <text>`),
-    /// because `SandboxSpec` has no stdin channel. Those arguments reach `bwrap`'s
-    /// command line, `bwrap` stays in the host PID namespace, and `/proc/<pid>/cmdline`
-    /// is world-readable — so any local uid can read the text for the life of the
-    /// execution (V-67, measured 2026-10-10).
+    /// This declaration used to describe a mechanism: `sandbox_plan` put the file's
+    /// contents in `args` (`--contents <text>`), those arguments reached `bwrap`'s
+    /// command line, and `/proc/<pid>/cmdline` is mode `0444` (V-67, measured
+    /// 2026-10-10). ADR-0054 removed that mechanism — the body now travels as a framed
+    /// payload on the child's stdin, and `args` carries only `--path` and the transport
+    /// version — so the honest description of *this function* is `None`.
     ///
-    /// Because this answers [`crate::dispatch::ArgvPayload::Content`], the dispatcher **refuses** this capability unless
-    /// an owner has explicitly permitted it. That refusal is the interim control; the
-    /// exposure itself is unfixed until the transport carries content out of `argv`.
+    /// It stays `Content` anyway, deliberately, and the reason is a governance one rather
+    /// than a descriptive one: **ADR-0054 Decision 7 keeps the refusal until all four of
+    /// R-1's evidence conditions pass**, and one of them — the credential sentinel — is
+    /// still unreachable while credential-bearing Tier-1 capabilities remain prohibited
+    /// (Decision 5). Answering `None` here would silently re-enable `write-text` on the
+    /// default posture, and the interim control would disappear as a side effect of the
+    /// fix rather than by a decision anyone made.
     ///
-    /// **No bound is claimed.** The payload is the caller's `contents`, byte for byte,
-    /// and this implementation imposes no limit on it, so there is no number here that
-    /// would be a fact about this code.
+    /// **So this answer is a switch that is held on, and it should say so loudly.** It
+    /// stops being `Content` the moment Decision 7's conditions are met — and it stops
+    /// being right the moment a future change puts user content back into `args`, which
+    /// is the failure it would then correctly catch.
     ///
-    /// The host kernel does impose one — `MAX_ARG_STRLEN`, defined as
-    /// `32 * PAGE_SIZE` including the terminator — but that is a **per-host** constant
-    /// (131072 on a 4 KiB page, 2097152 on a 64 KiB one), and reporting one of those
-    /// figures from portable core would put a host-specific number in a disclosure that
-    /// reads as a property of the implementation. A caller who exceeds it gets an
-    /// `execve` failure, not a smaller write, so it bounds the exposure rather than
-    /// describing it.
+    /// **No bound is claimed**, because the payload no longer passes through here at
+    /// all: the bound is `stdin_frame::MAX_PAYLOAD_BYTES` (1 MiB), enforced in
+    /// `sandbox_plan` before this bundle produces a plan, and it is counted in UTF-8
+    /// bytes of the normalised `contents`.
+    ///
+    /// The historical `MAX_ARG_STRLEN` figure no longer applies to this capability: that
+    /// was the host kernel's ceiling on a single `argv` string (131072 on a 4 KiB page,
+    /// 2097152 on a 64 KiB one) and nothing here is an `argv` string any more.
     fn argv_payload(&self) -> crate::dispatch::ArgvPayload {
         crate::dispatch::ArgvPayload::Content {
             implementation_bound: None,
@@ -356,18 +364,46 @@ impl AdapterBundle for WriteTextBundle {
         let parsed = parse(invocation.params()).map_err(PlanError::InvalidParams)?;
         let absolute = resolve(&self.workspace, &parsed.path).map_err(PlanError::InvalidParams)?;
 
+        // ADR-0054 Decision 2: the bound is checked **here**, before a `SandboxPlan`
+        // exists and therefore before any process does. Checking it at the transport
+        // would mean the refusal came after a spawn that had to be cleaned up.
+        //
+        // `contents.len()` is UTF-8 **bytes**, which is what Decision 2 specifies. A
+        // character count would admit up to four times this for non-ASCII text.
+        if parsed.contents.len() > crate::stdin_frame::MAX_PAYLOAD_BYTES {
+            return Err(PlanError::InvalidParams(format!(
+                "`contents` is {} bytes, over the {} byte limit; refusing rather than \
+                 truncating, because a shortened body would be a different write than the \
+                 one that was asked for",
+                parsed.contents.len(),
+                crate::stdin_frame::MAX_PAYLOAD_BYTES,
+            )));
+        }
+
+        // The frame is built here so a payload that cannot be framed never reaches the
+        // sandbox at all. `encode` re-checks the bound; this is belt and braces, and it
+        // is the same limit rather than a second one.
+        let frame = crate::stdin_frame::encode(parsed.contents.as_bytes())
+            .map_err(|e| PlanError::InvalidParams(format!("could not frame the payload: {e}")))?;
+
         Ok(Some(SandboxPlan {
             program: self.helper.display().to_string(),
-            // The contents travel in argv because `SandboxSpec` has no stdin channel.
-            // Recorded as a known limitation rather than worked around by smuggling
-            // data through the credential environment variable, which is redacted for
-            // credentials and would be a far worse place to put a payload.
+            // ADR-0054 Decision 1: the payload is **not** here. `argv` reaches the host
+            // process table -- `bwrap` is executed with it, stays in the host PID
+            // namespace, and `/proc/<pid>/cmdline` is mode `0444` -- and on the cgroup
+            // branch the joiner shell carries the same vector before it `exec`s `bwrap`.
+            // Only `--path` and the transport version remain, and neither is user content.
             args: vec![
                 "--path".to_owned(),
                 absolute.display().to_string(),
-                "--contents".to_owned(),
-                parsed.contents,
+                // ADR-0054 Decision 6: the version travels in argv so an incompatible
+                // helper can refuse by name instead of silently mismatching. It is
+                // non-sensitive, which is exactly why the payload may not join it.
+                crate::stdin_frame::VERSION_ARG.to_owned(),
             ],
+            // Decision 4: an empty payload is a *declared* zero, framed here rather than
+            // inferred by the receiver from a stream that happened to be empty.
+            stdin_payload: Some(frame),
             // Empty on purpose: a child that needs nothing from the environment should
             // not be offered any.
             env: Default::default(),
