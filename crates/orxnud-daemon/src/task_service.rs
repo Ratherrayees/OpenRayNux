@@ -330,6 +330,49 @@ impl TaskService {
         Ok(Scheduler::new(&mut self.engine).next_wakeup_ms(now_ms)?)
     }
 
+    /// Registers a schedule.
+    ///
+    /// The creation route the scheduler was missing. `Scheduler::add_schedule` existed
+    /// and was tested, but nothing in production called it, so no schedule could be
+    /// registered and the daemon's timer had nothing to fire — see `serve.rs`.
+    ///
+    /// Validation is the scheduler's, not this layer's: `new_schedule` rejects a bad cron
+    /// expression or an unknown timezone *at the point of creation* rather than at 3am on
+    /// the first pass that tries to use it. Duplicating that check here would be a second
+    /// definition of what a valid schedule is.
+    ///
+    /// `catch_up_cap` and `misfire` come from this service's own `EngineLimits`, so a
+    /// schedule cannot ask for a catch-up the engine would refuse.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskServiceError::Engine`] carrying the scheduler's reason: an id already taken,
+    /// an unparseable cron expression, or an unknown timezone.
+    pub fn add_schedule(
+        &mut self,
+        spec: &orxnud_domain::task_state::ScheduleSpec,
+        now_ms: i64,
+    ) -> Result<(), TaskServiceError> {
+        if self.stopped {
+            return Err(TaskServiceError::Stopped);
+        }
+        Ok(Scheduler::new(&mut self.engine).add_schedule(spec, now_ms)?)
+    }
+
+    /// Every enabled schedule.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::tick`].
+    pub fn schedules(
+        &mut self,
+    ) -> Result<Vec<orxnud_store::schedule_repo::ScheduleRow>, TaskServiceError> {
+        if self.stopped {
+            return Err(TaskServiceError::Stopped);
+        }
+        Ok(Scheduler::new(&mut self.engine).schedules()?)
+    }
+
     /// Claims one task for `worker`, if any is claimable.
     ///
     /// # Errors

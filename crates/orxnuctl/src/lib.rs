@@ -27,6 +27,7 @@ use std::fmt;
 
 pub mod client;
 pub mod provider;
+pub mod schedule;
 pub mod task;
 
 use orxnud_protocol::{PROTOCOL_VERSION, RpcErrorCode};
@@ -107,6 +108,27 @@ pub enum UnknownProviderCommand {
     Command(String),
 }
 
+/// The `schedule` subcommands.
+///
+/// Present because the daemon's scheduler had **no creation route** before this: a timer
+/// with nothing to fire is not a feature. Without a client verb, `schedule/create` would
+/// be reachable only from the test suite — which is the shape this repository is most
+/// careful to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleCommand {
+    /// Register a recurring schedule.
+    Add {
+        /// The schedule id.
+        id: String,
+        /// A cron expression.
+        cron: String,
+        /// The IANA timezone it is interpreted in. Never the daemon's ambient local time.
+        timezone: Option<String>,
+    },
+    /// Every enabled schedule, with the daemon's next wake-up.
+    List,
+}
+
 /// The subcommands that exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -120,6 +142,8 @@ pub enum Command {
     Capability(CapabilityCommand),
     /// Manage the proposal provider's credential, in the platform secret store.
     Provider(ProviderCommand),
+    /// Manage recurring schedules, through the local daemon.
+    Schedule(ScheduleCommand),
 }
 
 /// Why a command line could not be understood.
@@ -214,6 +238,7 @@ impl fmt::Display for Command {
             Self::Task(_) => "task",
             Self::Capability(_) => "capability",
             Self::Provider(_) => "provider",
+            Self::Schedule(_) => "schedule",
         };
         f.write_str(s)
     }
@@ -334,6 +359,39 @@ where
                 let (command, endpoint) = parse_capability(rest)?;
                 Ok(Invocation {
                     command: Command::Capability(command),
+                    endpoint: endpoint.map(Into::into),
+                })
+            }
+            "schedule" => {
+                // `--endpoint` lifted here for the same reason as `task` and `capability`:
+                // a client needs to be able to name the daemon it meant.
+                let (endpoint, rest) = lift_endpoint(args_after(&args, 1))?;
+                let Some((verb, rest)) = rest.split_first() else {
+                    return Err(CliError::MissingFlag {
+                        command: "schedule",
+                        flag: "a command: add or list",
+                    });
+                };
+                let mut flags = Flags::parse(verb, rest)?;
+                if endpoint.is_some() && flags.take_optional("--endpoint").is_some() {
+                    return Err(CliError::RepeatedFlag { flag: "--endpoint" });
+                }
+                let command = match verb.as_str() {
+                    "add" => {
+                        let id = flags.take("add", "--id")?;
+                        let cron = flags.take("add", "--cron")?;
+                        let timezone = flags.take_optional("--timezone");
+                        flags.reject_all("add")?;
+                        ScheduleCommand::Add { id, cron, timezone }
+                    }
+                    "list" => {
+                        flags.reject_all("list")?;
+                        ScheduleCommand::List
+                    }
+                    other => return Err(CliError::UnknownTaskCommand(other.to_owned())),
+                };
+                Ok(Invocation {
+                    command: Command::Schedule(command),
                     endpoint: endpoint.map(Into::into),
                 })
             }
@@ -640,7 +698,7 @@ impl Flags {
         // question, answered by what that verb `take`s and by `reject_all` refusing
         // whatever is left -- so `task create --target x` parses here and is then
         // refused by the verb, rather than being invisible to the task parser.
-        const KNOWN: [&str; 11] = [
+        const KNOWN: [&str; 13] = [
             "--id",
             "--kind",
             // How many logical steps a task may have. Optional, and defaulted by the
@@ -660,6 +718,11 @@ impl Flags {
             // recomputes its digest, so holding one grants nothing by itself.
             "--approval",
             "--ttl-ms",
+            // `schedule add`. The cron expression is one argument containing spaces, which
+            // is why it is quoted in every example: unquoted, a shell glob-expands it and
+            // the program never sees it.
+            "--cron",
+            "--timezone",
         ];
 
         let mut values: Vec<(&'static str, String)> = Vec::new();
@@ -939,6 +1002,7 @@ pub fn doctor_with(observed: Option<&serde_json::Value>) -> DoctorReport {
             "task complete",
             "task cancel",
             "capability run",
+            "schedule add",
         ],
     }
 }
@@ -1180,6 +1244,7 @@ mod tests {
                 "task complete",
                 "task cancel",
                 "capability run",
+                "schedule add",
             ],
             "doctor must not list a command that does not parse"
         );
@@ -1208,6 +1273,11 @@ mod tests {
             vec!["task", "complete", "--id", "x", "--worker", "w"],
             vec!["task", "cancel", "--id", "x"],
             vec!["capability", "run", "--capability", "x", "--params", "{}"],
+            // The cron expression is ONE argument containing spaces, exactly as a shell
+            // would deliver it after quoting. Unquoted, a shell glob-expands it before the
+            // program ever sees it -- so `--cron '* * * * * *'` is not a nicety but the
+            // only spelling that works, and the help text says so.
+            vec!["schedule", "add", "--id", "x", "--cron", "* * * * * *"],
         ];
         assert_eq!(
             invocations.len(),

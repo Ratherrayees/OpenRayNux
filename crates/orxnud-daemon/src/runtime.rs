@@ -32,7 +32,7 @@
 //! single-use did not survive a restart — the exact property 5B was written to
 //! establish, silently absent for a few milliseconds on every start.
 //!
-//! # Concurrency: serialised, on purpose
+//! # Concurrency: what is serialised, and what is not
 //!
 //! [`Daemon::dispatcher`] takes `&mut self` because the governed dispatcher holds
 //! `&mut PolicyEngine` — V-41's single-writer guarantee. So a governed dispatch is
@@ -41,8 +41,30 @@
 //! never possible, and the alternative would be to weaken the guarantee to gain
 //! throughput nobody needs yet.
 //!
-//! Status requests do **not** take that lock. They read immutable composition
-//! state, so a health check never queues behind a dispatch.
+//! **Three things therefore do not wait for that lock**, and each was measured rather
+//! than assumed. The transport is in [`crate::serve`].
+//!
+//! * **Connections are served concurrently**, each on its own task, within a bounded
+//!   ceiling and under a bounded deadline. This module used to await every connection
+//!   inline in the accept loop, so one peer that opened a socket and never finished its
+//!   frame prevented every other client from being served.
+//! * **`daemon/status` takes no lock at all.** It reads a snapshot of composition state
+//!   taken before the endpoint was bound (`serve::StatusSnapshot`), so a health check
+//!   cannot queue behind a dispatch or a model call.
+//! * **The provider's network round trip is not held under the lock.** Both model routes
+//!   are gathered, released, called and then written back under the repository's own
+//!   fencing — see `gather_proposal_context` and `call_provider`.
+//!
+//! # What is still serialised, and why that is not yet fixed
+//!
+//! **A Tier-1 dispatch holds the lock across the sandbox execution**, which is up to ten
+//! seconds. `Dispatcher::dispatch` is a synchronous function borrowing `&mut Daemon`, and
+//! it settles its own audit obligation internally, so there is no seam at which the lock
+//! could be released mid-effect without breaking that obligation. Narrowing it is a
+//! change to the dispatcher — a seam between "authorised and audited" and "executed and
+//! settled" — not to the transport, and it is **not** attempted here. What a request
+//! needs durable state will therefore still queue behind an in-flight sandboxed write; the
+//! health probe does not, which is why the diagnostic stays usable.
 //!
 //! Nothing holds the lock across a capability's execution *and* something that can
 //! block the runtime indefinitely: the deadline and output caps in the sandbox
@@ -357,7 +379,7 @@ pub enum RequestError {
 
 impl RequestError {
     /// The JSON-RPC error this becomes.
-    fn to_rpc(&self) -> RpcError {
+    pub(crate) fn to_rpc(&self) -> RpcError {
         match self {
             // Found by the V-90 sweep: this was the same defect as the dispatcher's
             // `e.to_string()` calls, on the frame-decode path rather than the dispatch
@@ -492,7 +514,12 @@ pub struct Runtime<S: SecretsContract> {
     /// interleave. Task operations therefore serialise against each other *and*
     /// against governed dispatch — which is a throughput question, deliberately not
     /// answered here.
-    governed: tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    ///
+    /// An `Arc` rather than a bare mutex so a per-connection task can hold it for the
+    /// life of that connection (`serve.rs`). A bare `Mutex` cannot cross a task boundary
+    /// at all, and the alternative — a `&'static` obtained by transmuting a borrow — is
+    /// exactly what gate **G4** exists to forbid.
+    governed: Arc<tokio::sync::Mutex<(Daemon, S, TaskService)>>,
     /// Approved, verified reads waiting to inform the next proposal.
     ///
     /// Its own small lock rather than the governed one, and deliberately: the governed mutex
@@ -503,7 +530,7 @@ pub struct Runtime<S: SecretsContract> {
     /// Ephemeral by decision (ADR-0045 D4): a restart empties it, which is the fail-safe
     /// direction. See `ObservationStore` for why erasure is a stronger form of single-use than
     /// a durable flag would be.
-    observations: std::sync::Mutex<crate::observation::ObservationStore>,
+    observations: Arc<std::sync::Mutex<crate::observation::ObservationStore>>,
     /// Held so a caller can report *which* backend answered.
     backend: &'static str,
     /// The endpoint removal to perform on shutdown, if any.
@@ -526,6 +553,13 @@ pub struct Runtime<S: SecretsContract> {
     /// Established once at startup from the bound endpoint's own metadata, and consulted
     /// for every connection. See [`InstallationIdentity`].
     installation: InstallationIdentity,
+    /// The composition facts `daemon/status` reports, read once while nothing else can
+    /// hold the mutex. See [`crate::serve::StatusSnapshot`] for why a health check must
+    /// not queue behind a dispatch.
+    status: Arc<crate::serve::StatusSnapshot>,
+    /// How long a connection may take and how many may be in flight. See
+    /// [`crate::serve::ServeLimits`]; every field is a bound, and none is unbounded.
+    limits: crate::serve::ServeLimits,
 }
 
 impl<S: SecretsContract> std::fmt::Debug for Runtime<S> {
@@ -537,7 +571,7 @@ impl<S: SecretsContract> std::fmt::Debug for Runtime<S> {
     }
 }
 
-impl<S: SecretsContract> Runtime<S> {
+impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     /// Starts a runtime: durable state, then composition, then the endpoint.
     ///
     /// # The ordering is the security property
@@ -654,16 +688,26 @@ impl<S: SecretsContract> Runtime<S> {
         // path on disk, and a runtime that could not read it will refuse every connection
         // rather than serve an unattributable one.
         let installation = InstallationIdentity::establish(&bound);
+        let governed = Arc::new(tokio::sync::Mutex::new((daemon, secrets, tasks)));
+
+        // Composition facts for `daemon/status`, read here — after security state is
+        // attached, before the endpoint is bound — so serving them later never needs the
+        // governed mutex. See `crate::serve::StatusSnapshot`.
+        let status = crate::serve::StatusSnapshot::capture(&*governed.lock().await);
 
         Ok(Self {
             endpoint: bound,
             listener: Arc::new(listener),
-            governed: tokio::sync::Mutex::new((daemon, secrets, tasks)),
-            observations: std::sync::Mutex::new(crate::observation::ObservationStore::new()),
+            governed,
+            observations: Arc::new(std::sync::Mutex::new(
+                crate::observation::ObservationStore::new(),
+            )),
             backend: orxnud_platform_ipc::backend_name(),
             cleanup: Some(endpoint),
             proposer,
             installation,
+            status: Arc::new(status),
+            limits: crate::serve::ServeLimits::default(),
         })
     }
 
@@ -780,6 +824,14 @@ impl<S: SecretsContract> Runtime<S> {
     /// the graceful part: a request already being served gets to reach a defined
     /// outcome rather than having its socket torn out from under it.
     ///
+    /// Each connection is served by its own task, and both a count and a time bound
+    /// apply — see [`crate::serve::ServeLimits`] for the values and the reasoning.
+    /// The previous implementation awaited every connection **inline** in this loop
+    /// with no deadline, so one peer that opened a socket and never finished its frame
+    /// prevented every other client from being served, for as long as it chose. That is
+    /// reproducible from any process running as the daemon's own user, and is what
+    /// `tests/serve_lifecycle.rs` now pins.
+    ///
     /// # The endpoint is released on *every* exit path
     ///
     /// This used to clean up after the loop, which meant any `?` between the loop
@@ -800,112 +852,52 @@ impl<S: SecretsContract> Runtime<S> {
     /// client sending nonsense is not a reason to take the daemon down. A peer that
     /// disappears mid-response is likewise not an error and is not reported as one.
     pub async fn serve(
-        self,
+        mut self,
         shutdown: impl std::future::Future<Output = ()>,
     ) -> Result<(), IpcError> {
-        let listener = Arc::clone(&self.listener);
-        // Hoisted because the loop polls the listener and consults the installation in
-        // one `select!` arm; holding a borrow of `self` across that `.await` is not
-        // possible, and re-reading an immutable `Copy` field would be noise.
-        let installation = self.installation;
-        // Taken before the loop and released on every exit, including the `?`s below.
-        let _release = EndpointRelease {
+        // The loop itself lives in `serve.rs`, beside the bounds that govern it. What
+        // moves across the boundary is only the state: `Arc`s the loop can hand to a
+        // per-connection task, plus the limits it enforces.
+        //
+        // `cleanup` is *taken* out of `self` rather than copied, because `serve` consumes
+        // the runtime and the endpoint guard must own the one value it may unlink. Taking
+        // it leaves `None` behind, so a second release cannot happen even if this function
+        // were somehow re-entered.
+        let cleanup = self.cleanup.take();
+        let serving = crate::serve::Serving {
             listener: Arc::clone(&self.listener),
-            path: self.cleanup,
+            governed: Arc::clone(&self.governed),
+            proposer: self.proposer.clone(),
+            observations: Arc::clone(&self.observations),
+            installation: self.installation,
+            status: Arc::clone(&self.status),
         };
-        tokio::pin!(shutdown);
-
-        loop {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => break,
-                accepted = listener.accept() => {
-                    let mut stream = match accepted {
-                        Ok(s) => s,
-                        // Closed during shutdown, or the socket went away. Either
-                        // way there is nothing left to serve.
-                        Err(IpcError::Disconnected) | Err(IpcError::Unsupported) => break,
-                        Err(e) => return Err(e),
-                    };
-                    // The identity decision is made here, before `handle_connection`
-                    // reads a single byte. That ordering is the property: no request is
-                    // ever parsed, let alone routed, by a caller whose identity is
-                    // unknown or wrong, so there is no path from "connected" to "granted
-                    // authority" that skips this check.
-                    let authenticated = match authenticate(&stream, installation) {
-                        Ok(principal) => principal,
-                        Err(refusal) => {
-                            // Answered and then dropped, so the peer learns *why* rather
-                            // than seeing a connection reset. The connection ends either
-                            // way: a refused caller gets no channel to speak on.
-                            let response = Response::err(
-                                RequestId::Text("unknown".to_owned()),
-                                refusal.to_rpc(),
-                            );
-                            let _ = write_response(&mut stream, &response).await;
-                            continue;
-                        }
-                    };
-                    // One connection at a time, in the accept loop rather than in a
-                    // spawned task. The governed path is single-writer anyway, so
-                    // overlapping connections would only queue on the same mutex --
-                    // and handling them here means the loop cannot outlive `self`.
-                    let served = handle_connection(
-                        &mut stream,
-                        authenticated,
-                        &self.governed,
-                        &self.proposer,
-                        &self.observations,
-                    )
-                    .await;
-                    if let Err(IpcError::Disconnected) = served {
-                        // A client that opened and closed is not a failure, and
-                        // neither is one that vanished while we were answering it.
-                        // Both are the same event seen from two ends of the socket.
-                        continue;
-                    }
-                    served?;
-                }
-            }
-        }
-
-        Ok(())
+        crate::serve::serve(serving, self.limits, cleanup, shutdown).await
     }
-}
 
-/// Closes the listener and removes the endpoint this runtime created.
-///
-/// Held for the duration of [`Runtime::serve`] so the endpoint cannot outlive the
-/// runtime on any path, including an early return on a genuine transport error.
-///
-/// # Why the removal is still safe
-///
-/// The path here is not arbitrary: it is the endpoint [`Runtime::start`] successfully
-/// bound, and `orxnud_platform_ipc::bind` **refuses** a path another live daemon is
-/// listening on rather than unlinking it. So by the time a guard exists, the socket
-/// file is this runtime's own. Removing a file that has since been replaced by
-/// something else is the one case worth guarding against, and the check below does
-/// exactly that -- it unlinks only a socket file, and only at the recorded path.
-///
-/// A failure to remove is ignored on purpose: it is not the error the caller asked
-/// about, and inventing a second failure here would replace a real diagnosis with a
-/// cosmetic one.
-struct EndpointRelease {
-    listener: Arc<orxnud_platform_ipc::Listener>,
-    path: Option<PathBuf>,
-}
+    /// The bounds this runtime's serving loop enforces.
+    ///
+    /// Read-only: the values are fixed at composition, because a limit that could be
+    /// changed while serving would be a limit that could be raced.
+    pub fn limits(&self) -> crate::serve::ServeLimits {
+        self.limits
+    }
 
-impl Drop for EndpointRelease {
-    fn drop(&mut self) {
-        // Stop accepting before the path goes away, so a client that connected
-        // before shutdown is never refused by a vanished endpoint.
-        self.listener.close();
-        if let Some(path) = self.path.take() {
-            // The platform crate owns both the platform knowledge this needs and the
-            // ownership rule: it bound the path, and it is the only place that may
-            // unlink a socket file.
-            orxnud_platform_ipc::release_endpoint(&path);
-        }
+    /// This runtime with different serving bounds.
+    ///
+    /// A builder rather than a configuration value, for the same reason the argv-payload
+    /// exception is not one: a bound is a safety property, and a value that anything
+    /// running as the user could set would be settable by a shell profile or a compromised
+    /// dependency without an owner ever accepting it. Taken here, before `serve`, the
+    /// change lands in review.
+    ///
+    /// Exists so the bounds can be driven *small* in a test without waiting out the
+    /// production values - which is the only way to assert that a deadline is enforced
+    /// rather than merely present.
+    #[must_use]
+    pub fn with_limits(mut self, limits: crate::serve::ServeLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -916,14 +908,47 @@ impl Drop for EndpointRelease {
 /// [`IpcError`] if the peer could not be read from or written to. A *request* error
 /// is answered on the wire and reported as `Ok`, because the peer did exactly what
 /// we should let it do and learn that it was wrong.
-async fn handle_connection<S: SecretsContract>(
+pub(crate) async fn handle_connection<S: SecretsContract>(
     stream: &mut LocalStream,
     authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
+    status: &crate::serve::StatusSnapshot,
+    frame_read: std::time::Duration,
 ) -> Result<(), IpcError> {
-    let bytes = match stream.read_line_bounded(MAX_REQUEST_BYTES).await {
+    // The deadline on the read, and only on the read.
+    //
+    // `MAX_REQUEST_BYTES` bounds how *much* a peer may send; this bounds how *long* it may
+    // take. Both are needed and neither substitutes for the other: a size bound alone
+    // leaves a peer free to send one byte per hour forever, and a time bound alone leaves
+    // it free to send 8 MiB in one millisecond.
+    //
+    // A peer that runs out of time is *not* a transport fault and *not* a disconnect. It
+    // is answered with `Unavailable`, whose recovery is external — the daemon is fine,
+    // the client was too slow — and the connection is dropped so the slot it held returns.
+    let bytes =
+        match tokio::time::timeout(frame_read, stream.read_line_bounded(MAX_REQUEST_BYTES)).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let response = Response::err(
+                    RequestId::Text("unknown".to_owned()),
+                    RequestError::Unavailable {
+                        reason: "request-read-deadline-exceeded".to_owned(),
+                        detail: Some(format!(
+                            "this peer did not finish sending one request within {}ms",
+                            frame_read.as_millis()
+                        )),
+                    }
+                    .to_rpc(),
+                );
+                // Best effort: if the peer is gone the answer is moot, and the connection ends
+                // either way. A failure to write is not a reason to keep the slot.
+                let _ = write_response(stream, &response).await;
+                return Ok(());
+            }
+        };
+    let bytes = match bytes {
         Ok(b) => b,
         // A peer that opened and closed is not an error, and neither is one we
         // simply failed to read: both end the connection without an answer.
@@ -957,7 +982,15 @@ async fn handle_connection<S: SecretsContract>(
     };
 
     let id = request.id.clone();
-    let outcome = route(&request, authenticated, governed, provider, observations).await;
+    let outcome = route(
+        &request,
+        authenticated,
+        governed,
+        provider,
+        observations,
+        status,
+    )
+    .await;
     let response = match outcome {
         Ok(result) => Response::ok(id, result),
         Err(e) => Response::err(id, e.to_rpc()),
@@ -1073,7 +1106,7 @@ pub struct ArgvExposureEntry {
 /// field **absent** rather than `null`: absence is the signal, and a constant string (or a
 /// constant `null`) would be a field that always reads the same and therefore says
 /// nothing about whether it applies here.
-fn argv_payload_disclosure<S: SecretsContract>(
+pub(crate) fn argv_payload_disclosure<S: SecretsContract>(
     governed: &(Daemon, S, TaskService),
 ) -> Option<ArgvPayloadDisclosure> {
     // The dispatcher's own permit set, not a configuration lookup: there is no
@@ -1173,12 +1206,14 @@ pub fn join_sized(entries: &[ArgvExposureEntry]) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route<S: SecretsContract>(
     request: &Request,
     authenticated: AuthenticatedPrincipal,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
     provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
+    status: &crate::serve::StatusSnapshot,
 ) -> Result<serde_json::Value, RequestError> {
     // Derived once per connection, before a method is chosen. Handlers receive the
     // *actor* rather than the principal, so nothing below this line can re-derive an
@@ -1190,18 +1225,28 @@ async fn route<S: SecretsContract>(
 
     match method {
         Method::DaemonStatus => {
-            // No lock: the fields are composition state, immutable while serving.
-            let g = governed.lock().await;
+            // **No lock**, and deliberately. Every field here is composition state fixed
+            // before the endpoint was bound, so reading it through the single-writer
+            // mutex bought nothing and cost responsiveness: `doctor` is the command a
+            // person runs when they think something is wrong, and it must not queue
+            // behind a 60-second provider call or a 10-second sandboxed write. See
+            // `crate::serve::StatusSnapshot`.
+            //
+            // The runtime sandbox capability below is the one field that is *not* from
+            // the snapshot, because it is a property of the host rather than of the
+            // composition and it is what the dispatcher consults; it is also a cheap
+            // probe that takes no lock, so reading it now keeps the answer current
+            // rather than reporting a cached verdict.
             // The host's *runtime* sandbox capability, not just the compile-time backend
             // name. `transport` above answers "which backend did this build select";
             // this answers "can a Tier-1 capability actually run here", which is the
             // question a caller — including the end-to-end tests — actually needs, and
             // the one that explains a refusal instead of hiding behind the name.
             let sandbox = orxnud_platform_sandbox::host_capability();
-            let mut status = json!({
+            let mut reply = json!({
                 "status": "running",
                 "protocol": orxnud_protocol::version::PROTOCOL_VERSION.as_u16(),
-                "durable_audit": g.0.has_durable_audit(),
+                "durable_audit": status.durable_audit(),
                 "transport": orxnud_platform_ipc::backend_name(),
                 "sandbox": {
                     "backend": sandbox.backend,
@@ -1211,7 +1256,7 @@ async fn route<S: SecretsContract>(
                     "resources": sandbox.guarantees.resources,
                     "tier1_executable": sandbox.tier1_executable,
                 },
-                "capabilities_enabled": g.0.components().enabled_capabilities(),
+                "capabilities_enabled": status.enabled_capabilities(),
             });
             // Absent when no registered bundle exposes a payload, so its presence is
             // itself the signal. A constant string here would be a field that always
@@ -1222,8 +1267,8 @@ async fn route<S: SecretsContract>(
             // a client distinguishing "not applicable" from "the value is null" would
             // have to know this implementation's internal type. The field has to be
             // *absent*, so it is inserted only when it has something to say.
-            insert_argv_disclosure(&mut status, argv_payload_disclosure(&g));
-            Ok(status)
+            insert_argv_disclosure(&mut reply, status.argv_payload().cloned());
+            Ok(reply)
         }
         Method::DaemonVersion => Ok(json!({
             "current": orxnud_protocol::version::PROTOCOL_VERSION.as_u16(),
@@ -1238,6 +1283,13 @@ async fn route<S: SecretsContract>(
             }))
         }
         Method::Echo => Ok(request.params.clone().unwrap_or(json!({}))),
+        // Schedules are first-party durable state like the tasks. They grant nothing:
+        // registering a schedule stores a row and nothing more, and the daemon's own timer
+        // reads it. See `schedule` for why the authorised-by id is the authenticated
+        // principal's rather than anything the request could have named.
+        Method::ScheduleCreate | Method::ScheduleList => {
+            schedule(method, request, authenticated, governed).await
+        }
         Method::CapabilityDispatch => dispatch(request, &actor, governed).await,
         Method::CapabilityApprove => approve(request, &actor, governed).await,
         // First-party durable state, not capability execution. These go to the
@@ -1309,7 +1361,7 @@ const STANDALONE_APPROVAL_STEP: u32 = 1;
 /// socket that cannot be attributed to anyone, which is the state this change exists to
 /// end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallationIdentity {
+pub(crate) enum InstallationIdentity {
     /// The bound endpoint is owned by this uid.
     Owned(u32),
     /// The owner could not be established. Every connection is refused.
@@ -1354,7 +1406,7 @@ impl InstallationIdentity {
 /// established is refused before it becomes one of these, so the absence of such a case
 /// is the type saying that an unauthenticated caller cannot be *represented* as a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthenticatedPrincipal {
+pub(crate) enum AuthenticatedPrincipal {
     /// The peer is the operating-system user this installation belongs to.
     ///
     /// Carries no uid of its own: the installation already is the identity, and keeping a
@@ -1409,7 +1461,7 @@ impl AuthenticatedPrincipal {
 /// not the owner; how the daemon knows that is not information it is entitled to, and a
 /// uid in an error message would be an operating-system identifier leaving the daemon for
 /// no benefit.
-fn authenticate(
+pub(crate) fn authenticate(
     stream: &LocalStream,
     installation: InstallationIdentity,
 ) -> Result<AuthenticatedPrincipal, RequestError> {
@@ -1526,10 +1578,30 @@ async fn ai_propose<S: SecretsContract>(
     let worker = required_str(&params, "worker")?;
     check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
 
-    let mut g = governed.lock().await;
-    let now = g.2.clock_now_ms();
+    // The gather/call/persist split, written out here rather than hidden behind a helper,
+    // because **the release is the whole point** and a reader should not have to know a
+    // helper exists to see it:
+    //
+    //   lock -> gather the menu and the context      (durable reads, no waiting)
+    //   drop the lock
+    //   call the provider                          (up to 60s, no lock held)
+    //   lock -> persist, under the repository's own fencing
+    //
+    // The `?` between the phases means the lock is *not* held on the error path either,
+    // which is what stops a failed model call from being the thing that wedges the daemon.
+    // Everything `persist_proposal` and `complete_task_with` need is re-validated by the
+    // store inside its own transaction, so a task that changed state during the call is
+    // refused at the write rather than written on stale knowledge.
+    let (asked, now) = {
+        let mut g = governed.lock().await;
+        let now = g.2.clock_now_ms();
+        let ask = gather_proposal_context(&mut g, provider, &task_id, observations)?;
+        (ask, now)
+    };
+    let text = call_provider(provider, &asked.ctx).await?;
+    let asked = interpret_provider_answer(text, &asked)?;
 
-    let asked = ask_next_step(&mut g, provider, &task_id, observations).await?;
+    let mut g = governed.lock().await;
     let disclosed_json = disclosure_json(&asked.disclosed);
     let validated = match asked.outcome {
         crate::proposer::ProposalOutcome::Step(v) => v,
@@ -1591,27 +1663,42 @@ async fn ai_propose<S: SecretsContract>(
     }))
 }
 
-/// Asks the configured provider what a task should do next, and interprets the answer.
+/// Everything the model is shown, gathered while the governed state is locked.
 ///
-/// Shared by `task/ai-propose` and `task/continue` so the two cannot drift: the context
-/// the model is shown, the strict parse, the allowlist check and the refusal taxonomy are
-/// all one implementation, and a change to what the model is offered cannot land in one
-/// route and not the other.
+/// # Shared, so the two model routes cannot drift
+///
+/// `task/ai-propose` and `task/continue` both come through here and through
+/// [`call_provider`] and [`interpret_provider_answer`], so what the model is shown, the
+/// strict parse, the allowlist check and the refusal taxonomy are one implementation. A
+/// change to what the model is offered cannot land in one route and not in the other.
 ///
 /// The task is re-read here rather than passed in, because both callers need the row they
-/// read for a different reason (one to check a lease, one to check a boundary) and the
+/// read for a different reason — one to check a lease, one to check a boundary — and the
 /// `attempt_no` in the context must be the attempt the claim just created.
 ///
-/// # Errors
+/// # Why this is a separate function
 ///
-/// [`RequestError::Invalid`] if the task is gone, or a structured refusal when the
-/// provider could not answer or its answer is not one this build understands.
-async fn ask_next_step<S: SecretsContract>(
+/// Before the split, this whole assembly ran inside `ask_next_step`, which held the
+/// governed mutex across the provider's network round trip. That made a slow model — up
+/// to `http_provider.rs`'s 60 s — hold the single mutex that every other request needs,
+/// including `daemon/status`. Concurrency at the transport was therefore necessary but
+/// not sufficient: a spawned connection would still queue behind the mutex.
+///
+/// Everything here is local durable state and an in-memory scan. None of it waits on
+/// anything outside the process, so holding the mutex across it costs nothing and is the
+/// simpler, safer shape.
+///
+/// The disclosure release is the one part that *mutates* something, and it mutates the
+/// observation store — which has its own lock precisely so it is not on the governed
+/// mutex's critical path. Recording a disclosure before the request that carries it is the
+/// property that matters and it is preserved: if the model then cannot be asked, the
+/// content has already been recorded as disclosed, which is the conservative direction.
+fn gather_proposal_context<S: SecretsContract>(
     g: &mut (Daemon, S, TaskService),
     provider: &Arc<dyn crate::proposer::ProposalProvider>,
     task_id: &str,
     observations: &std::sync::Mutex<crate::observation::ObservationStore>,
-) -> Result<AskOutcome, RequestError> {
+) -> Result<ProposalAsk, RequestError> {
     // The task's own words. Read here, from durable state, so the model is shown what
     // was actually asked rather than what a caller says was asked.
     let row =
@@ -1694,20 +1781,65 @@ async fn ask_next_step<S: SecretsContract>(
     // report what was disclosed without keeping a second copy of the bytes.
     let disclosed = disclosures.summary();
 
-    let ctx = crate::proposer::ProposalContext {
-        task_id: task_id.to_owned(),
-        content: row.payload.clone().unwrap_or_default(),
-        attempt_no: row.attempts,
-        allowed,
-        prior_steps,
-        disclosures,
-    };
+    Ok(ProposalAsk {
+        ctx: crate::proposer::ProposalContext {
+            task_id: task_id.to_owned(),
+            content: row.payload.clone().unwrap_or_default(),
+            attempt_no: row.attempts,
+            allowed,
+            prior_steps,
+            disclosures,
+        },
+        registered_ids,
+        disclosed,
+    })
+}
 
-    // The provider trait is synchronous, and a synchronous network call inside an async
-    // task would occupy a runtime worker for the length of a model call. Handing it to the
-    // blocking pool keeps the trait free of async -- which is what stops every implementor
-    // and every test from needing a runtime -- without holding a worker thread hostage
-    // meanwhile.
+/// Everything one model question needs, gathered with the governed state locked.
+///
+/// A struct rather than three return values because the three travel together into the
+/// unlocked phase and naming them at the call site would be noise. `registered_ids` is
+/// carried deliberately: the allowlist check after the call must be against the registry
+/// **as it was when the menu was built**, not against whatever it is by the time the model
+/// answers. Re-reading it later would let a capability registered mid-call become
+/// proposable on the strength of a menu that never mentioned it.
+struct ProposalAsk {
+    ctx: crate::proposer::ProposalContext,
+    registered_ids: Vec<String>,
+    disclosed: Vec<crate::observation::DisclosureSummary>,
+}
+
+/// Asks the provider, with **no governed lock held**.
+///
+/// # Why this is a separate function, and why that matters
+///
+/// This is the change that makes transport concurrency *sufficient*. Before it, the call
+/// sat between `governed.lock().await` and the proposal write, so a 60-second model round
+/// trip held the one mutex every other request needs. A spawned connection would have
+/// queued on it exactly as the inline one did, which is why transport concurrency alone
+/// would have looked like a fix and not been one.
+///
+/// Two properties make the release safe:
+///
+/// * **Nothing here touches governed state.** The provider trait is a question about
+///   itself and a text generator; it holds no handle on tasks, proposals, approvals,
+///   policy, the audit chain or the filesystem.
+/// * **The proposal write re-validates under its own transaction.** `propose_action`
+///   re-reads the task's state and its live lease holder inside one SQLite transaction and
+///   refuses unless the task is still `Running` under *this worker's* live lease. A task
+///   claimed away, completed, cancelled or let-expire during the model call is therefore
+///   refused **at the write**, not written on stale knowledge. The mutex was a convenience
+///   serialiser; the repository has always been the authority.
+///
+/// # The provider stays synchronous
+///
+/// Handing it to the blocking pool keeps the trait free of async -- which is what stops
+/// every implementor and every test from needing a runtime -- and keeps a synchronous
+/// network call from occupying a runtime worker for the length of a model call.
+async fn call_provider(
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+    ctx: &crate::proposer::ProposalContext,
+) -> Result<String, RequestError> {
     let asker = Arc::clone(provider);
     let for_call = ctx.clone();
     let answered = tokio::task::spawn_blocking(move || asker.complete(&for_call))
@@ -1718,27 +1850,36 @@ async fn ask_next_step<S: SecretsContract>(
                 .to_owned(),
             detail: Some(format!("the provider task did not finish: {e}")),
         })?;
-    let text = answered.map_err(|e| {
-        // A provider failure is not a declined request: the caller did nothing wrong and
-        // the deterministic reason is preserved so a client can tell "the model said no"
-        // from "the model could not be asked".
-        RequestError::ProviderRefused {
-            reason: e.reason().to_owned(),
-            detail: Some(e.to_string()),
-        }
+    // A provider failure is not a declined request: the caller did nothing wrong and the
+    // deterministic reason is preserved so a client can tell "the model said no" from "the
+    // model could not be asked".
+    answered.map_err(|e| RequestError::ProviderRefused {
+        reason: e.reason().to_owned(),
+        detail: Some(e.to_string()),
+    })
+}
+
+/// Interprets the model's text against the menu it was shown.
+///
+/// Reads no governed state, so the validation is a pure function of the answer and the
+/// question. Kept separate so "the allowlist check happens here, against the registry as it
+/// was when the menu was built" has one place to look.
+fn interpret_provider_answer(text: String, ask: &ProposalAsk) -> Result<AskOutcome, RequestError> {
+    let outcome = crate::proposer::validate(&text, &ask.ctx, &|id| {
+        ask.registered_ids.iter().any(|r| r == id)
+    })
+    .map_err(|e| RequestError::Declined {
+        reason: e.reason().to_owned(),
+        // The refusal's own words, not a fixed string: "which field was wrong" is
+        // the only thing that lets an operator tell a model that misunderstood the
+        // shape from a capability that has drifted from its declaration.
+        detail: Some(e.to_string()),
     })?;
 
-    let outcome =
-        crate::proposer::validate(&text, &ctx, &|id| registered_ids.iter().any(|r| r == id))
-            .map_err(|e| RequestError::Declined {
-                reason: e.reason().to_owned(),
-                // The refusal's own words, not a fixed string: "which field was wrong" is
-                // the only thing that lets an operator tell a model that misunderstood the
-                // shape from a capability that has drifted from its declaration.
-                detail: Some(e.to_string()),
-            })?;
-
-    Ok(AskOutcome { outcome, disclosed })
+    Ok(AskOutcome {
+        outcome,
+        disclosed: ask.disclosed.clone(),
+    })
 }
 
 /// What one provider question produced: the answer, and what was sent to get it.
@@ -1920,12 +2061,31 @@ async fn continue_task<S: SecretsContract>(
     // From here the boundary is crossed, so every failure has to put it back — otherwise
     // the task is left holding a lease for a step that will never be proposed and
     // continuation can never be retried.
-    let asked = match ask_next_step(&mut g, provider, &task_id, observations).await {
-        Ok(asked) => asked,
-        Err(e) => {
-            let why = e.to_string();
-            release_to_boundary(&mut g, &id, &worker, now, &why);
-            return Err(e);
+    // The same gather/call/persist split as `ai_propose`, and for the same reason.
+    //
+    // Here it additionally lines up with what this function's own documentation already
+    // promised: "the claim and the proposal are not atomic, deliberately -- a model call
+    // can take seconds". The claim commits first, the boundary is released again if the
+    // model cannot be asked, and a crash between the two leaves a `Running` task with no
+    // proposal that recovers the ordinary way. Releasing the *mutex* across the call
+    // extends that same window to the daemon's other clients: nothing here claims the task
+    // was untouched, only that the claim is fenced and the boundary releasable, both of
+    // which the store enforces.
+    let asked = {
+        let ask = gather_proposal_context(&mut g, provider, &task_id, observations);
+        let call = match ask {
+            Ok(ask) => call_provider(provider, &ask.ctx)
+                .await
+                .and_then(|text| interpret_provider_answer(text, &ask)),
+            Err(e) => Err(e),
+        };
+        match call {
+            Ok(asked) => asked,
+            Err(e) => {
+                let why = e.to_string();
+                release_to_boundary(&mut g, &id, &worker, now, &why);
+                return Err(e);
+            }
         }
     };
 
@@ -4097,6 +4257,127 @@ const MAX_MAX_STEPS: u32 = 64;
 /// capability invocation would mean asking the policy engine to authorise the daemon
 /// writing its own queue, and would put a row in the capability audit chain for
 /// something that has no capability, no target and no side effect.
+/// Registers or lists schedules.
+///
+/// # Why this route had to be added
+///
+/// `TaskService::tick` and `next_wakeup_ms` existed, were tested, and had **no production
+/// caller**: `Scheduler::add_schedule` had no route either, so no schedule could be
+/// registered, so the timer had nothing to fire. A scheduler that cannot be written to is
+/// not an unwired feature; it is an unreachable one. Adding the timer without this route
+/// would have produced a test-only capability, which is the shape this repository is most
+/// careful to avoid.
+///
+/// # What it grants, and what it does not
+///
+/// Nothing. A schedule is a row the daemon owns, exactly like a task: registering one
+/// performs no capability invocation, resolves no credential, and creates no proposal. The
+/// occurrence it eventually produces is a `Pending` task, which then goes through the
+/// ordinary claim/propose/approve/execute route — so nothing here is a way around the
+/// governed path, and nothing here is authorised *by* the schedule.
+///
+/// # Why `authorised_by` is the authenticated principal
+///
+/// It is taken from `AuthenticatedPrincipal::user()`, not from the request. A schedule
+/// record that named its own author would be an assertion about a string, which is exactly
+/// what ADR-0051 removed from the actor path.
+#[allow(clippy::too_many_arguments)]
+async fn schedule<S: SecretsContract>(
+    method: Method,
+    request: &Request,
+    authenticated: AuthenticatedPrincipal,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let mut g = governed.lock().await;
+    let now = g.2.clock_now_ms();
+
+    match method {
+        Method::ScheduleCreate => {
+            let id = required_str(&params, "id")?;
+            check_len("id", &id, MAX_TASK_ID_BYTES)?;
+            let cron = required_str(&params, "cron")?;
+            check_len("cron", &cron, MAX_TASK_CONTENT_BYTES)?;
+            // Defaults, stated rather than implied: the daemon's ambient local time is
+            // never used, because a schedule whose meaning depends on the machine it was
+            // registered on is not a schedule the user can reason about. `UTC` is
+            // explicit and documented in the reply.
+            let timezone = optional_str(&params, "timezone")?.unwrap_or_else(|| "UTC".to_owned());
+            let authorised_by = authenticated.user();
+            let limits = g.2.limits();
+            // The scheduler owns validation: a bad cron expression or an unknown timezone
+            // is refused here, at the point of creation, rather than at 3am on the first
+            // pass that tries to use it.
+            let spec = orxnud_task::scheduler::new_schedule(
+                &id,
+                &cron,
+                &timezone,
+                authorised_by.as_str(),
+                limits,
+            )
+            .map_err(|e| RequestError::InvalidInput {
+                reason: "schedule-rejected".to_owned(),
+                detail: Some(e.to_string()),
+            })?;
+            g.2.add_schedule(&spec, now).map_err(schedule_fault)?;
+            Ok(json!({
+                "schedule": spec.id.as_str(),
+                "cron": spec.cron,
+                "timezone": spec.timezone,
+                "misfire": format!("{:?}", spec.misfire),
+                "catch_up_cap": spec.catch_up_cap,
+                "enabled": spec.enabled,
+                "authorised_by": spec.authorised_by.as_str(),
+                "next_wakeup_ms": g.2.next_wakeup_ms(now).ok().flatten(),
+            }))
+        }
+        Method::ScheduleList => {
+            let rows = g.2.schedules().map_err(schedule_fault)?;
+            Ok(json!({
+                "schedules": rows
+                    .iter()
+                    .map(|r| json!({
+                        "id": r.id.as_str(),
+                        "cron": r.cron,
+                        "timezone": r.timezone,
+                        "enabled": r.enabled,
+                        "authorised_by": r.authorised_by.as_str(),
+                        "last_fired_ms": r.last_fired_ms,
+                        "created_at_ms": r.created_at_ms,
+                    }))
+                    .collect::<Vec<_>>(),
+                "next_wakeup_ms": g.2.next_wakeup_ms(now).ok().flatten(),
+            }))
+        }
+        // Unreachable: `route` only sends this function the two methods above. Written as
+        // a refusal rather than an `unreachable!` because a future arm added here must fail
+        // closed, and a panic in a daemon is not failing closed.
+        _ => Err(RequestError::UnknownMethod(method.as_str().to_owned())),
+    }
+}
+
+/// A scheduler fault as a request error.
+///
+/// `InvalidInput` rather than `Internal`: an unusable cron expression or an id already
+/// taken is the caller's to fix, and reporting it as an internal fault would send an
+/// operator to a bug report instead of their own request.
+fn schedule_fault(e: crate::task_service::TaskServiceError) -> RequestError {
+    use crate::task_service::TaskServiceError;
+    match e {
+        TaskServiceError::Engine(inner) => RequestError::InvalidInput {
+            reason: "schedule-rejected".to_owned(),
+            detail: Some(inner.to_string()),
+        },
+        // A stopped service cannot accept a schedule; the daemon is shutting down.
+        TaskServiceError::Stopped => RequestError::Unavailable {
+            reason: "shutting-down".to_owned(),
+            detail: Some(
+                "the daemon is shutting down and is not accepting new schedules".to_owned(),
+            ),
+        },
+    }
+}
+
 async fn tasks<S: SecretsContract>(
     method: Method,
     request: &Request,
@@ -4571,7 +4852,10 @@ async fn dispatch<S: SecretsContract>(
 }
 
 /// Writes one response frame.
-async fn write_response(stream: &mut LocalStream, response: &Response) -> Result<(), IpcError> {
+pub(crate) async fn write_response(
+    stream: &mut LocalStream,
+    response: &Response,
+) -> Result<(), IpcError> {
     let bytes = response
         .encode()
         .map_err(|e| IpcError::Other(e.to_string()))?;
@@ -4581,6 +4865,89 @@ async fn write_response(stream: &mut LocalStream, response: &Response) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The effect critical section never suspends, so a request deadline cannot interrupt
+    /// a reserved-but-unsettled effect.
+    ///
+    /// # What this pins
+    ///
+    /// `serve_one` wraps the whole of `handle_connection` in a `tokio::time::timeout`.
+    /// A timeout can only fire when polled, and a future is only polled at an `.await`.
+    /// `execute_proposal` therefore has a guarantee that holds only because of its *shape*:
+    /// its one `.await` is the `governed.lock()` **before** the effect is reserved, so
+    /// spending the approval, reserving the effect, dispatching into the sandbox and
+    /// settling the result all run without a suspension point.
+    ///
+    /// That is what makes "a timeout cannot turn a possibly-completed non-idempotent
+    /// effect into a retryable one" structural rather than lucky. Without this check it
+    /// would be a comment: adding one `.await` between the reservation and its settlement
+    /// would silently reintroduce a window in which a 120-second deadline could cut a
+    /// governed dispatch in half.
+    ///
+    /// # Why a source check and not a runtime test
+    ///
+    /// A behavioural test cannot observe the absence of a suspension point, and the
+    /// property is not about any observable state — it is about where the compiler is
+    /// allowed to yield. The same reasoning as the argv-payload source check in this file:
+    /// only a check that reads the *code* can fail on the *code*.
+    ///
+    /// The check is lexical and therefore needs the same care as any text scan: it counts
+    /// `.await` occurrences in code positions only, so a mention in a comment — which is
+    /// how the lock scope was once documented in this very function — cannot satisfy or
+    /// fail it.
+    #[test]
+    fn the_effect_critical_section_never_suspends() {
+        // Read this file rather than using `line!`-style spans, because the property is
+        // about a *range* of the source and a span would move with every edit above it.
+        let source = include_str!("runtime.rs");
+        let lines: Vec<&str> = source.lines().collect();
+
+        // The markers are the statements whose order defines the window. Locating them by
+        // text rather than by a fixed line number is what lets this survive the edits above
+        // without being updated.
+        let reserve = lines
+            .iter()
+            .position(|l| l.contains(".reserve_effect("))
+            .expect("execute_proposal must reserve an effect");
+        let settle = lines
+            .iter()
+            .position(|l| l.contains(".resolve_effect("))
+            .expect("execute_proposal must settle an effect");
+        assert!(
+            settle > reserve,
+            "the reservation must precede the settlement; found reserve at {reserve} and              settle at {settle}"
+        );
+
+        // `.await` inside the window, in a code position. `split("//")` is not enough on its
+        // own, because a string literal may contain `//`; so the check requires the `//` to
+        // be preceded only by whitespace, which is what a line comment looks like.
+        let offending: Vec<(usize, &str)> = lines
+            .iter()
+            .enumerate()
+            .skip(reserve)
+            .take(settle - reserve)
+            .filter_map(|(i, l)| {
+                let before_comment = l.split("//").next().unwrap_or(l);
+                if !before_comment.contains(".await") {
+                    return None;
+                }
+                Some((i + 1, *l))
+            })
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "an `.await` was added between reserving an effect (line {}) and settling it \
+             (line {}): {:?}\n\nA request deadline in `serve_one` fires at an `.await`, so this \
+             reintroduces a window in which a governed dispatch can be cut between reserving \
+             its effect and settling it -- exactly the window the conservative \
+             `needs-verification` path exists for. Move the await outside the window, or \
+             restructure so the whole reserve/dispatch/settle sequence cannot yield.",
+            reserve + 1,
+            settle + 1,
+            offending
+        );
+    }
 
     /// With no provider configured, a daemon asks the declared stand-in.
     ///
@@ -5301,10 +5668,10 @@ mod tests {
             // Before the guard this was exactly the path that returned before the
             // cleanup block and left a stale socket behind.
             let outcome: Result<(), IpcError> = {
-                let _release = EndpointRelease {
-                    listener: Arc::clone(&listener),
-                    path: Some(endpoint.clone()),
-                };
+                let _release = crate::serve::EndpointRelease::new(
+                    Arc::clone(&listener),
+                    Some(endpoint.clone()),
+                );
                 Err(IpcError::Accept("a genuine accept failure".to_owned()))
             };
 
@@ -5334,10 +5701,10 @@ mod tests {
 
             let listener = Arc::new(orxnud_platform_ipc::bind(&endpoint).await.expect("bind"));
             {
-                let _release = EndpointRelease {
-                    listener: Arc::clone(&listener),
-                    path: Some(endpoint.clone()),
-                };
+                let _release = crate::serve::EndpointRelease::new(
+                    Arc::clone(&listener),
+                    Some(endpoint.clone()),
+                );
                 assert!(endpoint.exists(), "precondition: still bound");
             }
             assert!(!endpoint.exists(), "shutdown must release the endpoint");
@@ -5350,10 +5717,10 @@ mod tests {
         // `start` on a platform with no transport refuses, so `cleanup` is `None`
         // there. The guard must tolerate that rather than panicking on a missing path.
         sync_rt().block_on(async {
-            let _release = EndpointRelease {
-                listener: Arc::new(orxnud_platform_ipc::Listener::Unsupported),
-                path: None,
-            };
+            let _release = crate::serve::EndpointRelease::new(
+                Arc::new(orxnud_platform_ipc::Listener::Unsupported),
+                None,
+            );
         });
     }
 }

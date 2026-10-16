@@ -121,6 +121,25 @@ pub enum Method {
     /// a caller decides whether to continue again, and `max_steps` remains the only thing
     /// that bounds a task's length (ADR-0043, ADR-0047).
     TaskContinue,
+
+    /// Register a recurring schedule.
+    ///
+    /// First-party durable state, like the `task/*` methods: a schedule is a row this
+    /// daemon owns, and creating one grants no authority over anything. It exists
+    /// because the scheduler had **no** creation route at all -- `Scheduler::add_schedule`
+    /// had no production caller, so no schedule could ever exist and therefore no
+    /// occurrence could ever fire. A timer with nothing to fire is not a feature.
+    ///
+    /// Authorised by the same authenticated local principal as every other method, and
+    /// stored with that principal's id, so the record names who asked for it.
+    ScheduleCreate,
+
+    /// Every enabled schedule, with its next occurrence.
+    ///
+    /// Exists so a caller can see what the daemon's own timer is armed for, rather than
+    /// having to infer it from tasks appearing. Metadata only: no parameters, no
+    /// capability, nothing executable.
+    ScheduleList,
 }
 
 impl Method {
@@ -128,7 +147,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -144,6 +163,8 @@ impl Method {
         Self::TaskExecute,
         Self::TaskAiPropose,
         Self::TaskContinue,
+        Self::ScheduleCreate,
+        Self::ScheduleList,
     ];
 
     /// The wire name.
@@ -165,6 +186,8 @@ impl Method {
             Self::TaskExecute => "task/execute",
             Self::TaskAiPropose => "task/ai-propose",
             Self::TaskContinue => "task/continue",
+            Self::ScheduleCreate => "schedule/create",
+            Self::ScheduleList => "schedule/list",
         }
     }
 
@@ -193,6 +216,8 @@ impl Method {
             "task/execute" => Some(Self::TaskExecute),
             "task/ai-propose" => Some(Self::TaskAiPropose),
             "task/continue" => Some(Self::TaskContinue),
+            "schedule/create" => Some(Self::ScheduleCreate),
+            "schedule/list" => Some(Self::ScheduleList),
             _ => None,
         }
     }

@@ -61,6 +61,9 @@ pub mod http_provider;
 pub mod observation;
 pub mod proposer;
 pub mod runtime;
+/// The serving loop and the bounds that govern it. See the module documentation for
+/// what changed and, more usefully, what deliberately did not.
+pub mod serve;
 pub mod task_service;
 pub mod transport;
 

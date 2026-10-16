@@ -38,7 +38,7 @@ capability set. One surface ships today.
 | Audit | Append-only, hash-chained, durable, survives restart |
 | Approvals | Single-use, digest-bound **v3**, time-boxed, bound to an approver *and* a logical step |
 | Sandbox | Tier-1 execution under `bubblewrap`; cgroup v2 ceilings where the host delegates |
-| Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 15 methods |
+| Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 17 methods |
 | CLI | `orxnuctl` — hand-written parser, 5 verb groups |
 | Daemon | `orxnud` — composition root, single-instance lock, serves the socket |
 | Provider | **One real HTTPS provider**, TLS with chain and hostname verification |
@@ -143,6 +143,26 @@ the surfaces listed last, and nothing else.
   false, and they contradicted §3 of [`03-system-architecture.md`](03-system-architecture.md),
   which already described the 4c governance core as delivered *with* both wirings. They are
   corrected here rather than left to contradict a normative document.
+* **The scheduler is wired.** `TaskService::tick` and `next_wakeup_ms` had **no production
+  caller** and `Scheduler::add_schedule` had no route at all, so no schedule could be
+  registered and the timer had nothing to fire. Both are now live: `schedule/create` and
+  `schedule/list` are reachable through `orxnuctl schedule add|list`, and the daemon's own
+  event loop runs a bounded pass when the engine's next occurrence is due — re-reading the
+  deadline each pass, so a schedule created after the timer was armed takes effect at once
+  rather than waiting out the old one. A due occurrence is now created with **no request
+  arriving**. Evidence: `crates/orxnud-daemon/tests/serve_lifecycle.rs`.
+* **Connections are served concurrently, with bounds.** Each is its own task, under a
+  connection ceiling and a frame-read deadline; `daemon/status` answers from a composition
+  snapshot and takes no governed lock, and neither model route holds that lock across the
+  provider's network round trip. Before this, one peer that opened a socket and never
+  finished a frame prevented every other client from being served — reproducibly, and
+  indefinitely. See `crates/orxnud-daemon/src/serve.rs`.
+* **Still not fixed, and recorded rather than hidden:** a Tier-1 dispatch holds the
+  governed lock across the sandbox execution (up to 10 s), because `Dispatcher::dispatch`
+  is a synchronous function that settles its own audit obligation internally and offers no
+  seam at which the lock could be released mid-effect. A request that needs durable state
+  therefore still queues behind an in-flight sandboxed write. Narrowing that is a change to
+  the dispatcher, not to the transport.
 * Also absent: no GUI or Tauri application, no TUI, no MCP surface, no messaging, no local
   ASR/TTS, no general shell capability, no unrestricted filesystem capability, no Windows
   sandbox backend, no actor runtime beyond the local authority model.

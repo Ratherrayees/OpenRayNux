@@ -115,6 +115,20 @@ pub enum IpcError {
     #[error("the local peer's identity could not be established")]
     PeerIdentityUnavailable,
 
+    /// The server is already serving as many connections as it admits.
+    ///
+    /// Its own variant rather than [`Self::Other`] because the two mean opposite things
+    /// to a caller: a fault to report is not a capacity signal to retry later. Nothing
+    /// here enforces the ceiling — the transport has no opinion about how many
+    /// connections a daemon should accept — so this exists to *name* the condition the
+    /// server above decided, and the server is what chooses the bound.
+    #[error("the endpoint is already serving its maximum number of connections ({limit})")]
+    Overloaded {
+        /// The ceiling that was reached, carried so a refusal can name its own bound
+        /// rather than leaving a client to guess whether to wait or give up.
+        limit: usize,
+    },
+
     /// Any other transport-level failure.
     #[error("local transport error: {0}")]
     Other(String),

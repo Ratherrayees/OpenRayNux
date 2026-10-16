@@ -124,6 +124,21 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            Command::Schedule(ref verb) => {
+                // Through the daemon, like every other durable-state verb: a schedule is a
+                // row the daemon owns, and it is the daemon's own timer that reads it.
+                let client = client_for(&invocation.endpoint);
+                match orxnuctl::schedule::run(verb, &client) {
+                    Ok(output) => {
+                        println!("{output}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(why) => {
+                        eprintln!("error: {why}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
             Command::Task(ref verb) => {
                 // The one place the endpoint is decided, so no command body can
                 // forget the override. `None` means the daemon's own default
