@@ -39,7 +39,18 @@ fn run(helper: &std::path::Path, args: &[&str], stdin: Option<&[u8]>) -> (bool, 
     {
         let mut pipe = child.stdin.take().expect("stdin is piped");
         if let Some(bytes) = stdin {
-            pipe.write_all(bytes).expect("stdin accepts the frame");
+            // A helper that refuses its arguments exits *without reading stdin*, so a
+            // write racing that exit gets EPIPE. That is the refusal working, not a
+            // transport failure: the assertions below are about the exit status, the
+            // message and the absent file, and none of them are reachable if this panics
+            // first. Panicking here made `an_unknown_transport_version_is_refused_by_name`
+            // fail roughly one run in three under full-suite parallelism and never in
+            // isolation. Only EPIPE is tolerated; any other write error still fails.
+            match pipe.write_all(bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => panic!("stdin accepts the frame: {e:?}"),
+            }
         }
         // Dropping the pipe here is the *correct* sender behaviour (ADR-0054 Decision
         // 3a) and is what every case below depends on to terminate at all.
