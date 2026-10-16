@@ -54,7 +54,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use orxnud_domain::ids::TaskId;
@@ -257,14 +257,32 @@ fn is_ready(endpoint: &Path) -> bool {
     .is_some_and(|v| v.get("result").is_some())
 }
 
-fn await_ready(endpoint: &Path) {
+fn await_ready(daemon: &mut Daemon) {
+    let endpoint = daemon.endpoint.clone();
     for _ in 0..600 {
-        if is_ready(endpoint) {
+        if is_ready(&endpoint) {
             return;
+        }
+        // A daemon that exits before binding its socket is the common failure here,
+        // and polling for six seconds through it throws away the only evidence that
+        // explains why. Report the status and the startup output instead.
+        if let Some(status) = daemon.exited() {
+            panic!(
+                "the daemon exited before becoming ready: {status}\n\
+                 startup output:\n{}\n\
+                 A daemon started this way must reach `serve` with no provider \
+                 configured, exactly as a user would start it.",
+                daemon.startup_output()
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("the daemon never became ready at {}", endpoint.display());
+    panic!(
+        "the daemon never became ready at {} (still running, and it never exited)\n\
+         startup output:\n{}",
+        endpoint.display(),
+        daemon.startup_output()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -347,37 +365,83 @@ fn child_pids(pid: u32) -> usize {
 struct Daemon {
     child: Child,
     endpoint: PathBuf,
+    /// Where the daemon's stderr goes.
+    ///
+    /// A file rather than a pipe, and not `Stdio::null()`. A pipe nobody drains fills at
+    /// 64 KB and blocks the daemon that is being measured, which would corrupt the very
+    /// numbers this harness exists to take; discarding stderr throws away the one thing
+    /// that explains a daemon that exits before it is ready.
+    stderr_path: PathBuf,
 }
 
 impl Daemon {
     fn spawn(root: &Path) -> Self {
         let endpoint = root.join("orxnud.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_orxnud"))
-            .arg("--state-root")
-            .arg(root)
+        let stderr_path = root.join("orxnud.stderr");
+        let stderr = std::fs::File::create(&stderr_path).expect("create the stderr capture");
+        // The debug-only exception, requested **only where it exists**.
+        //
+        // `scripts/measure-v25.sh --debug` exists to smoke-test the harness on an
+        // unoptimised build, and the sandbox section needs a capability that actually
+        // executes. In that profile the flag is compiled in, so asking for it is honest.
+        // In release it is not compiled in -- that is the control which gives a shipped
+        // daemon no route to permit an argv payload -- so it is not passed, and the
+        // section below reports itself as unmeasurable rather than weakening anything
+        // to obtain a number.
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_orxnud"));
+        cmd.arg("--state-root").arg(root);
+        if cfg!(debug_assertions) {
+            cmd.arg("--permit-argv-payload-exposure-for-tests");
+        }
+        let child = cmd
             // No provider: this measures the core daemon a user without a configured
             // model actually runs. `--provider-scripted` would add a proposer to the
             // measured process for no cost a core-only user pays.
-            // R-1's exception, granted to the daemon this harness spawns.
             //
-            // There is no configuration key and no environment variable for this -- see `Daemon`
-            // in `lib.rs` -- so the route is a flag that exists only in a debug build. A shipped
-            // release binary has no way to permit an argv payload at all. These suites measure the
-            // governed path (approval, single use, expiry, settlement, audit across restart) and
-            // need a capability that actually executes; this is how they get one.
+            // **No `--permit-argv-payload-exposure-for-tests`, deliberately.** It used to
+            // be passed unconditionally, which only worked because the measurement ran in
+            // the debug profile. The flag is compiled out of a release build by
+            // `#[cfg(debug_assertions)]` -- that is the control which gives a shipped
+            // daemon no route at all to permit an argv payload -- so under
+            // `scripts/measure-v25.sh`, which uses the release profile, the daemon exited
+            // with "unrecognised argument" before binding its socket and every readiness
+            // measurement timed out.
             //
-            // It does NOT satisfy R-1 option 2 (owner, bounded period, review date). See the open
-            // owner decision in `docs/18` section 12.
-            .arg("--permit-argv-payload-exposure-for-tests")
+            // The measurements do not need it. The core numbers deliberately never invoke
+            // a capability, and the one measurement that does executes
+            // `filesystem/write-text`, whose payload travels on stdin and has since the
+            // S-17 stdin transport -- not in argv. Granting a security exception to run a
+            // benchmark that never asks for it was the wrong trade; V-25 now measures the
+            // same configuration a user actually starts.
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn orxnud");
-        Self { child, endpoint }
+        Self {
+            child,
+            endpoint,
+            stderr_path,
+        }
     }
 
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The exit status, if the daemon is already gone. `None` while it is still running.
+    fn exited(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// Whatever the daemon wrote to stderr before or while failing to start.
+    fn startup_output(&self) -> String {
+        let text = std::fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            "<nothing on stderr>".to_owned()
+        } else {
+            text.to_owned()
+        }
     }
 
     fn endpoint(&self) -> &Path {
@@ -396,8 +460,8 @@ impl Daemon {
     /// same root would deadlock against its own first process.
     fn start(root: &Path) -> (Self, Duration) {
         let t0 = Instant::now();
-        let daemon = Self::spawn(root);
-        await_ready(&daemon.endpoint);
+        let mut daemon = Self::spawn(root);
+        await_ready(&mut daemon);
         let elapsed = t0.elapsed();
         (daemon, elapsed)
     }
@@ -410,6 +474,7 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.endpoint);
+        let _ = std::fs::remove_file(&self.stderr_path);
     }
 }
 
@@ -790,6 +855,28 @@ fn tier1_sandbox_overhead_is_measured_or_declined() {
         cap.tier1_executable,
     );
 
+    // The cheapest real capability is `filesystem/write-text`, which is precisely
+    // `ARGV_PAYLOAD_EXPOSED_CAPABILITY_ID` -- the capability the shipped posture
+    // refuses. A release daemon refuses it, so measuring its execution cost there
+    // would need the debug-only exception this harness deliberately no longer asks
+    // for. Removing that refusal to take a benchmark number would be the wrong trade:
+    // the refusal is the control, and the budget is about what ships.
+    //
+    // So this measurement is reported as unobtainable under the shipping profile,
+    // with the reason, rather than failing or printing a number that was not
+    // measured. That is the same shape as the V-87 branch above: a statement about
+    // the configuration, not a failure of the harness.
+    if !cfg!(debug_assertions) {
+        println!(
+            "V25 | sandbox cost NOT MEASURABLE in the release profile: the capability it \
+             executes (`filesystem/write-text`) is the argv-payload-exposed one, and a \
+             release daemon has no route to permit it -- by design (F-17). Run with \
+             --debug to measure the harness path; those numbers are about the debug \
+             build and do not describe what ships."
+        );
+        return;
+    }
+
     if !cap.tier1_executable {
         println!(
             "V25 | sandbox cost NOT MEASURABLE on this host: Tier-1 capabilities are \
@@ -843,9 +930,13 @@ fn tier1_sandbox_overhead_is_measured_or_declined() {
             .as_bytes(),
         )
         .expect("propose");
+        // Report the response, not just the missing field. A refusal answers with an
+        // `error` object and no `result`, and "proposal id" alone does not say which
+        // refusal it was -- which is the difference between a harness bug and a real
+        // capability refusal.
         let proposal = p["result"]["proposal"]["proposal_id"]
             .as_str()
-            .expect("proposal id")
+            .unwrap_or_else(|| panic!("task/propose returned no proposal id: {p}"))
             .to_owned();
         send_raw(
             &endpoint,
