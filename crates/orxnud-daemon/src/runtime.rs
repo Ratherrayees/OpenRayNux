@@ -2289,14 +2289,30 @@ fn effect_status_for_dispatch_failure(
         },
 
         // Demonstrably did not run. See the stage table above.
+        // Every arm above is a decision taken *before* a process exists, which is what
+        // makes `not-performed` a warrant rather than an inference. ADR-0056 Decision 4.
         DispatchError::Policy(_)
         | DispatchError::NoImplementation(_)
         | DispatchError::Disabled { .. }
         | DispatchError::ClassEscalation { .. }
         | DispatchError::Credential(_)
         | DispatchError::Reentrant(_)
-        | DispatchError::InvalidInput { .. }
-        | DispatchError::VerificationRefuted { .. } => EffectStatus::NotPerformed,
+        | DispatchError::InvalidInput { .. } => EffectStatus::NotPerformed,
+
+        // **Not** in the group above, and that is the whole point of this arm existing.
+        //
+        // A refuted *verification* is evidence about a postcondition. This error is raised
+        // after the capability ran, so there is a world in which the effect happened and a
+        // later actor changed or removed what it left. Reporting `not-performed` here
+        // issued a retry permission for a possibly-performed non-idempotent effect, with no
+        // human involved. It now records the uncertainty instead.
+        //
+        // Before ADR-0056 this arm sat in the list above, next to `Policy` and
+        // `ClassEscalation`, which made a post-execution finding look like a pre-execution
+        // refusal. The two are indistinguishable in the type and were not distinguished in
+        // the mapping, which is how the defect survived a review that checked the verdict
+        // and not the route.
+        DispatchError::VerificationRefuted { .. } => EffectStatus::Unknown,
     }
 }
 
@@ -2711,13 +2727,6 @@ fn delegated_actor(
 enum Certainty {
     /// The effect is present as described.
     Established,
-    /// The effect is provably **not** present as described.
-    ///
-    /// Stronger than an adapter-reported failure, and it is the only finding that makes a
-    /// retry safe for a capability that is not idempotent. The capability layer already
-    /// reasons this way — `WriteTextVerifier` distinguishes "does not exist" from "could
-    /// not be read" precisely so that only `Refuted` opens the retry path.
-    Disproved,
     /// Nobody can say either way. The dangerous one.
     Unknown,
 }
@@ -2770,7 +2779,7 @@ fn uncertainty_target(certainty: Certainty, idempotent: bool) -> TaskState {
     match certainty {
         // Established never reaches here; if it somehow did, `Failed` is the fail-closed
         // answer, because it is the one row that does not claim an effect happened.
-        Certainty::Established | Certainty::Disproved => TaskState::Failed,
+        Certainty::Established => TaskState::Failed,
         Certainty::Unknown if idempotent => TaskState::Failed,
         Certainty::Unknown => TaskState::NeedsVerification,
     }
@@ -2807,7 +2816,6 @@ fn settle_unverified(
         capability,
         match certainty {
             Certainty::Established => "established",
-            Certainty::Disproved => "disproved",
             Certainty::Unknown => "unknown",
         }
     );
@@ -2850,11 +2858,52 @@ struct UnverifiedSettlement {
 }
 
 /// Reads the certainty a verification outcome establishes.
+///
+/// **A `Refuted` finding establishes `Unknown`, not `Disproved` (ADR-0056).** This is the
+/// change that closes F-17, and the whole of it is this one line.
+///
+/// A verifier reports evidence about a **postcondition**. `WriteTextVerifier` re-reads the
+/// filesystem and compares bytes; it does not and cannot report whether a process ran. A
+/// `write-text` that genuinely succeeded and whose file a second task, an editor or a
+/// concurrent governed run then changed is byte-for-byte indistinguishable, from here, from
+/// one that never wrote — and "the file is absent" is the same inference, because a write
+/// that happened and whose output was later deleted also looks absent.
+///
+/// `Disproved` used to mean "this answer is a disproof", which conflated *the verdict's
+/// shape* with *a warrant*. `not-performed` is the one status `recover()` excludes from its
+/// "may already have happened" test, so it is a retry permission, and a postcondition is not
+/// evidence that an effect did not occur.
+///
+/// `Disproved` is therefore no longer produced here, and this is deliberate rather than
+/// tidy: the variant keeps its meaning ("demonstrably did not happen"), and the arms that
+/// consume it still map it to `not-performed`. That mapping stays correct for a future
+/// producer that *can* warrant it. What ADR-0056 removed is the producer, not the meaning —
+/// so a warrant can only ever come from pre-execution evidence (`ExecutionCertainty::
+/// NothingAttempted`, or a `Policy` refusal decided before a process exists), never from
+/// looking at a file afterwards.
+/// The effect-ledger status a settled certainty implies.
+///
+/// **This is the only place a verification outcome becomes an effect status**, and
+/// `not-performed` deliberately has no arm (ADR-0056 Decision 1). It is a named function
+/// rather than an inline `match` because the mapping is the load-bearing step of F-17 and
+/// an inline one cannot be tested directly: the first version of the S-03 regression
+/// re-implemented this `match` locally, which meant it tested its own copy rather than the
+/// production one -- and a mutation of the real mapping passed the suite. Extraction is what
+/// makes the property testable at the seam where it actually lives.
+fn effect_status_for_certainty(certainty: Certainty) -> EffectStatus {
+    match certainty {
+        Certainty::Established => EffectStatus::Observed,
+        Certainty::Unknown => EffectStatus::Unknown,
+    }
+}
+
 fn certainty_of(o: &orxnud_capability::verification::VerificationOutcome) -> Certainty {
     use orxnud_capability::verification::VerificationOutcome as V;
     match o {
         V::Verified { .. } => Certainty::Established,
-        V::Refuted { .. } => Certainty::Disproved,
+        // Read carefully before "fixing" this back to `Disproved`: the verdict really is
+        // negative, and that is precisely why it may not be treated as proof.
+        V::Refuted { .. } => Certainty::Unknown,
         V::Undetermined { .. } => Certainty::Unknown,
     }
 }
@@ -3222,11 +3271,7 @@ async fn execute_proposal<S: SecretsContract>(
     );
     {
         let settled_at = g.2.clock_now_ms();
-        let effect_status = match certainty_of(&o.verification) {
-            Certainty::Established => EffectStatus::Observed,
-            Certainty::Disproved => EffectStatus::NotPerformed,
-            Certainty::Unknown => EffectStatus::Unknown,
-        };
+        let effect_status = effect_status_for_certainty(certainty_of(&o.verification));
         if let Err(e) =
             g.2.resolve_effect(&effect_key, effect_status, None, settled_at)
         {
@@ -4680,9 +4725,13 @@ mod tests {
     ///
     /// The exhaustive form matters because the safe direction is not symmetric: a row that
     /// wrongly sends an uncertain task to `Failed` requeues it and duplicates a side
-    /// effect, while a row that wrongly sends a *disproved* task to `NeedsVerification`
-    /// merely makes a retryable task wait for a person. Only one of those is a correctness
+    /// effect, while a row that wrongly sends an *established* task to `NeedsVerification`
+    /// merely makes a finished task wait for a person. Only one of those is a correctness
     /// disaster, and this table is what stops the first one being introduced quietly.
+    ///
+    /// The `Disproved` rows that used to be here were deleted by ADR-0056, not relaxed.
+    /// There is no longer a verification outcome that establishes non-execution, so the
+    /// cells no longer exist; `Refuted` now lands on the `Unknown` rows below.
     #[test]
     fn the_uncertainty_decision_table_is_exhaustive_and_oriented() {
         use TaskState::{Failed, NeedsVerification};
@@ -4690,8 +4739,6 @@ mod tests {
             // certainty, idempotent, expected
             (Certainty::Established, false, Failed),
             (Certainty::Established, true, Failed),
-            (Certainty::Disproved, false, Failed),
-            (Certainty::Disproved, true, Failed),
             (Certainty::Unknown, true, Failed),
             (Certainty::Unknown, false, NeedsVerification),
         ];
@@ -5433,6 +5480,155 @@ mod effect_status_for_dispatch_failure_tests {
     /// Requirement: a dispatch that definitively fails *before* execution is recorded as
     /// `not-performed`, which is the one verdict that says a repeat cannot duplicate
     /// anything — and therefore the one that restores a legitimate retry.
+    /// **F-17 / ADR-0056 regression.** The daemon half of the pair whose other half is
+    /// `a_write_that_occurred_and_was_later_overwritten_is_refuted_and_survives_admission`
+    /// in `orxnud-capability`.
+    ///
+    /// Drives the real production chain in the real order — `admit_verification`,
+    /// `certainty_of`, the effect-status mapping, a real migrated database,
+    /// `resolve_effect`, a process restart, `recover()`, `claim_specific` — and asserts the
+    /// property end to end: a `write-text` that succeeded and whose file a later actor
+    /// changed is **not** handed back to a worker.
+    ///
+    /// Nothing here is mocked. `WriteTextVerifier` cannot be named from this crate
+    /// (`AdapterBundle` is `pub(crate)`), so the seam is the public `VerificationOutcome`
+    /// enum; the capability-side test pins that the real verifier produces exactly this
+    /// value for exactly this filesystem state, so the two together cover the chain without
+    /// a gap in it.
+    ///
+    /// **F-17 remains probable exposure.** The competing write is staged, not raced, and no
+    /// end-to-end live-daemon run has been performed. What is proven here is the mapping and
+    /// the consequence, not the reachability of the timing window.
+    #[test]
+    fn a_refuted_write_text_does_not_authorise_a_retry_after_a_possible_execution() {
+        use super::{Certainty, certainty_of, effect_status_for_certainty};
+        use orxnud_capability::dispatch::admit_verification;
+        use orxnud_capability::verification::{ExecutionOutcome, VerificationOutcome};
+        use orxnud_domain::task_state::TaskKind;
+        use orxnud_store::migration::MigrationRunner;
+        use orxnud_store::pragma::Pragma;
+        use orxnud_store::task_repo::{NewTask, TargetedClaimOutcome, TaskRepository};
+
+        const NOW: i64 = 1_767_225_600_000;
+        const LEASE: i64 = 60_000;
+
+        // What the real `WriteTextVerifier` returns for a succeeded write whose file was
+        // later changed: the postcondition does not hold, and it says so truthfully.
+        let execution = ExecutionOutcome::Succeeded {
+            output: Some(String::new()),
+        };
+        let reported = VerificationOutcome::Refuted {
+            evidence: "…/f.txt exists but holds 24 bytes, not the 6 requested".to_owned(),
+        };
+
+        // Step 1 -- the real admission table. It must let a true observation through.
+        let admitted = admit_verification(&execution, reported);
+        assert!(
+            matches!(admitted, VerificationOutcome::Refuted { .. }),
+            "admission must not suppress a true postcondition observation; got {admitted:?}"
+        );
+
+        // Step 2 -- the real consumer. THIS is what ADR-0056 changed: a refuted
+        // postcondition is uncertainty, never a disproof.
+        assert_eq!(
+            certainty_of(&admitted),
+            Certainty::Unknown,
+            "a refuted postcondition is evidence about a postcondition, not about whether the \
+             effect occurred"
+        );
+
+        // Step 3 -- the real effect-ledger mapping, which is where the retry permission was
+        // issued before.
+        let status = effect_status_for_certainty(certainty_of(&admitted));
+        assert_ne!(
+            status,
+            EffectStatus::NotPerformed,
+            "`not-performed` is the one status `recover()` excludes, so writing it here is \
+             the defect itself, not a description of it"
+        );
+
+        // Steps 4-7 -- the real durable chain.
+        // Nonce-keyed rather than PID-keyed. A PID alone is not unique across runs on a
+        // busy host, and two runs of this suite sharing a scratch directory produce
+        // `AlreadyExists` on the second one -- a failure that has nothing to do with what
+        // the test is asserting. Observed exactly that once while mutation-testing.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("f17-chain-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let db = dir.join("state.db");
+        let tid = orxnud_domain::ids::TaskId::new("f17-task");
+        let key = orxnud_task::DurableEngine::idempotency_key(&tid, "filesystem/write-text", "1/1");
+        {
+            let mut c = rusqlite::Connection::open(&db).expect("open");
+            Pragma::critical().apply(&c).expect("pragmas");
+            MigrationRunner::new(&c).run(true).expect("migrate");
+            let mut repo = TaskRepository::new(&mut c);
+            repo.insert(&NewTask::new(tid.clone(), TaskKind::Query, NOW), NOW)
+                .expect("insert");
+            assert!(matches!(
+                repo.claim_specific(&tid, "w1", NOW, LEASE),
+                Ok(TargetedClaimOutcome::Claimed(_))
+            ));
+            // Non-idempotent, which is the only case where repeating the effect can do harm.
+            repo.reserve_effect(&key, &tid, 1, 1, "filesystem/write-text", false, NOW)
+                .expect("reserve")
+                .expect("inserted");
+            assert!(
+                repo.resolve_effect(&key, status, None, NOW + 1)
+                    .expect("resolve")
+            );
+        }
+        {
+            // A restart -- the only thing that calls recover() in production.
+            let mut c = rusqlite::Connection::open(&db).expect("reopen");
+            Pragma::critical().apply(&c).expect("pragmas");
+            let mut repo = TaskRepository::new(&mut c);
+            repo.recover(NOW + LEASE + 1).expect("recover");
+
+            // THE PROPERTY: no second worker may repeat the effect.
+            assert!(
+                !matches!(
+                    repo.claim_specific(&tid, "w2", NOW + LEASE + 2, LEASE),
+                    Ok(TargetedClaimOutcome::Claimed(_))
+                ),
+                "the effect is non-idempotent and unresolved, so a repeat could duplicate an \
+                 effect that already happened; recovery must not issue the retry permission"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control for the regression above, and it is the one that keeps the fix honest.
+    ///
+    /// A pre-execution refusal still records `not-performed`, and that path must keep its
+    /// retry permission. If it did not, the fix would be over-broad: every genuinely safe
+    /// repeat would have become an adjudication, which is a real cost and not a safety win.
+    /// Asserted here so that the two properties are pinned together and cannot be traded.
+    #[test]
+    fn a_refusal_before_execution_still_earns_its_retry_permission() {
+        use orxnud_capability::dispatch::{ExecutionCertainty, SandboxRefusal};
+        let refusal = SandboxRefusal::nothing_attempted(
+            cap(),
+            "the workspace was not writable",
+            vec!["a writable workspace"],
+        );
+        assert_eq!(
+            refusal.certainty,
+            ExecutionCertainty::NothingAttempted,
+            "a refusal decided before a process exists carries the warrant"
+        );
+        assert_eq!(
+            effect_status_for_dispatch_failure(&DispatchError::SandboxRefused(refusal)),
+            EffectStatus::NotPerformed,
+            "positive evidence of non-execution keeps its retry permission; ADR-0056 \
+             withdraws warrants from postcondition evidence, never from pre-execution ones"
+        );
+    }
+
     #[test]
     fn a_refusal_before_execution_is_recorded_as_not_performed() {
         let cases: Vec<(&str, DispatchError)> = vec![
@@ -5476,16 +5672,28 @@ mod effect_status_for_dispatch_failure_tests {
         }
     }
 
-    /// `VerificationRefuted` is a disproof too, and reading it any other way would make
-    /// a *proven* non-effect indistinguishable from an uncertain one.
+    /// ADR-0056 Decision 4: a refuted *verification* is NOT a disproof.
+    ///
+    /// This assertion used to read `NotPerformed`, and its justification was that reading it
+    /// any other way "would make a *proven* non-effect indistinguishable from an uncertain
+    /// one". That justification was the defect. The finding is not proven non-execution: it
+    /// is a verdict about a postcondition, and the capability demonstrably ran before it was
+    /// produced. `not-performed` is a retry permission, so this arm was authorising an
+    /// automatic repeat of a possibly-performed non-idempotent effect.
+    ///
+    /// The evidence string is left saying "proved" on purpose — it is what a verifier can
+    /// honestly write, and the point is that the ledger must not take the word for it.
     #[test]
-    fn a_refuted_verification_is_recorded_as_not_performed() {
+    fn a_refuted_verification_is_recorded_as_unknown_not_as_not_performed() {
         let e = DispatchError::VerificationRefuted {
             evidence: "the verifier proved the file was not written".to_owned(),
         };
         assert_eq!(
             effect_status_for_dispatch_failure(&e),
-            EffectStatus::NotPerformed
+            EffectStatus::Unknown,
+            "a refuted postcondition is not evidence that the effect did not occur; \
+             `not-performed` here would hand a possibly-performed non-idempotent effect \
+             straight back to a worker"
         );
     }
 
@@ -5664,6 +5872,7 @@ mod effect_status_for_dispatch_failure_tests {
         let err =
             orxnud_capability::subprocess::SandboxExecutionBackend::with_runner(Arc::new(GivesUp))
                 .execute(&orxnud_capability::dispatch::ExecutionContract {
+                    stdin_payload: None,
                     capability: cap(),
                     program: "/bin/true".to_owned(),
                     args: Vec::new(),
@@ -5781,7 +5990,7 @@ mod effect_status_for_dispatch_failure_tests {
     /// `Refuted`. Before the capability layer's admission rule, that was reachable: a
     /// verifier written as "the target must not hold the old bytes" answers *absent*
     /// whenever it cannot confirm the write, and the daemon read that as
-    /// `Certainty::Disproved`. The whole downstream chain is then exercised here, in the
+    /// a disproof. The whole downstream chain is then exercised here, in the
     /// production order and through the production functions, against real durable state:
     ///
     /// ```text
@@ -5801,7 +6010,7 @@ mod effect_status_for_dispatch_failure_tests {
     /// channel to do that.
     #[test]
     fn a_refuted_claim_from_a_silent_capability_can_never_become_a_disproof() {
-        use super::{Certainty, certainty_of};
+        use super::{Certainty, certainty_of, effect_status_for_certainty};
         use orxnud_capability::dispatch::admit_verification;
         use orxnud_capability::verification::{
             ExecutionOutcome, VerificationOutcome, Verifier as _,
@@ -5860,20 +6069,25 @@ mod effect_status_for_dispatch_failure_tests {
                 "{name}: the admission rule must refuse a claim made against an execution \
                  that did not report success; got {admitted:?}"
             );
-            assert_ne!(
+            assert_eq!(
                 certainty_of(&admitted),
-                Certainty::Disproved,
-                "{name}: and therefore certainty_of must not be able to see a disproof here"
+                Certainty::Unknown,
+                "{name}: an admission-refused finding must land on uncertainty, never on a \
+                 verdict that would authorise a repeat"
             );
 
-            // What the ledger would have written before the rule existed, asserted so the
-            // shape cannot be dismissed as a fiction. Checked first, on a clone, because
-            // `admit_verification` consumes the answer.
+            // The second line of defence, added by ADR-0056. Checked on the *unadmitted*
+            // finding, so it holds even if the admission rule were removed: a refuted
+            // postcondition is not proof of non-execution regardless of what admitted it.
+            // Before ADR-0056 this assertion read `Disproved` -- it asserted that without
+            // the admission rule the answer *would* have been a disproof, which was the
+            // argument that the admission rule was the only thing standing in the way.
+            // That is no longer true and no longer the desired property.
             assert_eq!(
                 certainty_of(&reported),
-                Certainty::Disproved,
-                "{name}: without the admission rule this answer is a disproof, which is the \
-                 entire reason the rule has to exist"
+                Certainty::Unknown,
+                "{name}: even bypassing admission, a refuted postcondition must not become a \
+                 disproof. `certainty_of` no longer has a disproof to give (ADR-0056)."
             );
 
             // Now the full durable chain with the admitted (conservative) verdict.
@@ -5884,11 +6098,7 @@ mod effect_status_for_dispatch_failure_tests {
             let tid = orxnud_domain::ids::TaskId::new("claim-task");
             let key =
                 orxnud_task::DurableEngine::idempotency_key(&tid, "filesystem/write-text", "1/1");
-            let status = match certainty_of(&admitted) {
-                Certainty::Established => EffectStatus::Observed,
-                Certainty::Disproved => EffectStatus::NotPerformed,
-                Certainty::Unknown => EffectStatus::Unknown,
-            };
+            let status = effect_status_for_certainty(certainty_of(&admitted));
             {
                 let mut c = rusqlite::Connection::open(&db).expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
@@ -6081,15 +6291,24 @@ mod effect_status_for_dispatch_failure_tests {
             },
             Row {
                 what: "verification refuted",
-                audit: orxnud_audit::OutcomeKind::Failed,
+                audit: orxnud_audit::OutcomeKind::Uncertain,
                 error: DispatchError::VerificationRefuted {
                     evidence: "the file is absent".to_owned(),
                 },
-                // It ran, and the verifier *disproved* the effect, so the effect ledger may
-                // still say `not-performed`: this is the one row where "it ran" and "the
-                // effect is absent" are both true, and the ledger is right to say so.
-                may_have_run: false,
-                effect: EffectStatus::NotPerformed,
+                // **Both of these changed, and they changed together** (ADR-0056
+                // Decision 4). The row used to claim the capability `may_have_run: false`,
+                // which is not true: the finding is raised in stage 9, after the capability
+                // ran and was verified. The old comment read "this is the one row where 'it
+                // ran' and 'the effect is absent' are both true" — and then it recorded
+                // `may_have_run: false`, which contradicts its own sentence. The type could
+                // not express the distinction, and the mapping picked the wrong side of it.
+                //
+                // Now that it is honestly `may_have_run: true`, the table's own
+                // "unsafe direction" assertion below applies to this row too, which is the
+                // property worth having: it is enforced by the table rather than exempted
+                // from it.
+                may_have_run: true,
+                effect: EffectStatus::Unknown,
             },
         ];
 
@@ -6146,14 +6365,16 @@ mod effect_status_for_dispatch_failure_tests {
             //    | `Completed`   | `Observed` only           |
             //    | `Failed`      | `NotPerformed` or `Unknown` |
             //
-            //    `Failed` is the one row with two answers, and legitimately so: a
-            //    capability can run and still leave no effect — that is exactly what
-            //    `VerificationRefuted` means, and the ledger is right to say the effect is
-            //    absent while the journal says the action ran.
+            //    `Failed` keeps two answers for a narrower reason than it used to: a
+            //    capability can exit non-zero and still have left no effect, and the
+            //    ledger cannot tell. `VerificationRefuted` used to live here as well, on
+            //    the claim that a refuted postcondition is a proven absence. ADR-0056
+            //    removed that claim, and the row moved to `Uncertain`/`Unknown`.
             //
             //    Every other pairing would be a contradiction in one direction or the
             //    other. `Denied` with `Unknown` contradicts the journal. `Uncertain` with
-            //    `NotPerformed` is the defect this table was written for.
+            //    `NotPerformed` is the defect this table was written for, and is now also
+            //    the pairing ADR-0056 prevents a refuted verification from reaching.
             let allowed: &[EffectStatus] = match row.audit {
                 orxnud_audit::OutcomeKind::Denied => &[EffectStatus::NotPerformed],
                 orxnud_audit::OutcomeKind::Uncertain => &[EffectStatus::Unknown],

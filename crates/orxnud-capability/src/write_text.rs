@@ -528,6 +528,136 @@ pub fn resolve_helper() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------- F-17 (S-03)
+    //
+    // F-17: `Refuted` is the only verification finding that becomes
+    // `EffectStatus::NotPerformed`, and `not-performed` is the one status `recover()`
+    // treats as "a repeat cannot duplicate anything" -- i.e. a retry permission.
+    //
+    // So every `Refuted` is a licence to re-run a possibly-performed non-idempotent
+    // write. This test pins the case where the write DID occur and a later actor
+    // changed the file. `WriteTextVerifier` re-reads the filesystem, so it cannot
+    // distinguish "never written" from "written, then overwritten" -- and it answers
+    // the second exactly as the first.
+    //
+    // The assertion below is the SAFE outcome, so it FAILS on the current code. That
+    // failure is the evidence; a version of this test that asserted `Refuted` would
+    // pass and would document the defect as though it were the contract.
+    fn verifier_for(ws: &Path) -> WriteTextVerifier {
+        WriteTextVerifier {
+            workspace: ws.to_path_buf(),
+        }
+    }
+
+    // The capability layer's half of the F-17 regression. It asserts what this crate is
+    // responsible for -- the verdict is accurate, and it passes through the real admission
+    // table unchanged -- and deliberately stops there.
+    //
+    // It originally asserted that this verdict must NOT be `Refuted`, which put the fix in
+    // the wrong crate. ADR-0056 put it in the consumer: a verifier cannot tell a genuine
+    // write-then-overwrite from a write that never ran, so downgrading the verdict here
+    // would have destroyed a true observation without closing the hole. The property that
+    // actually matters -- that the verdict does not authorise a retry -- is asserted in
+    // `orxnud-daemon`, where `certainty_of`, the effect ledger and `recover()` live, in
+    // `a_refuted_write_text_does_not_authorise_a_retry_after_a_possible_execution`.
+    //
+    // Both halves are needed. This one stops anyone "fixing" F-17 by making the verifier
+    // stop reporting a true postcondition.
+    #[test]
+    fn a_write_that_occurred_and_was_later_overwritten_is_refuted_and_survives_admission() {
+        let ws = std::env::temp_dir().join(format!("f17-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir");
+
+        // The capability was asked to write "wanted".
+        let requested = "wanted";
+        // The write genuinely happened -- the file holds exactly what was asked for.
+        std::fs::write(ws.join("f.txt"), requested).expect("the write occurs");
+
+        // ... and then a second task, an editor, or a concurrent governed run changed
+        // the same path before verification re-read it.
+        let later = "somebody else wrote this";
+        std::fs::write(ws.join("f.txt"), later).expect("the later write occurs");
+
+        let params = serde_json::json!({ "path": "f.txt", "contents": requested });
+        let execution = ExecutionOutcome::Succeeded {
+            output: Some(String::new()),
+        };
+        let out = verifier_for(&ws)
+            .verify(&execution, &params, 0)
+            .expect("verification runs");
+
+        // The postcondition genuinely does not hold, so the verifier must say so. This
+        // observation is TRUE and stays available to the consumer, which is what lets the
+        // consumer record an uncertainty instead of guessing.
+        assert!(
+            matches!(out, VerificationOutcome::Refuted { .. }),
+            "the file does not hold the requested bytes, so `Refuted` is the accurate \
+             observation; suppressing it here would hide a true fact and still not prove \
+             anything about execution. Observed verdict: {out:?}"
+        );
+
+        // And the real admission table lets it through unchanged -- `(Succeeded, Refuted)`
+        // is admissible. That is not the defect and must not be "fixed" either: refusing it
+        // here would hide a true observation for the same reason, and ADR-0056 places the
+        // boundary one layer up where the retry permission is actually issued.
+        let admitted = crate::dispatch::admit_verification(&execution, out.clone());
+        assert!(
+            matches!(admitted, VerificationOutcome::Refuted { .. }),
+            "admission is a no-op on a refuted postcondition after a successful execution, \
+             and must stay one; the consumption of this answer is what ADR-0056 changed. \
+             Got: {admitted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// ADR-0056 Decision 7. **This test was inverted on purpose and the old assertion was
+    /// the defect.**
+    ///
+    /// It previously read `Refuted` and justified it as "a genuinely absent file IS proven
+    /// not to have been written". It is not proven, and that sentence is the same error as
+    /// the one above it: a file's absence is a postcondition, and a write that happened
+    /// whose output was subsequently deleted is indistinguishable from one that never ran.
+    ///
+    /// Note what is *not* being decided here. The retry permission is not being taken away
+    /// from every absence — it was never held on evidence this strong. Genuine
+    /// non-execution is still warrantable, and it is warrantable from a refusal decided
+    /// before a process exists (`ExecutionCertainty::NothingAttempted`), which never reaches
+    /// this function at all. Three tests in `orxnud-daemon` and one in `settlement.rs` cover
+    /// that path and are unaffected by this change.
+    ///
+    /// So the verifier's answer is still `Refuted` — the postcondition genuinely does not
+    /// hold, and saying so is accurate. What ADR-0056 changed is what the daemon is allowed
+    /// to *do* with that answer, and that is `certainty_of`, not this function.
+    #[test]
+    fn an_absent_file_is_still_refuted_but_refutes_nothing_about_execution() {
+        let ws = std::env::temp_dir().join(format!("f17-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir");
+
+        let params = serde_json::json!({ "path": "missing.txt", "contents": "wanted" });
+        let out = verifier_for(&ws)
+            .verify(
+                &ExecutionOutcome::Succeeded {
+                    output: Some(String::new()),
+                },
+                &params,
+                0,
+            )
+            .expect("verification runs");
+
+        assert!(
+            matches!(out, VerificationOutcome::Refuted { .. }),
+            "the postcondition genuinely does not hold, so the verifier must keep reporting \
+             that accurately -- downgrading it here would destroy a true observation and fix \
+             nothing, because the fix belongs in how the answer is consumed. Observed \
+             verdict: {out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[test]
     fn the_declaration_is_high_risk_subprocess_and_not_idempotent() {
         let d = declaration();

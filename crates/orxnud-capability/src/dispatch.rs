@@ -1635,6 +1635,7 @@ impl<'p, S: SecretsContract> Dispatcher<'p, S> {
             capability: capability.clone(),
             program: sandboxed.program,
             args: sandboxed.args,
+            stdin_payload: sandboxed.stdin_payload,
             env: sandboxed.env,
             working_dir: sandboxed.working_dir,
             grant_rw: sandboxed.grant_rw,
@@ -2303,12 +2304,28 @@ pub fn terminal_outcome_for_failure(
             Some(format!("verification did not settle the effect: {e}")),
         ),
 
-        // The verifier disproved the effect. The capability ran and demonstrably did
-        // not do what was asked, which is a stronger statement than "failed" and must
-        // not be recorded as an ordinary failure.
+        // The verifier refuted the postcondition. **ADR-0056: this is `Uncertain`, not
+        // `Failed`.**
+        //
+        // It was `Failed`, on the reasoning that "the capability ran and demonstrably did
+        // not do what was asked, which is a stronger statement than 'failed'". That
+        // reasoning conflated the strength of the *verdict* with certainty about the
+        // *effect*. The verdict is strong — the bytes are not what was asked for — and the
+        // effect is not: the capability ran, its exit code was 0, and a later actor may
+        // have changed the file afterwards. `Failed` asserts the action did not achieve its
+        // effect, which is exactly what nobody can say here.
+        //
+        // The journal has to move with the effect ledger. A `Failed` journal beside an
+        // `Unknown` ledger is the pair ADR-0056 exists to prevent, and leaving this arm
+        // alone would have produced exactly that contradiction while the ledger looked
+        // correct.
         DispatchError::VerificationRefuted { .. } => (
-            OutcomeKind::Failed,
-            Some("verification refuted the reported effect".to_owned()),
+            OutcomeKind::Uncertain,
+            Some(
+                "verification refuted the postcondition, which is not evidence that the \
+                 effect did not occur"
+                    .to_owned(),
+            ),
         ),
 
         // An adapter called back into the dispatcher.
