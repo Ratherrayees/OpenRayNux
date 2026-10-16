@@ -135,6 +135,144 @@ class Fixture:
         )
 
 
+class DocFixture:
+    """A temporary cargo workspace the real G15 can be pointed at.
+
+    G15 runs `cargo doc`, so unlike the boundary gates it cannot be driven by a
+    source transform over this repository's own crates: the fixture has to be a real
+    workspace, because the behaviour under test is rustdoc's, not a text substitution's.
+    """
+
+    def __init__(self, root: str, lib: str) -> None:
+        self.root = root
+        crate = os.path.join(root, "crates", "docfix")
+        os.makedirs(os.path.join(crate, "src"), exist_ok=True)
+        self.write("Cargo.toml", DOC_WORKSPACE)
+        self.write("crates/docfix/Cargo.toml", DOC_CRATE)
+        self.write("crates/docfix/src/lib.rs", lib)
+
+    def write(self, rel: str, text: str) -> None:
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def gate(self) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, ORXNUD_DOC_ROOT=self.root)
+        # A target directory of its own, so the fixture cannot write into this
+        # repository's target/ and cannot inherit a warm cache that hides a warning.
+        env["CARGO_TARGET_DIR"] = os.path.join(self.root, "target")
+        return subprocess.run(
+            ["bash", GATE, "G15"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=REPO,
+            check=False,
+        )
+
+
+DOC_WORKSPACE = """[workspace]
+members = ["crates/docfix"]
+resolver = "2"
+"""
+
+DOC_CRATE = """[package]
+name = "docfix"
+version = "0.0.0"
+edition = "2021"
+publish = false
+"""
+
+# Positive: public documentation that links only to public items.
+DOC_CLEAN = """//! A crate whose documentation resolves.
+//!
+//! The public method is [`Thing::visible`].
+
+/// The public surface.
+pub struct Thing;
+
+impl Thing {
+    /// A public method, linked correctly above.
+    pub fn visible(&self) -> u8 {
+        private_helper()
+    }
+}
+
+fn private_helper() -> u8 {
+    7
+}
+"""
+
+# Negative: public documentation linking to a private item. This is the exact class
+# of defect CI run #59 reported and the local gate suite missed.
+DOC_PRIVATE_LINK = """//! A crate whose documentation links to something private.
+//!
+//! The implementation is [`Thing::hidden`], which is crate-private, so this link
+//! cannot resolve in public documentation.
+
+/// The public surface.
+pub struct Thing;
+
+impl Thing {
+    /// A public method.
+    pub fn visible(&self) -> u8 {
+        self.hidden()
+    }
+
+    /// Crate-private, and linked from the module documentation above.
+    fn hidden(&self) -> u8 {
+        7
+    }
+}
+"""
+
+# Negative: a link to a name that does not exist at all.
+DOC_BROKEN_LINK = """//! A crate whose documentation links to a name that does not exist.
+//!
+//! See [`Thing::absent`] for details.
+
+/// The public surface.
+pub struct Thing;
+
+impl Thing {
+    /// A public method.
+    pub fn visible(&self) -> u8 {
+        7
+    }
+}
+"""
+
+DOC_CASES = [
+    ("rustdoc accepts documentation whose links resolve", False, DOC_CLEAN),
+    ("rustdoc rejects public documentation linking to a private item", True, DOC_PRIVATE_LINK),
+    ("rustdoc rejects public documentation linking to an absent item", True, DOC_BROKEN_LINK),
+]
+
+
+def run_doc_case(tmp: str, name: str, expect_fail: bool, lib: str) -> tuple[bool, str]:
+    """Drive the real G15 over a fixture workspace and require the stated verdict.
+
+    Both directions are required. A gate that cannot be made to fail proves nothing:
+    the whole reason this gate exists is that a broken-documentation tree reported
+    green, so a positive-only self-test would have passed just as well.
+    """
+    root = os.path.join(tmp, "doc-case")
+    shutil.rmtree(root, ignore_errors=True)
+    fx = DocFixture(root, lib)
+    result = fx.gate()
+    rejected = result.returncode != 0
+    if rejected == expect_fail:
+        return True, ""
+    return (
+        False,
+        f"{name}\n     expected G15 to "
+        f"{'REJECT' if expect_fail else 'ACCEPT'} the fixture, and it "
+        f"{'rejected' if rejected else 'accepted'}\n"
+        f"     gate output:\n{result.stdout}\n{result.stderr}",
+    )
+
+
 # --------------------------------------------------------------------------
 # Case table
 # --------------------------------------------------------------------------
@@ -894,6 +1032,18 @@ def main() -> int:
         for name, gate, rel, expect_fail in G2D_CASES + G2D_ANY_TEST_CASES + G3_CASES:
             total += 1
             ok, detail = run_case(tmp, name, gate, rel, expect_fail, source_for(name))
+            if ok:
+                print(f"  ok    {name}")
+            else:
+                print(f"  FAIL  {name}")
+                failures.append(detail)
+
+        # G15: the rustdoc gate must accept clean documentation and reject broken
+        # documentation. Run against a real cargo workspace, because the behaviour
+        # under test belongs to rustdoc rather than to a text substitution.
+        for name, expect_fail, lib in DOC_CASES:
+            total += 1
+            ok, detail = run_doc_case(tmp, name, expect_fail, lib)
             if ok:
                 print(f"  ok    {name}")
             else:

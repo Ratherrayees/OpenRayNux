@@ -99,6 +99,7 @@ declare -A NAMES=(
   [G12]="semver"
   [G13]="boundary gate self-tests"
   [G14]="CI toolchain pinning (S-24)"
+  [G15]="rustdoc (warnings denied)"
 )
 
 banner() { printf '\n\033[1m== %s: %s\033[0m\n' "$1" "${NAMES[$1]}"; }
@@ -151,6 +152,45 @@ manifest_deps() {
 # functions against temporary sources rather than against a reimplementation of them.
 gate_root() {
   printf '%s' "${ORXNUD_GATE_ROOT:-$REPO_ROOT}"
+}
+
+# The root whose documentation is built. Pointed at a fixture tree by
+# `scripts/gate-selftest.py`, for the same reason as `gate_root`: a self-test has to
+# drive the real check, not a reimplementation of it that could pass while the gate
+# does nothing.
+doc_root() {
+  printf '%s' "${ORXNUD_DOC_ROOT:-$REPO_ROOT}"
+}
+
+# G15 -- the public documentation builds with warnings denied.
+#
+# This check exists because CI caught four broken intra-doc links that the local gate
+# suite reported green through: `cargo doc` ran only in a separate CI job, so
+# documentation regressions surfaced on the Actions run rather than before a push.
+#
+# Warnings are denied for the same reason they are denied for rustc and clippy
+# elsewhere in this file. A repository that treats warnings as errors everywhere else
+# and tolerates them in its documentation is not consistent, and the specific failure
+# here is silent -- a link to a private item is a warning, and a warning nobody reads
+# is a broken link nobody notices.
+#
+# `--no-deps` builds this workspace's documentation only. Dependencies are not ours to
+# fix, and denying their warnings would fail on someone else's code.
+gate_G15() {
+  banner G15
+  local root flags log
+  root=$(doc_root)
+  flags="${ORXNUD_RUSTDOCFLAGS:--D warnings}"
+  log=$(mktemp)
+  if ( cd "$root" && RUSTDOCFLAGS="$flags" cargo doc --workspace --no-deps ) >"$log" 2>&1; then
+    ok "cargo doc --workspace --no-deps with RUSTDOCFLAGS=$flags"
+  else
+    # The failing lines, not the whole build log: the useful part of a rustdoc
+    # failure is the two or three lines naming the file and the item.
+    grep -E '^(error|warning)' "$log" | head -20
+    fail_gate "documentation does not build with RUSTDOCFLAGS=\"$flags\""
+  fi
+  rm -f "$log"
 }
 
 # G2d -- authority is minted only by orxnud-policy, and only where rustc can see it.
@@ -821,15 +861,15 @@ gate_G14() {
   fi
 }
 
-ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14)
+ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14 G15)
 
 run() {
   case "$1" in
 G1) gate_G1 ;;  G2) gate_G2 ;;  G2d) gate_G2d ;;  G3) gate_G3 ;;  G4) gate_G4 ;;
     G5) gate_G5 ;;  G6) gate_G6 ;;  G7) gate_G7 ;;  G8) gate_G8 ;;  G9) gate_G9 ;;
     G10) gate_G10 ;;  G11) gate_G11 ;;  G12) gate_G12 ;;  G13) gate_G13 ;;
-    G14) gate_G14 ;;
-    *) printf 'unknown gate: %s (expected G1..G14)\n' "$1" >&2; exit 2 ;;
+    G14) gate_G14 ;;  G15) gate_G15 ;;
+    *) printf 'unknown gate: %s (expected G1..G15)\n' "$1" >&2; exit 2 ;;
   esac
 }
 
