@@ -301,7 +301,7 @@ mod atomicity {
         Pragma::critical().apply(&c).expect("pragmas");
         let r = MigrationRunner::new(&c);
         if r.applied_version().expect("version") == 0 {
-            r.run(true).expect("migrate");
+            r.migrate(path).expect("migrate");
         }
         c
     }

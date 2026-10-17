@@ -100,6 +100,7 @@ declare -A NAMES=(
   [G13]="boundary gate self-tests"
   [G14]="CI toolchain pinning (S-24)"
   [G15]="rustdoc (warnings denied)"
+  [G16]="migration snapshot path (S-11/F-26)"
 )
 
 banner() { printf '\n\033[1m== %s: %s\033[0m\n' "$1" "${NAMES[$1]}"; }
@@ -861,15 +862,43 @@ gate_G14() {
   fi
 }
 
-ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14 G15)
+# G16 -- the migration snapshot path is not optional in production code.
+#
+# S-11 / F-26. `MigrationRunner::run(&self, snapshot_verified: bool)` took no snapshot and
+# restored nothing; it refused only when the boolean was false, so `run(true)` -- what
+# production actually called, for the audit journal and the approval ledger -- applied every
+# migration unprotected. The replacement is `migrate(path)` (snapshots and verifies its own,
+# hands back a recovery obligation on failure) beside `migrate_ephemeral` (no snapshot, no
+# rollback, named for the only cases where that is honest).
+#
+# Removing the boolean is only half of it. `migrate_ephemeral` is still callable from
+# production, and no behavioural test can tell whether a caller chose it: both paths end in
+# the same migrations and the same `schema_meta`, so a test that ran the wrong one would see
+# the same database. The property is about *which function was called*, so it is checked on
+# the source -- the same reasoning as the sandbox crate's compile-time check that a
+# `Refused` may not be constructed after a process exists.
+#
+# It runs through `gate_policy.py g16` rather than living in the migration module, because
+# the boundary is workspace-wide: a caller in orxnud-daemon is exactly as bad as one in
+# orxnud-store, and only something that reads every crate's production source can say so.
+gate_G16() {
+  banner G16
+  if python3 scripts/gate_policy.py g16 --root "$(gate_root)"; then
+    ok "production code reaches the schema only through the snapshotting migration path"
+  else
+    fail_gate "production code can apply schema changes with no verified snapshot and no rollback"
+  fi
+}
+
+ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14 G15 G16)
 
 run() {
   case "$1" in
 G1) gate_G1 ;;  G2) gate_G2 ;;  G2d) gate_G2d ;;  G3) gate_G3 ;;  G4) gate_G4 ;;
     G5) gate_G5 ;;  G6) gate_G6 ;;  G7) gate_G7 ;;  G8) gate_G8 ;;  G9) gate_G9 ;;
     G10) gate_G10 ;;  G11) gate_G11 ;;  G12) gate_G12 ;;  G13) gate_G13 ;;
-    G14) gate_G14 ;;  G15) gate_G15 ;;
-    *) printf 'unknown gate: %s (expected G1..G15)\n' "$1" >&2; exit 2 ;;
+    G14) gate_G14 ;;  G15) gate_G15 ;;  G16) gate_G16 ;;
+    *) printf 'unknown gate: %s (expected G1..G16)\n' "$1" >&2; exit 2 ;;
   esac
 }
 

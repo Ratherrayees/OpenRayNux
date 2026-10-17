@@ -140,7 +140,7 @@ pub fn open_migrated(path: &std::path::Path) -> rusqlite::Connection {
         .verify(&conn)
         .expect("verify pragmas");
     orxnud_store::MigrationRunner::new(&conn)
-        .run(true)
+        .migrate(path)
         .expect("migrate");
     conn
 }

@@ -48,7 +48,7 @@ fn engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).run(true).expect("migrate");
+    MigrationRunner::new(&conn).migrate(path).expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -498,7 +498,7 @@ fn p1_17_a_rejected_fire_is_not_reported_as_an_already_present_fire() {
     {
         let conn = rusqlite::Connection::open(&path).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn).migrate(&path).expect("migrate");
     }
     let mut e = engine(&path);
     {

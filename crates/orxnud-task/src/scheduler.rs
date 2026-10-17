@@ -401,7 +401,9 @@ mod tests {
     fn engine() -> DurableEngine {
         let c = rusqlite::Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         DurableEngine::new(c, EngineLimits::documented()).expect("engine")
     }
 
@@ -537,7 +539,9 @@ mod tests {
             {
                 let c = rusqlite::Connection::open_in_memory().expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
-                MigrationRunner::new(&c).run(true).expect("migrate");
+                MigrationRunner::new(&c)
+                    .migrate_ephemeral()
+                    .expect("migrate");
                 c
             },
             EngineLimits {
@@ -635,7 +639,9 @@ mod tests {
             {
                 let c = rusqlite::Connection::open_in_memory().expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
-                MigrationRunner::new(&c).run(true).expect("migrate");
+                MigrationRunner::new(&c)
+                    .migrate_ephemeral()
+                    .expect("migrate");
                 c
             },
             EngineLimits {

@@ -86,7 +86,7 @@ fn db(tag: &str) -> (PathBuf, Connection) {
     let p = d.join("state.db");
     let c = Connection::open(&p).expect("open");
     Pragma::critical().apply(&c).expect("pragmas");
-    MigrationRunner::new(&c).run(true).expect("migrate");
+    MigrationRunner::new(&c).migrate(&p).expect("migrate");
     (p, c)
 }
 

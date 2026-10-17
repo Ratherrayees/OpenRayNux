@@ -511,7 +511,9 @@ mod tests {
     fn mem() -> Connection {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         c
     }
 
@@ -808,7 +810,7 @@ mod tests {
         {
             let mut c = Connection::open(&path).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).run(true).expect("migrate");
+            MigrationRunner::new(&c).migrate(&path).expect("migrate");
             let mut repo = ScheduleRepository::new(&mut c);
             repo.insert(&spec("s", MisfirePolicy::FireAll, 10), NOW)
                 .expect("insert");

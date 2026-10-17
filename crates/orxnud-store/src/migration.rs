@@ -12,13 +12,25 @@
 //! * **Transactional.** All of a migration's statements, or none.
 //! * **Idempotent.** Re-running a migration that has already been applied is a
 //!   no-op, checked against `schema_meta`.
-//! * **Snapshot-protected.** The caller takes a verified snapshot *before*
-//!   running any; the runner refuses to proceed unless told the snapshot exists.
+//! * **Snapshot-protected.** Production code reaches the schema only through
+//!   [`MigrationRunner::migrate`], which takes and verifies its own snapshot
+//!   before running anything and hands back a recovery obligation on failure.
 //!
-//! That last one is why [`MigrationRunner::run`] takes a
-//! `snapshot_verified: bool`. It is not ceremony: a migration is the single
-//! highest-risk write path in the system, and it operates on the only copy of
-//! the user's data.
+//! That last one used to be a boolean, and it was the defect this module was
+//! audited for (S-11 / F-26). `MigrationRunner::run(snapshot_verified: bool)` took a
+//! `snapshot_verified: bool`, checked it, and then applied every migration — it
+//! took no snapshot and restored nothing, so the boolean was the whole of its
+//! safety. A caller that passed `true` without holding anything got no refusal
+//! and no rollback. The two production call sites that did this were the audit
+//! journal and the approval ledger, which between them hold the only tamper
+//! evidence the system produces.
+//!
+//! There is now no parameter to get wrong. `migrate` decides for itself, and the
+//! alternative — [`MigrationRunner::migrate_ephemeral`] — is named for the only
+//! case where deciding differently is honest: a database with no durable copy,
+//! such as an in-memory fixture. A source-level check keeps production code off
+//! that path, because no behavioural test can observe which function a caller
+//! chose.
 
 use std::path::Path;
 
@@ -65,11 +77,6 @@ pub enum MigrationError {
 
     /// The runner was asked to migrate without a verified snapshot.
     ///
-    /// Refused rather than warned: this is the one write path where a mistake is
-    /// unrecoverable.
-    #[error("refusing to migrate without a verified pre-migration snapshot (ADR-0017)")]
-    NoSnapshot,
-
     /// Taking or verifying the pre-migration snapshot failed.
     #[error("snapshot protection failed: {0}")]
     Snapshot(#[from] BackupError),
@@ -306,23 +313,51 @@ impl<'a> MigrationRunner<'a> {
         .map_err(|source| MigrationError::Failed { version: 0, source })
     }
 
-    /// Applies every pending migration, in ascending order.
+    /// Applies every pending migration to a database with **no durable copy**.
     ///
-    /// Returns the versions applied. An empty vector means already up to date.
+    /// # This is not the production entry point
     ///
-    /// **Does not take a snapshot.** See [`Self::migrate`] — production code
-    /// wants that one. This exists for the case where the caller already holds a
-    /// verified snapshot, and for tests.
+    /// Production code must use [`Self::migrate`], which takes and verifies its
+    /// own snapshot and can restore it. This method does neither, and it says so
+    /// in its name rather than leaving a flag for the caller to set.
+    ///
+    /// It exists because a snapshot of a database that does not survive the
+    /// process would be meaningless. The legitimate callers are an in-memory
+    /// fixture, a file-scoped test fixture that is about to be deleted, and a
+    /// child process about to be killed on purpose — in all of them there is no
+    /// previous state to protect, so "take a snapshot first" would be theatre.
+    ///
+    /// # Why the unsafe form was removed rather than flagged
+    ///
+    /// The previous shape was `run(snapshot_verified: bool)`: it took no
+    /// snapshot, restored nothing, and refused only when the boolean was false.
+    /// The four production call sites that passed `true` therefore had no
+    /// snapshot and no rollback, and the two that ran in production were the
+    /// audit journal and the approval ledger.
+    ///
+    /// A boolean that names its own safety is not a safety mechanism; it is a
+    /// claim, and a claim is exactly what S-11 recorded as being asserted rather
+    /// than established. Removing the parameter leaves one production meaning,
+    /// and this method — whose name is a warning — leaves one other meaning.
+    ///
+    /// `migrate_ephemeral` is refused in production code by gate **G16**
+    /// (`scripts/gate_policy.py g16`, run by `scripts/ci-gates.sh`), which reads
+    /// every crate's production source. A behavioural test cannot tell which of
+    /// two methods a caller invoked -- both end in the same migrations and the
+    /// same `schema_meta` -- so the check that keeps this off the production path
+    /// has to be a check on the code. G13 exercises that gate against injected
+    /// violations in both directions, so it is known to be able to fail.
     ///
     /// # Errors
     ///
-    /// [`MigrationError::NoSnapshot`] if `snapshot_verified` is false — the
-    /// runner refuses to touch the only copy of the user's data without a
-    /// verified way back. Otherwise [`MigrationError::Failed`].
-    pub fn run(&self, snapshot_verified: bool) -> Result<Vec<u32>, MigrationError> {
-        if !snapshot_verified {
-            return Err(MigrationError::NoSnapshot);
-        }
+    /// [`MigrationError::Failed`] if a statement fails.
+    ///
+    /// There is no "refusing to migrate without a snapshot" variant, and there used to
+    /// be one. `MigrationError::NoSnapshot` existed to answer `run(false)`; it is gone
+    /// because the boolean is gone. Keeping it would have been worse than dead code: a
+    /// variant named for a refusal that can no longer happen advertises a guarantee the
+    /// type no longer has.
+    pub fn migrate_ephemeral(&self) -> Result<Vec<u32>, MigrationError> {
         let mut applied = Vec::new();
         for m in MIGRATIONS {
             // Re-checked **inside** the transaction, per migration, rather than filtered
@@ -416,30 +451,31 @@ impl<'a> MigrationRunner<'a> {
     /// verified, [`MigrationError::Failed`] if a migration failed (snapshot
     /// restored), or [`MigrationError::RestoreFailed`] if a migration failed
     /// *and* the restore failed.
-    pub fn migrate(
-        &self,
-        db_path: &Path,
-        snapshot_verified_by_caller: bool,
-    ) -> Result<Vec<u32>, MigrationError> {
+    pub fn migrate(&self, db_path: &Path) -> Result<Vec<u32>, MigrationError> {
         let current = self.applied_version()?;
         let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > current).collect();
         if pending.is_empty() {
             return Ok(Vec::new());
         }
 
-        // The caller's claim is checked, never trusted: if the caller says it
-        // holds a snapshot but none exists on disk, take one anyway.
-        let snapshot = if snapshot_verified_by_caller {
-            let path = Backup::path_for(db_path);
-            match Backup::verify(&path) {
-                Ok(_) => Some(Backup::existing(path)),
-                Err(_) => Some(Backup::take(self.conn, db_path)?),
-            }
-        } else {
-            Some(Backup::take(self.conn, db_path)?)
+        // The snapshot decision is made here, and there is no longer a parameter for a
+        // caller to get wrong. The previous shape took
+        // `snapshot_verified_by_caller: bool` and, when it was `true`, reused a snapshot
+        // from disk after checking it. The check made the flag harmless — `false`, which
+        // is what every production caller passed, could not produce an unprotected
+        // migration — but a parameter whose two values mean "take a snapshot" and "do not
+        // take a snapshot" is a parameter a future caller can read backwards. Removing it
+        // leaves exactly one behaviour, and it is the safe one.
+        //
+        // A pre-existing snapshot file at the conventional path is still reused rather
+        // than overwritten, because it may be the only good copy of a database whose last
+        // migration failed. It is used only if it verifies against this database.
+        let snapshot = match Backup::verify(&Backup::path_for(db_path)) {
+            Ok(_) => Some(Backup::existing(Backup::path_for(db_path))),
+            Err(_) => Some(Backup::take(self.conn, db_path)?),
         };
 
-        match self.run(true) {
+        match self.migrate_ephemeral() {
             Ok(applied) => {
                 // Only now is the snapshot obsolete.
                 if let Some(s) = &snapshot {
@@ -487,33 +523,117 @@ fn now_ms() -> i64 {
 /// # Errors
 ///
 /// Any [`StoreError`].
-pub fn open_and_migrate(
-    path: &std::path::Path,
-    snapshot_verified: bool,
-) -> Result<crate::sqlite::Store, StoreError> {
+pub fn open_and_migrate(path: &std::path::Path) -> Result<crate::sqlite::Store, StoreError> {
+    // Whether the file already exists is read *before* opening it, because a failed
+    // first migration must not leave a half-built file behind for the next start to
+    // inherit. See `discard_failed_initialisation`.
+    let pre_existing = path.exists();
     let store = crate::sqlite::Store::open(path, true)?;
-    // S-31: the store holds shared ownership for as long as it lives, so a restore
-    // on this path could not take exclusive ownership. Hand the recovery back rather
-    // than attempting it under our own lease.
-    match MigrationRunner::new(store.conn()).migrate(path, snapshot_verified) {
+    match MigrationRunner::new(store.conn()).migrate(path) {
         Ok(_) => Ok(store),
         Err(MigrationError::RecoveryRequired { source, snapshot }) => {
+            // S-31: the store holds shared ownership for as long as it lives, so a restore
+            // on this path could not take exclusive ownership. Drop it first, which
+            // closes the connection and releases the lease, then recover.
             drop(store);
-            crate::backup::Backup::existing(snapshot.clone())
-                .restore_coordinated(path)
-                .map_err(|e| {
-                    StoreError::Migration(Box::new(MigrationError::RestoreFailed(Box::new(
-                        RestoreFailure {
-                            version: 0,
-                            snapshot: snapshot.display().to_string(),
-                            source: e,
-                        },
-                    ))))
-                })?;
+            recover_from_snapshot(path, &snapshot)?;
             Err(StoreError::Migration(source))
         }
-        Err(e) => Err(StoreError::Migration(Box::new(e))),
+        Err(e) => {
+            drop(store);
+            discard_failed_initialisation(path, pre_existing);
+            Err(StoreError::Migration(Box::new(e)))
+        }
     }
+}
+
+/// Recovers `db_path` from `snapshot` under exclusive ownership.
+///
+/// The one implementation of the sequence every migration caller needs, so it exists once
+/// rather than three times and cannot drift between them:
+///
+/// 1. every connection and shared lease on `db_path` must already be dropped;
+/// 2. exclusive ownership is taken (S-31), failing fast if another process holds it;
+/// 3. the snapshot is restored, which verifies the restored *logical* content (S-30).
+///
+/// # Errors
+///
+/// [`MigrationError::RestoreFailed`] if the restore does not produce a database whose
+/// logical content matches the snapshot. The original migration error is the caller's to
+/// keep: this reports that recovery itself failed, which is a different and more urgent
+/// fact.
+pub fn recover_from_snapshot(db_path: &Path, snapshot: &Path) -> Result<(), StoreError> {
+    crate::backup::Backup::existing(snapshot.to_path_buf())
+        .restore_coordinated(db_path)
+        .map_err(|source| {
+            StoreError::Migration(Box::new(MigrationError::RestoreFailed(Box::new(
+                RestoreFailure {
+                    version: 0,
+                    snapshot: snapshot.display().to_string(),
+                    source,
+                },
+            ))))
+        })
+}
+
+/// Removes a database this call created, after its first migration failed.
+///
+/// # Why a first migration failure is different from any other
+///
+/// Every other migration failure has a snapshot to roll back to, and the caller restores
+/// it. A failure on a **brand-new** database may have no usable snapshot — V-33 records the
+/// case where the very first migration cannot take one at all — and even when it can, the
+/// thing being rolled back to is empty. What is left behind is a file that exists, holds
+/// some of the schema, and will be opened by the next start as though it were a database to
+/// migrate rather than one to create.
+///
+/// So the file is removed, and the next start begins clean. That is strictly better than
+/// inheriting a half-built schema, and it cannot lose data: a file this call *created*
+/// contained nothing but what the migrations put there.
+///
+/// # The guard, and why it is not optional
+///
+/// `pre_existing` is read **before** the store is opened. Only a file this call created is
+/// ever removed. A pre-existing database with no `schema_meta` is a real case — a foreign
+/// file, or one whose first migration failed under an older build — and deleting that would
+/// destroy a user's data on the strength of a version check. Absence of `schema_meta` is not
+/// evidence of emptiness.
+pub(crate) fn discard_failed_initialisation(db_path: &Path, pre_existing: bool) {
+    if pre_existing {
+        return;
+    }
+    // The sidecars too. A `-wal` without its database is not inert: SQLite may recreate
+    // the database from it on the next open, which is precisely the stale-data problem
+    // S-30 exists to prevent, one step removed.
+    // The snapshot goes too. `Backup::take` does not clean up after itself: if the copy or
+    // the verification fails partway, the file it created stays on disk. On this path there
+    // is nothing to recover from, so that file is debris -- and debris with a snapshot's
+    // name is worse than none, because the *next* start's `migrate` adopts any existing
+    // file at this path that verifies, and an empty database's snapshot can verify.
+    for path in [
+        db_path.to_path_buf(),
+        wal_sidecar(db_path),
+        shm_sidecar(db_path),
+        Backup::path_for(db_path),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The `-wal` path SQLite derives from a database path.
+fn wal_sidecar(db_path: &Path) -> std::path::PathBuf {
+    suffix(db_path, "-wal")
+}
+
+/// The `-shm` path SQLite derives from a database path.
+fn shm_sidecar(db_path: &Path) -> std::path::PathBuf {
+    suffix(db_path, "-shm")
+}
+
+fn suffix(db_path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    db_path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -558,7 +678,9 @@ mod tests {
     #[test]
     fn every_migration_applies_and_reaches_the_current_version() {
         let conn = mem();
-        let applied = MigrationRunner::new(&conn).run(true).expect("migrate");
+        let applied = MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
         assert_eq!(
             applied,
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<u32>>(),
@@ -580,7 +702,9 @@ mod tests {
     #[test]
     fn composition_columns_exist_on_a_fresh_database_with_their_defaults() {
         let conn = mem();
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
 
         for (table, column, default) in [
             ("tasks", "max_steps", 1),
@@ -629,7 +753,9 @@ mod tests {
     #[test]
     fn a_logical_step_may_hold_several_attempted_proposals() {
         let conn = mem();
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
         conn.execute(
             "INSERT INTO tasks (id,kind,state,idempotent,max_attempts,created_at_ms,updated_at_ms)
              VALUES ('rt','query','pending',0,5,1,1);",
@@ -850,7 +976,7 @@ mod tests {
 
         let fresh = mem();
         MigrationRunner::new(&fresh)
-            .run(true)
+            .migrate_ephemeral()
             .expect("fresh migrate");
         let migrated = mem();
         migrate_to(&migrated, CURRENT_VERSION);
@@ -867,13 +993,15 @@ mod tests {
     #[test]
     fn rerunning_the_migrations_changes_nothing() {
         let conn = mem();
-        let first = MigrationRunner::new(&conn).run(true).expect("migrate");
+        let first = MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
         assert_eq!(
             first,
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<u32>>()
         );
         let second = MigrationRunner::new(&conn)
-            .run(true)
+            .migrate_ephemeral()
             .expect("re-run is a no-op");
         assert!(
             second.is_empty(),
@@ -890,7 +1018,9 @@ mod tests {
     #[test]
     fn a_step_result_records_an_outcome_and_authorises_nothing() {
         let conn = mem();
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
         conn.execute(
             "INSERT INTO tasks (id,kind,state,idempotent,max_attempts,created_at_ms,updated_at_ms)
              VALUES ('sr','query','pending',0,3,1,1);",
@@ -979,8 +1109,15 @@ mod tests {
                     .expect("busy timeout");
                 // Either this thread applied the migrations or found them already applied;
                 // both are success. What must never happen is a hard failure.
+                //
+                // Ephemeral on purpose. All four threads share one database path, so
+                // `migrate` would have them race for the single snapshot at
+                // `Backup::path_for`, and the test would fail on snapshot contention
+                // instead of on the lock behaviour it exists to pin. The snapshot path has
+                // its own coverage (`migrate` takes and verifies one before touching a
+                // file); this test is about `IMMEDIATE` transactions.
                 MigrationRunner::new(&conn)
-                    .run(true)
+                    .migrate_ephemeral()
                     .map(|_| ())
                     .unwrap_or_else(|e| {
                         // A `SQLITE_BUSY` that outlives the busy timeout is a lock
@@ -996,7 +1133,9 @@ mod tests {
 
         let conn = rusqlite::Connection::open(&path).expect("reopen");
         assert_eq!(
-            MigrationRunner::new(&conn).run(true).expect("read version"),
+            MigrationRunner::new(&conn)
+                .migrate(&path)
+                .expect("read version"),
             Vec::<u32>::new(),
             "everything is applied exactly once"
         );
@@ -1009,7 +1148,9 @@ mod tests {
         // because something required it, and this test fails if one is added
         // without a table in `schema.rs` and a row in ADR-0028.
         let conn = mem();
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
         let mut names: Vec<String> = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type='table'
@@ -1048,7 +1189,9 @@ mod tests {
         // to later phases; a schema for one of them appearing now would be exactly
         // the speculative work this phase forbids.
         let conn = mem();
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate");
         let forbidden = [
             "users",
             "health",
@@ -1082,29 +1225,497 @@ mod tests {
         let conn = mem();
         let r = MigrationRunner::new(&conn);
         assert_eq!(
-            r.run(true).expect("first run"),
+            r.migrate_ephemeral().expect("first run"),
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<u32>>()
         );
-        assert_eq!(r.run(true).expect("second run"), Vec::<u32>::new());
+        assert_eq!(
+            r.migrate_ephemeral().expect("second run"),
+            Vec::<u32>::new()
+        );
         assert_eq!(r.applied_version().expect("version"), CURRENT_VERSION);
     }
 
+    /// S-11 / F-26. The guarantee this module now has to keep, stated as something
+    /// observable rather than as an argument.
+    ///
+    /// The previous shape was `run(snapshot_verified: bool)`. Its refusal was real but
+    /// weak: `run(false)` returned a `NoSnapshot` refusal, so a test could observe that
+    /// the runner declined an unprotected migration, while `run(true)` took no snapshot and
+    /// restored nothing. The refusal proved the runner could say no; it did not make the yes safe,
+    /// and production answered yes.
+    ///
+    /// What replaces it cannot be a refusal, because there is nothing left to refuse.
+    /// `migrate` has no boolean, so the only way to reach an unprotected migration is to
+    /// name it: `migrate_ephemeral`. The property to pin is therefore the positive one --
+    /// **`migrate` on a real database has taken and verified a snapshot by the time a
+    /// migration fails**, and hands that snapshot back as a recovery obligation.
+    ///
+    /// Observed on a genuine mid-migration failure rather than on a mock, because the
+    /// failure has to be a real one for "the snapshot was already there" to mean anything.
     #[test]
-    fn migration_refuses_without_a_verified_snapshot() {
-        // The one write path where a mistake is unrecoverable, so the runner
-        // refuses rather than warns.
-        let conn = mem();
-        assert!(matches!(
-            MigrationRunner::new(&conn).run(false),
-            Err(MigrationError::NoSnapshot)
-        ));
-        // And nothing was applied.
-        assert_eq!(
-            MigrationRunner::new(&conn)
-                .applied_version()
-                .expect("version"),
-            0
+    fn a_failing_file_backed_migration_hands_back_a_snapshot_that_exists_and_verifies() {
+        // A database at version 1 with a `tasks` table that is *not* migration 2's: the
+        // name collides, so `MIGRATION_TASKS` fails with "table tasks already exists".
+        // A real statement failure, produced by real schema conflict, not by a flag.
+        let path = tmp_db("fail-midway");
+        {
+            let c = Connection::open(&path).expect("open");
+            c.execute_batch(
+                "CREATE TABLE schema_meta (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_meta (version, name, applied_at) VALUES (1, 'schema_meta', 0);
+                 CREATE TABLE tasks (id TEXT PRIMARY KEY);",
+            )
+            .expect("stage a version-1 database");
+        }
+
+        let c = Connection::open(&path).expect("reopen");
+        let err = MigrationRunner::new(&c)
+            .migrate(&path)
+            .expect_err("migration 2 must fail against the colliding table");
+
+        // The obligation, not a warning: this is the only copy of the old state, and the
+        // caller is told where it is.
+        let snapshot = match &err {
+            MigrationError::RecoveryRequired { snapshot, .. } => snapshot.clone(),
+            other => panic!("expected RecoveryRequired, got {other:?}"),
+        };
+        assert!(
+            snapshot.exists(),
+            "a failed migration must leave a snapshot behind at {}",
+            snapshot.display()
         );
+        Backup::verify(&snapshot).expect("the snapshot handed back must verify");
+
+        // And the failure is reported as itself, not swallowed into the recovery story.
+        let MigrationError::RecoveryRequired { source, .. } = &err else {
+            unreachable!()
+        };
+        assert!(
+            matches!(**source, MigrationError::Failed { .. }),
+            "the original failure must survive as the cause, got {source:?}"
+        );
+
+        // The database is untouched: no half-applied migration 2 is visible.
+        assert_eq!(
+            MigrationRunner::new(&c).applied_version().expect("version"),
+            1,
+            "a failed migration must not record a version"
+        );
+        let cols: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'kind';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("probe");
+        assert_eq!(
+            cols, 0,
+            "the colliding table must be left exactly as it was: migration 2 added no columns"
+        );
+        drop(c);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// A pre-existing snapshot that fails verification is **replaced, not adopted**.
+    ///
+    /// `migrate` reuses a snapshot already at the conventional path, because it may be the
+    /// only good copy of a database whose previous migration failed. Reuse is only safe if
+    /// the file is checked, and this is the check.
+    ///
+    /// This is the branch the old `snapshot_verified_by_caller: bool` decided between, and
+    /// it is only observable now because the decision lives in one place with no parameter.
+    /// A caller that passed `true` got this reuse unconditionally — it was told the snapshot
+    /// was verified, and it believed the caller.
+    ///
+    /// The arrangement makes adoption and replacement distinguishable. If `migrate` trusted
+    /// the file, the failure below would hand back the planted garbage as the recovery
+    /// obligation. It has to hand back something that verifies against the source.
+    #[test]
+    fn a_failed_migration_replaces_a_snapshot_that_does_not_verify() {
+        let path = tmp_db("bad-preexisting-snapshot");
+        {
+            let c = Connection::open(&path).expect("open");
+            c.execute_batch(
+                "CREATE TABLE schema_meta (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_meta (version, name, applied_at) VALUES (1, 'schema_meta', 0);
+                 CREATE TABLE tasks (id TEXT PRIMARY KEY);",
+            )
+            .expect("stage a version-1 database whose migration 2 must fail");
+        }
+
+        // Garbage at the snapshot path: not a database at all.
+        let planted = Backup::path_for(&path);
+        std::fs::write(&planted, b"this is not a snapshot of anything").expect("plant garbage");
+        assert!(planted.exists(), "precondition: the garbage is in place");
+
+        let c = Connection::open(&path).expect("reopen");
+        let err = MigrationRunner::new(&c)
+            .migrate(&path)
+            .expect_err("migration 2 must still fail against the colliding table");
+        drop(c);
+
+        let snapshot = match &err {
+            MigrationError::RecoveryRequired { snapshot, .. } => snapshot.clone(),
+            other => panic!("expected RecoveryRequired, got {other:?}"),
+        };
+        // Not a path comparison. `Backup::take` builds at a unique staging name and
+        // renames into the canonical one, so the obligation is *at* the canonical path by
+        // design; what distinguishes replacement from adoption is what is written there.
+        let published = std::fs::read(&snapshot).expect("the published snapshot is readable");
+        assert_ne!(
+            published, b"this is not a snapshot of anything",
+            "the bytes at the snapshot path must be the snapshot this call took, not the \
+             planted file it was supposed to reject"
+        );
+        assert!(
+            snapshot.exists(),
+            "and it must exist: the only copy of the old state is at {}",
+            snapshot.display()
+        );
+        // The real test: it verifies against the source, under the *strict* branch. The
+        // staged database does have `schema_meta` -- it is a version-1 database -- so the
+        // snapshot must too, and the planted bytes could not possibly satisfy this.
+        let source = Connection::open(&path).expect("reopen source");
+        assert!(
+            Backup::has_schema_meta(&source),
+            "precondition: the staged database is a version-1 database, so the strict \
+             branch applies and no relaxation is being relied on"
+        );
+        Backup::verify_against_source(&snapshot, &source, false)
+            .expect("the replacement snapshot must verify against the source");
+        drop(source);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// A first initialisation that cannot even take its snapshot leaves nothing behind.
+    ///
+    /// The case the other failure paths cannot cover. V-33 records that a brand-new
+    /// database used to be refused by snapshot *verification*, because there was no
+    /// `schema_meta` to compare against -- so the very first migration could not run at
+    /// all. Verification is now relaxed for an empty source, which means `Backup::take`
+    /// is what can fail, and when it does there is no snapshot to restore from. What would
+    /// otherwise be left on disk is a file that exists, holds part of the schema, and will
+    /// be opened by the next start as a database to *migrate* rather than one to create.
+    ///
+    /// So it is removed. Forcing the failure by occupying the snapshot path with a
+    /// directory makes `Backup::take` fail for a real, uninteresting reason.
+    #[test]
+    fn a_failed_first_initialisation_leaves_no_database_file_and_no_sidecars() {
+        let path = tmp_db("fresh-init-fail");
+        // The snapshot path is a directory, so creating the snapshot file there cannot
+        // succeed. Nothing else about this database is unusual.
+        std::fs::create_dir_all(Backup::path_for(&path)).expect("occupy the snapshot path");
+        assert!(
+            !path.exists(),
+            "precondition: the database file must not exist before the call"
+        );
+
+        let Err(err) = open_and_migrate(&path) else {
+            panic!("the snapshot path is a directory, so the migration cannot proceed");
+        };
+        // The failure is reported, not swallowed by the cleanup: a silent success here
+        // would leave a daemon believing it has a database it does not have.
+        assert!(
+            matches!(err, crate::sqlite::StoreError::Migration(_)),
+            "a failed first migration must surface as a migration error, got {err:?}"
+        );
+
+        assert!(
+            !path.exists(),
+            "a database this call created and could not migrate must not be left behind: the \
+             next start would inherit a half-built schema and treat it as one to migrate"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// The sidecars, tested where they can actually exist.
+    ///
+    /// An earlier version of the test above asserted that no `-wal`/`-shm` survived, and
+    /// **passed with the sidecar removal deleted**. Nothing wrote to the database before
+    /// the snapshot was attempted, so SQLite had not created them and the assertion could
+    /// not fail. That is the failure mode AGENTS.md §3 warns about: a green test reading as
+    /// coverage of something it never touched.
+    ///
+    /// So the claim is tested directly, against a directory that really does contain the
+    /// sidecars. It is still the same guarantee — a `-wal` whose database has been deleted
+    /// is not inert, because SQLite may rebuild the database from it on the next open.
+    #[test]
+    fn discarding_a_failed_initialisation_removes_the_sidecars_and_the_snapshot() {
+        let path = tmp_db("sidecars");
+        // Built by hand, because nothing on this path writes before the failure.
+        std::fs::write(&path, b"sqlite-format-3\0").expect("db");
+        std::fs::write(wal_sidecar(&path), b"wal").expect("wal");
+        std::fs::write(shm_sidecar(&path), b"shm").expect("shm");
+        std::fs::write(Backup::path_for(&path), b"snapshot").expect("snapshot");
+        for p in [
+            path.clone(),
+            wal_sidecar(&path),
+            shm_sidecar(&path),
+            Backup::path_for(&path),
+        ] {
+            assert!(p.exists(), "precondition: {} must exist", p.display());
+        }
+
+        discard_failed_initialisation(&path, false);
+
+        for p in [
+            path.clone(),
+            wal_sidecar(&path),
+            shm_sidecar(&path),
+            Backup::path_for(&path),
+        ] {
+            assert!(
+                !p.exists(),
+                "{} must be removed with the database it belonged to",
+                p.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// **A live independent connection when a failed initialisation is discarded.**
+    ///
+    /// The sidecars are removed with the database, and S-30's criterion 4(b) measured that
+    /// removing `-shm` while a connection has it memory-mapped makes **that** connection
+    /// fail with `disk I/O error`. S-30 drew the lesson that sidecar deletion must not be the
+    /// restore mechanism; this is a different call site, and it deletes them too.
+    ///
+    /// In-process ordering is already handled — both callers drop their own connection and
+    /// their shared lease first — but S-31 *shared* ownership exists precisely so a second
+    /// process may hold the same database open. So the question is not hypothetical: a
+    /// failed first initialisation can run its cleanup while another process is reading.
+    ///
+    /// Measured rather than assumed, and the measurement is the point: this records what
+    /// actually happens instead of what it was hoped would happen.
+    #[test]
+    fn discarding_a_failed_initialisation_while_another_connection_has_it_open() {
+        let path = tmp_db("live-reader");
+        // A live reader, as another process would be: its own connection, WAL mode, the
+        // sidecars created and mapped.
+        let reader = Connection::open(&path).expect("open as the other process would");
+        crate::pragma::Pragma::critical()
+            .apply(&reader)
+            .expect("pragmas, which create the WAL sidecars");
+        reader
+            .execute_batch("CREATE TABLE someone_elses (id TEXT PRIMARY KEY);")
+            .expect("write, so there is real state and a real mapped -shm");
+        let shm = shm_sidecar(&path);
+        let wal = wal_sidecar(&path);
+        assert!(
+            shm.exists() && wal.exists(),
+            "precondition: WAL mode must have produced both sidecars, got shm={} wal={}",
+            shm.exists(),
+            wal.exists()
+        );
+        let before: i64 = reader
+            .query_row("SELECT COUNT(*) FROM someone_elses;", [], |r| r.get(0))
+            .expect("the reader can read before the cleanup");
+
+        // The cleanup runs. `pre_existing = false` says "this call created the file", which
+        // is the branch that deletes.
+        discard_failed_initialisation(&path, false);
+
+        // Not vacuous: confirm the sidecars really were removed. If they were already gone
+        // the cleanup would have had nothing to do and the measurement below would be of
+        // nothing -- which is how this file has already produced two green tests that
+        // covered no code.
+        assert!(
+            !shm.exists() && !wal.exists(),
+            "precondition: the cleanup must actually have deleted the sidecars, or this              test measures nothing (shm={} wal={})",
+            shm.exists(),
+            wal.exists()
+        );
+
+        // --- case 2: the reader holds an ACTIVE read transaction across the cleanup ---
+        //
+        // This is the shape S-30's criterion 4(b) used, and it is stronger than an idle
+        // handle: the `-shm` index is genuinely in use, so removing it is removing something
+        // mapped and live rather than something merely present.
+        let d2 = tmp_db("live-reader-active");
+        {
+            let active = Connection::open(&d2).expect("open");
+            crate::pragma::Pragma::critical()
+                .apply(&active)
+                .expect("pragmas");
+            active
+                .execute_batch("CREATE TABLE someone_elses (id TEXT PRIMARY KEY);")
+                .expect("write");
+            let shm2 = shm_sidecar(&d2);
+            assert!(shm2.exists(), "precondition: the -shm must exist");
+            active
+                .execute_batch("BEGIN; SELECT COUNT(*) FROM someone_elses;")
+                .expect("take a live read transaction");
+
+            discard_failed_initialisation(&d2, false);
+            assert!(
+                !shm2.exists(),
+                "precondition: the -shm must really have been removed, or this case                  measures nothing"
+            );
+
+            let after_active: rusqlite::Result<i64> =
+                active.query_row("SELECT COUNT(*) FROM someone_elses;", [], |r| r.get(0));
+            active.execute_batch("COMMIT;").ok();
+            assert!(
+                after_active.is_ok(),
+                "a connection holding a live read transaction is broken by the cleanup: \
+                 {after_active:?}. This is S-30 criterion 4(b)'s failure exactly: the -shm \
+                 index is mapped and in use, and it has been removed underneath it."
+            );
+            drop(active);
+        }
+        let _ = std::fs::remove_dir_all(d2.parent().expect("dir"));
+
+        // --- case 1 (continued): the idle reader. This is the measurement.
+        let after: rusqlite::Result<i64> =
+            reader.query_row("SELECT COUNT(*) FROM someone_elses;", [], |r| r.get(0));
+        assert!(
+            after.is_ok(),
+            "an independent connection that had the database open is broken by the cleanup: \
+             {after:?}. S-30 criterion 4(b) measured this exact failure -- deleting a \
+             memory-mapped -shm -- and here it is reachable because S-31 shared ownership \
+             deliberately lets a second process hold the database."
+        );
+        assert_eq!(
+            after.expect("readable"),
+            before,
+            "and its data must be intact"
+        );
+        drop(reader);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// **The guard, in both directions, on the same code path as above.**
+    ///
+    /// `pre_existing` is the only thing between "this is debris from a failed first
+    /// migration" and "this is a user's file". Deleting the wrong one loses data
+    /// irrecoverably and invisibly, so both branches are pinned: created files and every
+    /// sidecar go, and a pre-existing file and all of its sidecars stay.
+    #[test]
+    fn discarding_is_refused_for_a_file_that_predates_the_call() {
+        let path = tmp_db("sidecars-kept");
+        std::fs::write(&path, b"a real database").expect("db");
+        std::fs::write(wal_sidecar(&path), b"wal").expect("wal");
+        std::fs::write(shm_sidecar(&path), b"shm").expect("shm");
+        std::fs::write(Backup::path_for(&path), b"the only good copy").expect("snapshot");
+
+        discard_failed_initialisation(&path, true);
+
+        for p in [
+            path.clone(),
+            wal_sidecar(&path),
+            shm_sidecar(&path),
+            Backup::path_for(&path),
+        ] {
+            assert!(
+                p.exists(),
+                "{} must survive: it existed before this call, and nothing here is entitled \
+                 to decide it was debris",
+                p.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// **The guard on that deletion, in both directions.**
+    ///
+    /// Deleting a database because its first migration failed is only safe when this call
+    /// created it. A file that was already there and carries no `schema_meta` is a real
+    /// case -- a foreign file, or one an older build left half-built -- and "no
+    /// `schema_meta`" is not evidence that there is nothing to lose. This test plants a
+    /// pre-existing file, fails the same way, and requires it to survive with its rows.
+    ///
+    /// Without the second half, `discard_failed_initialisation` would be a rule that is only
+    /// ever safe when it is right, and nothing would say which times those are.
+    #[test]
+    fn a_failed_migration_never_removes_a_file_that_was_already_there() {
+        let path = tmp_db("preexisting-kept");
+        {
+            let c = Connection::open(&path).expect("open");
+            c.execute_batch(
+                "CREATE TABLE somebody_elses_table (id TEXT PRIMARY KEY, payload TEXT NOT NULL);\
+                 INSERT INTO somebody_elses_table (id, payload) VALUES ('x', 'user data');",
+            )
+            .expect("seed a pre-existing file");
+        }
+        // Same obstacle as the test above, against a file that now already exists.
+        std::fs::create_dir_all(Backup::path_for(&path)).expect("occupy the snapshot path");
+        assert!(path.exists(), "precondition: the file is already there");
+
+        assert!(
+            open_and_migrate(&path).is_err(),
+            "the snapshot cannot be taken, so the migration cannot proceed"
+        );
+
+        assert!(
+            path.exists(),
+            "a pre-existing file must never be removed, however its migration failed: \
+             absence of schema_meta is not evidence of emptiness"
+        );
+        let c = Connection::open(&path).expect("reopen");
+        let payload: String = c
+            .query_row(
+                "SELECT payload FROM somebody_elses_table WHERE id = 'x';",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the row must still be there");
+        assert_eq!(
+            payload, "user data",
+            "user data must survive a failed migration"
+        );
+        drop(c);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// The same failure on a database that never had a `schema_meta` at all.
+    ///
+    /// The case above starts from a real version-1 database, so the snapshot has something
+    /// to record. This one starts from a file with no bookkeeping whatsoever, which is what
+    /// `discard_failed_initialisation` exists for -- and it pins that the *error* is still
+    /// reported rather than turned into a silent success by the cleanup.
+    #[test]
+    fn a_failed_first_migration_on_a_foreign_file_still_reports_and_leaves_it_alone() {
+        let path = tmp_db("foreign-file");
+        {
+            let c = Connection::open(&path).expect("open");
+            // A file that is not ours: no `schema_meta`, and a `tasks` table we must not
+            // destroy. This is the case where absence of `schema_meta` is *not* evidence
+            // of emptiness.
+            c.execute_batch("CREATE TABLE tasks (id TEXT PRIMARY KEY, mine TEXT NOT NULL);")
+                .expect("seed a foreign file");
+            c.execute("INSERT INTO tasks (id, mine) VALUES ('u1', 'keep me');", [])
+                .expect("seed a row");
+        }
+
+        let c = Connection::open(&path).expect("reopen");
+        let err = MigrationRunner::new(&c)
+            .migrate(&path)
+            .expect_err("migration 2 must fail against the colliding table");
+        drop(c);
+
+        // `migrate` itself never deletes: cleanup is the caller's decision, and it is
+        // guarded by whether the file pre-existed. This test is the reason that guard
+        // exists, so it asserts the file is still there.
+        assert!(
+            path.exists(),
+            "a pre-existing file must never be removed by a failed migration"
+        );
+        let c = Connection::open(&path).expect("reopen");
+        let kept: String = c
+            .query_row("SELECT mine FROM tasks WHERE id = 'u1';", [], |r| r.get(0))
+            .expect("the row must still be there");
+        assert_eq!(kept, "keep me", "user data must survive a failed migration");
+        assert!(
+            matches!(err, MigrationError::RecoveryRequired { .. }),
+            "the caller must still be told a snapshot exists to recover from, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
     #[test]
@@ -1138,7 +1749,7 @@ mod tests {
         let path = dir.join("m.db");
         let _ = std::fs::remove_file(&path);
 
-        let store = open_and_migrate(&path, true).expect("open+migrate");
+        let store = open_and_migrate(&path).expect("open+migrate");
         assert_eq!(
             MigrationRunner::new(store.conn())
                 .applied_version()
@@ -1147,10 +1758,10 @@ mod tests {
         );
         drop(store);
         // Reopen: the version is durable.
-        let store2 = open_and_migrate(&path, true).expect("reopen");
+        let store2 = open_and_migrate(&path).expect("reopen");
         assert_eq!(
             MigrationRunner::new(store2.conn())
-                .run(true)
+                .migrate(&path)
                 .expect("rerun"),
             Vec::<u32>::new()
         );
@@ -1181,7 +1792,7 @@ mod tests {
 
         let store = crate::sqlite::Store::open(&path, true).expect("open");
         let applied = MigrationRunner::new(store.conn())
-            .migrate(&path, false)
+            .migrate(&path)
             .expect("a fresh database must migrate");
         assert_eq!(applied.len(), MIGRATIONS.len(), "every migration applies");
         assert_eq!(
@@ -1209,7 +1820,9 @@ mod tests {
         let path = tmp_db("strict-nometa");
         {
             let store = crate::sqlite::Store::open(&path, true).expect("open");
-            MigrationRunner::new(store.conn()).run(true).expect("run");
+            MigrationRunner::new(store.conn())
+                .migrate(&path)
+                .expect("run");
         }
         let backup = Backup::take(&Connection::open(&path).expect("reopen"), &path).expect("take");
         {
@@ -1222,7 +1835,9 @@ mod tests {
         let path = tmp_db("strict-norows");
         {
             let store = crate::sqlite::Store::open(&path, true).expect("open");
-            MigrationRunner::new(store.conn()).run(true).expect("run");
+            MigrationRunner::new(store.conn())
+                .migrate(&path)
+                .expect("run");
         }
         let backup = Backup::take(&Connection::open(&path).expect("reopen"), &path).expect("take");
         {
@@ -1240,8 +1855,13 @@ mod tests {
         let backup =
             Backup::take(store.conn(), &path).expect("a fresh database can be snapshotted");
 
-        // Relative to a source with no schema_meta: accepted.
-        Backup::verify_against_source(backup.path(), store.conn())
+        // Relative to a source with no schema_meta: accepted. The answer is passed in,
+        // read before the copy; see `Backup::verify_against_source`.
+        assert!(
+            !Backup::has_schema_meta(store.conn()),
+            "precondition: a freshly opened store has not been migrated"
+        );
+        Backup::verify_against_source(backup.path(), store.conn(), true)
             .expect("an empty snapshot of an empty database is faithful");
         // Absolute: refused, because nothing about the file says it is safe.
         Backup::verify(backup.path()).expect_err("the strict API still refuses emptiness");

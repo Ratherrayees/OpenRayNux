@@ -136,7 +136,7 @@ fn open_with(path: &Path, pragma: Pragma) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).expect("open");
     pragma.apply(&conn).expect("pragmas");
     pragma.verify(&conn).expect("verify");
-    MigrationRunner::new(&conn).run(true).expect("migrate");
+    MigrationRunner::new(&conn).migrate(path).expect("migrate");
     conn
 }
 

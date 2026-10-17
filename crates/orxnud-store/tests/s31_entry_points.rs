@@ -32,8 +32,8 @@ fn seeded(tag: &str) -> (PathBuf, PathBuf) {
     // `Store::open` alone does not migrate — it applies pragmas and verifies SQLite.
     // The schema is produced by `open_and_migrate`, which is the production path for
     // "create this database if it is not there yet".
-    let store = orxnud_store::migration::open_and_migrate(&db, false)
-        .expect("create a real migrated store");
+    let store =
+        orxnud_store::migration::open_and_migrate(&db).expect("create a real migrated store");
     drop(store);
     (d, db)
 }
@@ -71,8 +71,8 @@ fn c_every_entry_point_participates_in_the_ownership_rule() {
     );
 
     // 2. `open_and_migrate` — a second, distinct way into the store.
-    let migrate = orxnud_store::migration::open_and_migrate(&db, false)
-        .expect_err("open_and_migrate must refuse");
+    let migrate =
+        orxnud_store::migration::open_and_migrate(&db).expect_err("open_and_migrate must refuse");
     assert!(
         refused_for_ownership(&migrate.to_string()),
         "open_and_migrate must refuse for ownership, got: {migrate}"

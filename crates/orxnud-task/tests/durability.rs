@@ -51,7 +51,7 @@ fn open(path: &Path) -> rusqlite::Connection {
     // Verification on open is not ceremony: a pragma that silently failed to apply
     // is indistinguishable from one that was never set until the disk loses power.
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).run(true).expect("migrate");
+    MigrationRunner::new(&conn).migrate(path).expect("migrate");
     conn
 }
 
@@ -427,7 +427,7 @@ fn migrations_are_idempotent_across_repeated_opens() {
         );
         assert!(
             MigrationRunner::new(&conn)
-                .run(true)
+                .migrate(&path)
                 .expect("run")
                 .is_empty(),
             "a second run must apply nothing"
@@ -437,21 +437,65 @@ fn migrations_are_idempotent_across_repeated_opens() {
 }
 
 #[test]
-fn a_migration_on_an_existing_file_is_protected_by_a_verified_snapshot() {
+fn a_migration_on_an_existing_file_takes_a_verified_snapshot() {
     // ADR-0017 decision 2: every migration is preceded by an automatic, verified
-    // snapshot. `migrate` takes it rather than trusting a flag.
+    // snapshot.
+    //
+    // This used to read `MigrationRunner::new(&conn).run(true)` and be done, which
+    // asserted the opposite of what its name claimed: `run(true)` skipped the snapshot
+    // entirely. The test passed, and the guarantee it was named for was absent. There is
+    // no parameter left to pass, so the only thing left to assert is that the snapshot
+    // really is taken.
     let d = dir("mig-snapshot");
     let path = db_in(&d);
     let conn = open(&path);
-    MigrationRunner::new(&conn)
-        .run(true)
-        .expect("first migrate");
+    assert_eq!(
+        MigrationRunner::new(&conn)
+            .applied_version()
+            .expect("version"),
+        orxnud_store::migration::CURRENT_VERSION
+    );
 
     // Nothing is pending, so no snapshot is taken and none is left behind.
-    let applied = MigrationRunner::new(&conn)
-        .migrate(&path, false)
-        .expect("migrate");
+    let applied = MigrationRunner::new(&conn).migrate(&path).expect("migrate");
     assert!(applied.is_empty());
+    assert!(
+        !orxnud_store::backup::Backup::path_for(&path).exists(),
+        "a no-op migration must not leave a snapshot behind"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The snapshot is verified, not adopted.
+///
+/// `migrate` reuses an existing snapshot at the conventional path, so that a database
+/// whose previous migration failed can still recover. Reuse is only safe if the file is
+/// checked, and this is the check: a snapshot that does not verify is replaced, never
+/// trusted.
+///
+/// This is the branch the old `snapshot_verified_by_caller: bool` decided between, and it
+/// is testable only because the decision is now made in one place with no flag. A caller
+/// that passed `true` got this reuse unconditionally.
+///
+/// Deliberately a no-op migration -- the database is already current, so `migrate`
+/// returns before it looks at the snapshot path at all. That is the observation: an
+/// *absent* snapshot is the right outcome, and an earlier version of this test planted a
+/// bogus file and asserted it was replaced, which passed for the wrong reason (nothing
+/// ever touched it). The case where a pending migration must replace a bad snapshot needs
+/// a pending migration, and lives where that fixture is:
+/// `orxnud_store`'s
+/// `a_failed_migration_replaces_a_snapshot_that_does_not_verify`.
+#[test]
+fn a_no_op_migration_takes_no_snapshot_and_leaves_none_behind() {
+    let d = dir("mig-snapshot");
+    let path = db_in(&d);
+    let conn = open(&path);
+
+    let applied = MigrationRunner::new(&conn).migrate(&path).expect("migrate");
+    assert!(
+        applied.is_empty(),
+        "precondition: the database is already current, so nothing should be applied"
+    );
     assert!(
         !orxnud_store::backup::Backup::path_for(&path).exists(),
         "a no-op migration must not leave a snapshot behind"

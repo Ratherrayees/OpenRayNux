@@ -75,6 +75,9 @@ impl SqliteAuditJournal {
     /// or given the critical pragmas.
     pub fn open(path: &std::path::Path) -> Result<Self, JournalError> {
         let unavailable = |e: String| JournalError::Unavailable(e);
+        // Read *before* the file is opened or created. Only a file this call created may
+        // be removed after a failed first migration.
+        let pre_existing = path.exists();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -95,41 +98,70 @@ impl SqliteAuditJournal {
         pragma
             .verify(&conn)
             .map_err(|e| unavailable(e.to_string()))?;
-        MigrationRunner::new(&conn)
-            .run(true)
-            .map_err(|e| unavailable(e.to_string()))?;
-        Ok(Self {
-            conn,
-            _ownership: ownership,
-        })
+        // The whole database's schema is migrated here, not just the journal's: every
+        // migration in `MIGRATIONS` creates tables in this one file, and this function
+        // runs **before** `TaskService::open` does. So this is the site's first shot at
+        // changing the schema, and it is the site S-11 recorded as taking no snapshot and
+        // restoring nothing.
+        //
+        // It now takes the same route every other production caller takes: a verified
+        // snapshot before any statement runs, and a restore on failure. The sequence is
+        // the awkward part — the restore needs *exclusive* ownership and this function
+        // holds a *shared* lease plus an open connection, and `flock` conflicts between
+        // them even in one process — so both are dropped before recovery.
+        match MigrationRunner::new(&conn).migrate(path) {
+            Ok(_) => Ok(Self {
+                conn,
+                _ownership: ownership,
+            }),
+            Err(crate::migration::MigrationError::RecoveryRequired { source, snapshot }) => {
+                // Drop the connection and the shared lease before anything asks for
+                // exclusive ownership. Scoped so the drops happen on this path rather than
+                // at the end of the function.
+                drop(conn);
+                drop(ownership);
+                crate::migration::recover_from_snapshot(path, &snapshot)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                Err(unavailable(source.to_string()))
+            }
+            Err(e) => {
+                drop(conn);
+                drop(ownership);
+                // A failure with no snapshot to recover from, on a file this call created:
+                // remove it, so the next start begins clean instead of inheriting a
+                // half-built schema. `pre_existing` was read before opening, so a file
+                // that was already there is never touched.
+                crate::migration::discard_failed_initialisation(path, pre_existing);
+                Err(unavailable(e.to_string()))
+            }
+        }
     }
 
     /// An in-memory journal, migrated. **Tests only** — a real install must not
     /// lose the audit history when the process ends.
+    ///
+    /// `#[cfg(test)]` rather than a doc comment saying "tests only". The journal it builds
+    /// is *ephemeral by construction* -- an in-memory database is gone when the process
+    /// ends, so the tamper evidence the system exists to keep simply evaporates. A public
+    /// function that can only be misused, documented not to be, is the same shape as the
+    /// `snapshot_verified: bool` this crate was audited for (S-11/F-26): a claim where a
+    /// boundary belongs. Compiling it out puts the refusal in the type system.
+    ///
+    /// The companion [`SqliteAuditJournal::migrate`] that used to let any caller migrate a
+    /// connection it had been handed is gone for the same reason. `Self::open` is the only
+    /// way to obtain a journal over a real database, and it snapshots first.
+    #[cfg(test)]
     #[must_use]
-    pub fn open_in_memory() -> Self {
+    fn open_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("in-memory connection");
-        Self::migrate(&conn).expect("migrate the in-memory journal");
+        MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect("migrate the in-memory journal");
         Self {
             conn,
             // No file, so nothing to coordinate across processes.
             _ownership: crate::ownership::SharedOwnership::in_memory(),
         }
-    }
-
-    /// Applies the schema to an existing connection without owning it.
-    ///
-    /// For the test helpers that already hold a connection. Shares the migration
-    /// runner rather than re-implementing it, so there is one migration path.
-    ///
-    /// # Errors
-    ///
-    /// [`JournalError::Unavailable`] if a pending migration failed.
-    pub fn migrate(conn: &Connection) -> Result<(), JournalError> {
-        MigrationRunner::new(conn)
-            .run(true)
-            .map(|_| ())
-            .map_err(|e| JournalError::Unavailable(e.to_string()))
     }
 
     /// The connection, for tests that need to corrupt a row on purpose.
@@ -273,6 +305,8 @@ impl SqliteApprovalLedger {
     /// or given the critical pragmas.
     pub fn open(path: &std::path::Path) -> Result<Self, LedgerError> {
         let unavailable = |e: String| LedgerError::Unavailable(e);
+        // Read *before* the file is opened or created; see `Journal::open`.
+        let pre_existing = path.exists();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -288,37 +322,33 @@ impl SqliteApprovalLedger {
         pragma
             .verify(&conn)
             .map_err(|e| unavailable(e.to_string()))?;
-        MigrationRunner::new(&conn)
-            .run(true)
-            .map_err(|e| unavailable(e.to_string()))?;
-        Ok(Self {
-            conn,
-            _ownership: ownership,
-        })
-    }
-
-    /// An in-memory ledger, migrated. **Tests only.**
-    #[must_use]
-    pub fn open_in_memory() -> Self {
-        let conn = Connection::open_in_memory().expect("in-memory connection");
-        Self::migrate(&conn).expect("migrate the in-memory ledger");
-        Self {
-            conn,
-            // No file, so nothing to coordinate across processes.
-            _ownership: crate::ownership::SharedOwnership::in_memory(),
+        // As with `SqliteAuditJournal::open`: this migrates the whole database, and this
+        // is the site's first attempt at it. The approval ledger is the replay gate that
+        // stops one approval being presented twice across restarts, so a half-applied
+        // migration here is the failure mode K.1 is about.
+        match MigrationRunner::new(&conn).migrate(path) {
+            Ok(_) => Ok(Self {
+                conn,
+                _ownership: ownership,
+            }),
+            Err(crate::migration::MigrationError::RecoveryRequired { source, snapshot }) => {
+                drop(conn);
+                drop(ownership);
+                crate::migration::recover_from_snapshot(path, &snapshot)
+                    .map_err(|e| unavailable(e.to_string()))?;
+                Err(unavailable(source.to_string()))
+            }
+            Err(e) => {
+                drop(conn);
+                drop(ownership);
+                // A failure with no snapshot to recover from, on a file this call created:
+                // remove it, so the next start begins clean instead of inheriting a
+                // half-built schema. `pre_existing` was read before opening, so a file
+                // that was already there is never touched.
+                crate::migration::discard_failed_initialisation(path, pre_existing);
+                Err(unavailable(e.to_string()))
+            }
         }
-    }
-
-    /// Applies the schema to an existing connection without owning it.
-    ///
-    /// # Errors
-    ///
-    /// [`LedgerError::Unavailable`] if a pending migration failed.
-    pub fn migrate(conn: &Connection) -> Result<(), LedgerError> {
-        MigrationRunner::new(conn)
-            .run(true)
-            .map(|_| ())
-            .map_err(|e| LedgerError::Unavailable(e.to_string()))
     }
 }
 
@@ -734,5 +764,200 @@ mod tests {
             .consume_at(&digest(1), 0)
             .expect("consume afterwards");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------------------------------------------------------
+    // Production-path recovery: a failing migration must leave the security
+    // state exactly as it was, and must leave the journal/ledger unusable rather
+    // than half-built.
+    //
+    // This is the S-11/F-26 regression. `SqliteAuditJournal::open` and
+    // `SqliteApprovalLedger::open` used to call `MigrationRunner::run(true)`: no
+    // snapshot, no restore, and the two constructors that guard the system's only
+    // tamper evidence were the two that changed the schema with nothing to roll
+    // back to. These two tests drive the *production* entry points rather than the
+    // runner, because the runner behaving correctly while its caller ignores it
+    // was the whole defect.
+    // ----------------------------------------------------------------------
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orxnud-secstate-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d.join("state.db")
+    }
+
+    /// A file-backed database at `version`, already carrying audit and approval rows.
+    ///
+    /// Seeded through SQL rather than through the journal's own API, because seeding
+    /// through the API would require a working journal -- which is the thing whose
+    /// construction is failing.
+    fn stage_pre_migration(tag: &str, version: u32) -> std::path::PathBuf {
+        let path = tmp_path(tag);
+        let c = Connection::open(&path).expect("open");
+        crate::pragma::Pragma::critical()
+            .apply(&c)
+            .expect("pragmas");
+        for m in crate::migration::MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= version)
+        {
+            c.execute_batch(m.sql)
+                .unwrap_or_else(|e| panic!("migration {}: {e}", m.version));
+            c.execute(
+                "INSERT OR REPLACE INTO schema_meta (version, name, applied_at) VALUES (?1,?2,0);",
+                rusqlite::params![m.version, m.name],
+            )
+            .expect("record");
+        }
+        c.execute_batch(
+            "INSERT INTO tasks (id,kind,state,idempotent,attempts,max_attempts,
+                                 created_at_ms,updated_at_ms)
+               VALUES ('t1','query','completed',1,1,3,1,1);",
+        )
+        .expect("task");
+        // One audit record and one consumed approval, so recovery has something to lose.
+        c.execute(
+            "INSERT INTO audit_log (seq, prev_hash, record_hash, record) VALUES (1,?1,?2,'{}');",
+            rusqlite::params![[1u8; 32], [2u8; 32]],
+        )
+        .expect("audit row");
+        c.execute(
+            "INSERT INTO spent_approvals (digest, consumed_at_ms) VALUES (?1, 7);",
+            rusqlite::params![[3u8; 32]],
+        )
+        .expect("spent approval");
+        drop(c);
+        path
+    }
+
+    /// Two different actions for one execution identity: exactly what migration 14
+    /// refuses to guess between.
+    fn seed_conflicting_proposals(path: &std::path::Path) {
+        let c = Connection::open(path).expect("open");
+        for (id, capability, target) in [
+            ("p-a", "cap.one", "out.txt"),
+            ("p-b", "cap.two", "OTHER.txt"),
+        ] {
+            c.execute(
+                "INSERT INTO task_proposals (proposal_id,task_id,step_no,attempt_no,capability,
+                                              target,params,proposer,created_at_ms,status)
+                 VALUES (?1,'t1',1,1,?2,?3,'{}','me',100,'pending');",
+                rusqlite::params![id, capability, target],
+            )
+            .expect("proposal");
+        }
+        drop(c);
+    }
+
+    fn audit_and_approval_rows(path: &std::path::Path) -> (i64, i64, u32) {
+        let c = Connection::open(path).expect("reopen");
+        let audits: i64 = c
+            .query_row("SELECT COUNT(*) FROM audit_log;", [], |r| r.get(0))
+            .expect("audit count");
+        let spent: i64 = c
+            .query_row("SELECT COUNT(*) FROM spent_approvals;", [], |r| r.get(0))
+            .expect("spent count");
+        let version: u32 = c
+            .query_row("SELECT MAX(version) FROM schema_meta;", [], |r| r.get(0))
+            .expect("version");
+        drop(c);
+        (audits, spent, version)
+    }
+
+    /// `SqliteAuditJournal::open` on a database whose migration fails must restore it.
+    #[test]
+    fn the_journal_constructor_recovers_the_database_when_its_migration_fails() {
+        let path = stage_pre_migration("journal-recover", 13);
+        seed_conflicting_proposals(&path);
+        assert_eq!(
+            audit_and_approval_rows(&path),
+            (1, 1, 13),
+            "precondition: staged at version 13 with one audit row and one spent approval"
+        );
+
+        let Err(err) = SqliteAuditJournal::open(&path) else {
+            panic!("migration 14 must refuse the conflicting proposals");
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("authority decision"),
+            "the original failure must be reported, not swallowed by the recovery: {text}"
+        );
+
+        // The snapshot was taken before anything ran and restored after the failure, so
+        // the version is back where it started and the seeded rows are intact. Before this
+        // change there was no snapshot and no restore, so the schema was left wherever the
+        // failed migration had reached -- which for this database is indistinguishable
+        // from a migrated one at a version it never completed.
+        assert_eq!(
+            audit_and_approval_rows(&path),
+            (1, 1, 13),
+            "a failed migration must leave the security state exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// The same for `SqliteApprovalLedger::open`.
+    #[test]
+    fn the_ledger_constructor_recovers_the_database_when_its_migration_fails() {
+        let path = stage_pre_migration("ledger-recover", 13);
+        seed_conflicting_proposals(&path);
+
+        let Err(err) = SqliteApprovalLedger::open(&path) else {
+            panic!("migration 14 must refuse the conflicting proposals");
+        };
+        assert!(
+            err.to_string().contains("authority decision"),
+            "the original failure must be reported: {err}"
+        );
+
+        assert_eq!(
+            audit_and_approval_rows(&path),
+            (1, 1, 13),
+            "a failed migration must leave the security state exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// The negative control, and the reason the two tests above are worth anything.
+    ///
+    /// A database with no conflicting proposals migrates, and the journal opens. Without
+    /// this, "the constructor failed" would satisfy both tests above -- a constructor that
+    /// refuses every database would pass them.
+    #[test]
+    fn the_journal_constructor_opens_when_the_migration_succeeds() {
+        let path = stage_pre_migration("journal-ok", 13);
+        let journal = SqliteAuditJournal::open(&path).expect("no conflict, so this must open");
+        let (audits, spent, version) = audit_and_approval_rows(&path);
+        assert_eq!(
+            (audits, spent, version),
+            (1, 1, crate::migration::CURRENT_VERSION),
+            "a successful migration applies the remaining versions and discards its snapshot"
+        );
+        // And the migrated database is usable through the normal API. One row is seeded
+        // directly by SQL at seq 1, so the next entry is seq 2.
+        journal
+            .append(&entry(2, [9u8; 32]))
+            .expect("append to the journal that opened");
+        drop(journal);
+        assert_eq!(
+            audit_and_approval_rows(&path).0,
+            2,
+            "the audit chain is writable after the migration"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// And the ledger, likewise.
+    #[test]
+    fn the_ledger_constructor_opens_when_the_migration_succeeds() {
+        let path = stage_pre_migration("ledger-ok", 13);
+        let _ledger = SqliteApprovalLedger::open(&path).expect("no conflict, so this must open");
+        assert_eq!(
+            audit_and_approval_rows(&path).2,
+            crate::migration::CURRENT_VERSION
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 }

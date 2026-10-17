@@ -107,7 +107,9 @@ Legend — **Cadence**: `event` (re-checked on a named trigger) · `quarterly` �
 phase gate).
 
 | ID | Claim | Verification source | Cadence / trigger | Last verified | Consequence of silent drift |
-| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
+| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — research candidate, not approved), and S-11's wider specification. The original 2026-10-14 text follows, retained because it records what was measured.**
+
+The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
 §7-S30) owns the restore defect; S-11 (§7-S11) owns the six entry points. **S-11 is blocked on
 S-30** and must not claim safety until S-30's five acceptance criteria hold — a coordinator whose
 rollback can return `Ok(())` while restoring the wrong state would make its own safety claim
@@ -119,7 +121,7 @@ A-007. F-26b is nonetheless recorded as still open**, on the grounds A-007 sets 
 invariant is enforced within one process only, and a failed restore after a stale log was
 folded in leaves post-snapshot data absorbed rather than discarded. It fails closed rather than
 reporting success, but that is not a clean rollback and this row does not claim it is.
-**S-11 is not unblocked by this**, and S-29 remains blocked behind S-11 (§6.4). | **event:** any change to `MigrationRunner`, `Backup`, `Store::open`, `open_and_migrate`, or any function that calls `.run(true)` or `.migrate(`; and on any change adding a persisted table, column, `CHECK` constraint or task-state value, which is gated on S-11 (§6.4) | 2026-10-14 (**confirmed still open**) | **High.** A migration failure on a production upgrade leaves a half-applied schema and the only copy of the user's data with no verified way back. Four of six entry points cannot produce one even on request. |
+**S-11 is not unblocked by this**, and S-29 remains blocked behind S-11 (§6.4). | **event:** any change to `MigrationRunner`, `Backup`, `Store::open`, `open_and_migrate`, or any function that calls `migrate(`, `migrate_ephemeral(` or `Backup::take`; and on any change to gate **G16** or to `scripts/rustscan.py`'s test-region rules, which that gate depends on; and on any change adding a persisted table, column, `CHECK` constraint or task-state value, which is gated on S-11 (§6.4) | 2026-10-17 (**A-009 applied; confirmed still open**) | **High.** A migration failure on a production upgrade leaves a half-applied schema and the only copy of the user's data with no verified way back. Four of six entry points cannot produce one even on request. |
 
 |----|-------|--------------------|-------------------|---------------|---------------------------|
 | **V-01** | **MCP spec revision is `2026-07-28`; the protocol is stateless; Sampling/Roots/Logging are deprecated with a ≥12-month window; Tasks is an extension** | `https://modelcontextprotocol.io/specification/latest` and the versioned changelog at `/specification/2026-07-28/changelog` | **event:** any new revision date on the latest page; plus quarterly | 2026-09-30 | **High.** A new revision may reintroduce sessions, change the Tasks extension, or move a deprecation to removal. Our MRTR mapping and our stateless-safety argument (ADR-0010) both depend on it. |
@@ -848,6 +850,213 @@ native `GetFileInformationByHandle` path exists. Recorded as a support decision,
   *failed* restore leaves post-snapshot data absorbed rather than discarded. It fails closed
   rather than reporting success, which is the required behaviour, but it is not a clean
   rollback.
+
+### A-009 — S-11 (D-S11-a, D-S11-b): the trust-me migration APIs are gone, and the one remaining unprotected path is refused in production source
+
+**F-26 remains OPEN. F-26b and F-26c remain OPEN. S-11 is NOT closed and S-29 remains blocked.**
+This amendment records what was built and what was measured. It does **not** close the finding.
+
+**What was removed, and why removal rather than restriction.**
+
+`MigrationRunner::run(&self, snapshot_verified: bool)` took no snapshot and restored nothing. It
+refused only when the boolean was `false`, so `run(true)` — which both production callers in
+`security_state.rs` passed — applied every migration unprotected. Its one real behaviour was the
+refusal, and a refusal that a caller can talk its way out of is a claim rather than a mechanism.
+
+The boolean is gone rather than hidden. `run` is replaced by `migrate_ephemeral()`, which has no
+parameter, and `MigrationError::NoSnapshot` is deleted with it: a variant named for a refusal
+that can no longer happen would advertise a guarantee the type no longer has, which is the
+failure this register exists to prevent. `migrate(db_path)` and `open_and_migrate(path)` lost
+their booleans too. `SqliteAuditJournal::open_in_memory` is now `#[cfg(test)]` rather than a
+public function documented as "tests only", for the same reason — a public constructor that can
+only be misused is the same shape as the flag.
+
+**Enforcement is a source check, and why it has to be.** Gate **G16**
+(`scripts/gate_policy.py g16`, wired into `scripts/ci-gates.sh` and therefore into CI) reads
+every crate's production source — comments and string literals blanked, `#[cfg(test)]` regions
+stripped, using `scripts/rustscan.py`'s own rules — and fails if `migrate_ephemeral` is reached
+outside two declared exemptions, each counted so that any addition fails the gate. No
+behavioural test can do this: both paths end in the same migrations and the same `schema_meta`,
+so a test that ran the wrong one would see the same database. It also fails on **drift** — if
+`migrate_ephemeral` is renamed away, or `run(bool)` returns, the gate refuses rather than
+passing vacuously. G13 drives it against 16 injected cases in both directions, including the
+wrappings an ordinary refactor produces (a bare import, a free-function wrapper,
+`#[cfg(any(test, unix))]`, `examples/`, `benches/`).
+
+**Two latent defects in `Backup::take`, exposed by building this.**
+
+Making the production path actually snapshot made two concurrency bugs reachable that were
+previously merely present, because nothing had ever taken two snapshots of one database at once:
+
+* *Non-atomic publication.* `take` deleted the canonical snapshot path and wrote the copy into
+  it in place, so a second `take` removed the first one's file mid-write and the first then
+  verified a half-written snapshot. `take` now builds at a unique staging name and renames into
+  place, so the canonical path only ever names a snapshot that was built **and verified in
+  full** — a restore, or the next `migrate` deciding whether to reuse a snapshot, cannot arrive
+  mid-write. Measured: `the_canonical_snapshot_path_never_names_a_half_written_database` fails
+  with the in-place write and passes with staging plus rename.
+* *Verification read after the copy.* `verify_against_source` decided whether an empty snapshot
+  was legitimate by asking the **live** source. Asked after the copy, that describes a database
+  another thread may have migrated in between, so a faithful copy of an unmigrated database was
+  refused with "has no `schema_meta` table". Observed directly: **eight concurrent opens of one
+  fresh database failed seven of the time.** The emptiness answer is now a **required parameter**
+  the caller must read before the copy, so an ordering mistake is a visible edit to a documented
+  parameter rather than a silent re-read.
+
+**Measured after the change.** `security_state::tests::concurrent_opens_of_{one,both}` — the
+tests that found the bug — pass 8 runs of 8. Two pre-existing tests that had been passing on
+the unprotected path were failing during the change and are now the evidence for the fix.
+
+**Read-ordering: the deterministic gap is closed (A-010).** The mutation that re-derives the
+emptiness flag from the live source at verification time — M6 — was left uncaught by this suite
+and is now caught **deterministically**. `Backup::on_after_copy` and `Backup::on_before_publish`
+are two `#[cfg(test)]`, thread-local, one-shot seams placed on the two boundaries the
+staging-and-rename design introduces.
+`a_snapshot_taken_from_an_unmigrated_source_verifies_even_if_that_source_is_migrated_after_the_copy`
+installs a hook that migrates the source **from a second connection between the copy and the
+verification** — the exact interleaving that made eight concurrent opens fail seven times — and
+requires the snapshot to verify anyway, because the flag it was verified against was captured for
+that snapshot. Measured: with the re-read restored, **3 of 3 runs fail**; with the correct
+implementation, **3 of 3 pass**, and the whole `orxnud-store` suite is 326/327 with the mutant
+against 327/327 without it. The probabilistic concurrent-open tests are no longer the only line
+of defence. The seams are absent from the production rlib (verified by symbol table), are
+`#[cfg(test)]` at every declaration, are thread-local so they cannot cross between parallel
+tests, and add no public API.
+
+**Two further defects found in `Backup::take` while hardening it (A-010), both fixed.**
+
+* **A false premise, and a destructive fallback built on it.** `publish` carried a Windows
+  `remove_file`-then-rename retry on the stated premise that `std::fs::rename` does not replace
+  an existing file there. Verified against this toolchain's own `std::fs::rename` documentation
+  (1.98.1): *"replacing the original file if `to` already exists"*, implemented on Windows as
+  `MoveFileExW` with a fallback to `SetFileInformationByHandle`. The premise is false, and the
+  fallback had a failure mode the direct rename does not: if the retry failed, the snapshot that
+  may be the only good copy of the database had already been deleted. The fallback is deleted,
+  not repaired. `a_failed_publication_leaves_the_existing_snapshot_in_place` fails if it is
+  restored (mutation M9).
+* **The staging file leaked on publication failure.** `take` cleaned up around the copy and
+  verification and then used `?` on the publication, so a failed rename left a verified,
+  never-published snapshot beside the database under a name no reader looks at — one per failed
+  publication, reclaimed by nothing, because a later `take` only removes the staging name it
+  generated itself. `a_failed_publication_removes_the_staging_file_it_never_published` covers it
+  (mutation M10), and `publish` being reduced to a silent copy is caught too (M11).
+
+**Measured, not assumed: the sidecar cleanup does not break a concurrent reader.**
+`discard_failed_initialisation` removes `-wal` and `-shm`, and S-30's criterion 4(b) measured that
+removing a memory-mapped `-shm` gives the affected connection `disk I/O error`. S-31 *shared*
+ownership deliberately lets a second process hold the database, so a failed first initialisation
+can run its cleanup while another connection is reading. Both callers drop their own connection
+and lease first, and
+`discarding_a_failed_initialisation_while_another_connection_has_it_open` measures the two cases
+— an independent idle connection, and one holding a **live read transaction** across the
+cleanup. **Both survive, with the sidecars confirmed deleted** (the test asserts the deletion
+happened, because an earlier version of this file's sidecar test passed while the code it claimed
+to cover was deleted). This is an in-process measurement on Linux; it does **not** extend to a
+separate process with its own mappings, and is not offered as if it did.
+
+**Not verified, stated plainly.**
+
+* **The Windows runtime behaviour of `Backup::publish` was not executed.** The replace-existing
+  property is asserted from the `std` documentation, not measured on Windows, and
+  `publication_replaces_an_existing_destination_with_the_new_snapshot` is written so it will
+  assert it wherever `orxnud-store`'s lib tests run. **No current CI lane runs them there**:
+  `windows-portability` excludes `orxnud-store` with a stated reason (bundled SQLite built by
+  `cl.exe`; the MSVC target has no working linker on a bare runner, which is why `windows-check`
+  is check-only), and this host cannot even build it — `cc-rs: failed to find tool "lib.exe"`.
+  Adding a step that cannot be run or verified locally would put a red lane into CI for reasons
+  unrelated to this work, so none was added.
+* No Tier-1 sandbox behaviour is claimed, and the hosted runner still cannot produce it.
+* F-26b/F-26c, ADR-0058, and S-11's wider specification are untouched by this.
+
+**Evidence.** Gate G16 green; G13 **90 of 90** self-tests (16 of them G16's); G15 green after
+fixing three intra-doc links to the removed items, which it caught. `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo fmt --all --check` clean, `cargo test --workspace`
+**1759 passed, 0 failed, 7 ignored**, and `ci-gates.sh` all 16 gates pass with G12 skipped for
+want of a release tag.
+
+### A-010 — WP-2 hardening: the read-ordering gap closed deterministically, and two more `Backup::take` defects found
+
+**F-26, F-26b and F-26c remain OPEN. S-11 is NOT closed.** A-010 records verification hardening
+inside WP-2. It changes no guarantee's status; it changes what is *proven* about two of them.
+
+**What A-009 left open, and what closed it.** A-009 reported M6 — the mutation that re-derives the
+snapshot's emptiness answer from the live source at verification time, rather than using the
+answer captured for that snapshot — as **uncaught**, with the only coverage being the two
+probabilistic concurrent-open tests (3 of 8 runs failing with the mutant). That was an accurate
+report of a genuine weakness in the evidence, and it is now closed.
+
+The fix is two `#[cfg(test)]`, thread-local, one-shot seams on the boundaries the
+staging-and-rename design introduces: one between the copy and the verification, one between the
+verification and the publication. The first lets a test migrate the source **from a second
+connection** at exactly the moment that distinguishes a verifier using what it captured from
+one re-reading live state. Measured, not argued:
+
+| Implementation | Result |
+|---|---|
+| Correct (flag captured pre-copy) | 3 of 3 runs pass; `orxnud-store` 327/327 |
+| M6 restored (flag re-read at verification) | **3 of 3 runs fail**; `orxnud-store` 326/327 |
+
+The failing test is
+`backup::tests::a_snapshot_taken_from_an_unmigrated_source_verifies_even_if_that_source_is_migrated_after_the_copy`.
+A companion test asserts the seam fires exactly once and before publication, so a green run
+cannot mean "the seam was never reached" — the same vacuity this file has already produced twice.
+
+The seams are verified absent from production: every declaration is `#[cfg(test)]`, and the
+symbols are not in the non-test `rlib`. They are thread-local so parallel tests cannot interfere,
+they add no public API, and they grant no capability the production path lacks.
+
+**Two more defects in `Backup::take`, found by tracing rather than by a failing test.**
+
+1. `publish` carried a Windows `remove_file`-then-rename retry, premised on `std::fs::rename` not
+   replacing an existing file on Windows. That premise is **false** — this toolchain's own
+   `std::fs::rename` documentation (1.98.1) says it replaces, implemented as `MoveFileExW`. The
+   fallback was not merely unnecessary but destructive: had the retry failed, the snapshot that
+   may be the only good copy of the database would already have been deleted. Removed rather than
+   repaired; mutation M9 confirms a test catches its return.
+2. `take` cleaned up its staging file only around the copy and verification, then used `?` on the
+   publication — so a failed rename leaked a verified, never-published snapshot per attempt, and
+   nothing reclaimed them, because a later `take` removes only the staging name it generated
+   itself. Mutations M10 (cleanup reverted) and M11 (`publish` reduced to a silent copy) both fail.
+
+**A hypothesis tested and closed.** `discard_failed_initialisation` removes `-wal`/`-shm`, and
+S-30 criterion 4(b) measured that removing a mapped `-shm` breaks the affected connection with
+`disk I/O error`; S-31 shared ownership lets a second process hold the database, so the case is
+reachable in principle. Measured: an independent idle connection **and** one holding a live read
+transaction both survive, with the sidecars confirmed deleted. In-process, Linux, one host.
+
+**Evidence.** `cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -D warnings`
+clean. `cargo test -p orxnud-store --lib` 327 passed, 0 failed, 1 ignored. G16 green; G13 90/90.
+
+**Still unproven, and unchanged by this amendment.**
+
+* **No Windows runtime evidence.** `publication_replaces_an_existing_destination_with_the_new_snapshot`
+  will assert the replace-existing property wherever `orxnud-store`'s lib tests run, but no CI lane
+  runs them on Windows: `windows-portability` excludes `orxnud-store` for a stated reason (bundled
+  SQLite via `cl.exe`; the MSVC target has no working linker on a bare runner, which is why
+  `windows-check` is check-only), and this host cannot build it at all — `cc-rs: failed to find
+  tool "lib.exe"`. No CI step was added, because a step that cannot be run or verified here would
+  turn the lane red for reasons unrelated to this work.
+* The in-process sidecar measurement does **not** extend to a separate process with its own
+  mappings.
+* **A residual enforcement gap: `MIGRATIONS` is public, so G16 does not cover every route to
+  the schema.** `pub const MIGRATIONS: &[Migration]` exposes the raw SQL of every migration,
+  because tests need it to stage a database at a chosen version. Production code can therefore
+  execute that SQL directly — `conn.execute_batch(m.sql)` for each entry — and reach the schema
+  without `migrate` or `migrate_ephemeral` at all. **G16 checks only for `migrate_ephemeral`,
+  so that route is not policed by it.**
+  This is blunter than the bypasses G16 does close: it would skip `schema_meta` bookkeeping and
+  the per-migration `IMMEDIATE` transaction, and the schema-invariant tests
+  (`the_schema_contains_exactly_the_declared_tables_and_nothing_more`, `migration_versions_are_unique_and_ascending`,
+  `fresh_and_migrated_schemas_converge`) would fail if it were done. It is nonetheless a real
+  hole, and it is recorded here rather than minimised.
+  **It is not fixed.** Closing it means either narrowing `MIGRATIONS` to `pub(crate)` with a
+  test-only accessor, or extending G16 to detect direct execution of migration SQL. Neither is
+  a narrow correction, and both change a public API; the decision belongs to whoever owns
+  S-11's remaining specification, not to this hardening pass.
+  **What must not be claimed:** that all migration bypasses are impossible, or that the
+  schema can only be changed through the snapshotting path.
+* F-26b, F-26c and ADR-0058 are untouched; S-11's wider specification is not discharged by
+  removing the trust-me APIs.
 
 ### A-007 — S-30 (`S-11-RESTORE`): the restore path is now coordinated and logically verified
 

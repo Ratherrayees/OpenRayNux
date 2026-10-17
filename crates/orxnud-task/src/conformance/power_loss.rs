@@ -92,8 +92,13 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
 pub fn victim_main(db_path: &Path, ready_path: &Path, iterations: u32) -> ! {
     let store = orxnud_store::Store::open(db_path, true).expect("victim: open store");
     let conn = store.into_connection();
+    // Ephemeral, and here that is the honest answer rather than a shortcut.
+    // This process is about to be killed at an arbitrary instruction, so a snapshot
+    // taken at this moment would have to survive a `SIGKILL` to be of any use -- and the
+    // property under test is precisely that nothing survives it. There is no earlier
+    // state to protect: the victim wants the schema applied and nothing cleaned up.
     orxnud_store::MigrationRunner::new(&conn)
-        .run(true)
+        .migrate_ephemeral()
         .expect("victim: migrate");
     orxnud_store::pragma::Pragma::critical()
         .verify(&conn)

@@ -36,7 +36,7 @@ fn tid(s: &str) -> TaskId {
 fn open_engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
-    MigrationRunner::new(&conn).run(true).expect("migrate");
+    MigrationRunner::new(&conn).migrate(path).expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 

@@ -988,7 +988,9 @@ mod tests {
     fn engine_with(limits: EngineLimits) -> DurableEngine {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         DurableEngine::new(c, limits).expect("limits")
     }
 
@@ -997,7 +999,9 @@ mod tests {
     fn mem() -> DurableEngine {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         engine_on(c)
     }
 
@@ -1047,7 +1051,9 @@ mod tests {
             {
                 let c = Connection::open_in_memory().expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
-                MigrationRunner::new(&c).run(true).expect("migrate");
+                MigrationRunner::new(&c)
+                    .migrate_ephemeral()
+                    .expect("migrate");
                 c
             },
             EngineLimits {
@@ -1077,7 +1083,9 @@ mod tests {
             {
                 let c = Connection::open_in_memory().expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
-                MigrationRunner::new(&c).run(true).expect("migrate");
+                MigrationRunner::new(&c)
+                    .migrate_ephemeral()
+                    .expect("migrate");
                 c
             },
             EngineLimits {

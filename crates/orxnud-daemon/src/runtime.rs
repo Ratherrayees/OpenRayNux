@@ -5932,7 +5932,7 @@ mod effect_status_for_dispatch_failure_tests {
         {
             let mut c = rusqlite::Connection::open(&db).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).run(true).expect("migrate");
+            MigrationRunner::new(&c).migrate(&db).expect("migrate");
             let mut repo = TaskRepository::new(&mut c);
             repo.insert(&NewTask::new(tid.clone(), TaskKind::Query, NOW), NOW)
                 .expect("insert");
@@ -6281,7 +6281,7 @@ mod effect_status_for_dispatch_failure_tests {
         {
             let mut c = rusqlite::Connection::open(&db).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).run(true).expect("migrate");
+            MigrationRunner::new(&c).migrate(&db).expect("migrate");
             let mut repo = TaskRepository::new(&mut c);
             repo.insert(
                 &NewTask::new(TaskId::new("k1-task"), TaskKind::Query, NOW),
@@ -6469,7 +6469,7 @@ mod effect_status_for_dispatch_failure_tests {
             {
                 let mut c = rusqlite::Connection::open(&db).expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
-                MigrationRunner::new(&c).run(true).expect("migrate");
+                MigrationRunner::new(&c).migrate(&db).expect("migrate");
                 let mut repo = TaskRepository::new(&mut c);
                 repo.insert(&NewTask::new(tid.clone(), TaskKind::Query, NOW), NOW)
                     .expect("insert");

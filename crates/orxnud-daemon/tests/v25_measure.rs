@@ -720,7 +720,7 @@ fn engine(path: &Path) -> DurableEngine {
     // `false` would report `FULL` as costing nothing.
     let store = orxnud_store::sqlite::Store::open(path, true).expect("open the store");
     orxnud_store::migration::MigrationRunner::new(store.conn())
-        .migrate(path, false)
+        .migrate(path)
         .expect("migrate");
     DurableEngine::new(store.into_connection(), EngineLimits::documented()).expect("engine")
 }

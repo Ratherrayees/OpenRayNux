@@ -6009,16 +6009,104 @@ genuinely safe to repeat are now re-driven through the full path rather than sho
 
 ## ADR-0057 — Every production schema change holds a verified snapshot, the trusting mode becomes unselectable, and a restore may not be reopened against stale WAL sidecars
 
-**Status.** **D-S11-a and D-S11-b APPROVED (b in principle). D-S11-c MEASURED and the invariant
-S-11-RESTORE derived from it. Nothing implemented, nothing merged.** S-11 is **specified and
-unbuilt**; F-26 is **open**. This ADR must not be cited as though the snapshot invariant holds —
-approving the shape is not the same as building it.
+**Status.** **D-S11-a and D-S11-b BUILT 2026-10-17 (uncommitted working tree at the time of
+writing). D-S11-c MEASURED and the invariant S-11-RESTORE derived from it; S-30 built and
+closed.** The trust-me APIs are gone from the source: `MigrationRunner::run(bool)` and both
+`snapshot_verified` booleans no longer exist, so there is no unprotected migration for a
+caller to reach, and gate **G16** refuses the remaining unprotected path in production source.
+**S-11 is not closed and F-26 is still open** — see "What was built, and what is still open".
 
 | Decision | Status |
 |---|---|
-| D-S11-a — remove public `run(bool)`; one snapshot-owning coordinator | **Approved 2026-10-14** |
-| D-S11-b — make `migrate(conn)` helpers private; no path parameter | **Approved in principle 2026-10-14** |
-| D-S11-c — WAL sidecars on restore | **Measured 2026-10-14; S-11-RESTORE derived; scope decided — tracked separately as S-30, a hard prerequisite for S-11.** |
+| D-S11-a — remove public `run(bool)`; one snapshot-owning coordinator | **Built 2026-10-17** |
+| D-S11-b — make `migrate(conn)` helpers private; no path parameter | **Built 2026-10-17** |
+| D-S11-c — WAL sidecars on restore | **Measured 2026-10-14; S-11-RESTORE derived; scope decided — tracked separately as S-30, built and closed.** |
+
+### What was built, and what is still open
+
+Built, and verified against observable state:
+
+* `MigrationRunner::run(snapshot_verified: bool)` **deleted**. Replaced by
+  `MigrationRunner::migrate_ephemeral()`, which takes no parameter because there is nothing
+  left to lie about: it applies migrations with no snapshot and no rollback, and its name says
+  so. `MigrationError::NoSnapshot` is deleted with it — a variant named for a refusal that can
+  no longer happen advertises a guarantee the type no longer has.
+* `migrate(db_path)` and `open_and_migrate(path)` lost their booleans. `migrate` decides for
+  itself: reuse an existing snapshot only if it verifies, otherwise take one; on failure, hand
+  back `RecoveryRequired`.
+* Both production constructors in `security_state.rs` — `SqliteAuditJournal::open` and
+  `SqliteApprovalLedger::open`, the audit journal and the approval ledger — now migrate through
+  `migrate`, drop the connection and the shared lease, and recover through the new
+  `migration::recover_from_snapshot`, which is also what `TaskService::open` now calls, so the
+  drop-lease-then-take-exclusive sequence exists once rather than three times.
+* `SqliteAuditJournal::migrate(&Connection)` and `SqliteApprovalLedger::migrate(&Connection)`
+  deleted, and `SqliteApprovalLedger::open_in_memory` deleted as dead. `SqliteAuditJournal::open_in_memory`
+  is now `#[cfg(test)]`: a public constructor that can only be misused, documented not to be,
+  is the same shape as the boolean this ADR removes.
+* A brand-new database whose first migration fails is now removed, with its `-wal`, `-shm` and
+  the failed snapshot left by `Backup::take`. Guarded by whether the file existed **before** the
+  call was made: a pre-existing file with no `schema_meta` may be a foreign database, and
+  deleting a user's file on a version check is not a recovery.
+* Gate **G16** (`scripts/gate_policy.py g16`, run by `scripts/ci-gates.sh` and therefore by CI)
+  refuses `migrate_ephemeral` in production source outside two declared exemptions, and fails on
+  drift in the surface it reads. It is a source check because no behavioural test can observe
+  *which* of two functions a caller invoked. G13 drives it against injected violations in both
+  directions — 16 cases, including the wrappings an ordinary refactor would produce.
+
+Two defects in `Backup::take` were latent until the production path actually snapshotted, and
+are fixed here rather than left for the next concurrent start to find:
+
+* the canonical snapshot path was deleted and written into in place, so a second `take` removed
+  the first one's file mid-write and the first verified a half-written snapshot. `take` now
+  builds at a unique staging name and renames into place, so the canonical path only ever names
+  a snapshot that was built and verified in full;
+* `verify_against_source` decided whether an empty snapshot was acceptable by asking the *live*
+  source, which another thread could migrate between the copy and the question — refusing a
+  faithful copy with "has no `schema_meta` table". Eight concurrent opens of one fresh database
+  failed seven of the time. The emptiness answer is now a parameter the caller must have read
+  before the copy.
+
+**Still open, and not claimed here:**
+
+* **A residual enforcement gap, deliberately left open.** `MIGRATIONS` remains public, because
+  tests need its SQL to stage a database at a chosen version. Production code can therefore run
+  that SQL directly and reach the schema without `migrate` or `migrate_ephemeral`, and **gate
+  G16 does not police that route** — it checks only for `migrate_ephemeral`. Such code would
+  skip `schema_meta` bookkeeping and the per-migration transaction, and the schema-invariant
+  tests would fail, but it is a real hole. Closing it means narrowing `MIGRATIONS` to
+  `pub(crate)` or extending G16 to detect direct execution of migration SQL; either is a public
+  API change and a decision for whoever owns the rest of S-11.
+  **Consequence for how this record may be cited: it does not establish that the schema can
+  only be changed through the snapshotting path, or that all migration bypasses are impossible.**
+  It establishes that the *trust-me APIs this record names* are gone and that the one remaining
+  protected-path alternative is refused in production source.
+* **F-26 stays open** and **F-26b stays open**: a hard-linked alias still produces a second lock
+  file and bypasses ownership entirely (ADR-0058; research candidate, not approved).
+* **S-11 is not closed.** What is gone is the trust-me API and the two production callers that
+  used it. S-11's wider specification in the remediation plan is not fully discharged by this.
+* The ordering in `Backup::take` — reading the source's emptiness before the copy — **was**
+  unpinned deterministically, and is now. Two `#[cfg(test)]`, thread-local, one-shot seams let a
+  test migrate the source from a second connection between the copy and the verification, which
+  is the exact interleaving that broke eight concurrent opens. With the re-read restored the test
+  fails **3 runs of 3**; with the correct implementation it passes 3 of 3. The seams do not exist
+  in a production build.
+* Nothing here is evidence about Tier-1 sandbox behaviour.
+* **Nothing was measured on Windows**, and `Backup::publish` carries a Windows-relevant claim:
+  that `std::fs::rename` replaces an existing destination there. That is asserted from the `std`
+  documentation for this toolchain (1.98.1, `MoveFileExW`), not measured. No CI lane runs
+  `orxnud-store`'s tests on Windows — `windows-portability` excludes the crate for a stated
+  linker reason — and no CI step was added, because one that cannot be run or verified would turn
+  the lane red for reasons unrelated to this work.
+
+### A first version of the publication path was wrong, and was corrected here
+
+An earlier form of `Backup::publish` tried `rename`, and on failure deleted the destination and
+retried, on the premise that `std::fs::rename` does not replace an existing file on Windows. That
+premise is false, and the fallback was not merely unnecessary: a retry that failed **after** the
+`unlink` would have destroyed the only good copy of the database, turning a migration failure into
+a data-loss failure. The fallback is deleted, not repaired. A second defect in the same area — a
+failed publication leaking its staging file, one per attempt, reclaimed by nothing — is fixed the
+same way. Both are covered by mutation checks. See `docs/12-verification-register.md` A-010.
 
 **Context.** S-11 exists because `MigrationRunner` has two entry points whose names do not
 describe them. `migrate(db_path, claimed)` verifies-or-takes a snapshot, returns early when

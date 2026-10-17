@@ -75,7 +75,7 @@ fn open_engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).run(true).expect("migrate");
+    MigrationRunner::new(&conn).migrate(path).expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -936,7 +936,7 @@ fn a_claim_from_another_connection_never_observes_a_recoverable_uncertain_task()
     let other = {
         let conn = rusqlite::Connection::open(&db).expect("second connection");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn).migrate(&db).expect("migrate");
         conn
     };
 

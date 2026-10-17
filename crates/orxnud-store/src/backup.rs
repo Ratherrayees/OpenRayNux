@@ -60,6 +60,21 @@ pub enum BackupError {
         source: rusqlite::Error,
     },
 
+    /// A filesystem operation on the snapshot failed outside SQLite.
+    ///
+    /// Separate from [`BackupError::Write`] because that one carries a `rusqlite::Error`,
+    /// and reporting "could not write the snapshot: disk I/O error" for a failed `rename`
+    /// would send an operator looking at SQLite. Moving a finished snapshot into place is
+    /// not a database operation.
+    #[error("could not move the snapshot into place at {path}: {source}")]
+    Io {
+        /// The canonical snapshot path.
+        path: String,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The snapshot was written but does not open.
     #[error("the snapshot at {path} cannot be opened: {source}")]
     Unreadable {
@@ -177,6 +192,52 @@ pub struct Backup {
     path: PathBuf,
 }
 
+// Test-only: the per-thread hook fired between `Backup::take`'s copy and its verification.
+//
+// (A plain comment, not a doc comment: `thread_local!` is a macro invocation, so a doc
+// comment attaches to nothing and rustc warns.)
+//
+// **Thread-local on purpose.** A process-wide `static` would be visible to every test in the
+// binary running at the same moment, and `cargo test` runs them in parallel — which is how a
+// seam becomes a flake instead of a tool. `RefCell` rather than a `Mutex` because the borrow
+// never escapes the calling thread and never spans the hook's own execution: the hook runs
+// after `Backup::fire_after_copy` has already taken the value out.
+//
+// `#[cfg(test)]` and module-private, so it does not exist in a production binary at all.
+// There is no environment variable to set and no public entry point that reaches it.
+#[cfg(test)]
+std::thread_local! {
+    static SEAMS: RefCell<Seams> = const {
+        RefCell::new(Seams {
+            after_copy: None,
+            before_publish: None,
+        })
+    };
+}
+
+/// Test-only: the two points inside [`Backup::take`] a test can act at.
+///
+/// Both sit on boundaries that are otherwise unreachable from outside, and they are the two
+/// the staging-and-rename design introduces:
+///
+/// * `after_copy` — the copy is written, verification has not begun. Mutating the *source*
+///   here is what exposes a verifier that re-reads live state instead of using what it
+///   captured for the snapshot in hand.
+/// * `before_publish` — the snapshot is verified but not yet at its canonical name. This is
+///   the only place from which a publication failure can be provoked deterministically,
+///   because the staged file must be made to go missing between the two steps that touch it.
+///
+/// Each is one-shot and per-thread.
+#[cfg(test)]
+#[derive(Default)]
+struct Seams {
+    after_copy: Option<Box<dyn Fn()>>,
+    before_publish: Option<Box<dyn Fn()>>,
+}
+
+#[cfg(test)]
+use std::cell::RefCell;
+
 impl Backup {
     /// Where the snapshot for `db_path` lives.
     ///
@@ -188,6 +249,74 @@ impl Backup {
         let mut name = db_path.file_name().unwrap_or_default().to_os_string();
         name.push(".pre-migration.bak");
         db_path.with_file_name(name)
+    }
+
+    /// A unique staging name beside `canonical`.
+    ///
+    /// Uniqueness needs the process id *and* a counter: `PathService::open` and
+    /// `SqliteAuditJournal::open` can both reach `take` for one database inside one
+    /// process, and pid alone would collide there exactly as it would across processes.
+    fn staging_path(canonical: &Path) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut name = canonical.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(
+            ".staging-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        canonical.with_file_name(name)
+    }
+
+    /// Moves a verified snapshot into its canonical name.
+    ///
+    /// # Why the rename, and not write-in-place
+    ///
+    /// `take` used to `remove_file` the canonical path and write the copy straight into
+    /// it. That is safe for one caller and wrong for two: a second `take` running against
+    /// the same database deleted the first one's snapshot out from under it, and the first
+    /// then verified a file the second was still writing — "the snapshot at ... has no
+    /// `schema_meta` table".
+    ///
+    /// Nothing hit that until S-11/F-26 made the production migration path take a snapshot
+    /// at all. Before this change `SqliteAuditJournal::open` and `SqliteApprovalLedger::open`
+    /// called `MigrationRunner::run(true)`, which took none, so two concurrent opens of one
+    /// fresh database never raced on the snapshot path. The race was real; it was simply
+    /// unreachable, which is a different thing from absent.
+    ///
+    /// Staging and renaming also means the canonical path only ever names a snapshot that
+    /// was built *and verified in full*. A reader that finds a file there — a restore, or
+    /// the next `migrate` deciding whether to reuse an existing snapshot — cannot arrive
+    /// mid-write.
+    ///
+    /// # Why there is no delete-then-rename fallback, and there was one
+    ///
+    /// The first version of this function carried a Windows fallback: `rename`, and on
+    /// failure `remove_file` the destination and rename again, on the stated premise that
+    /// "`rename` does not replace an existing file on Windows".
+    ///
+    /// **That premise is false.** Verified against this toolchain's own `std::fs::rename`
+    /// documentation (1.98.1): *"Renames a file or directory to a new name, **replacing the
+    /// original file if `to` already exists**"*, implemented on Windows as `MoveFileExW` with
+    /// a fallback to `SetFileInformationByHandle`. The fallback was never needed.
+    ///
+    /// Worse than unnecessary, it was destructive. A fallback that removes the destination
+    /// has a failure mode the direct rename does not: if the second rename fails — a
+    /// different error, a different moment, an antivirus scanner holding the path — the
+    /// canonical snapshot has already been deleted and the only good copy of the database is
+    /// gone. `take` reports the error, and the operator is left with a migration failure
+    /// *and* a destroyed recovery point, which is the opposite of what a snapshot is for.
+    ///
+    /// So the fallback is deleted rather than repaired. The direct rename replaces the
+    /// destination atomically on both platforms, and if it fails the destination is
+    /// **untouched** — which is the property worth having. A rename can still legitimately
+    /// fail on Windows (`ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION` when another handle
+    /// holds the file without `FILE_SHARE_DELETE`); that is reported, with the staging file
+    /// cleaned up by [`Self::take`], and the previous snapshot left in place.
+    fn publish(staging: &Path, canonical: &Path) -> Result<(), BackupError> {
+        std::fs::rename(staging, canonical).map_err(|source| BackupError::Io {
+            path: canonical.display().to_string(),
+            source,
+        })
     }
 
     /// Adopts an existing snapshot at `path`, without creating or verifying it.
@@ -214,13 +343,47 @@ impl Backup {
     /// `integrity_check`, or has no `schema_meta`.
     pub fn take(conn: &Connection, db_path: &Path) -> Result<Self, BackupError> {
         let path = Self::path_for(db_path);
-        // Remove any previous snapshot first. Writing over an existing file would
-        // leave stale bytes if the copy were shorter than the old one.
-        let _ = std::fs::remove_file(&path);
+        // Built and verified at a unique staging name, then moved into place. See
+        // `publish`.
+        let staging = Self::staging_path(&path);
+        let _ = std::fs::remove_file(&staging);
 
+        // **Both** steps below can fail, and the staging file must not survive either of
+        // them. An earlier version cleaned up only around the copy/verify step and then
+        // used `?` on the publication, so a failed rename leaked a verified-but-unpublished
+        // snapshot beside the database under a name no reader looks at. It accumulated one
+        // file per failed publication, and -- because a later `take` only removes the
+        // staging name it generated itself -- nothing ever reclaimed them.
+        let taken = Self::take_into(conn, &staging);
+        #[cfg(test)]
+        if taken.is_ok() {
+            // The second seam point: verified, but not yet at its canonical name.
+            Self::fire_before_publish();
+        }
+        let published = taken.and_then(|()| Self::publish(&staging, &path));
+        if let Err(e) = published {
+            // The staging file is never the recovery point: it has not been published, so
+            // nothing can have been told to restore from it. Removing it cannot lose a
+            // snapshot anyone depends on. The canonical path is deliberately untouched --
+            // if a previous snapshot existed it is still there, and `publish` is written so
+            // that a failed rename cannot have destroyed it.
+            let _ = std::fs::remove_file(&staging);
+            return Err(e);
+        }
+        Ok(Self { path })
+    }
+
+    /// Copies `conn` to `dst_path` and verifies the copy against `conn`.
+    ///
+    /// Split out of [`Self::take`] so the caller owns the staging file's lifetime: every
+    /// `?` in here has to be able to remove it.
+    fn take_into(conn: &Connection, dst_path: &Path) -> Result<(), BackupError> {
+        // Asked *before* the copy, and carried to the verification below rather than
+        // re-read there. See `verify_against_source`.
+        let source_was_unmigrated = !Self::has_schema_meta(conn);
         {
-            let mut dst = Connection::open(&path).map_err(|source| BackupError::Write {
-                path: path.display().to_string(),
+            let mut dst = Connection::open(dst_path).map_err(|source| BackupError::Write {
+                path: dst_path.display().to_string(),
                 source,
             })?;
             // 64 pages per step, zero pause: SQLite's own default page count, so
@@ -229,25 +392,78 @@ impl Backup {
             // correctly but takes locks long enough to stall the single writer.
             let backup = rusqlite::backup::Backup::new(conn, &mut dst).map_err(|source| {
                 BackupError::Write {
-                    path: path.display().to_string(),
+                    path: dst_path.display().to_string(),
                     source,
                 }
             })?;
             backup
                 .run_to_completion(PAGES_PER_STEP, std::time::Duration::from_millis(0), None)
                 .map_err(|source| BackupError::Write {
-                    path: path.display().to_string(),
+                    path: dst_path.display().to_string(),
                     source,
                 })?;
             // Drop the `Backup` before reading `dst`: it holds a mutable borrow,
             // and its `Drop` is what finalises the copy.
         }
 
-        let verified = Self::verify_against_source(&path, conn)?;
+        // The seam for the read-ordering test. It sits **between the copy and the
+        // verification**, which is the only place a mutation of the source can change the
+        // answer without changing the snapshot -- and that is precisely the defect.
+        //
+        // It is `#[cfg(test)]`, thread-local, and unreadable in production: there is no
+        // environment variable, no flag, no public entry point, and a second thread cannot
+        // see or set it. The three seams this crate has used before (an environment
+        // variable compiled into production, `pre_exec` descriptor handover, and a
+        // whole-environment gate) are all documented in `restore_with_lease_for_tests`;
+        // this one is deliberately narrower than any of them, because it does not pause
+        // anything -- it only runs code the test itself supplies, at a moment the test
+        // chooses.
+        #[cfg(test)]
+        Self::fire_after_copy();
+
+        let verified = Self::verify_against_source(dst_path, conn, source_was_unmigrated)?;
         // The verification result is used by the caller; it is computed here so a
         // failure is reported by `take` rather than discovered later.
         let _ = verified;
-        Ok(Self { path })
+        Ok(())
+    }
+
+    /// Test-only: run the `after_copy` hook for the calling thread, if any, and consume it.
+    #[cfg(test)]
+    fn fire_after_copy() {
+        let f = SEAMS.with(|s| s.borrow_mut().after_copy.take());
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    /// Test-only: run the `before_publish` hook for the calling thread, if any, and consume
+    /// it.
+    #[cfg(test)]
+    fn fire_before_publish() {
+        let f = SEAMS.with(|s| s.borrow_mut().before_publish.take());
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    /// Test-only: install `f` to run after the copy and before the verification of the next
+    /// [`Self::take`] **on this thread**. One-shot: consumed by [`Self::fire_after_copy`].
+    #[cfg(test)]
+    fn on_after_copy(f: impl Fn() + 'static) {
+        SEAMS.with(|s| s.borrow_mut().after_copy = Some(Box::new(f)));
+    }
+
+    /// Test-only: install `f` to run after the verification and before the publication of
+    /// the next [`Self::take`] **on this thread**. One-shot: consumed by
+    /// [`Self::fire_before_publish`].
+    ///
+    /// This is the only place from which a publication failure can be provoked
+    /// deterministically: the staged file has to be made to disappear between the two steps
+    /// that touch it, and there is no window to hit from outside.
+    #[cfg(test)]
+    fn on_before_publish(f: impl Fn() + 'static) {
+        SEAMS.with(|s| s.borrow_mut().before_publish = Some(Box::new(f)));
     }
 
     /// Verifies a snapshot by comparing it with the database it was taken from.
@@ -265,7 +481,7 @@ impl Backup {
     /// where OpenRayNux has never run.
     ///
     /// That is not hypothetical. Phase 2's migration tests all drove
-    /// [`crate::migration::MigrationRunner::run`], which trusts its caller's
+    /// `MigrationRunner::run(snapshot_verified: bool)`, which trusts its caller's
     /// snapshot claim and never takes one, so `take` was never called on an unmigrated
     /// database. The bug surfaced only when the production startup path in
     /// `orxnud-daemon` began calling `migrate` for real.
@@ -277,11 +493,47 @@ impl Backup {
     ///
     /// [`BackupError`] as for [`Self::verify`], except that an absent `schema_meta` is
     /// accepted when the source also lacks it.
+    ///
+    /// # `source_was_unmigrated` is a parameter, not a re-read
+    ///
+    /// "May this snapshot have no `schema_meta`?" is really "was the database I copied
+    /// already unmigrated?" — a property of the source at the moment of the copy. Reading
+    /// it here, after the copy, re-reads a source another thread may have migrated in
+    /// between, and the answer then describes a different database than the one in the
+    /// snapshot.
+    ///
+    /// Observed, not theorised: with eight threads opening one fresh database, seven
+    /// failed. Each copied an empty file, then found `schema_meta` on the live source —
+    /// another thread having applied migration 1 — and refused its own perfectly good
+    /// snapshot with "has no `schema_meta` table". The relaxation for a fresh install
+    /// (V-33) was unreachable under concurrency, and unreachable *by accident*.
+    ///
+    /// So the answer is passed in rather than computed here. The caller must have read it
+    /// **before** the copy, and a signature change is the honest way to say so: there is no
+    /// two-argument form to reach for by accident. A caller that genuinely wants the
+    /// after-the-fact answer can still write `!Self::has_schema_meta(source)`, and it will
+    /// read as a deliberate re-read rather than as the default.
+    ///
+    /// Reading before is also the safer direction. If the source gained `schema_meta`
+    /// between the read and the copy, the copy either contains it (so the question does
+    /// not arise) or does not (so the snapshot is a faithful copy of the unmigrated
+    /// database, which is what accepting it asserts). The guard that matters — refusing an
+    /// emptied snapshot of a *migrated* database — still holds, because a source that had
+    /// been migrated had `schema_meta` before the read.
+    ///
+    /// `source` is retained because it names the database the snapshot is evidence *about*,
+    /// and because a future verification that needs to read it should not have to widen the
+    /// signature. It is not consulted: every check is a property of `path`.
+    #[allow(
+        unused_variables,
+        reason = "see the note above; kept for call-site meaning"
+    )]
     pub fn verify_against_source(
         path: &Path,
         source: &Connection,
+        source_was_unmigrated: bool,
     ) -> Result<VerifiedSnapshot, BackupError> {
-        Self::verify_impl(path, !Self::has_schema_meta(source))
+        Self::verify_impl(path, source_was_unmigrated)
     }
 
     /// Whether a connection has the `schema_meta` table.
@@ -753,8 +1005,707 @@ mod tests {
     fn migrated_db(path: &Path) -> Connection {
         let conn = Connection::open(path).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).run(true).expect("migrate");
+        MigrationRunner::new(&conn).migrate(path).expect("migrate");
         conn
+    }
+
+    /// **Concurrent snapshots of one database must all succeed.**
+    ///
+    /// S-11/F-26 made this reachable. `SqliteAuditJournal::open` and
+    /// `SqliteApprovalLedger::open` used to reach `MigrationRunner::run(true)`, which took
+    /// no snapshot at all, so two constructors opening one database never touched the
+    /// snapshot path together. Making the production path snapshot is the whole point of
+    /// that change, and it exposed two defects in `Backup::take` that had been latent:
+    ///
+    /// 1. it deleted the canonical snapshot and wrote the copy into it in place, so a
+    ///    second `take` removed the first one's file mid-write and the first verified a
+    ///    half-written snapshot; and
+    /// 2. `verify_against_source` decided whether an empty snapshot was acceptable by
+    ///    asking the *live* source, which another thread could migrate between the copy
+    ///    and the question -- refusing a good snapshot of a database that had legitimately
+    ///    been migrated by someone else in the meantime.
+    ///
+    /// Both were fixed by publishing through a unique staging name and by asking about the
+    /// source before the copy. Both are observable here, and neither was reachable before,
+    /// which is why the old suite was green.
+    #[test]
+    fn concurrent_snapshots_of_one_database_all_succeed() {
+        const N: usize = 8;
+        let dir = dir("concurrent-take");
+        let path = dir.join("state.db");
+        // A brand-new, unmigrated database: the state in which an empty snapshot is
+        // legitimate, and therefore the state that exercised the ordering bug.
+        {
+            let c = Connection::open(&path).expect("open");
+            Pragma::critical().apply(&c).expect("pragmas");
+        }
+        assert!(
+            !Backup::path_for(&path).exists(),
+            "precondition: no snapshot exists yet"
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let p = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let c = Connection::open(&p).expect("open");
+                    barrier.wait();
+                    Backup::take(&c, &p).map(|b| b.path().to_path_buf())
+                })
+            })
+            .collect();
+
+        let mut failures = Vec::new();
+        let mut handed_out: Vec<std::path::PathBuf> = Vec::new();
+        for h in handles {
+            match h.join().expect("join") {
+                Ok(p) => handed_out.push(p),
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "every concurrent snapshot must succeed; {} failed, first: {}",
+            failures.len(),
+            failures.first().map(String::as_str).unwrap_or("")
+        );
+        assert_eq!(
+            handed_out.len(),
+            N,
+            "every caller must have been handed a path"
+        );
+
+        // And what survives is a snapshot, not a torn one.
+        //
+        // Not `Backup::verify`: that is the *strict* form, and it refuses a snapshot with
+        // no `schema_meta` because restoring one would replace a database with nothing.
+        // The source here was never migrated, so an empty snapshot is the honest result --
+        // `take` is allowed to produce it because it saw the empty source, and `verify`
+        // alone cannot see that. So what is asserted is what must hold either way: the
+        // file is a readable SQLite database with a clean integrity check, and it sits at
+        // the canonical name every caller was handed.
+        let canonical = Backup::path_for(&path);
+        assert!(
+            canonical.exists(),
+            "the snapshot must be published at its name"
+        );
+        for p in &handed_out {
+            assert_eq!(
+                p, &canonical,
+                "every caller must be handed the canonical path, not its own staging name"
+            );
+        }
+        let snapshot = Connection::open(&canonical).expect("the published snapshot must open");
+        let integrity: String = snapshot
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .expect("integrity_check");
+        assert_eq!(
+            integrity, "ok",
+            "a published snapshot must be a whole database, not a half-written one"
+        );
+        assert!(
+            !canonical.to_string_lossy().contains("staging"),
+            "the published file is at the canonical name, not a staging one"
+        );
+        // No staging file is left behind on the success path.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a successful take must not leave staging files behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The canonical path never names a half-written database.**
+    ///
+    /// The first of the two defects `take` had. It removed the canonical snapshot and wrote
+    /// the copy into it in place, so for the duration of every copy the canonical path named
+    /// a truncated file -- and anything that found it there (a restore, or the next
+    /// `migrate` deciding whether to reuse an existing snapshot) could read it.
+    ///
+    /// Asserted by watching the path rather than by racing two threads: a poller reads the
+    /// canonical path continuously while takes run, and *every* file it finds must be a
+    /// whole database. This is the only assertion that can fail with the in-place write and
+    /// pass with staging plus rename, and the reason the earlier
+    /// `concurrent_snapshots_of_one_database_all_succeed` was not enough: eight threads
+    /// copying an identical empty file can finish in an order that never exposes the torn
+    /// state, so that test passed with the fix reverted. A test that cannot fail its own
+    /// bug is not a regression test.
+    #[test]
+    fn the_canonical_snapshot_path_never_names_a_half_written_database() {
+        let dir = dir("never-torn");
+        let path = dir.join("state.db");
+        drop(migrated_db(&path));
+        let canonical = Backup::path_for(&path);
+        let _ = std::fs::remove_file(&canonical);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poller_stop = std::sync::Arc::clone(&stop);
+        let watched = canonical.clone();
+        let poller = std::thread::spawn(move || {
+            let mut observed = 0usize;
+            while !poller_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if watched.exists() {
+                    observed += 1;
+                    // Whatever is at the canonical name must open and be intact. A
+                    // half-written copy fails here -- usually by not opening at all.
+                    let verdict = Connection::open(&watched).and_then(|c| {
+                        c.query_row("PRAGMA integrity_check;", [], |r| r.get::<_, String>(0))
+                    });
+                    assert_eq!(
+                        verdict.as_deref().unwrap_or("<unreadable>"),
+                        "ok",
+                        "the canonical snapshot path named a file that is not a whole database; \
+                         a reader must never observe one mid-write"
+                    );
+                }
+                std::hint::spin_loop();
+            }
+            observed
+        });
+
+        for _ in 0..25 {
+            let c = Connection::open(&path).expect("open");
+            Backup::take(&c, &path).expect("take");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let observed = poller.join().expect("poller");
+        assert!(
+            observed > 0,
+            "the poller never saw the snapshot, so it could not have checked anything"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The emptiness question is asked of the source as it was before the copy.**
+    ///
+    /// The second defect, and the subtle one. `verify_against_source` answered "may this
+    /// snapshot have no `schema_meta`?" by asking the *live* source. Asked after the copy,
+    /// that question describes a database that may no longer be the one in the snapshot: if
+    /// another thread migrated the source in between, a faithful copy of an unmigrated
+    /// database gets refused with "has no `schema_meta` table". With S-11/F-26's production
+    /// snapshot that stopped being theoretical -- eight threads opening one fresh database
+    /// failed seven of the time, which is how it was found.
+    ///
+    /// Pinned at the decision rather than at the race, because the race cannot be scheduled
+    /// deterministically and a test that only fails sometimes is not a test. The property
+    /// is that the answer is a property *of the source at copy time*, so it is passed in
+    /// rather than re-read -- and this asserts that the two disagree on exactly the case
+    /// that broke, with the source read afterwards.
+    ///
+    /// **What this test does and does not prove.** It pins the semantics of the flag and
+    /// shows the two orderings disagree, so it cannot be satisfied by a verifier that
+    /// ignores the flag. It does **not** prove that `take` reads the flag before its copy:
+    /// reverting `take` to derive it at verification time leaves this test green.
+    ///
+    /// That revert was measured, not assumed. The evidence for it is
+    /// `security_state::tests::concurrent_opens_of_*`, which fails in 3 of 8 runs with the
+    /// ordering wrong and 0 of 8 with it right -- the only tests in the tree that catch it,
+    /// and flaky, which is a real weakness rather than a pass. The durable mitigation is the
+    /// signature: `verify_against_source` takes the flag, so an ordering mistake is now a
+    /// visible edit to a documented parameter rather than a silent re-read inside a
+    /// function that looks correct.
+    #[test]
+    fn a_snapshot_of_an_unmigrated_source_stays_acceptable_after_that_source_is_migrated() {
+        let dir = dir("emptiness-read-first");
+        let path = dir.join("state.db");
+        let snapshot = dir.join("early.bak");
+        // The snapshot: taken while the source was empty, so it has no `schema_meta`.
+        {
+            let c = Connection::open(&path).expect("open");
+            Pragma::critical().apply(&c).expect("pragmas");
+            let mut dst = Connection::open(&snapshot).expect("open dst");
+            rusqlite::backup::Backup::new(&c, &mut dst)
+                .expect("backup")
+                .run_to_completion(64, std::time::Duration::from_millis(0), None)
+                .expect("copy");
+        }
+        let has_meta = |c: &Connection| {
+            c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta');",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("query")
+                != 0
+        };
+        {
+            let c = Connection::open(&snapshot).expect("reopen snapshot");
+            assert!(
+                !has_meta(&c),
+                "precondition: the snapshot of an empty database has no schema_meta"
+            );
+        }
+
+        // Another thread migrates the source after our copy was taken.
+        {
+            let c = Connection::open(&path).expect("open");
+            MigrationRunner::new(&c).migrate(&path).expect("migrate");
+            assert!(has_meta(&c), "precondition: the source is now migrated");
+        }
+
+        // Read afterwards: the live source now says "migrated", so the relaxation is
+        // withheld and a good snapshot is refused. This is the bug -- and it is why
+        // `take` must not derive the flag from the source at verification time.
+        let c = Connection::open(&path).expect("reopen source");
+        let after_the_fact = !has_meta(&c);
+        assert!(
+            !after_the_fact,
+            "precondition: the live source now looks migrated"
+        );
+        assert!(
+            Backup::verify_against_source(&snapshot, &c, after_the_fact).is_err(),
+            "reading the source after the copy refuses a snapshot that was faithful when it \
+             was taken; this is the behaviour `take` must not depend on"
+        );
+        // Read before: the answer travels with the snapshot, so the same snapshot is
+        // accepted. A snapshot is evidence of the state at copy time, not of the state now.
+        Backup::verify_against_source(&snapshot, &c, true)
+            .expect("a snapshot taken from an unmigrated source must remain acceptable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The read-ordering fix, forced deterministically.**
+    ///
+    /// This is the test that replaces "3 of 8 runs fail, so the fix probably works". The
+    /// interleaving it needs is: *the source is migrated between our copy finishing and our
+    /// verification running*. That cannot be scheduled reliably from outside — it needs a
+    /// moment inside `take` — so `Backup::on_after_copy` supplies it. The hook
+    /// is `#[cfg(test)]` and thread-local; no production binary contains it.
+    ///
+    /// **The arrangement.** A brand-new, unmigrated database: no `schema_meta`, so
+    /// `source_was_unmigrated` is read as `true` before the copy, and the copy therefore
+    /// contains no `schema_meta` either. Then, between the copy and the verification, a
+    /// *second connection* migrates that same database.
+    ///
+    /// **What each implementation does.**
+    ///
+    /// * Correct: the flag was read before the copy and is carried forward. It is `true`.
+    ///   The snapshot legitimately has no `schema_meta`, so the relaxation applies and
+    ///   `take` succeeds. The snapshot is faithful evidence of the database as it was when
+    ///   the copy was made, and nothing about what happened afterwards changes that.
+    /// * Faulty: the flag is re-read at verification time. The live source now *has*
+    ///   `schema_meta` — the hook migrated it — so the relaxation is withheld and `take`
+    ///   fails with `NoSchemaMeta` on a snapshot that is perfectly good.
+    ///
+    /// The faulty branch is exactly the production defect: verification observing a
+    /// *different database* than the one it is verifying. This is the interleaving that made
+    /// eight concurrent opens of one fresh database fail seven times, and here it happens on
+    /// the first attempt, every time.
+    #[test]
+    fn a_snapshot_taken_from_an_unmigrated_source_verifies_even_if_that_source_is_migrated_after_the_copy()
+     {
+        let dir = dir("read-ordering");
+        let path = dir.join("state.db");
+        {
+            // A fresh database: opened and pragma'd, never migrated. No `schema_meta`.
+            let c = Connection::open(&path).expect("open");
+            Pragma::critical().apply(&c).expect("pragmas");
+        }
+        assert!(
+            !Backup::has_schema_meta(&Connection::open(&path).expect("reopen")),
+            "precondition: the source has never been migrated"
+        );
+
+        // The seam. A second connection migrates the source at the one moment that matters.
+        let migrated = path.clone();
+        Backup::on_after_copy(move || {
+            let other = Connection::open(&migrated).expect("hook: open a second connection");
+            Pragma::critical().apply(&other).expect("hook: pragmas");
+            MigrationRunner::new(&other)
+                .migrate(&migrated)
+                .expect("hook: migrate the source after the copy finished");
+        });
+
+        let conn = Connection::open(&path).expect("reopen for take");
+        let result = match Backup::take(&conn, &path) {
+            Ok(b) => Ok(b.path().to_path_buf()),
+            Err(e) => Err(e.to_string()),
+        };
+
+        // Assert the hook actually fired and actually changed the source. Without this the
+        // test would pass on an implementation where the seam is never reached -- which is
+        // the same class of vacuous test this file has already produced twice.
+        assert!(
+            Backup::has_schema_meta(&Connection::open(&path).expect("reopen")),
+            "precondition: the hook must have migrated the source, or this test proves \
+             nothing -- the whole fault requires the source to have changed"
+        );
+        assert_eq!(
+            result,
+            Ok(Backup::path_for(&path)),
+            "verification must use the state captured for this snapshot, not the live \
+             source's state at verification time; a re-read reports NoSchemaMeta on a \
+             snapshot that is perfectly good"
+        );
+
+        // And the published snapshot really is the pre-migration one.
+        let published = result.expect("published");
+        let snap = Connection::open(&published).expect("open the snapshot");
+        assert!(
+            !Backup::has_schema_meta(&snap),
+            "the snapshot was taken before the migration, so it must not contain it -- \
+             otherwise the test is not exercising the empty-snapshot relaxation at all"
+        );
+        drop(snap);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The negative control for the test above, as a fact about the *seam* rather than as a
+    /// mutation someone has to apply by hand.
+    ///
+    /// Without it, "the seam was never reached" and "the ordering is right" are
+    /// indistinguishable from a green run. This proves the hook fires exactly once, at the
+    /// copy/verify boundary, and that it is one-shot — so the test above cannot pass by
+    /// having quietly not run it.
+    #[test]
+    fn the_read_ordering_seam_fires_once_between_the_copy_and_the_verification() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = dir("seam-fires");
+        let path = dir.join("state.db");
+        drop(migrated_db(&path));
+
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&count);
+        let watched = path.clone();
+        Backup::on_after_copy(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            // Inside the seam the snapshot is staged but not yet published, so the
+            // canonical path must not exist yet: that is what "between the copy and the
+            // verification" means.
+            assert!(
+                !Backup::path_for(&watched).exists(),
+                "the seam runs before publication, so the canonical path must be empty"
+            );
+        });
+
+        let conn = Connection::open(&path).expect("open");
+        Backup::take(&conn, &path).expect("take");
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the seam must fire exactly once per take"
+        );
+        // One-shot: a second take must not re-run it.
+        Backup::take(&conn, &path).expect("second take");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the seam is consumed, not persistent"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A failed replacement must leave the previous snapshot intact and usable.**
+    ///
+    /// This is the guarantee that makes staging-and-rename worth doing at all. The snapshot
+    /// at the canonical path may be the *only* good copy of a database whose last migration
+    /// failed, so a `take` that cannot finish must not make things worse than it found them.
+    ///
+    /// The failure is forced deterministically through verification rather than through a
+    /// permissions trick: emptying `schema_meta` leaves the source with the table but zero
+    /// rows, so the staged copy is refused by [`BackupError::Empty`] — a real verdict from
+    /// the real verifier, not an injected one.
+    ///
+    /// Asserted in both directions, because "the old snapshot survived" and "nothing partial
+    /// replaced it" are different claims: the file must still be the *previous* snapshot, at
+    /// the previous version, and not merely something that parses.
+    #[test]
+    fn a_replacement_that_fails_verification_leaves_the_previous_snapshot_intact() {
+        let dir = dir("failed-replacement");
+        let path = dir.join("state.db");
+        let conn = migrated_db(&path);
+        let canonical = Backup::path_for(&path);
+
+        // The good snapshot that must survive.
+        let first = Backup::take(&conn, &path).expect("first take");
+        assert_eq!(first.path(), canonical.as_path());
+        let before = Backup::verify(&canonical).expect("the first snapshot verifies");
+        assert_eq!(
+            before.schema_version,
+            crate::migration::CURRENT_VERSION,
+            "precondition: a real snapshot of a migrated database"
+        );
+
+        // Now make the *source* impossible to snapshot honestly. The table survives; its
+        // rows do not. `verify_impl` reads `total_rows` from `schema_meta`, so this lands on
+        // the `Empty` branch rather than the `NoSchemaMeta` one.
+        conn.execute("DELETE FROM schema_meta;", [])
+            .expect("empty schema_meta");
+        assert!(
+            Backup::has_schema_meta(&conn),
+            "the table is still there; it is the rows that are gone"
+        );
+
+        let err = Backup::take(&conn, &path).expect_err("an empty snapshot must be refused");
+        assert!(
+            matches!(err, BackupError::Empty { .. }),
+            "the failure must be reported as an unverifiable snapshot, got {err:?}"
+        );
+        // The error names the staging file it actually tried to publish, which is the
+        // evidence an operator needs: not "migrate failed", but "the copy at this path could
+        // not be verified".
+        let text = err.to_string();
+        assert!(
+            text.contains(".staging-"),
+            "the error must name the staging file that failed, not a generic failure: {text}"
+        );
+
+        // 1. The previous snapshot is still there.
+        assert!(
+            canonical.exists(),
+            "a failed replacement must not remove the snapshot that was already there"
+        );
+        // 2. It is still the *previous* one, not a partial rewrite.
+        let after = Backup::verify(&canonical).expect("the previous snapshot still verifies");
+        assert_eq!(
+            after, before,
+            "a failed replacement must leave the previous snapshot exactly as it was"
+        );
+        // 3. And it is still restorable, which is the only reason any of this matters.
+        drop(conn);
+        Backup::existing(canonical.clone())
+            .restore_coordinated(&path)
+            .expect("the surviving snapshot must still restore");
+        let restored =
+            crate::migration::MigrationRunner::new(&Connection::open(&path).expect("reopen"))
+                .applied_version()
+                .expect("version");
+        assert_eq!(
+            restored,
+            crate::migration::CURRENT_VERSION,
+            "and the restore must have brought back a usable database, not a stub"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A failed publication must not delete the destination it could not write to.**
+    ///
+    /// The property the removed Windows fallback would have violated. That fallback did
+    /// `remove_file(canonical)` and renamed again, on the premise — since shown to be false —
+    /// that `std::fs::rename` does not replace an existing file on Windows. A fallback that
+    /// removes the destination has a failure mode the direct rename does not: if the retry
+    /// fails, the snapshot that was the only good copy of the database has been deleted, and
+    /// the caller is left with a migration failure *and* a destroyed recovery point.
+    ///
+    /// The rename is made to fail by making the staged file go missing at the one moment
+    /// between the verification and the publication — which is the real condition being
+    /// modelled, and the only place from which it can be provoked deterministically.
+    #[test]
+    fn a_failed_publication_leaves_the_existing_snapshot_in_place() {
+        let dir = dir("failed-publication");
+        let path = dir.join("state.db");
+        let conn = migrated_db(&path);
+        let canonical = Backup::path_for(&path);
+        Backup::take(&conn, &path).expect("first take");
+        let before = Backup::verify(&canonical).expect("first verifies");
+
+        // Make the staged file disappear between the verification and the rename.
+        let watched = dir.clone();
+        Backup::on_before_publish(move || {
+            let staged: Vec<_> = std::fs::read_dir(&watched)
+                .expect("readdir")
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(".staging-"))
+                })
+                .collect();
+            assert_eq!(
+                staged.len(),
+                1,
+                "precondition: exactly one staged snapshot, between verification and publication"
+            );
+            std::fs::remove_file(&staged[0]).expect("remove the staged snapshot");
+        });
+
+        let err = Backup::take(&conn, &path).expect_err("the rename must fail");
+        assert!(
+            matches!(err, BackupError::Io { .. }),
+            "a failed rename is an I/O error at the destination, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&canonical.display().to_string()),
+            "the error must name the canonical path it could not publish to: {err}"
+        );
+
+        // The claim. With the delete-then-rename fallback this is where the snapshot went.
+        assert!(
+            canonical.exists(),
+            "a failed publication must leave the existing snapshot in place"
+        );
+        assert_eq!(
+            Backup::verify(&canonical).expect("still verifies"),
+            before,
+            "and it must be the same snapshot, unchanged"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A failed publication must clean up the staging file it never published.**
+    ///
+    /// The second half of the failure contract, and the half WP-2 got wrong. `take` cleaned
+    /// up around the copy and the verification and then used `?` on the publication, so a
+    /// failed rename leaked a fully-verified, never-published snapshot beside the database
+    /// under a name no reader looks at. Nothing reclaimed them: a later `take` only removes
+    /// the staging name it generated itself, so the counter's uniqueness — the thing that
+    /// makes concurrent takes safe — is also what guarantees every attempt leaves a file
+    /// behind. One file per failed publication, for as long as the directory lives.
+    ///
+    /// The failure is provoked by making the **destination** un-renameable rather than by
+    /// removing the staging file, because removing the staging file would make the debris
+    /// assertion trivially true: there would be nothing left to find. Here the staged file
+    /// genuinely survives the attempt and must still be cleaned up afterwards.
+    ///
+    /// (`rename` of a file onto a directory fails with `EISDIR` on this host, and
+    /// `MoveFileExW` refuses it too. **Not executed on Windows** — see the CI note on the
+    /// `windows-portability` lane, which excludes `orxnud-store` deliberately.)
+    #[test]
+    fn a_failed_publication_removes_the_staging_file_it_never_published() {
+        let dir = dir("failed-publication-cleanup");
+        let path = dir.join("state.db");
+        let conn = migrated_db(&path);
+        let canonical = Backup::path_for(&path);
+        // A directory where the snapshot goes: the rename cannot succeed onto it.
+        std::fs::create_dir_all(&canonical).expect("occupy the canonical path");
+        assert!(
+            canonical.is_dir(),
+            "precondition: the destination is a directory, so publication must fail"
+        );
+
+        let err = Backup::take(&conn, &path).expect_err("the rename must fail");
+        assert!(
+            matches!(err, BackupError::Io { .. }),
+            "a failed rename is an I/O error at the destination, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&canonical.display().to_string()),
+            "the error must name the destination: {err}"
+        );
+
+        // The destination is not "cleaned up" either. A publication failure must not delete
+        // anything that was there before.
+        assert!(
+            canonical.is_dir(),
+            "a failed publication must not remove what was already at the destination"
+        );
+
+        // The actual contract under test.
+        let debris: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-"))
+            .collect();
+        assert!(
+            debris.is_empty(),
+            "a failed publication must not leave staging files behind: {debris:?}"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Publication replaces an existing destination, and the result is the new snapshot.**
+    ///
+    /// This is the platform-specific claim, stated so it is testable wherever it runs.
+    /// `std::fs::rename` is documented (this toolchain's own `std::fs::rename`, 1.98.1) as
+    /// *"replacing the original file if `to` already exists"*, implemented on Windows as
+    /// `MoveFileExW`. WP-2 asserted the opposite and carried a delete-then-rename fallback
+    /// for it; the fallback was unnecessary and destructive, and has been removed.
+    ///
+    /// A replace that silently did *not* replace would leave the old snapshot in place, and
+    /// every subsequent recovery would restore the wrong version of the database — so this
+    /// distinguishes the two outcomes by content, not by the mere existence of the file.
+    #[test]
+    fn publication_replaces_an_existing_destination_with_the_new_snapshot() {
+        let dir = dir("replace-destination");
+        let path = dir.join("state.db");
+        let conn = migrated_db(&path);
+        let canonical = Backup::path_for(&path);
+
+        // First publication.
+        Backup::take(&conn, &path).expect("first take");
+        let first = Backup::verify(&canonical).expect("first verifies");
+
+        // Make the source observably different, then publish again over the same path.
+        conn.execute(
+            "INSERT INTO audit_log (seq, prev_hash, record_hash, record)
+             VALUES (1, ?1, ?2, '{}');",
+            rusqlite::params![[1u8; 32], [2u8; 32]],
+        )
+        .expect("write a row the first snapshot cannot contain");
+        Backup::take(&conn, &path).expect("second take");
+        let second = Backup::verify(&canonical).expect("second verifies");
+
+        assert_eq!(
+            second.schema_version, first.schema_version,
+            "precondition: both snapshots are of the same schema version"
+        );
+        let published = Connection::open(&canonical).expect("open the published snapshot");
+        let rows: i64 = published
+            .query_row("SELECT COUNT(*) FROM audit_log;", [], |r| r.get(0))
+            .expect("count audit rows");
+        drop(published);
+        assert_eq!(
+            rows, 1,
+            "the destination must hold the *second* snapshot: a rename that did not replace \
+             would leave the first one in place, and every later recovery would then restore \
+             a database missing committed rows"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same concurrency on a database that *has* been migrated, where the empty-
+    /// snapshot relaxation does not apply and every take must produce a real snapshot.
+    #[test]
+    fn concurrent_snapshots_of_a_migrated_database_all_succeed() {
+        const N: usize = 6;
+        let dir = dir("concurrent-take-migrated");
+        let path = dir.join("state.db");
+        drop(migrated_db(&path));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let p = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let c = Connection::open(&p).expect("open");
+                    barrier.wait();
+                    Backup::take(&c, &p).map(|_| ())
+                })
+            })
+            .collect();
+
+        let mut failures = Vec::new();
+        for h in handles {
+            match h.join().expect("join") {
+                Ok(()) => {}
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "every concurrent snapshot must succeed; {} failed, first: {}",
+            failures.len(),
+            failures.first().map(String::as_str).unwrap_or("")
+        );
+        Backup::verify(&Backup::path_for(&path)).expect("the published snapshot must verify");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4538,7 +4538,7 @@ mod tests {
         assert_eq!(before, 0, "precondition: version 10 has no such column");
 
         MigrationRunner::new(&c)
-            .run(true)
+            .migrate_ephemeral()
             .expect("upgrade to current");
         let version: u32 = c
             .query_row("SELECT MAX(version) FROM schema_meta;", [], |r| r.get(0))
@@ -4622,7 +4622,7 @@ mod tests {
         }
 
         crate::migration::MigrationRunner::new(&c)
-            .run(true)
+            .migrate_ephemeral()
             .expect("upgrade");
         let version: u32 = c
             .query_row("SELECT MAX(version) FROM schema_meta;", [], |r| r.get(0))
@@ -4672,7 +4672,9 @@ mod tests {
     fn mem() -> Connection {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         c
     }
 
@@ -6545,7 +6547,9 @@ mod composition_tests {
     fn mem() -> Connection {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         c
     }
 
@@ -7276,7 +7280,9 @@ mod advancement_tests {
     fn mem() -> Connection {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         c
     }
 
@@ -8044,7 +8050,9 @@ mod next_step_claim_tests {
     fn mem() -> Connection {
         let c = Connection::open_in_memory().expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
-        MigrationRunner::new(&c).run(true).expect("migrate");
+        MigrationRunner::new(&c)
+            .migrate_ephemeral()
+            .expect("migrate");
         c
     }
 
@@ -8535,7 +8543,7 @@ mod next_step_claim_tests {
         {
             let mut c = Connection::open(&path).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).run(true).expect("migrate");
+            MigrationRunner::new(&c).migrate(&path).expect("migrate");
             TaskRepository::new(&mut c)
                 .insert(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
                 .expect("insert");

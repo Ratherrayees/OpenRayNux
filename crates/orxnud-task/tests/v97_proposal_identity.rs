@@ -51,7 +51,7 @@ fn db(tag: &str) -> (PathBuf, Connection) {
     let p = d.join("state.db");
     let c = Connection::open(&p).expect("open");
     Pragma::critical().apply(&c).expect("pragmas");
-    MigrationRunner::new(&c).run(true).expect("migrate");
+    MigrationRunner::new(&c).migrate(&p).expect("migrate");
     (p, c)
 }
 
@@ -563,7 +563,9 @@ fn equivalent_existing_duplicates_reconcile_to_one_and_are_recorded() {
         "duplicates are reachable"
     );
 
-    MigrationRunner::new(&c).run(true).expect("migrate");
+    MigrationRunner::new(&c)
+        .migrate_ephemeral()
+        .expect("migrate");
 
     assert_eq!(
         count_identity(&c, "t1", 1, 1),
@@ -617,7 +619,9 @@ fn conflicting_existing_duplicates_stop_the_migration_without_touching_anything(
     seed_proposal(&c, "p-a", "t1", 1, 1, "out.txt", 100, "approved");
     seed_proposal(&c, "p-b", "t1", 1, 1, "OTHER.txt", 200, "approved");
 
-    let err = MigrationRunner::new(&c).run(true).expect_err("must refuse");
+    let err = MigrationRunner::new(&c)
+        .migrate_ephemeral()
+        .expect_err("must refuse");
     let text = err.to_string();
     assert!(
         text.contains("authority decision"),
@@ -646,7 +650,7 @@ fn proposals_on_distinct_identities_are_never_conflicts() {
     seed_proposal(&c, "p-2", "t1", 1, 2, "b.txt", 100, "pending");
     seed_proposal(&c, "p-3", "t2", 2, 1, "c.txt", 100, "pending");
     MigrationRunner::new(&c)
-        .run(true)
+        .migrate_ephemeral()
         .expect("three distinct identities must migrate");
     let total: i64 = c
         .query_row("SELECT COUNT(*) FROM task_proposals;", [], |r| r.get(0))

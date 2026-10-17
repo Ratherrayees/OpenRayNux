@@ -160,10 +160,13 @@ impl TaskService {
         // `critical = true`: the task database is the one region ADR-0006 marks
         // critical, so its pragmas are verified rather than merely applied.
         //
-        // Always migrate, never `run()` alone. `migrate` snapshots first; `run`
-        // trusts the caller to have done that. The difference is the difference
-        // between "a failed migration is rolled back" and "the schema is now
-        // half-applied and nobody can say which half".
+        // Always `migrate`. There is no longer a `run()` beside it, so there is nothing
+        // to remember to prefer: `migrate` snapshots and verifies before it applies
+        // anything, and there is no parameter that can talk it out of that. (S-11/F-26:
+        // the alternative took a `snapshot_verified: bool`, trusted it, and both
+        // production call sites here and in `security_state.rs` passed `true` -- so
+        // "a failed migration is rolled back" was never actually true on the path that
+        // migrated the schema.)
         //
         // S-31: the migration happens in its own scope so the `Store` -- and with it
         // the shared ownership lease it holds for the database -- is **dropped** before
@@ -173,7 +176,7 @@ impl TaskService {
         let (applied, conn, ownership) = {
             let store = Store::open(path, true).map_err(StartupError::Store)?;
             let runner = MigrationRunner::new(store.conn());
-            match runner.migrate(path, false) {
+            match runner.migrate(path) {
                 Ok(applied) => {
                     // Carry the connection *and* its lease onward. `into_connection`
                     // would drop both, unprotecting a connection that is still in use.
@@ -191,13 +194,17 @@ impl TaskService {
                     };
                     drop(store);
                     if let Some(snapshot) = snapshot {
-                        orxnud_store::backup::Backup::existing(snapshot.clone())
-                            .restore_coordinated(path)
-                            .map_err(|e| {
+                        // The shared recovery sequence, shared with the two security-state
+                        // constructors. Three copies of drop-the-lease-then-take-exclusive
+                        // is three chances to get the order wrong, and getting it wrong is a
+                        // deadlock rather than a test failure.
+                        orxnud_store::migration::recover_from_snapshot(path, &snapshot).map_err(
+                            |e| {
                                 StartupError::Migration(format!(
                                     "the migration failed and its snapshot could not be restored: {e}"
                                 ))
-                            })?;
+                            },
+                        )?;
                     }
                     return Err(StartupError::Migration(source.to_string()));
                 }

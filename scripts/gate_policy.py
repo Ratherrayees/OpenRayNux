@@ -425,6 +425,123 @@ def platform_violations(root: str, sources: list[str]) -> list[Violation]:
 
 
 # --------------------------------------------------------------------------
+# G16 -- the migration snapshot path is not optional in production
+# --------------------------------------------------------------------------
+
+#: Where `migrate_ephemeral` is allowed to appear in production code, and how many times.
+#:
+#: Exemptions are counted, not located, so that any addition fails the gate. A line-number
+#: exemption would go stale on the first unrelated edit and then quietly permit whatever
+#: landed in its place; a count cannot be satisfied by a new call site.
+#:
+#: * `orxnud-store/src/migration.rs` -- two. The `fn` itself, and the one call inside
+#:   `MigrationRunner::migrate`. That internal call is the safe path *executing* its own
+#:   apply step after it has already taken and verified a snapshot, so it is not a second
+#:   way in; it is the first way in, and it cannot be reached without the snapshot.
+#: * `orxnud-task/src/conformance/power_loss.rs` -- one. The TP-7 victim, which is killed at
+#:   an arbitrary instruction and whose entire point is that nothing survives it. A
+#:   snapshot taken there would have to outlive a `SIGKILL`.
+MIGRATION_EPHEMERAL_EXEMPTIONS = {
+    os.path.join("crates", "orxnud-store", "src", "migration.rs"): 2,
+    os.path.join("crates", "orxnud-task", "src", "conformance", "power_loss.rs"): 1,
+}
+
+
+def migration_violations(root: str, sources: list[str]) -> list[Violation]:
+    """Production calls to `MigrationRunner::migrate_ephemeral`.
+
+    # Why a source check and not a test
+
+    The property is "production code reaches the schema only through the path that snapshots
+    first". No behavioural test can observe that, because both paths end in the same
+    migrations and the same `schema_meta`; the difference is entirely *which function was
+    called*, and a test that ran the wrong one would see the same database. This is the
+    same reasoning as `no_refusal_is_constructed_after_a_process_exists` in
+    `orxnud-platform-sandbox/src/linux.rs`: the thing to check is control flow that no
+    execution can be made to reach.
+
+    # Why this method had to exist at all
+
+    `MigrationRunner::run(&self, snapshot_verified: bool)` (S-11/F-26) took no snapshot and
+    restored nothing; it refused only when the boolean was false, so `run(true)` -- what
+    production actually called, twice, for the audit journal and the approval ledger --
+    applied every migration unprotected. A boolean that names its own safety is not a
+    safety mechanism. Replacing it with `migrate_ephemeral` is only an improvement if
+    reaching it is *disallowed* rather than discouraged, which is what this gate does.
+
+    # How production code is found
+
+    Comments and string literals are blanked first (`code_only`), then `#[cfg(test)]`
+    regions (`strip_test_only`). Both steps preserve length, so a match maps back to the
+    line it was written on. Blanking comments is what lets the module documentation name
+    this method freely while the gate still reports only real code.
+    """
+    out: list[Violation] = []
+    for path in sources:
+        src = open(path, encoding="utf-8").read()
+        code = rustscan.code_only(src, rustscan.code_mask(src))
+        production = rustscan.strip_test_only(code)
+        rel = os.path.relpath(path, root)
+        found = [
+            rustscan.line_of(production, at)
+            for m in production_matcher.finditer(production)
+            for at in [m.start()]
+        ]
+        if not found:
+            continue
+        allowed = MIGRATION_EPHEMERAL_EXEMPTIONS.get(rel, 0)
+        if len(found) > allowed:
+            extra = ", ".join(str(n) for n in found[allowed:]) or "-"
+            out.append(
+                Violation(
+                    path,
+                    found[allowed],
+                    "production code reaches `MigrationRunner::migrate_ephemeral`, which "
+                    "applies schema changes with no verified snapshot and no rollback. "
+                    f"{len(found)} occurrence(s) here, {allowed} allowed; the unallowed "
+                    f"one(s) start at line(s) {extra}. Use "
+                    "`MigrationRunner::migrate(path)`, which takes and verifies its own "
+                    "snapshot and hands back a recovery obligation on failure.",
+                )
+            )
+    return out
+
+
+production_matcher = re.compile(r"migrate_ephemeral")
+
+
+def migration_surface_drift(root: str) -> list[str]:
+    """Whether the surface this gate depends on still has the shape it was written for.
+
+    A gate that cannot fail is worse than no gate, so it is asserted against drift: the
+    method must still exist (otherwise the gate would pass on a tree where the ephemeral
+    path was renamed away and the guarantee silently moved somewhere unchecked), and the
+    exempt sites must still be present, because an exemption nobody calls is a hole waiting
+    for the next caller.
+    """
+    out: list[str] = []
+    migration = os.path.join(root, "crates", "orxnud-store", "src", "migration.rs")
+    src = open(migration, encoding="utf-8").read()
+    if "pub fn migrate_ephemeral(&self)" not in rustscan.code_only(
+        src, rustscan.code_mask(src)
+    ):
+        out.append(
+            "MigrationRunner::migrate_ephemeral is gone. If it was renamed, this gate is "
+            "checking a name nobody can call and the guarantee it protects has moved; if "
+            "it was removed because the ephemeral path was eliminated, delete this gate in "
+            "the same commit rather than leaving it green."
+        )
+    if "pub fn run(&self, snapshot_verified: bool)" in rustscan.code_only(
+        src, rustscan.code_mask(src)
+    ):
+        out.append(
+            "MigrationRunner::run(&self, snapshot_verified: bool) is back. That is the "
+            "S-11/F-26 trust-me API: it snapshots nothing and refuses only on `false`."
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
 
@@ -440,7 +557,7 @@ def report(name: str, violations: list[Violation], root: str) -> int:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("gate", choices=["g2d", "g3", "g3-platform-crates"])
+    ap.add_argument("gate", choices=["g2d", "g3", "g3-platform-crates", "g16"])
     ap.add_argument(
         "--root",
         default=None,
@@ -468,6 +585,23 @@ def main(argv: list[str]) -> int:
         return report(
             "G2d: a policy-seal symbol is reachable outside orxnud-policy in production code",
             authority_violations(root, sources),
+            root,
+        )
+
+    if args.gate == "g16":
+        drift = migration_surface_drift(root)
+        if drift:
+            for d in drift:
+                print(f"   {d}")
+            print(
+                "FAIL  G16: the migration surface has changed. This is a decision, not a "
+                "formality: re-read ADR-0017 and update the gate.",
+                file=sys.stderr,
+            )
+            return 1
+        return report(
+            "G16: production code reaches the unprotected migration path",
+            migration_violations(root, sources),
             root,
         )
 

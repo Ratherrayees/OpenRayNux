@@ -414,7 +414,6 @@ impl From<orxnud_store::migration::MigrationError> for EngineError {
             // retryable. Routing it anywhere else would let a caller treat an
             // unrecovered schema as recoverable.
             M::RecoveryRequired { .. } => EngineErrorKind::Invariant,
-            M::NoSnapshot => EngineErrorKind::InvalidInput,
         };
         Self::new(kind, e.to_string())
     }
@@ -601,9 +600,43 @@ mod tests {
         );
     }
 
+    /// Every variant `MigrationRunner` can still return must be non-retryable.
+    ///
+    /// This replaces `a_missing_snapshot_is_invalid_input_not_a_bug`, which asserted that
+    /// `MigrationError::NoSnapshot` mapped to `InvalidInput` and was retryable. That
+    /// variant is gone: it only ever answered a boolean, and the boolean is gone
+    /// (`MigrationRunner::run(bool)` -> `migrate_ephemeral()`).
+    ///
+    /// What replaced it is the stronger claim. There is no longer a migration error that
+    /// means "you did not give me a snapshot" and is therefore *retryable* by asking
+    /// again -- every remaining failure leaves the schema in an unknown state, so every
+    /// remaining failure is `Invariant`.
     #[test]
-    fn a_missing_snapshot_is_invalid_input_not_a_bug() {
-        let e = EngineError::from(orxnud_store::migration::MigrationError::NoSnapshot);
-        assert_eq!(e.kind, EngineErrorKind::InvalidInput);
+    fn every_remaining_migration_error_is_not_retryable() {
+        let cases = [
+            orxnud_store::migration::MigrationError::Failed {
+                version: 3,
+                source: rusqlite::Error::QueryReturnedNoRows,
+            },
+            orxnud_store::migration::MigrationError::RecoveryRequired {
+                source: Box::new(orxnud_store::migration::MigrationError::Failed {
+                    version: 3,
+                    source: rusqlite::Error::QueryReturnedNoRows,
+                }),
+                snapshot: std::path::PathBuf::from("/tmp/whatever.db.snapshot"),
+            },
+        ];
+        for e in cases {
+            let mapped = EngineError::from(e);
+            assert_eq!(
+                mapped.kind,
+                EngineErrorKind::Invariant,
+                "every migration failure is unrecoverable: {mapped}"
+            );
+            assert!(
+                !mapped.kind.is_retryable(),
+                "retrying a migration could compound the damage"
+            );
+        }
     }
 }

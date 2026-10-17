@@ -465,6 +465,322 @@ G3_CASES: list[tuple[str, str, str, bool]] = [
 ]
 
 
+# --------------------------------------------------------------------------
+# G16 -- the migration snapshot path
+# --------------------------------------------------------------------------
+#
+# G16 is the only one of these three gates whose subject is a *method choice* rather than
+# a symbol. `migrate(path)` snapshots first; `migrate_ephemeral()` does not. Both end in the
+# same migrations and the same `schema_meta`, so nothing a test executes can tell them apart
+# -- which is exactly why the gate reads source, and why these cases are about the
+# classifier (production vs test, code vs prose) rather than about behaviour.
+#
+# The fixture must contain a plausible `migration.rs` carrying both methods, because G16's
+# drift check reads it: a fixture without one would fail the drift check rather than the
+# case under test, and every case here would "fail" for the same wrong reason.
+
+G16_MIGRATION_SRC = """
+//! Production code reaches the schema through `MigrationRunner::migrate`.
+
+impl MigrationRunner<'_> {
+    /// Takes and verifies its own snapshot.
+    pub fn migrate(&self, db_path: &std::path::Path) -> Result<Vec<u32>, MigrationError> {
+        let snapshot = Backup::take(self.conn, db_path)?;
+        match self.migrate_ephemeral() {
+            Ok(applied) => {
+                snapshot.discard();
+                Ok(applied)
+            }
+            Err(e) => Err(MigrationError::RecoveryRequired { source: Box::new(e), snapshot: snapshot.path().to_path_buf() }),
+        }
+    }
+
+    /// Applies pending migrations with no durable copy to protect.
+    pub fn migrate_ephemeral(&self) -> Result<Vec<u32>, MigrationError> {
+        Ok(Vec::new())
+    }
+}
+"""
+
+G16_CASES: list[tuple[str, str, str, bool]] = [
+    # ---- must fail ---------------------------------------------------------------
+    (
+        "G16: production code calling migrate_ephemeral in orxnud-task",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: production code calling migrate_ephemeral in orxnud-daemon",
+        "G16",
+        "crates/orxnud-daemon/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: a fully qualified migrate_ephemeral is still a call",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: an imported `use ...::migrate_ephemeral;` then called bare",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: a free function wrapping the call does not launder it",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: #[cfg(any(test, unix))] is production code and must NOT be exempt",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: an example is production-reachable and must NOT be exempt",
+        "G16",
+        "crates/orxnud-task/examples/bad.rs",
+        True,
+    ),
+    (
+        "G16: benches/ is production-reachable and must NOT be exempt",
+        "G16",
+        "crates/orxnud-task/benches/bad.rs",
+        True,
+    ),
+    (
+        "G16: migration.rs gaining a second production call beyond the two allowed",
+        "G16",
+        "crates/orxnud-store/src/migration.rs",
+        True,
+    ),
+    (
+        "G16: MigrationRunner::run(snapshot_verified: bool) is drift and must be rejected",
+        "G16",
+        "crates/orxnud-store/src/migration.rs",
+        True,
+    ),
+    (
+        "G16: migrate_ephemeral being renamed away is drift and must be rejected",
+        "G16",
+        "crates/orxnud-store/src/migration.rs",
+        True,
+    ),
+    # ---- must pass ---------------------------------------------------------------
+    (
+        "G16: production code calling migrate(path) is the safe path",
+        "G16",
+        "crates/orxnud-task/src/good.rs",
+        False,
+    ),
+    (
+        "G16: a real #[cfg(test)] module may use migrate_ephemeral to build a fixture",
+        "G16",
+        "crates/orxnud-task/src/good.rs",
+        False,
+    ),
+    (
+        "G16: a #[test] fn outside a cfg(test) module is still a test",
+        "G16",
+        "crates/orxnud-task/src/good.rs",
+        False,
+    ),
+    (
+        "G16: documentation naming migrate_ephemeral is prose, not a call",
+        "G16",
+        "crates/orxnud-store/src/migration.rs",
+        False,
+    ),
+    (
+        # In `migration.rs`, not `good.rs`: the fixture body *is* the migration module, so
+        # the two legitimate occurrences it contains are the ones the exemption covers.
+        # Written to `good.rs` the same text would carry a definition plus an internal
+        # call in a crate allowed none, and the case would be testing the wrong thing.
+        "G16: a string literal containing migrate_ephemeral is not a call",
+        "G16",
+        "crates/orxnud-store/src/migration.rs",
+        False,
+    ),
+]
+
+
+G16_GOOD = """
+pub fn safe(db_path: &std::path::Path, conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(conn).migrate(db_path);
+}
+
+#[cfg(test)]
+mod tests {
+    use orxnud_store::migration::MigrationRunner;
+
+    /// A fixture has no durable copy, so there is nothing to snapshot.
+    fn fixture() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        MigrationRunner::new(&c).migrate_ephemeral().unwrap();
+        c
+    }
+
+    #[test]
+    fn bare_test_attr() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        MigrationRunner::new(&c).migrate_ephemeral().unwrap();
+    }
+}
+
+#[cfg(any(test, unix))]
+fn platform_production(conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(conn).migrate(std::path::Path::new("db"));
+}
+"""
+
+G16_BAD_FORMS: dict[str, str] = {
+    "G16: production code calling migrate_ephemeral in orxnud-task": """
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(conn).migrate_ephemeral();
+}
+""",
+    "G16: production code calling migrate_ephemeral in orxnud-daemon": """
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(conn).migrate_ephemeral();
+}
+""",
+    "G16: a fully qualified migrate_ephemeral is still a call": """
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::migrate_ephemeral(conn);
+}
+""",
+    "G16: an imported `use ...::migrate_ephemeral;` then called bare": """
+use orxnud_store::migration::MigrationRunner::migrate_ephemeral;
+
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = migrate_ephemeral(conn);
+}
+""",
+    "G16: a free function wrapping the call does not launder it": """
+pub fn migrate_cheaply(conn: &rusqlite::Connection) -> Vec<u32> {
+    orxnud_store::migration::MigrationRunner::new(conn).migrate_ephemeral().unwrap_or_default()
+}
+
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = migrate_cheaply(conn);
+}
+""",
+    "G16: #[cfg(any(test, unix))] is production code and must NOT be exempt": """
+#[cfg(any(test, unix))]
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(conn).migrate_ephemeral();
+}
+""",
+    "G16: an example is production-reachable and must NOT be exempt": """
+fn main() {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    let _ = orxnud_store::migration::MigrationRunner::new(&c).migrate_ephemeral();
+}
+""",
+    "G16: benches/ is production-reachable and must NOT be exempt": """
+fn bench(c: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(c).migrate_ephemeral();
+}
+""",
+}
+
+G16_DRIFT_FORMS: dict[str, str] = {
+    "G16: migration.rs gaining a second production call beyond the two allowed": G16_MIGRATION_SRC
+    + """
+fn another_way_in(conn: &rusqlite::Connection) {
+    let _ = MigrationRunner::new(conn).migrate_ephemeral();
+}
+""",
+    "G16: MigrationRunner::run(snapshot_verified: bool) is drift and must be rejected": """
+impl MigrationRunner<'_> {
+    pub fn migrate(&self, db_path: &std::path::Path) -> Result<Vec<u32>, MigrationError> {
+        self.run(true)
+    }
+
+    /// The S-11/F-26 trust-me API.
+    pub fn run(&self, snapshot_verified: bool) -> Result<Vec<u32>, MigrationError> {
+        Ok(Vec::new())
+    }
+
+    pub fn migrate_ephemeral(&self) -> Result<Vec<u32>, MigrationError> {
+        Ok(Vec::new())
+    }
+}
+""",
+    "G16: migrate_ephemeral being renamed away is drift and must be rejected": """
+impl MigrationRunner<'_> {
+    pub fn migrate(&self, db_path: &std::path::Path) -> Result<Vec<u32>, MigrationError> {
+        self.migrate_unchecked()
+    }
+
+    /// Renamed, so the gate's name would match nothing.
+    pub fn migrate_unchecked(&self) -> Result<Vec<u32>, MigrationError> {
+        Ok(Vec::new())
+    }
+}
+""",
+}
+
+G16_MUST_PASS_FORMS: dict[str, str] = {
+    "G16: production code calling migrate(path) is the safe path": G16_GOOD,
+    "G16: a real #[cfg(test)] module may use migrate_ephemeral to build a fixture": G16_GOOD,
+    "G16: a #[test] fn outside a cfg(test) module is still a test": G16_GOOD,
+    "G16: documentation naming migrate_ephemeral is prose, not a call": G16_MIGRATION_SRC
+    + """
+/// The unprotected entry point is `migrate_ephemeral`; it is refused in production code by
+/// this gate, and the check reads `MigrationRunner::migrate_ephemeral` as text.
+pub const NOTE: &str = "call migrate_ephemeral to skip the snapshot";
+""",
+    "G16: a string literal containing migrate_ephemeral is not a call": G16_MIGRATION_SRC
+    + """
+pub const NOTE: &str = "migrate_ephemeral";
+
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = MigrationRunner::new(conn).migrate(std::path::Path::new("db"));
+}
+""",
+}
+
+
+def g16_source(name: str) -> str:
+    """The fixture source for a G16 case.
+
+    `crates/orxnud-store/src/migration.rs` is the drift check's subject, so the fixture
+    always contains the baseline `G16_MIGRATION_SRC` and the case under test is written
+    *over* it only when that file is the subject.
+    """
+    for table in (G16_BAD_FORMS, G16_DRIFT_FORMS, G16_MUST_PASS_FORMS):
+        if name in table:
+            return table[name]
+    raise KeyError(name)
+
+
+def run_g16_case(tmp: str, name: str, gate: str, rel: str, expect_fail: bool) -> tuple[bool, str]:
+    root = os.path.join(tmp, "g16case")
+    shutil.rmtree(root, ignore_errors=True)
+    fx = Fixture(root)
+    # The baseline every case starts from, so a failure is about the case and not about a
+    # missing subject for the drift check.
+    fx.write("crates/orxnud-store/src/migration.rs", G16_MIGRATION_SRC)
+    fx.write("crates/orxnud-task/src/conformance/power_loss.rs", "")
+    fx.write(rel, g16_source(name))
+    result = fx.gate(gate)
+    rejected = result.returncode != 0
+    if rejected == expect_fail:
+        return True, ""
+    return (
+        False,
+        f"{name}\n     expected the gate to "
+        f"{'REJECT' if expect_fail else 'ACCEPT'}, and it "
+        f"{'rejected' if rejected else 'accepted'}\n"
+        f"     gate output:\n{result.stdout}\n{result.stderr}",
+    )
+
+
 def source_for(name: str) -> str:
     """The fixture source for a named case."""
     table = {
@@ -1032,6 +1348,18 @@ def main() -> int:
         for name, gate, rel, expect_fail in G2D_CASES + G2D_ANY_TEST_CASES + G3_CASES:
             total += 1
             ok, detail = run_case(tmp, name, gate, rel, expect_fail, source_for(name))
+            if ok:
+                print(f"  ok    {name}")
+            else:
+                print(f"  FAIL  {name}")
+                failures.append(detail)
+
+        # G16: the migration-path gate must reject production calls to the unprotected
+        # entry point, accept the safe path and the test-only fixtures, and reject drift
+        # in the surface it reads.
+        for name, gate, rel, expect_fail in G16_CASES:
+            total += 1
+            ok, detail = run_g16_case(tmp, name, gate, rel, expect_fail)
             if ok:
                 print(f"  ok    {name}")
             else:
