@@ -2629,6 +2629,43 @@ fn a_fully_approved_write_is_refused_by_default_and_writes_nothing() {
             "the refusal must name the argv exposure; got {executed}"
         );
 
+        // The refusal's *explanation* is the operator's only route to the
+        // remediation, and it was wrong: it said the refusal lasted "until S-17
+        // changes the transport", and S-17 has landed. An operator reading it was
+        // being sent after a change that had already happened.
+        //
+        // The refusal itself is unchanged -- the same code, the same classification --
+        // and this test proves that too: a **real** approval was granted above, and
+        // the capability is still refused, because this restriction is independent of
+        // the approval path.
+        let message = executed["error"]["data"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let full = format!("{reason}: {message}");
+        assert!(
+            !full.contains("until S-17"),
+            "the refusal must not point at a transport change that has already landed: \
+             {full}"
+        );
+        assert!(
+            full.contains("Decision 7"),
+            "the refusal must cite ADR-0054 Decision 7: {full}"
+        );
+        assert!(
+            full.contains("R-1"),
+            "the refusal must cite the R-1 evidence conditions: {full}"
+        );
+        assert!(
+            full.contains("not a mitigation"),
+            "the refusal must still say it is containment, not a mitigation: {full}"
+        );
+        assert!(
+            full.contains("approval does not"),
+            "the refusal must say an approval does not lift it -- and this test is the \
+             evidence, because a real approval was granted above: {full}"
+        );
+
         // The observable effect, which is what makes this a containment claim rather
         // than a claim about an error string.
         assert!(

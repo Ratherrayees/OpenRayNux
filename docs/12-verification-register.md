@@ -321,15 +321,20 @@ refused rather than written. Daemon/helper transport versioning is explicit, so 
 with a new daemon is refused rather than silently mismatched. Feasibility was **measured** on the development host before any edit — `bwrap`
 forwards its own stdin to the sandboxed child, and 262144 bytes complete with no deadlock when
 the child reads — and the cross-uid harness above was reproduced on that same host (`cmdline` read
-by uid 4242 succeeded; `environ` denied). **ADR-0054 is written and not yet merged, and
-`docs/18` §6.3 gates the implementation phase on that, so no S-17 code exists.** Two consequences
+by uid 4242 succeeded; `environ` denied). **AMENDED 2026-10-19: the transport change has
+landed.** The framed-stdin implementation is in the tree (`orxnud-capability`'s `stdin_frame`
+module, the 1 MiB bound, and `sandbox_plan` producing the framed payload), so the statement
+that "no S-17 code exists" is no longer true and is corrected here. **The default refusal of
+`filesystem/write-text` is unchanged and deliberate** -- ADR-0054 Decision 7 keeps it until
+R-1's evidence conditions are met. Two consequences
 recorded rather than smoothed over: `SandboxSpec.env` still renders as `--setenv K V`, so the
 **credential** channel is unaffected by any stdin fix and credential-carrying Tier-1 capabilities
 remain prohibited; and R-1's first condition requires a credential sentinel, which is not
 reachable while no credential-carrying capability exists — so a payload-only pass would leave that
 condition **vacuous**, not satisfied.
 
-**What this is not.** The argv transport is unchanged. Any execution permitted to run still
+**What this is not.** The argv transport is unchanged *in the way this row measured it*: the
+default posture still refuses the capability, and any execution permitted to run still
 places its payload in the host process table for the life of the execution — **F-10 stays open
 and this row is not evidence of containment.** **There is also no user-reachable way to grant
 the exception:** the configuration key and environment variable that were briefly added have

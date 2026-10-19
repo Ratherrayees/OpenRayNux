@@ -411,22 +411,7 @@ async fn serve(
     // Absent when no registered bundle exposes a payload, for the same reason the status
     // field is: a line that always prints says nothing.
     if let Some(exposure) = runtime.argv_payload_disclosure() {
-        eprintln!(
-            "orxnud: argv payload exposure OPEN -- {}\
-             Exposed: {}. Refused: {}. Permitted: {}. \
-             This is interim containment for the default posture, not a mitigation: for \
-             any execution that does run, the payload sits in argv for the life of the \
-             execution, and whether another uid can read it depends on this host's /proc. \
-             The transport stays unfixed until S-17.",
-            exposure.exposure,
-            orxnud_daemon::runtime::join_sized(&exposure.exposed),
-            orxnud_daemon::runtime::join(&exposure.refused),
-            if exposure.permitted.is_empty() {
-                "(none)".to_owned()
-            } else {
-                orxnud_daemon::runtime::join(&exposure.permitted)
-            },
-        );
+        eprintln!("{}", argv_payload_banner(&exposure));
     }
 
     let endpoint = runtime.endpoint().to_path_buf();
@@ -540,4 +525,169 @@ fn doctor(paths: &Paths) {
     println!("  {}", paths.database.display());
     println!("  both are attached and verified before the endpoint is bound");
     println!("(no paths were created; --doctor only reports)");
+}
+
+/// The startup banner for the argv-payload disclosure.
+///
+/// Extracted from the call site so the **text an operator reads** is a testable
+/// value rather than a string inside a `println!` that no test can reach. The wording
+/// is the operator's only route to the remediation, and it was wrong: it said the
+/// transport stayed unfixed until S-17, which had already landed. The refusal itself
+/// is unchanged; only the explanation of it moved.
+fn argv_payload_banner(exposure: &orxnud_daemon::runtime::ArgvPayloadDisclosure) -> String {
+    format!(
+        "orxnud: argv payload exposure OPEN -- {}\
+         Exposed: {}. Refused: {}. Permitted: {}. \
+         The framed-stdin transport is implemented, so a payload no longer travels in \
+         argv. What is reported above is the capability's conservative \
+         ArgvPayload::Content declaration, which is held on deliberately: it is an \
+         upper bound on the exposure, not a claim that the landed stdin transport \
+         puts the framed payload in argv. \
+         This is interim containment for the default posture, not a mitigation: for \
+         any execution that is permitted to run, the payload would sit in the host \
+         process table for the life of the execution, and whether another uid can \
+         read it depends on this host's /proc. \
+         filesystem/write-text stays refused by default under ADR-0054 Decision 7 \
+         until the R-1 evidence requirements are satisfied; an approval does not \
+         override that restriction.",
+        exposure.exposure,
+        orxnud_daemon::runtime::join_sized(&exposure.exposed),
+        orxnud_daemon::runtime::join(&exposure.refused),
+        if exposure.permitted.is_empty() {
+            "(none)".to_owned()
+        } else {
+            orxnud_daemon::runtime::join(&exposure.permitted)
+        },
+    )
+}
+
+#[cfg(test)]
+mod argv_payload_banner_tests {
+    use super::argv_payload_banner;
+    use orxnud_daemon::runtime::ArgvPayloadDisclosure;
+
+    fn disclosure() -> ArgvPayloadDisclosure {
+        ArgvPayloadDisclosure {
+            exposure: "argv reaches the host process table.",
+            exposed: vec![],
+            permitted: vec![],
+            refused: vec!["filesystem/write-text".to_owned()],
+            control: "none a user can reach.",
+            status: "OPEN",
+        }
+    }
+
+    /// The banner must not send an operator after a transport change that already
+    /// landed. It is the surface an operator reads without having asked for anything,
+    /// so a wrong remediation here is worse than no disclosure.
+    #[test]
+    fn the_banner_names_the_r1_evidence_rather_than_an_unlanded_transport_change() {
+        let banner = argv_payload_banner(&disclosure());
+        assert!(
+            !banner.contains("until S-17"),
+            "the banner still sends the operator after S-17, which has landed: {banner}"
+        );
+        assert!(
+            !banner.contains("stays unfixed"),
+            "the banner still describes the transport as unfixed: {banner}"
+        );
+        assert!(
+            banner.contains("Decision 7") && banner.contains("R-1"),
+            "the banner must name ADR-0054 Decision 7 and its R-1 evidence conditions: \
+             {banner}"
+        );
+        assert!(
+            banner.contains("not a mitigation"),
+            "the banner must still say the refusal is containment, not a mitigation: \
+             {banner}"
+        );
+    }
+
+    /// The banner must distinguish what the **transport** does from what the
+    /// **classification** conservatively asserts.
+    ///
+    /// The banner said the framed-stdin transport had landed and, two sentences later,
+    /// that "the payload sits in argv for the life of the execution". Both cannot be
+    /// true of the same execution. The resolution is that the second is a consequence
+    /// of the deliberately-held `ArgvPayload::Content` declaration -- an upper bound
+    /// on the exposure, kept conservative so the refusal cannot be lost -- and not a
+    /// claim about the landed implementation. The wording now says so, and says it
+    /// conditionally, so an operator does not read it as a live exposure finding.
+    #[test]
+    fn the_banner_distinguishes_the_landed_transport_from_the_conservative_classification() {
+        let banner = argv_payload_banner(&disclosure());
+
+        // The transport: implemented.
+        assert!(
+            banner.contains("framed-stdin transport is implemented"),
+            "the banner must say the transport is implemented: {banner}"
+        );
+        assert!(
+            banner.contains("no longer travels in argv"),
+            "the banner must say the payload no longer travels in argv: {banner}"
+        );
+
+        // The classification: conservative, an upper bound, and explicitly not a claim
+        // about the landed transport.
+        assert!(
+            banner.contains("ArgvPayload::Content"),
+            "the banner must name the declaration the report comes from: {banner}"
+        );
+        assert!(
+            banner.contains("upper bound"),
+            "the banner must say the classification is an upper bound: {banner}"
+        );
+        assert!(
+            banner.contains("not a claim that the landed stdin transport"),
+            "the banner must distinguish the classification from the transport: {banner}"
+        );
+
+        // And it must not assert the old literal claim about a permitted execution.
+        assert!(
+            !banner.contains("the payload sits in argv"),
+            "the banner must not assert that a permitted execution's payload literally \
+             sits in argv merely because the conservative classification is enabled: \
+             {banner}"
+        );
+        assert!(
+            banner.contains("would sit in the host process table"),
+            "the banner must keep the caution, stated as a consequence of the \
+             conservative classification: {banner}"
+        );
+    }
+
+    /// The banner must not read as though R-1 were satisfied, or the credential
+    /// sentinel had been produced, or the capability were enabled.
+    #[test]
+    fn the_banner_does_not_claim_r1_is_satisfied_or_the_capability_is_enabled() {
+        let banner = argv_payload_banner(&disclosure());
+        assert!(
+            !banner.contains("credential sentinel has been"),
+            "the banner must not claim the credential-sentinel condition is met: {banner}"
+        );
+        assert!(
+            !banner.contains("R-1 is satisfied") && !banner.contains("R-1 has been met"),
+            "the banner must not claim R-1 is satisfied: {banner}"
+        );
+        assert!(
+            banner.contains("stays refused by default"),
+            "the banner must say the capability stays refused by default: {banner}"
+        );
+        assert!(
+            banner.contains("an approval does not"),
+            "the banner must say an approval does not override the restriction: {banner}"
+        );
+    }
+
+    /// The banner keeps the facts that make it a disclosure rather than a disclaimer.
+    #[test]
+    fn the_banner_still_reports_what_is_exposed_and_refused() {
+        let banner = argv_payload_banner(&disclosure());
+        assert!(banner.contains("filesystem/write-text"), "{banner}");
+        assert!(
+            banner.contains("Refused: filesystem/write-text"),
+            "{banner}"
+        );
+        assert!(banner.contains("Permitted: (none)"), "{banner}");
+    }
 }

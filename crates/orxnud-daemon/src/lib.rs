@@ -580,8 +580,11 @@ const ARGV_PAYLOAD_EXPOSED_CAPABILITY_ID: &str = "filesystem/write-text";
 /// indefinite bypass as the plan's "bounded, owner-approved exception", which is the
 /// specific misreading R-1 exists to prevent.
 ///
-/// So the exception is refused by configuration, permanently, until S-17 removes the
-/// need for one. The governed-path test suites grant it through a **named code seam**
+/// So the exception is refused by configuration, permanently, until ADR-0054 Decision 7's
+/// R-1 evidence conditions are met **and** an explicitly authorised policy change
+/// lifts the default refusal. The transport change that removed the payload from
+/// `argv` has landed; the refusal outlived it, deliberately. The governed-path test
+/// suites grant it through a **named code seam**
 /// instead -- see `Runtime::start_permitting_argv_payload_exposure` -- which is a source
 /// change that lands in review, rather than a value that appears in an environment.
 /// Declares every shipped capability in the registry.
@@ -736,7 +739,15 @@ impl Daemon {
     ///
     /// Deliberately not reachable from configuration, from the environment, or from
     /// any command-line flag, so that the exception is a reviewable source change rather
-    /// than a value. **Remove with S-17.**
+    /// than a value.
+    ///
+    /// **Not removed by the transport change.** S-17 has landed and the payload no
+    /// longer travels in `argv`; ADR-0054 Decision 7 keeps the default refusal in
+    /// force anyway, pending the R-1 evidence conditions. This helper therefore
+    /// remains only for suites that must measure the governed path, and it retires
+    /// when that evidence exists and the default refusal is lifted by an explicitly
+    /// authorised policy change. Removing it is separate work from correcting the
+    /// explanation of why it is still here.
     #[must_use]
     pub fn with_argv_payload_exception_for_this_process(mut self) -> Self {
         self.components

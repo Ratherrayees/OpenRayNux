@@ -4834,11 +4834,34 @@ test now says so rather than letting the absence pass unnoticed.
 
 ## ADR-0054 — The Tier-1 payload travels on the child's stdin; credential-carrying capabilities stay prohibited
 
-**Status.** **Decided and reviewed; not implemented.** Owner review 2026-10-10 approved the
-direction and the 1 MiB limit, and required the empty-vs-absent framing detail that Decision 4
-now specifies. `docs/18` §6.3 gates S-17's implementation phase on this record being **merged**;
-it is written and unmerged, so no S-17 code exists. Lifts nothing. F-10 stays open and R-1
-stands.
+**Status.** **Decided and reviewed; the transport implementation has landed, and the default
+refusal remains in force.** Owner review 2026-10-10 approved the direction and the 1 MiB limit,
+and required the empty-vs-absent framing detail that Decision 4 now specifies. `docs/18` §6.3
+gated S-17's implementation phase on this record being **merged**; that gate has been passed.
+Lifts nothing. F-10 stays open and R-1 stands.
+
+> **AMENDED 2026-10-19 — the transport change has landed; the refusal deliberately has not.**
+> The framed-stdin transport described below is implemented: `orxnud-capability`'s
+> `stdin_frame` module carries the payload as a length-prefixed frame with the 1 MiB bound
+> Decision 4 specifies, `sandbox_plan` produces that framed payload, and the body no longer
+> travels in `argv`. S-17's implementation phase is complete.
+>
+> **What has not changed is Decision 7.** `filesystem/write-text` **remains refused by
+> default**, and it remains refused *because* of this ADR rather than in spite of it:
+> Decision 7 keeps the refusal until R-1's four evidence conditions are met, and the first
+> of them — the credential sentinel — cannot be produced while Decision 5 prohibits
+> credential-bearing Tier-1 capabilities. That tension is the one this ADR already recorded
+> as a known consequence of Decision 5, and it is still open.
+>
+> **A correction to the operator-facing text, made 2026-10-19.** The refusal message, the
+> daemon's startup banner and the `daemon/status` disclosure all said the refusal lasted
+> "until S-17 changes the transport". That was wrong, and wrong in a way that matters: it
+> sent an operator after a change that had already landed, and told them nothing about what
+> is actually blocking them. They now name Decision 7 and the R-1 evidence conditions, and
+> still say that the refusal is interim containment rather than a mitigation, and that an
+> approval does not lift it. **The refusal behaviour, its error code, its classification and
+> the `ArgvPayload::Content` declaration are all unchanged**; only the explanation moved.
+> The policy in Decisions 5 and 7 is untouched, and ADR-0055's prohibition is untouched.
 
 **Context.** `filesystem/write-text` puts the file body in `argv`
 (`write_text.rs` → `SandboxPlan.args` → `subprocess.rs::spec_for` → `SandboxSpec.args` →

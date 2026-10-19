@@ -1100,6 +1100,27 @@ pub struct ArgvExposureEntry {
     pub implementation_bound_bytes: Option<usize>,
 }
 
+/// The `control` field of the argv-payload disclosure.
+///
+/// Named so a test can assert on the **value the daemon actually reports** rather
+/// than on a copy of it. The wording was wrong: it described the transport as unfixed
+/// until S-17, which had already landed, so it sent an operator after the wrong
+/// remediation.
+pub(crate) const ARGV_EXPOSURE_CONTROL: &str = "none a user can reach. No configuration \
+    key and no environment variable can permit this, and a release build has no flag \
+    that does either; the capability stays refused under ADR-0054 Decision 7 until its \
+    R-1 evidence conditions are met. That is the plan's refusal posture, not a \
+    degradation, and not a fix";
+
+/// The `status` field of the argv-payload disclosure.
+///
+/// The transport change has landed; the refusal has not, deliberately. The wording
+/// must not imply the capability is enabled, and must not claim R-1 is satisfied.
+pub(crate) const ARGV_EXPOSURE_STATUS: &str = "OPEN -- the framed-stdin transport has \
+    landed, but ADR-0054 Decision 7 keeps this capability refused by default until the \
+    R-1 evidence conditions are met. Refusing by default limits reachability; it does \
+    not remove the exposure for any execution that is permitted to run.";
+
 /// What the operator is told when they have not asked for anything.
 ///
 /// `None` when no registered bundle exposes a payload, and the caller must then leave the
@@ -1143,13 +1164,8 @@ pub(crate) fn argv_payload_disclosure<S: SecretsContract>(
             .filter(|e| !e.permitted)
             .map(|e| name(&e.id))
             .collect(),
-        control: "none a user can reach. No configuration key and no environment \
-                  variable can permit this, and a release build has no flag that does \
-                  either; the capability is refused until S-17 changes the transport. \
-                  That is the plan's refusal posture, not a degradation, and not a fix",
-        status: "OPEN -- the argv transport itself is unfixed until S-17. Refusing by \
-                 default limits reachability; it does not remove the exposure for any \
-                 execution that is permitted to run.",
+        control: ARGV_EXPOSURE_CONTROL,
+        status: ARGV_EXPOSURE_STATUS,
     })
 }
 
@@ -6763,6 +6779,46 @@ mod effect_status_for_dispatch_failure_tests {
             );
         }
     }
+}
+
+/// The disclosure's own text must name the remediation that applies.
+///
+/// The `control` and `status` fields are what `daemon/status` returns, and they
+/// described the transport as unfixed until S-17 -- a change that has already landed.
+/// An operator reading `daemon/status` was being sent after the wrong thing. This
+/// pins the corrected wording, and the parts of it that must survive: the refusal
+/// stays until the R-1 evidence conditions are met, and refusing by default is not
+/// the same as removing the exposure.
+#[test]
+fn the_disclosure_text_names_the_r1_evidence_and_not_an_unlanded_transport_change() {
+    for (field, text) in [
+        ("status", crate::runtime::ARGV_EXPOSURE_STATUS),
+        ("control", crate::runtime::ARGV_EXPOSURE_CONTROL),
+    ] {
+        assert!(
+            !text.contains("until S-17"),
+            "the {field} still points at a transport change that has landed: {text}"
+        );
+        assert!(
+            !text.contains("unfixed until S-17"),
+            "the {field} still describes the transport as unfixed: {text}"
+        );
+        assert!(
+            text.contains("Decision 7") && text.contains("R-1"),
+            "the {field} must name ADR-0054 Decision 7 and its R-1 evidence conditions: \
+             {text}"
+        );
+    }
+    assert!(
+        crate::runtime::ARGV_EXPOSURE_STATUS.contains("does not remove the exposure"),
+        "the status must still say refusing by default does not remove the exposure: {}",
+        crate::runtime::ARGV_EXPOSURE_STATUS
+    );
+    assert!(
+        crate::runtime::ARGV_EXPOSURE_CONTROL.contains("not a degradation, and not a fix"),
+        "the control must still say the refusal posture is not a fix: {}",
+        crate::runtime::ARGV_EXPOSURE_CONTROL
+    );
 }
 
 /// Negative control: the disclosure field is **absent**, not `null`, when nothing is

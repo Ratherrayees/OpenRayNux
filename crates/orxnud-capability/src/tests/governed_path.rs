@@ -2119,6 +2119,67 @@ mod v46 {
 
 // --- S-02 / F-10: the argv-payload exposure gate --------------------------------
 
+/// **The refusal message must name the remediation that actually applies.**
+///
+/// The message used to say the refusal lasted "until S-17 changes the transport".
+/// S-17 landed: the payload now travels on the framed stdin path. ADR-0054 Decision 7
+/// keeps `filesystem/write-text` refused anyway, pending R-1's evidence conditions --
+/// and the first of them, the credential sentinel, is blocked while Decision 5
+/// prohibits credential-bearing Tier-1 capabilities.
+///
+/// So the old wording sent an operator after a change that had already happened, and
+/// told them nothing about what is actually blocking them. This pins the corrected
+/// wording, and pins the parts of it that must not be lost: that the refusal is
+/// containment and not a mitigation, and that an approval does not lift it.
+///
+/// The refusal itself is unchanged: the same variant, the same code, the same
+/// classification. Only the explanation moved.
+#[test]
+fn the_argv_payload_refusal_names_the_r1_evidence_and_not_an_unlanded_transport_change() {
+    let reason = DisabledReason::ArgvPayload;
+    let text = reason.to_string();
+
+    assert!(
+        !text.contains("until S-17"),
+        "the refusal must not point at a transport change that has already landed: {text}"
+    );
+    assert!(
+        !text.contains("transport changes"),
+        "the refusal must not present the transport as unfinished: {text}"
+    );
+    assert!(
+        text.contains("Decision 7"),
+        "the refusal must cite ADR-0054 Decision 7: {text}"
+    );
+    assert!(
+        text.contains("R-1"),
+        "the refusal must cite the R-1 evidence conditions: {text}"
+    );
+    assert!(
+        text.contains("Decision 5"),
+        "the refusal must say the credential-sentinel condition is blocked by Decision 5: \
+         {text}"
+    );
+    assert!(
+        text.contains("not a mitigation"),
+        "the refusal must still say it is containment, not a mitigation: {text}"
+    );
+    assert!(
+        text.contains("approval does not"),
+        "the refusal must say an approval does not lift it: {text}"
+    );
+
+    // The semantics are untouched: the same variant, the same stable code, the same
+    // classification. A wording fix that moved the error would be a policy change.
+    assert_eq!(
+        reason.code(),
+        "argv_payload_exposure_refused",
+        "the stable code is part of the operator-facing contract and must not change"
+    );
+    assert_eq!(reason, DisabledReason::ArgvPayload);
+    assert_ne!(reason, DisabledReason::Configured);
+}
+
 // The pre-fix demonstration: this compiles against the code as it stands today, so
 // its failure is a behavioural failure and not a build failure (V-94).
 

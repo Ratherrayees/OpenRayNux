@@ -1358,12 +1358,24 @@ impl ArgvPayload {
 pub enum DisabledReason {
     /// The operator switched it off.
     Configured,
-    /// It places user-supplied content in `argv`, and the default posture refuses that
-    /// until the transport changes (S-17).
+    /// The default posture refuses a capability that places user-supplied content in
+    /// `argv`, and the refusal **outlives the transport change**.
+    ///
+    /// S-17's framed-stdin transport has landed: the payload no longer travels in
+    /// `argv`. ADR-0054 **Decision 7** nevertheless keeps `filesystem/write-text`
+    /// refused by default until R-1's evidence conditions are satisfied, and the first
+    /// of them -- the credential sentinel -- cannot be produced while ADR-0054
+    /// **Decision 5** prohibits credential-bearing Tier-1 capabilities. That tension is
+    /// recorded in the ADR as a known consequence, not an oversight.
     ///
     /// Not a mitigation of the exposure. The refusal is what makes the exposure
     /// unreachable by default; a payload in `argv` is still world-readable through
     /// `/proc/<pid>/cmdline` for anything granted the owner-approved exception (V-67).
+    ///
+    /// **This refusal is independent of the approval path.** A granted approval
+    /// satisfies the risk tier's consent requirement and does not lift this: the two
+    /// are different questions, and answering the second one does not answer the
+    /// first.
     ArgvPayload,
 }
 
@@ -1371,9 +1383,10 @@ impl DisabledReason {
     /// The stable identifier for logs, tests and the status surface.
     ///
     /// Distinct codes, because the recovery differs: `configured` needs an operator to
-    /// change a switch, and `argv_payload_exposure_refused` needs the transport to
-    /// change. Reporting both as `"capability_disabled"` would leave an operator with a
-    /// refusal and no way to tell which one they are looking at.
+    /// change a switch, and `argv_payload_exposure_refused` needs the R-1 evidence
+    /// conditions in ADR-0054 Decision 7 to be met. Reporting both as
+    /// `"capability_disabled"` would leave an operator with a refusal and no way to
+    /// tell which one they are looking at.
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
@@ -1388,9 +1401,12 @@ impl std::fmt::Display for DisabledReason {
         f.write_str(match self {
             Self::Configured => "switched off by configuration",
             Self::ArgvPayload => {
-                "places user-supplied content in argv, which the default posture refuses \
-                 until S-17 changes the transport (V-67); this is a refusal, not a \
-                 mitigation of the exposure"
+                "refused by default under ADR-0054 Decision 7: the framed-stdin transport \
+                 has landed, but the refusal stays until the R-1 evidence conditions are \
+                 met, and the credential-sentinel condition is blocked while Decision 5 \
+                 prohibits credential-bearing Tier-1 capabilities; this is interim \
+                 containment, not a mitigation of the exposure, and an approval does not \
+                 lift it"
             }
         })
     }
