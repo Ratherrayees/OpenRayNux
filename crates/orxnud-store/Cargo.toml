@@ -15,6 +15,22 @@ publish.workspace = true
 # for why a hook is the only way to test mid-transaction atomicity, and
 # tests/fault_feature_is_not_shipped.rs for the check that it stays off.
 fault-injection = []
+# The raw migration SQL: `MIGRATIONS` and the `schema::MIGRATION_*` DDL it hands out.
+#
+# Off by default, for the same reason as `fault-injection` and with the same
+# consequence if it leaks: every one of these strings is a `CREATE TABLE` /
+# `ALTER TABLE` that a caller can execute on a live database with no
+# pre-migration snapshot and no recovery. Shipping them makes "the schema can
+# only be changed through the snapshotting path" a convention rather than a
+# fact, which is exactly the shape S-11 was raised about.
+#
+# It exists because integration tests in *other* crates need to stage a database
+# at a chosen schema version, and `#[cfg(test)]` is not visible across a crate
+# boundary. Resolver 3 does not unify a dev-dependency's features into a normal
+# build, so enabling it from `[dev-dependencies]` cannot ship it.
+#
+# See tests/test_support_feature_is_not_shipped.rs.
+test-support = []
 
 [dependencies]
 serde = { workspace = true }

@@ -95,7 +95,7 @@ pub const MISFIRE_POLICIES: &[&str] = &[
 ///
 /// Split out from the effects/approvals migration only so that a rollback of a
 /// later feature cannot take the task table with it.
-pub const MIGRATION_TASKS: &str = r#"
+pub(crate) const MIGRATION_TASKS: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
     id                     TEXT    NOT NULL PRIMARY KEY,
     kind                   TEXT    NOT NULL,
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS task_attempts (
 /// obligation: what a task was allowed to do (approval), and what it actually did
 /// (effect). Splitting them would let an effect exist with no approval record for
 /// the attempt that produced it.
-pub const MIGRATION_ACCOUNTING: &str = r#"
+pub(crate) const MIGRATION_ACCOUNTING: &str = r#"
 -- The side-effect ledger (TP-12).
 --
 -- `idempotency_key` is the primary key, which makes this table *also* the dedupe
@@ -275,7 +275,7 @@ CREATE TABLE IF NOT EXISTS task_approvals (
 /// Append-only. `AUTOINCREMENT` rather than a bare rowid so sequence numbers are
 /// **monotonic and never reused**: a log that reuses a sequence number after a
 /// delete makes "what happened after event 41" unanswerable.
-pub const MIGRATION_EVENTS: &str = r#"
+pub(crate) const MIGRATION_EVENTS: &str = r#"
 CREATE TABLE IF NOT EXISTS task_events (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id     TEXT,
@@ -292,7 +292,7 @@ CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events (task_id, seq);
 "#;
 
 /// `schedules` and the `schedule_fires` ledger.
-pub const MIGRATION_SCHEDULES: &str = r#"
+pub(crate) const MIGRATION_SCHEDULES: &str = r#"
 CREATE TABLE IF NOT EXISTS schedules (
     id              TEXT    NOT NULL PRIMARY KEY,
     cron            TEXT    NOT NULL,
@@ -346,7 +346,7 @@ CREATE INDEX IF NOT EXISTS idx_schedule_fires_task ON schedule_fires (task_id);
 ///
 /// `audit_log` carries no column for a secret: the record type has no field that
 /// could hold one, and `secret_ref` is a name.
-pub const MIGRATION_SECURITY_STATE: &str = r#"
+pub(crate) const MIGRATION_SECURITY_STATE: &str = r#"
 CREATE TABLE IF NOT EXISTS audit_log (
     seq         INTEGER NOT NULL PRIMARY KEY,
     prev_hash   BLOB    NOT NULL,
@@ -367,7 +367,8 @@ CREATE TABLE IF NOT EXISTS spent_approvals (
 ///
 /// Concatenated into [`crate::migration::MIGRATIONS`] at compile time so there is
 /// exactly one place a table can be created.
-pub const MIGRATION_SQL: &[(&str, &str)] = &[
+#[cfg(test)]
+pub(crate) const MIGRATION_SQL: &[(&str, &str)] = &[
     ("tasks", MIGRATION_TASKS),
     ("task_accounting", MIGRATION_ACCOUNTING),
     ("task_events", MIGRATION_EVENTS),
@@ -451,7 +452,7 @@ pub const MIGRATION_SQL: &[(&str, &str)] = &[
 ///
 /// Nothing is deleted: only `step_no`, `max_steps` and `steps_completed` are rewritten,
 /// and `attempt_no` -- the record of what actually happened -- is not touched.
-pub const MIGRATION_COMPOSITION_CORRECTION: &str = r#"
+pub(crate) const MIGRATION_COMPOSITION_CORRECTION: &str = r#"
 DROP INDEX IF EXISTS idx_task_proposals_step;
 
 CREATE INDEX IF NOT EXISTS idx_task_proposals_step_attempt
@@ -464,7 +465,7 @@ UPDATE tasks SET steps_completed = CASE WHEN state = 'completed' THEN 1 ELSE 0 E
 "#;
 
 /// The SQL itself.
-pub const MIGRATION_COMPOSITION: &str = r#"
+pub(crate) const MIGRATION_COMPOSITION: &str = r#"
 ALTER TABLE tasks ADD COLUMN max_steps       INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE tasks ADD COLUMN steps_completed INTEGER NOT NULL DEFAULT 0;
 
@@ -524,7 +525,7 @@ CREATE TABLE IF NOT EXISTS task_step_results (
 /// migration 8 applies to `tasks` and `task_proposals`: an attempt recorded before
 /// composition existed was a retry of step 1, not a step of its own. Nothing is deleted and
 /// `attempt_no` is not rewritten.
-pub const MIGRATION_ATTEMPT_STEP_SCOPE: &str = r#"
+pub(crate) const MIGRATION_ATTEMPT_STEP_SCOPE: &str = r#"
 CREATE TABLE task_attempts_scoped (
     task_id       TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     step_no       INTEGER NOT NULL DEFAULT 1,
@@ -587,7 +588,7 @@ ALTER TABLE task_attempts_scoped RENAME TO task_attempts;
 /// A forward migration rather than an edit to stage 2, for the reason the composition
 /// correction gives: a database that already applied stage 2 holds the old primary key,
 /// and editing the old version would leave it in place while claiming it never existed.
-pub const MIGRATION_APPROVAL_STEP_SCOPE: &str = r#"
+pub(crate) const MIGRATION_APPROVAL_STEP_SCOPE: &str = r#"
 CREATE TABLE task_approvals_scoped (
     task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     step_no        INTEGER NOT NULL DEFAULT 1,
@@ -616,7 +617,7 @@ ALTER TABLE task_approvals_scoped RENAME TO task_approvals;
 "#;
 
 /// Migration 11 — the side-effect ledger records its own repeat-safety. V-93.
-pub const MIGRATION_EFFECT_IDEMPOTENCY: &str = r#"
+pub(crate) const MIGRATION_EFFECT_IDEMPOTENCY: &str = r#"
 -- The repeat-safety of the *effect*, recorded when it is reserved.
 --
 -- V-93. `tasks.idempotent` says whether the task may be re-run as a unit; this says
@@ -695,7 +696,7 @@ ALTER TABLE task_effects ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0;
 /// `step_no IS NULL`. Migrations 9, 10 and 12 had to rebuild their tables because they
 /// were changing a primary key or adding a `CHECK` that `ADD COLUMN` cannot express; this
 /// one can be expressed, so rebuilding would be churn.
-pub const MIGRATION_EFFECT_STEP_SCOPE: &str = r#"
+pub(crate) const MIGRATION_EFFECT_STEP_SCOPE: &str = r#"
 ALTER TABLE task_effects
     ADD COLUMN step_no INTEGER CHECK (step_no IS NULL OR step_no >= 1);
 
@@ -754,7 +755,7 @@ CREATE INDEX IF NOT EXISTS idx_task_effects_scope
 /// also changing the value written by `record_approval`, so the type requirement lives in
 /// the copy's `WHERE` and in `parse_approval_digest`, which refuses a non-hex value with
 /// a typed error rather than a slice.
-pub const MIGRATION_APPROVAL_DIGEST_LENGTH: &str = r#"
+pub(crate) const MIGRATION_APPROVAL_DIGEST_LENGTH: &str = r#"
 CREATE TABLE task_approvals_length_checked (
     task_id        TEXT    NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     step_no        INTEGER NOT NULL DEFAULT 1,
@@ -832,7 +833,7 @@ ALTER TABLE task_approvals_length_checked RENAME TO task_approvals;
 ///
 /// The guard runs *before* the delete and *before* the index, so a database that cannot be
 /// reconciled is left exactly as it was.
-pub const MIGRATION_PROPOSAL_IDENTITY: &str = r#"
+pub(crate) const MIGRATION_PROPOSAL_IDENTITY: &str = r#"
 -- Step 1: refuse to proceed if any execution identity holds two DIFFERENT actions.
 --
 -- A temp table rather than a permanent one: this is migration scratch, and it must not

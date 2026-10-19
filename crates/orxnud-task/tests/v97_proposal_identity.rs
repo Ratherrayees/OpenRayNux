@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use orxnud_domain::{TaskId, TaskKind};
-use orxnud_store::migration::{MIGRATIONS, MigrationRunner};
+use orxnud_store::migration::MigrationRunner;
 use orxnud_store::pragma::Pragma;
 use orxnud_store::task_repo::{
     ApprovalRow, NewTask, TargetedClaimOutcome, TaskRepoError, TaskRepository,
@@ -68,18 +68,7 @@ fn schema10() -> Connection {
            (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
     )
     .expect("schema_meta");
-    for m in MIGRATIONS.iter().filter(|m| m.version <= 10) {
-        let tx = rusqlite::Transaction::new_unchecked(&c, rusqlite::TransactionBehavior::Immediate)
-            .expect("begin");
-        tx.execute_batch(m.sql)
-            .unwrap_or_else(|e| panic!("v{}: {e}", m.version));
-        tx.execute(
-            "INSERT OR REPLACE INTO schema_meta VALUES (?1,?2,?3);",
-            rusqlite::params![m.version, m.name, NOW],
-        )
-        .expect("record");
-        tx.commit().expect("commit");
-    }
+    orxnud_store::test_support::stage_schema(&c, 10).expect("stage schema 10");
     c.execute_batch(
         "INSERT INTO tasks (id,kind,state,idempotent,attempts,max_attempts,created_at_ms,updated_at_ms)
            VALUES ('t1','query','completed',1,1,3,1,1),

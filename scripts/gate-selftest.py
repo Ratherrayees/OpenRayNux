@@ -570,7 +570,38 @@ G16_CASES: list[tuple[str, str, str, bool]] = [
         "crates/orxnud-store/src/migration.rs",
         True,
     ),
+    # ---- schema DDL in production source ----
+    (
+        "G16: production code applying CREATE TABLE",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: production code applying DROP TABLE",
+        "G16",
+        "crates/orxnud-daemon/src/bad.rs",
+        True,
+    ),
+    (
+        "G16: DDL held in a constant is still DDL in production source",
+        "G16",
+        "crates/orxnud-task/src/bad.rs",
+        True,
+    ),
     # ---- must pass ---------------------------------------------------------------
+    (
+        "G16: a line comment describing a migration is prose, not DDL",
+        "G16",
+        "crates/orxnud-task/src/good.rs",
+        False,
+    ),
+    (
+        "G16: a #[cfg(test)] test may create a table",
+        "G16",
+        "crates/orxnud-task/src/good.rs",
+        False,
+    ),
     (
         "G16: production code calling migrate(path) is the safe path",
         "G16",
@@ -725,7 +756,43 @@ impl MigrationRunner<'_> {
 """,
 }
 
+G16_BAD_FORMS.update({
+    "G16: production code applying CREATE TABLE": """
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = conn.execute_batch("CREATE TABLE sneaky (id INTEGER PRIMARY KEY)");
+}
+""",
+    "G16: production code applying DROP TABLE": """
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = conn.execute_batch("DROP TABLE tasks");
+}
+""",
+    "G16: DDL held in a constant is still DDL in production source": """
+/// A ready-to-run schema change. Holding it in a const does not execute it --
+/// and executing it anywhere in production is the thing being refused.
+const BYPASS: &str = "ALTER TABLE tasks ADD COLUMN sneaky TEXT";
+""",
+})
+
 G16_MUST_PASS_FORMS: dict[str, str] = {
+    "G16: a line comment describing a migration is prose, not DDL": G16_GOOD + """
+// The old migration ran CREATE TABLE tasks; it is superseded by schema.rs.
+pub fn production(conn: &rusqlite::Connection) {
+    let _ = orxnud_store::migration::MigrationRunner::new(conn)
+        .migrate(std::path::Path::new("db"));
+}
+""",
+    "G16: a #[cfg(test)] test may create a table": """
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn builds_a_fixture_schema() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE IF NOT EXISTS scratch (id INTEGER);")
+            .unwrap();
+    }
+}
+""",
     "G16: production code calling migrate(path) is the safe path": G16_GOOD,
     "G16: a real #[cfg(test)] module may use migrate_ephemeral to build a fixture": G16_GOOD,
     "G16: a #[test] fn outside a cfg(test) module is still a test": G16_GOOD,
@@ -779,6 +846,237 @@ def run_g16_case(tmp: str, name: str, gate: str, rel: str, expect_fail: bool) ->
         f"{'rejected' if rejected else 'accepted'}\n"
         f"     gate output:\n{result.stdout}\n{result.stderr}",
     )
+
+
+G17_CASES: list[tuple[str, str, str, bool]] = [
+    # ---- must fail ---------------------------------------------------------------
+    ("G17: a production open with no lease above it", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open in a nested scope still counts", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: an already-qualified rusqlite::Connection::open is still an open", "G17", "crates/orxnud-daemon/src/a.rs", True),
+    ("G17: a fully qualified path with no lease above it", "G17", "crates/orxnud-task/src/a.rs", True),
+    # Property 2: the unchecked-lease route.
+    ("G17: a production exclusive unchecked lease bypasses the recovery check", "G17", "crates/orxnud-store/src/backup.rs", True),
+    ("G17: a production shared unchecked lease bypasses the recovery check", "G17", "crates/orxnud-store/src/backup.rs", True),
+    ("G17: an unchecked lease in production code with no open at all", "G17", "crates/orxnud-store/src/backup.rs", True),
+    ("G17: an unchecked lease hidden next to a test item is still caught", "G17", "crates/orxnud-store/src/backup.rs", True),
+    # Scanner regressions: production code adjacent to test items must stay visible.
+    ("G17: a production open before a test function is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a test function is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a wrapped test signature is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a use group is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a raw string is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a nested comment is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: an unguarded call to the recovery installer is still caught", "G17", "crates/orxnud-store/src/task_repo.rs", True),
+    # ---- must pass ---------------------------------------------------------------
+    ("G17: acquire then open is the guarded pattern", "G17", "crates/orxnud-task/src/a.rs", False),
+    ("G17: an in-memory database is not a file", "G17", "crates/orxnud-task/src/a.rs", False),
+    ("G17: a #[test] function's opens are not production", "G17", "crates/orxnud-task/src/a.rs", False),
+    ("G17: a #[cfg(test)] function's opens are not production", "G17", "crates/orxnud-task/src/a.rs", False),
+    ("G17: a #[cfg(test)] mod's opens are not production", "G17", "crates/orxnud-task/src/a.rs", False),
+    ("G17: the recovery module may use the unchecked lease", "G17", "crates/orxnud-store/src/recovery.rs", False),
+    ("G17: a test-only power loss helper is not production", "G17", "crates/orxnud-task/src/a.rs", False),
+]
+
+G17_BAD_FORMS: dict[str, str] = {
+    "G17: a production open with no lease above it": """
+pub fn production() {
+    let _c = rusqlite::Connection::open("/var/lib/orxnud/state.db");
+}
+""",
+    "G17: a production open in a nested scope still counts": """
+pub fn production(path: &std::path::Path) {
+    {
+        let _c = rusqlite::Connection::open(path);
+    }
+}
+""",
+    "G17: an already-qualified rusqlite::Connection::open is still an open": """
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a fully qualified path with no lease above it": """
+pub fn production() {
+    let _c = rusqlite::Connection::open_with_flags("/var/lib/orxnud/state.db", rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
+}
+""",
+    # -- property 2: the unchecked-lease route -------------------------------
+    # `acquire_*_unchecked` takes the lease with the recovery-intent check
+    # deliberately skipped. It exists so `recovery.rs` can complete a restore
+    # without recursing into the check that triggered it. Any other production
+    # caller can take a lease and open a database whose restore intent was never
+    # consulted, which is precisely the hole G17's second property closes.
+    "G17: a production exclusive unchecked lease bypasses the recovery check": """
+pub fn production(path: &std::path::Path) {
+    let _lease = crate::ownership::acquire_exclusive_unchecked(path);
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a production shared unchecked lease bypasses the recovery check": """
+pub fn production(path: &std::path::Path) {
+    let _lease = crate::ownership::acquire_shared_unchecked(path);
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: an unchecked lease in production code with no open at all": """
+pub fn production(path: &std::path::Path) {
+    let _lease = crate::ownership::acquire_exclusive_unchecked(path);
+}
+""",
+    "G17: an unchecked lease hidden next to a test item is still caught": """
+#[cfg(test)]
+fn a_test() {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+
+pub fn production(path: &std::path::Path) {
+    let _lease = crate::ownership::acquire_exclusive_unchecked(path);
+}
+""",
+    # -- scanner regressions -------------------------------------------------
+    "G17: a production open before a test function is still caught": """
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+
+#[test]
+fn a_test() {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+""",
+    "G17: a production open after a test function is still caught": """
+#[test]
+fn a_test() {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a production open after a wrapped test signature is still caught": """
+#[test]
+fn a_test_with_a_wrapped_signature(
+    path: &std::path::Path,
+) {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a production open after a use group is still caught": """
+use super::{A, B};
+
+#[test]
+fn a_test() {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a production open after a raw string is still caught": """
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+
+fn a_helper() {
+    let _raw = r#"{"capability":"filesystem/write-text"}"#;
+    let _more = r##"a { b "# c"##;
+}
+""",
+    "G17: an unguarded call to the recovery installer is still caught": """
+pub fn production(path: &std::path::Path) {
+    let _ = crate::recovery::install_staged(path, path, "digest");
+}
+""",
+    "G17: a production open after a nested comment is still caught": """
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+
+/* outer /* inner { */ still a comment */
+fn a_helper() {}
+""",
+}
+
+G17_GOOD = """
+pub fn guarded(path: &std::path::Path) {
+    let _lease = crate::ownership::acquire_shared(path);
+    let _c = rusqlite::Connection::open(path);
+}
+
+pub fn in_memory() {
+    let _c = rusqlite::Connection::open_in_memory();
+}
+
+#[test]
+fn a_test_may_open_a_scratch_database() {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+
+#[cfg(test)]
+fn also_a_test() {
+    let _c = rusqlite::Connection::open("/tmp/scratch2.db");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inside_a_test_mod() {
+        let _c = rusqlite::Connection::open("/tmp/scratch3.db");
+    }
+}
+"""
+
+G17_MUST_PASS_FORMS: dict[str, str] = {
+    "G17: acquire then open is the guarded pattern": G17_GOOD,
+    "G17: an in-memory database is not a file": G17_GOOD,
+    "G17: a #[test] function's opens are not production": G17_GOOD,
+    "G17: a #[cfg(test)] function's opens are not production": G17_GOOD,
+    "G17: a #[cfg(test)] mod's opens are not production": G17_GOOD,
+    # The legitimate use of the unchecked lease: `recovery.rs` completes a restore
+    # without recursing into the check that triggered it. It is the one module
+    # allowed to call it.
+    "G17: the recovery module may use the unchecked lease": """
+pub fn complete(path: &std::path::Path) {
+    let _lease = crate::ownership::acquire_exclusive_unchecked(path);
+}
+""",
+    # The test-only power-loss helper: it opens a database to prove the crash
+    # behaviour, and it is not production code.
+    "G17: a test-only power loss helper is not production": """
+#[cfg(test)]
+mod power_loss {
+    pub fn crash_point(path: &std::path::Path) {
+        let _c = rusqlite::Connection::open(path);
+    }
+}
+""",
+}
+
+
+def g17_source(name: str) -> str:
+    return G17_BAD_FORMS.get(name) or G17_MUST_PASS_FORMS[name]
+
+
+def run_g17_case(tmp: str, name: str, gate: str, rel: str, expect_fail: bool) -> tuple[bool, str]:
+    root = os.path.join(tmp, "g17case")
+    shutil.rmtree(root, ignore_errors=True)
+    fx = Fixture(root)
+    # The exemptions the gate names, so the fixture is not rejected for their absence.
+    for exempt in ("orxnud-store/src/ownership.rs", "orxnud-store/src/recovery.rs"):
+        fx.write(f"crates/{exempt}", "")
+    fx.write(rel, g17_source(name))
+    result = fx.gate(gate)
+    rejected = result.returncode != 0
+    if rejected == expect_fail:
+        return True, ""
+    return False, f"{name}\n     expected {'REJECT' if expect_fail else 'ACCEPT'}, \
+rejected={rejected}\n{result.stdout}\n{result.stderr}"
 
 
 def source_for(name: str) -> str:
@@ -1357,9 +1655,10 @@ def main() -> int:
         # G16: the migration-path gate must reject production calls to the unprotected
         # entry point, accept the safe path and the test-only fixtures, and reject drift
         # in the surface it reads.
-        for name, gate, rel, expect_fail in G16_CASES:
+        for name, gate, rel, expect_fail in G16_CASES + G17_CASES:
             total += 1
-            ok, detail = run_g16_case(tmp, name, gate, rel, expect_fail)
+            runner = run_g16_case if gate == "G16" else run_g17_case
+            ok, detail = runner(tmp, name, gate, rel, expect_fail)
             if ok:
                 print(f"  ok    {name}")
             else:

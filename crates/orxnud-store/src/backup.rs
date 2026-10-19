@@ -683,46 +683,97 @@ impl Backup {
     /// `restore` accepted both the snapshot and an unrelated path, which is the
     /// shape a "which database did I actually just overwrite?" incident needs.
     pub(crate) fn restore(&self, guard: &RestoreGuard) -> Result<(), BackupError> {
+        use crate::recovery;
+
         let db_path: &Path = guard.path();
         if !self.path.is_file() {
             return Err(BackupError::Missing(self.path.clone()));
         }
-        let src = Connection::open(&self.path).map_err(|source| BackupError::Unreadable {
-            path: self.path.display().to_string(),
-            source,
-        })?;
+        // Refuse before staging anything: a restore on a platform that cannot make its
+        // intent durable would be able to destroy the recovery point it just created.
+        recovery::Durability::require().map_err(BackupError::from)?;
+        let staging = recovery::staging_path_for(db_path);
+
+        // 1. Stage the intended image beside the database. Nothing live has been touched.
+        recovery::discard_prepared(db_path)?;
         {
-            // Scoped so the `Backup`'s borrow of `dst` ends before the connection is
-            // closed: `run_to_completion` is what finalises the copy.
-            let mut dst = Connection::open(db_path).map_err(|source| BackupError::Write {
-                path: db_path.display().to_string(),
+            let src = Connection::open(&self.path).map_err(|source| BackupError::Unreadable {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+            let mut dst = Connection::open(&staging).map_err(|source| BackupError::Write {
+                path: staging.display().to_string(),
                 source,
             })?;
             let backup = rusqlite::backup::Backup::new(&src, &mut dst).map_err(|source| {
                 BackupError::Write {
-                    path: db_path.display().to_string(),
+                    path: staging.display().to_string(),
                     source,
                 }
             })?;
-            backup
-                .run_to_completion(PAGES_PER_STEP, std::time::Duration::from_millis(0), None)
-                .map_err(|source| BackupError::Write {
-                    path: db_path.display().to_string(),
-                    source,
-                })?;
+            if let Err(e) =
+                backup.run_to_completion(PAGES_PER_STEP, std::time::Duration::from_millis(0), None)
+            {
+                let _ = std::fs::remove_file(&staging);
+                return Err(BackupError::Write {
+                    path: staging.display().to_string(),
+                    source: e,
+                });
+            }
         }
 
-        // Logical comparison. Both digests are computed over connections that must
-        // open cleanly; an unreadable database is an Err here, never a digest of
-        // nothing that compares equal to another digest of nothing.
-        let expected = Connection::open(&self.path).and_then(|c| logical_digest(&c));
-        let actual = Connection::open(db_path).and_then(|c| logical_digest(&c));
-        match (expected, actual) {
-            (Ok(e), Ok(a)) if e == a => Ok(()),
-            _ => Err(BackupError::RestoreUnverified {
-                path: db_path.display().to_string(),
-            }),
+        // 2. Verify the **staged** image before anything is committed.
+        let expected = Connection::open(&self.path)
+            .and_then(|c| logical_digest(&c))
+            .map_err(|source| BackupError::Unreadable {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        let staged_digest = Connection::open(&staging)
+            .and_then(|c| logical_digest(&c))
+            .map_err(|source| BackupError::Unreadable {
+                path: staging.display().to_string(),
+                source,
+            })?;
+        if staged_digest != expected {
+            let _ = std::fs::remove_file(&staging);
+            return Err(BackupError::RestoreUnverified {
+                path: staging.display().to_string(),
+            });
         }
+
+        // 3. Make the staged image durable, *then* publish the intent. The order is the
+        //    invariant: an intent naming an unsynced image would, after a crash, point at a
+        //    truncated file.
+        //
+        //    Two flushes, and the second one was wrong until this review. Flushing the
+        //    staged *file* makes its contents durable; it does not make its **name**
+        //    durable. The name lives in the parent directory's entry, and that entry is
+        //    what a crash can lose -- leaving a durable intent naming a staged file that
+        //    is not there. The flush must be of the directory that *contains* the staged
+        //    file, not of the database file.
+        recovery::fsync_file(&staging)?;
+        let staging_parent = recovery::parent_dir_of(&staging)?;
+        recovery::fsync_dir(&staging_parent)?;
+        let intent = recovery::RestoreIntent {
+            format: recovery::INTENT_FORMAT,
+            target: db_path.to_path_buf(),
+            staging: staging.clone(),
+            digest: staged_digest.clone(),
+        };
+        recovery::publish_intent(&intent)?;
+
+        // 4. From here on, `recovery::install_staged` is the only path that touches the
+        //    live database, and it is the same function a later open runs to finish a
+        //    restore this process did not survive. One implementation, so a rollback and
+        //    a roll-forward cannot drift apart.
+        recovery::install_staged(db_path, &staging, &staged_digest)?;
+
+        // 5. Verified. Clearing the intent is the last durable act; before it, a crash
+        //    simply repeats the install, which is idempotent.
+        recovery::clear_intent(db_path)?;
+        recovery::discard_prepared(db_path)?;
+        Ok(())
     }
 
     /// Restore under a lease the caller already holds. **Test seam.**
@@ -781,6 +832,16 @@ impl Backup {
     }
 }
 
+/// Whether this platform can flush a **directory entry** with `std`.
+///
+/// Exposed rather than assumed. `std::fs::File::open` on a directory succeeds on Unix and
+/// fails on Windows, so the answer differs by platform and it decides whether a published
+/// restore intent is crash-durable. F-26b's closure claim depends on it.
+#[must_use]
+pub fn directory_fsync_supported() -> bool {
+    std::fs::File::open(std::env::temp_dir()).is_ok()
+}
+
 /// A digest of a database's **logical** content: every row of every user table.
 ///
 /// This is deliberately not a hash of the file. SQLite is free to reorganise
@@ -795,7 +856,7 @@ impl Backup {
 /// runs and across connections. An error is propagated, never swallowed: a digest
 /// computed over a database that could not be read would otherwise be a digest of
 /// nothing, and would compare equal to another digest of nothing.
-fn logical_digest(conn: &Connection) -> Result<String, rusqlite::Error> {
+pub(crate) fn logical_digest(conn: &Connection) -> Result<String, rusqlite::Error> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

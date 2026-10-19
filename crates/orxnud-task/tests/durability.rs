@@ -31,9 +31,25 @@ use orxnud_task::{DurableEngine, EngineLimits, Scheduler};
 const NOW: i64 = 1_767_225_600_000;
 const HOUR: i64 = 3_600_000;
 
-/// A scratch directory, unique per test so the suite can run in parallel.
+/// A scratch directory, unique per **call** so the suite can run in parallel.
+///
+/// Uniqueness used to be per *tag*, which assumed a tag names exactly one test. Two
+/// tests here both call `dir("mig-snapshot")` -- `a_migration_on_an_existing_file_takes_a_verified_snapshot`
+/// and `a_no_op_migration_takes_no_snapshot_and_leaves_none_behind` -- and `cargo test`
+/// runs tests in threads of one process, so `std::process::id()` was identical for both
+/// and they shared one `state.db`. `dir` also does `remove_dir_all`, so whichever test
+/// started second unlinked the database out from under the other while it was migrating.
+/// SQLite returns `SQLITE_PROTOCOL` (extended code 15, "locking protocol") for exactly
+/// this, and the failure alternated between the two tests depending on which lost the
+/// race -- it passed in isolation, which is what made it look like a flaky SQLite rather
+/// than a fixture collision.
+///
+/// The counter is what makes the directory unique per call; the tag is kept so the
+/// directory still says which test it belongs to.
 fn dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("orxnud-dur-{}-{tag}", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("orxnud-dur-{}-{tag}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("mkdir");
     d

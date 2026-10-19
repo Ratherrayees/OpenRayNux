@@ -33,3 +33,9 @@ rusqlite = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 trybuild = { workspace = true }
+# `v93_effect_scope.rs` and `v97_proposal_identity.rs` stage a database at a chosen
+# schema version to test the migrations that follow it, which needs orxnud-store's
+# test-support surface. Resolver 3 keeps a dev-dependency's features out of a
+# normal build, so this cannot ship; `orxnud-store`'s
+# tests/test_support_feature_is_not_shipped.rs is what holds that.
+orxnud-store = { workspace = true, features = ["test-support"] }

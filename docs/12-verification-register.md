@@ -107,7 +107,7 @@ Legend — **Cadence**: `event` (re-checked on a named trigger) · `quarterly` �
 phase gate).
 
 | ID | Claim | Verification source | Cadence / trigger | Last verified | Consequence of silent drift |
-| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — research candidate, not approved), and S-11's wider specification. The original 2026-10-14 text follows, retained because it records what was measured.**
+| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — research candidate, not approved), and S-11's wider specification. **AMENDED 2026-10-17 (A-011): the public-schema-SQL route described by that residual gap is now closed and G16 also refuses production schema DDL — but F-26 remains OPEN**, because `orxnud-store` still publishes live `Connection` values and G16 is lexical enforcement, not a type-system guarantee. The original 2026-10-14 text follows, retained because it records what was measured.**
 
 The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
 §7-S30) owns the restore defect; S-11 (§7-S11) owns the six entry points. **S-11 is blocked on
@@ -1057,6 +1057,354 @@ clean. `cargo test -p orxnud-store --lib` 327 passed, 0 failed, 1 ignored. G16 g
   schema can only be changed through the snapshotting path.
 * F-26b, F-26c and ADR-0058 are untouched; S-11's wider specification is not discharged by
   removing the trust-me APIs.
+
+### A-011 — S-11 / F-26: the public schema-SQL route is closed; G16 now refuses production DDL
+
+**F-26 remains OPEN. S-11 is NOT closed. F-26b and F-26c remain OPEN and are untouched by this
+pass.** A-011 records what was implemented and, at greater length, what was **not** established.
+
+**The premise that had to be corrected.** A-009 recorded a "residual enforcement gap:
+`MIGRATIONS` is public", and proposed closing it by narrowing that constant **or** extending G16.
+That framing was wrong. Narrowing `MIGRATIONS` alone would have closed nothing: **all 14**
+`schema::MIGRATION_*` DDL constants were also `pub` and handed out the same SQL, and
+`Store::conn()` publishes a live `rusqlite::Connection` whose `execute_batch` takes `&self`.
+Three doors.
+
+**Implemented and verified.**
+
+* `MIGRATIONS`, `Migration`, and all **14** `schema::MIGRATION_*` constants are `pub(crate)`.
+  The public rustdoc for `orxnud_store::schema` contains **zero** `MIGRATION_*` items.
+* The cross-crate test need is served by a **function**, not by re-exporting SQL:
+  `orxnud_store::test_support::stage_schema(conn, version)`, behind a new **`test-support`**
+  feature enabled only from `orxnud-task`'s `[dev-dependencies]`. Re-exporting the strings behind
+  the feature was rejected: it restores the accident route in any build that enables it.
+  Resolver 3 keeps a dev-dependency's features out of a normal build.
+* `orxnud-store/tests/test_support_feature_is_not_shipped.rs` — three checks: the feature is
+  enabled only from `[dev-dependencies]`, it enables nothing, and `pub mod test_support` is behind
+  a `cfg` gate. Without the third, a later `pub fn` could be added to the same module and the
+  manifest checks would still pass.
+* **Gate G16 extended** with `ddl_violations`: schema-changing DDL in production source is refused,
+  alongside the existing `migrate_ephemeral` rule. Two exemptions, each stated: `schema.rs` (the
+  DDL as *data*, consumed only by `migration.rs`) and `power_loss.rs` (the TP-7 crash victim
+  creating its own scratch table, already an explicit exemption).
+
+**Two defects only the negative controls found — both would otherwise have shipped.**
+
+1. The first DDL rule used `rustscan.code_only`, which blanks string literals, and in Rust **DDL
+   is a string literal**. The rule matched nothing and the first injected production
+   `CREATE TABLE` **passed**. It now strips comments only.
+2. A measurement taken with the mask semantics inverted reported "zero production DDL". Corrected:
+   two files do contain it, and they are the two exemptions above. The earlier "zero" was wrong.
+
+**Demonstrated.** Injected `CREATE TABLE` (`orxnud-store`) and `ALTER TABLE` (`orxnud-daemon`) are
+rejected with the exact file and line; `DROP TABLE` and DDL held in a `const` are rejected; the
+clean tree passes; line-comment prose and `#[cfg(test)]` DDL are correctly not violations.
+G13 self-tests **95/95** (was 90). `cargo test --workspace` **1769 passed, 0 failed, 7 skipped**.
+`CI=true ./scripts/ci-gates.sh` **all 16 gates pass**, G12 skipped for want of a release tag, G9
+1766/1766 with 6 skipped and 2 leaky. **The attribution of those two to
+`orxnud-platform-sandbox` is not established and is withdrawn:** the count has been observed to
+fluctuate between one and two on an apparently unchanged tree, so the earlier attribution of
+both to a single crate was an assumption. The annotation is tracked as unexplained; see the
+A-012 row.
+
+### F-26b — the restore lifecycle, recorded as it actually is (unchanged, still OPEN)
+
+**This pass changed nothing here.** A trace of `crates/orxnud-store/src/backup.rs` establishes the
+failure sequence precisely, and it is worse than "the checkpoint absorbs" — the absorption can
+begin at **open**, before any statement of ours runs:
+
+| # | Line | Operation |
+|---|---|---|
+| 1 | `backup.rs:927` | `ownership::acquire_exclusive(db_path)` — S-31 exclusive lease |
+| 2 | `backup.rs:934` | `Connection::open(db_path)` — **SQLite may perform WAL recovery as part of opening** |
+| 3 | `backup.rs:941` | `PRAGMA wal_checkpoint(TRUNCATE)` — folds further WAL content into the main file |
+| 4 | `backup.rs:697`/`:708` | `Connection::open` + `run_to_completion` — the in-place copy, **after** 2 and 3 |
+| 5 | `backup.rs:722` | `RestoreUnverified` if the logical comparison fails |
+
+If the copy at step 4 then fails, post-snapshot data may **already have been absorbed** into the
+live database at steps 2 and 3. Returning `RestoreUnverified` is fail-closed in the required sense —
+the restore is not reported as successful, and nothing reads the database as restored — but it
+does **not** establish clean logical rollback, and the database is left in a state that is
+internally consistent and semantically wrong. That is the same class of outcome as the 2026-10-14
+stale-WAL measurement, one step earlier in the lifecycle.
+
+**F-26b remains OPEN.** The `RestoreGuard` and exclusive-ownership protections are preserved and
+untouched. **AMENDED (A-012): the roll-forward protocol and the nine deterministic
+failure/restart scenarios are now implemented and tested** -- see the A-012 row for the
+scenario-by-scenario evidence. F-26b stays open because the *platform* requirement is
+unmet: the protocol refuses to restore where directory durability cannot be established,
+and Windows crash durability has no evidence. The table above is retained as the
+pre-roll-forward record it is.
+
+### F-26c — feasibility research only (unchanged, still OPEN)
+
+Recorded in ADR-0058 and **not** implemented. Against the shipped `libsqlite3-sys` 0.38.2 bindings,
+`sqlite3_vfs`, `sqlite3_file`, `sqlite3_io_methods`, `sqlite3_vfs_register`, `xOpen` and
+`xFullPathname` are all present, while `unixFile` — the private struct the 2026-10-14 proof cast at
+a hardcoded offset — is **not** exposed. A gate implementing `io_methods` over POSIX could
+therefore avoid the undocumented-layout dependency.
+
+**That is feasibility, not safety.** No VFS has been integrated. Unsafe FFI and its audit;
+file-descriptor binding across SQLite's actual open path; WAL and rollback-journal behaviour
+including links created after a connection opens; a Windows implementation and Windows runtime
+evidence; upstream SQLite regression tests against an unmodified baseline; maintenance cost for
+the pinned SQLite version and upgrades; the availability/denial-of-service consequence of refusing
+a hard-linked database; and cross-process and filesystem limitations are all **unattempted and
+unmeasured**.
+
+**F-26c remains OPEN.**
+
+### A-012 — F-26b: durable roll-forward recovery, recovery-aware opening, and a durability refusal
+
+**F-26b remains OPEN. S-11 and F-26 remain OPEN and are untouched. F-26c is untouched.**
+
+**What was built.** `crates/orxnud-store/src/recovery.rs` implements a durable roll-forward: a
+verified staged image beside the database, a published `<db>.restore-intent` naming target,
+staging, format version and expected **logical digest**, then an in-place install that is
+idempotent and therefore repeatable after any crash. The state machine is three states read off
+the pair of artefacts — `Idle`, `Prepared` (staging without intent: never committed),
+`Outstanding` (intent published: must roll forward). The invariant is that **an intent exists
+only if the image it names is complete, verified and durable**, which makes publication the
+single commit point.
+
+**WAL finalization, ordered by the measured evidence.** A validation pass against the pinned
+SQLite (3.53.2) established that `Backup::new` preserves the destination's `wal` mode, that the
+restored content lives **only in the `-wal`** while the destination connection is open, and that
+removing the sidecars at that moment destroys the restore and leaves `disk I/O error`. The
+implemented sequence is therefore: quiesce any existing log → install in place (never a rename) →
+**close the destination connection** → explicit `TRUNCATE` if a log survives → close → *observe*
+that no WAL content remains → read normally (with no log to mask it, that read is the main file)
+→ compare digest → drop sidecars → fsync main and directory → clear the intent. Both WAL-present
+and WAL-absent are handled, and the checkpoint is judged by observing the file rather than its
+advisory counters.
+
+**Recovery-aware opening, enforced and gated.** The check runs in
+`ownership::acquire_shared`/`acquire_exclusive`, which is the real choke point — `Store::open`
+is **not**, as an earlier audit established when the two `security_state.rs` constructors turned
+out to open their own connections. Recovery takes its lease through `*_unchecked` variants so it
+cannot recurse, and re-reads the state **inside** the exclusive lease so there is no window
+between check and lease. **Gate G17** (`scripts/gate_policy.py g17`) fails a production
+file-backed open with no lease above it; it is not a filename blacklist, and `#[test]`,
+`#[cfg(test)]` functions and `#[cfg(test)]` mods are stripped first. Nine self-test cases cover
+both directions; G13 is now **116/116** (the measured total; it was 104/104 when this row was written).
+
+**Durability is enforced, not reported.** `Durability::require()` **refuses before anything
+destructive** when the platform cannot make the intent durable. On Linux, file and directory
+flushes are measured as supported. On Windows, `std::fs::File::open` on a directory fails, so
+the intent's directory entry would not survive a crash — and the operation now **refuses**
+rather than proceeding on an assumption. That is a measured limitation, not a documented
+Windows support regression.
+
+**Negative controls.** `without_a_published_intent_the_pre_restore_state_survives` shows the
+pre-restore rows persist when no intent exists, so the roll-forward tests detect something real.
+G17's injected unguarded open in `orxnud-store/src/task_repo.rs` was caught with the exact file
+and line.
+
+**Evidence.** `cargo test --workspace` 1793 passed / 0 failed / 7 ignored; G9 1790/1790,
+annotated `(1 leaky)`. The earlier measurements of 1778 passed / 0 failed / 7 skipped with G9
+1775/1775 and 1 leaky, and then 1789/1786, are retained as the dated records they were and are
+superseded by this one.
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -D warnings` clean.
+`CI=true ./scripts/ci-gates.sh` **all 17 gates pass**, G12 skipped for want of a release tag.
+
+**Not verified, and why the finding stays open.**
+
+* **No Windows runtime evidence of any kind.** `cargo check -p orxnud-store --target
+  x86_64-pc-windows-msvc` fails on this host — `libsqlite3-sys`'s build script cannot find
+  `lib.exe`. No Windows test ran. The Windows durability behaviour is *argued from the platform's
+  documented API shape and refused in code*, never executed.
+* **Native Windows directory durability is not implemented.** `FlushFileBuffers` on a directory
+  handle with `FILE_FLAG_BACKUP_SEMANTICS` is the likely route; until it exists and is tested on
+  a Windows runner, Windows cannot restore at all. That is a **functional restriction**, chosen
+  deliberately over restoring unsafely.
+* **Incomplete deterministic coverage.** Implemented and passing: crash after intent publication,
+  refused open while recovery is incomplete, idempotent repeat recovery, staged-image and intent
+  preservation on failure, and the negative control. **Not yet covered** by a deterministic test:
+  failure before staging becomes durable, failure before/after intent publication as an injected
+  error, failure during the in-place copy, crash between copy and checkpoint, a WAL persisting
+  after close, a competing-reader `SQLITE_BUSY` during recovery, post-copy verification failure,
+  and intent-removal failure.
+* **Absorption is still possible**; it is now recoverable rather than prevented.
+* No gate enforces the protocol's runtime correctness; G17 is defence in depth.
+* **HISTORICAL, superseded by the bullet below: Gate G17 was implemented and its mutations passed,
+  but it was NOT enabled in CI at that point.** Both
+  bypass classes it detects were proven with injected violations -- an unguarded
+  `Connection::open`, and a production call to `acquire_*_unchecked` from outside `recovery.rs`
+  -- and `gate-selftest.py` still ran its 9 cases (G13 was then 104/104). What blocked enabling it
+  is its own classifier: the `#[test]`-function stripper mis-reads
+  `orxnud-daemon/src/runtime.rs` and reports six opens that are inside test functions as
+  production, which would fail CI on a known false positive.
+  **Two real bugs in the gate's scanning were found and fixed while doing this**, both of which
+  had been silently blinding it: `code_only` blanks string literals (so it cannot find DDL,
+  which *is* a string literal), and the `#[test]` stripper counted braces inside string
+  literals, desynchronising and blanking **2002 of 2446 lines of `backup.rs`**. The second is
+  why a gate is trusted only after a mutation proves it.
+* **G17 NOW ENFORCES BOTH PROPERTIES, and is enabled in `ALL_GATES`.** The root cause of
+  every earlier failure was one lexer defect, and it was not the one that had been
+  assumed. `scripts/rustscan.py`'s `_RAW_PREFIX` omitted the standalone `r` prefix, so
+  `r#"..."#` was not recognised as a raw string at all; and the raw-string *terminator*
+  was built as a quote, the hashes, and **another** quote -- a three-character sequence
+  that never occurs in Rust source. The search for it therefore always failed and the
+  token ran to the end of the file: **216,876 characters of `runtime.rs` were
+  classified as string content**, and every `{` in that span with them, including the
+  `mod tests {` that the six false positives came from. A second defect: `_is_char_literal`
+  accepted only `\` and `''`, so `'{'` was mis-read as a lifetime and its brace counted
+  as code.
+  All three are fixed, and the terminator defect is the one that mattered most -- the
+  missing `r` prefix was a symptom of the same confusion.
+
+  The stripper is now offset-based and structural: `rustscan.classify` labels code,
+  string and comment content in one pass, `rustscan.delimiter_matches` pairs delimiters
+  with a stack over that, and every blank is a length-preserving offset replacement
+  (`rustscan.blank_range`), so production code adjacent to a test item is untouched
+  byte-for-byte. No filename exemptions and no indentation heuristic are involved.
+
+  Controls, each measured by the gate process's exit code:
+
+  | Control | Required | Exit | Result |
+  |---|---|---|---|
+  | unguarded production `Connection::open` | fail | 1 | caught |
+  | production `acquire_exclusive_unchecked` in `backup.rs` | fail | 1 | caught |
+  | production `acquire_shared_unchecked` in `backup.rs` | fail | 1 | caught |
+  | legitimate recovery calls in `recovery.rs` | pass | 0 | correct |
+  | test-only power-loss helper | pass | 0 | correct |
+  | six test-only opens in `runtime.rs` | pass | 0 | correct (0 of 6 visible) |
+  | production code adjacent to a test item | scanned | 1 | correct |
+  | clean repository invocation | pass | 0 | correct |
+
+  A repository-wide lexical scan of all 169 Rust sources reports **no** string or
+  comment run reaching EOF and **no** unbalanced delimiters. `rustscan` carries its own
+  executable self-tests (`python3 scripts/rustscan.py`), including a negative control:
+  reverting `_RAW_PREFIX` to the old expression makes them fail, which is how the defect
+  was pinned rather than merely fixed.
+  **What G17 still does not prove:** it proves the *structure* of the codebase, not the
+  runtime correctness of the recovery protocol. It also remains a lexical analysis: a
+  construct it cannot parse would be misclassified. It is defence in depth.
+
+* **A superseded note, kept because it records what was believed and why it was wrong.**
+  The previous revision of this row said the unchecked-lease property was unenforced
+  because the stripper over-blanked. The over-blanking was real, but the mutations that
+  appeared to demonstrate it were **injected into test-only code** -- `backup.rs`'s
+  `pub fn path_for` lives inside a `#[cfg(test)] impl Backup` block, and a correctly
+  blanking stripper removed the injected call along with the test block. The gate was
+  right and the control was wrong. An earlier table in this row was also invalid because
+  it inferred results by grepping coloured gate output, which cannot match the ANSI
+  escape byte; every control is now measured by exit code. Control results, re-measured against the policy exit code (an earlier
+  attempt at this table used a `grep` on the gate's coloured output that could never
+  match, so all six rows were meaningless and have been discarded):
+
+  | Control | Expected | Result |
+  |---|---|---|
+  | unguarded `Connection::open` in `task_repo.rs` | fails | **fails -- caught** |
+  | `acquire_exclusive_unchecked` route in `backup.rs` | fails | **passes -- NOT caught** |
+  | `acquire_shared_unchecked` route in `backup.rs` | fails | **passes -- NOT caught** |
+  | legitimate call inside `recovery.rs` | passes | passes |
+  | test-only opens | pass | pass |
+  | six `runtime.rs` test opens | no violation | 0 of 6 misclassified |
+
+  The two *unchecked* rows are false negatives and are the reason G17 stays out of
+  `ALL_GATES`. Root cause is the test-function stripper, not the unchecked rule itself:
+  the stripper that removes `#[cfg(test)]` function bodies **over-blanks**, and
+  production code adjacent to a test function is blanked along with it, so the
+  synthetic route in `backup.rs` was invisible to the rule. This is the unsafe direction
+  -- an over-blank hides production code from the gate rather than merely mislabeling it.
+  Two candidate implementations were measured and both are wrong: brace counting from a
+  pristine source correctly stops after six `use super::{{...}};` groups leak, and
+  indentation-based blanking over-blanks. `code_only` itself was verified sound for brace
+  matching (it blanks string and comment braces by design). A correct implementation
+  needs a single-pass lexer that tracks comments, strings and raw strings, character
+  literals versus lifetimes, and nested block comments together -- not a bolt-on stripper.
+* **The intermittent SQLite `FileLockingProtocolFailed` failure is RESOLVED. Root cause was a
+  test-fixture collision, not the recovery protocol.** In `crates/orxnud-task/tests/durability.rs`,
+  `a_migration_on_an_existing_file_takes_a_verified_snapshot` and
+  `a_no_op_migration_takes_no_snapshot_and_leaves_none_behind` both called
+  `dir("mig-snapshot")`. `dir` derived its path from `std::process::id()`, and `cargo test`
+  runs tests in threads of one process, so the two tests shared one `state.db`; `dir` also
+  does `remove_dir_all`, so whichever started second unlinked the database out from under
+  the other mid-migration. SQLite answers that with `SQLITE_PROTOCOL` (extended code 15,
+  "locking protocol"), which is why the failing test alternated and why each passed in
+  isolation. The F-26b snapshot/staging work widened the window, so a latent collision
+  began to lose the race.
+  Fix: `dir()` is now unique per **call** (atomic counter appended to the tag), which is
+  the actual defect -- the tag was assumed to name exactly one test. Before/after control
+  on the same machine: the old fixture fails **2 of 6** runs, the new one **0 of 6**;
+  `cargo test --workspace` then passed **4 of 4** runs at 1778 passed / 0 failed.
+* **A rejected first fix, recorded because it was wrong:** an attempt was made to stop
+  `MigrationError::RecoveryRequired` from wrapping unrelated errors, by returning the
+  underlying error when the recorded version was unchanged. That is incorrect, because
+  each migration runs in its own transaction, so a genuinely partial migration *rolls
+  back* and never advances the recorded version. It broke two existing S-31 tests
+  (`a_failing_file_backed_migration_hands_back_a_snapshot_that_exists_and_verifies` and
+  `a_failed_migration_replaces_a_snapshot_that_does_not_verify`). The hunk was reverted;
+  `RecoveryRequired` deliberately stays broad -- any migration failure hands back a
+  snapshot, and the fixture fix removes the error that was being mislabelled.
+* **G9 is intermittently failing on nextest's leak count, and the signal is racy.** Four
+  consecutive `cargo nextest run` invocations on an identical tree reported **1775 passed,
+  0 failed** every time, with the leak count varying `1, 2, 1, 2`. No test fails; only the
+  `(N leaky)` annotation varies, and G9 fails when it reads 2. This is nextest's post-exit
+  fd/child-process scan being nondeterministic, not a demonstrated descriptor leak, and it
+  is **not** attributed to the F-26b work. G9 was **not** weakened to hide it.
+* **The nine F-26b recovery scenarios are now covered by deterministic tests.** They live in
+  `crates/orxnud-store/src/recovery.rs`, module `scenarios`, and they drive the *production*
+  protocol: the same `publish_intent`, `install_staged` and `complete_outstanding_restore`
+  the runtime uses, reached through the ordinary `Store::open` path wherever a restart is
+  involved. The only test-only thing is *where* a failure is injected.
+
+  The injections are `#[cfg(test)]`-only seams (`recovery::seams`) at real operation
+  boundaries: before the intent is published, after it is durable, part-way through the
+  in-place copy, before the log is finalised, at the post-copy verification, and before
+  the intent is cleared. They do not exist in a production build, they are per-thread and
+  one-shot, and they cannot weaken locking or ownership: they only make an operation
+  return an error that it would otherwise have returned had the underlying operation
+  failed.
+
+  Every injected-failure test asserts that its fault **actually fired**, and the suite
+  was mutation-checked: with the seams disabled, exactly the six fault-dependent tests
+  fail and the five that construct their conditions directly still pass. A test that
+  passes because the fault never triggered would be worse than no test.
+
+  The scenarios, and what each proves:
+
+  | # | Scenario | Result |
+  |---|---|---|
+  | 1 | failure before the staged image is durable | no intent is published; the live database is served unchanged; the abandoned staging file is discarded |
+  | 2 | failure immediately before the intent is published | the live database is byte-identical; the state is `Prepared`, never `Outstanding` |
+  | 3 | failure immediately after the intent is published | the intent is durable and authoritative; the next ordinary open rolls forward to the staged content and clears the intent |
+  | 4 | failure during the in-place copy | the live database is genuinely partial; the staged image and intent survive; the partial database is refused; the retry converges |
+  | 5 | restart after the copy but before finalisation | the recovery is *retried*, not mistaken for completion -- proved by re-arming the fault and watching it fire again |
+  | 6 | a log that survives the connection close | the condition is forced and verified, not assumed; the log is folded in and the sidecars removed **before** the intent is cleared |
+  | 7 | a competing reader causes `SQLITE_BUSY` | the open is refused, the intent and the staged image survive, and the retry succeeds once the contention ends |
+  | 8 | failure during post-copy verification | the intent and the staged image survive, the database is refused, and the retry converges |
+  | 9 | failure to clear the intent | the data installation succeeded but the protocol did not, and the ordinary path still treats the restore as outstanding |
+
+  Two negative controls were added as well: `removing_the_log_without_checkpointing_it_loses_committed_rows`
+  demonstrates that naively deleting the `-wal` loses committed rows -- the behaviour the
+  protocol's ordering exists to prevent -- and `an_outstanding_intent_is_never_read_as_absent`
+  demonstrates that a malformed intent, and an intent whose staged image is gone, are both
+  outstanding restores rather than "no restore outstanding".
+
+  **AMENDED: the three defects the checkpoint review found are fixed.** (1) The shared
+  acquisition took the lease *after* reading the recovery state, so a restore could publish an
+  intent in between and crash, leaving the opener holding a lease on a database whose restore was
+  outstanding. The lease is now taken **first**: a restore publishes its intent under the
+  *exclusive* lease, so a held shared lease means no new intent can appear, and the read under it
+  cannot be stale. The exclusive path was corrected the same way -- lease first, recovery under
+  the held lease. The state is still re-read under the exclusive lease before installation.
+  (2) `install_staged`, `publish_intent` and `clear_intent` are now `pub(crate)`: a dependent
+  crate cannot reach them at all (proved by a compile error from an external probe), and G17
+  refuses an in-crate call to them from outside the two modules that hold the exclusive lease.
+  (3) The staged image's **parent directory** is now flushed before the intent is published. The
+  previous call flushed the *database file* in place of the directory whose entry makes the staged
+  file's name durable. Four new tests cover these: the shared lease is provably held before the
+  recovery read, an outstanding intent causes recovery rather than a normal open, the staging
+  parent's directory is flushed before publication, and a failed directory flush stops the restore
+  before anything destructive.
+
+  **F-26b remains OPEN.** These tests establish the protocol's behaviour on this platform
+  under injected failures. They do not establish crash durability on Windows, where
+  `std` provides no directory durability and the implementation therefore refuses to
+  restore rather than proceed. They remain listed as
+  missing in this row. F-26b is not close to closure.
 
 ### A-007 — S-30 (`S-11-RESTORE`): the restore path is now coordinated and logically verified
 

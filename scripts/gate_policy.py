@@ -509,6 +509,157 @@ def migration_violations(root: str, sources: list[str]) -> list[Violation]:
 
 production_matcher = re.compile(r"migrate_ephemeral")
 
+#: Schema-changing SQL. Deliberately not a keyword search over the whole file: the point
+#: is to catch *production source* that applies DDL, and the two legitimate places that
+#: do it are `migration.rs` (the migrations themselves) and `test_support` (behind a
+#: feature that a shipped build does not have).
+#:
+#: Measured before this rule existed: the workspace contained **zero** occurrences in
+#: production source. There is nothing to exempt today, so nothing is exempted, and a
+#: first offence is a real offence rather than a known exception.
+def strip_comments_only(src: str) -> str:
+    """Blank Rust comments, leaving string literals intact.
+
+    # Why this exists and why it is not `rustscan.code_only`
+
+    This gate looks for schema DDL, and in Rust **DDL is always a string literal** --
+    you execute it as `conn.execute_batch("CREATE TABLE ...")`. `code_only`, which
+    blanks comments *and* string literals, therefore blanks the very thing being
+    searched for, and the rule silently matched nothing.
+
+    That was found by the negative control, not by reading: the first injected
+    production `CREATE TABLE` passed the gate. A gate that cannot fail is worse than
+    no gate, so the check is only trusted once it has been observed to fail.
+
+    This is a small scanner rather than a change to `rustscan.py` because
+    `rustscan`'s job is the opposite one -- deciding what is *code* for the platform
+    and authority gates, where blanking strings is correct.
+    """
+    out = list(src)
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            # Skip a string literal. Raw strings need the hash count.
+            hashes = 0
+            j = i - 1
+            while j >= 0 and src[j] == "#":
+                hashes += 1
+                j -= 1
+            if j >= 0 and src[j] in "rRbB" and (j == 0 or src[j - 1] != "\\"):
+                term = '"' + "#" * hashes
+                k = src.find(term, i + 1)
+                i = n if k == -1 else k + len(term)
+            else:
+                k = i + 1
+                while k < n:
+                    if src[k] == "\\":
+                        k += 2
+                        continue
+                    if src[k] == '"':
+                        break
+                    k += 1
+                i = min(k + 1, n)
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            k = src.find("\n", i)
+            k = n if k == -1 else k
+            for x in range(i, k):
+                out[x] = " "
+            i = k
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            depth = 1
+            k = i + 2
+            while k < n and depth:
+                if src.startswith("/*", k):
+                    depth += 1
+                    k += 2
+                elif src.startswith("*/", k):
+                    depth -= 1
+                    k += 2
+                else:
+                    k += 1
+            for x in range(i, min(k, n)):
+                out[x] = " "
+            i = k
+            continue
+        i += 1
+    return "".join(out)
+
+
+SCHEMA_DDL = re.compile(
+    r"\b(?:CREATE\s+(?:TEMP\s+|TEMPORARY\s+|UNIQUE\s+|VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)"
+    r"|ALTER\s+TABLE"
+    r"|DROP\s+(?:TABLE|INDEX|TRIGGER|VIEW))\b",
+    re.IGNORECASE,
+)
+
+#: Production files permitted to contain schema DDL, each for a stated reason.
+#:
+#: Two, and neither is "this file is special":
+#:
+#: * `schema.rs` **is** the schema. Its `MIGRATION_*` constants hold the DDL as
+#:   *data*; nothing executes them here. They are `pub(crate)` since the S-11
+#:   change, so the only consumer in the workspace is `migration.rs`, which runs
+#:   them through `migrate_ephemeral` inside a per-migration transaction.
+#: * `power_loss.rs` is the TP-7 crash-test **victim**. It calls
+#:   `migrate_ephemeral` — already an explicit G16 exemption, for the same reason:
+#:   the process is about to be `SIGKILL`ed, so a snapshot taken at that moment
+#:   could not survive to be useful. The `CREATE TABLE tp7_tasks` below is that
+#:   victim's own scratch table in a database that is about to be killed; it is
+#:   not part of the product schema and nothing else references it.
+#:
+#: Every other file must be free of DDL. Measured before this rule existed:
+#: `schema.rs` and `power_loss.rs` were the only production sources containing any.
+SCHEMA_DDL_EXEMPT = {
+    os.path.join("crates", "orxnud-store", "src", "migration.rs"),
+    os.path.join("crates", "orxnud-store", "src", "schema.rs"),
+    os.path.join("crates", "orxnud-task", "src", "conformance", "power_loss.rs"),
+}
+
+
+def ddl_violations(root: str, sources: list[str]) -> list[Violation]:
+    """Production source that applies schema-changing SQL outside the migrations.
+
+    # Why the API narrowing is not enough
+
+    Narrowing `MIGRATIONS` and the `schema::MIGRATION_*` constants removes the route
+    that hands out the DDL as data. It does not remove a caller who writes its own
+    `CREATE TABLE`, and `orxnud-store` publishes `rusqlite::Connection` values
+    (`Store::conn()` and friends), so one is reachable. This is the second layer, and
+    the ordering matters: the API is the control and this is the check that the control
+    has not been routed around.
+
+    A keyword search cannot distinguish DDL *about this schema* from DDL in some
+    unrelated embedded database, so it would produce false positives. The alternative
+    would be to accept the false positives and maintain an exemption list, which is
+    how a gate becomes a list of known mistakes. The measurement above decided it: zero
+    production DDL today, so the rule starts empty.
+    """
+    out: list[Violation] = []
+    for path in sources:
+        rel = os.path.relpath(path, root)
+        if rel in SCHEMA_DDL_EXEMPT:
+            continue
+        text = open(path, encoding="utf-8").read()
+        production = strip_comments_only(rustscan.strip_test_only(text))
+        for m in SCHEMA_DDL.finditer(production):
+            out.append(
+                Violation(
+                    path,
+                    rustscan.line_of(production, m.start()),
+                    "production source applies schema-changing SQL "
+                    f"(`{m.group(0)}`). Every production schema change must go through "
+                    "`MigrationRunner::migrate(path)`, which takes and verifies a "
+                    "snapshot first and hands back a recovery obligation on failure. "
+                    "This crate publishes `Connection` values, so writing DDL here is "
+                    "reachable and unprotected.",
+                )
+            )
+    return out
+
 
 def migration_surface_drift(root: str) -> list[str]:
     """Whether the surface this gate depends on still has the shape it was written for.
@@ -557,7 +708,7 @@ def report(name: str, violations: list[Violation], root: str) -> int:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("gate", choices=["g2d", "g3", "g3-platform-crates", "g16"])
+    ap.add_argument("gate", choices=["g2d", "g3", "g3-platform-crates", "g16", "g17"])
     ap.add_argument(
         "--root",
         default=None,
@@ -599,9 +750,24 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 1
+        both = migration_violations(root, sources) + ddl_violations(root, sources)
+        both.sort(key=lambda v: (v.path, v.line))
         return report(
-            "G16: production code reaches the unprotected migration path",
-            migration_violations(root, sources),
+            "G16: production code can change the schema outside the snapshotting path",
+            both,
+            root,
+        )
+
+    if args.gate == "g17":
+        both = (
+            unguarded_open_violations(root, sources)
+            + unchecked_lease_violations(root, sources)
+            + unguarded_recovery_write_violations(root, sources)
+        )
+        both.sort(key=lambda v: (v.path, v.line))
+        return report(
+            "G17: production code bypasses the recovery-aware opening boundary",
+            both,
             root,
         )
 
@@ -620,6 +786,319 @@ def main(argv: list[str]) -> int:
     exempt = [c for c in exempt if c.startswith(PLATFORM_CRATE_PREFIX)]
     print(f"   platform crates exempt from G3: {' '.join(exempt)}")
     return 0
+
+
+
+
+# --------------------------------------------------------------------------
+# G17 -- every production SQLite open is recovery-aware
+# --------------------------------------------------------------------------
+
+#: Production files allowed to open a file-backed database without going through the
+#: recovery-aware ownership boundary. **Not a filename blacklist**: each entry is a
+#: *narrowly justified* site, and the rule is otherwise "no file-backed open outside
+#: ownership".
+#:
+#: * `ownership.rs` acquires the lease; it is the boundary, not a user of it.
+#: * `recovery.rs` completes a restore and must therefore install into the live database
+#:   while holding the lease it already took. It never opens without one.
+#:
+#: `security_state.rs` and `sqlite.rs` are **deliberately absent**: they look like
+#: candidates and are the reason this gate exists. Both call
+#: `ownership::acquire_shared` first, which is the boundary.
+#:
+#: * `power_loss.rs` is the TP-7 **crash verifier**. It opens the file a child process was
+#:   `SIGKILL`ed on, to check that what survived is coherent. Holding a lease is not just
+#:   unnecessary there but wrong: the point is to inspect the state a *dead* owner left, and
+#:   a lease taken over a database with no live owner would be indistinguishable from a
+#:   live owner. Its build scope was verified rather than assumed: `verify_file_coherent`
+#:   is reached only from the victim/verifier paths in that module, whose own `migrate_ephemeral`
+#:   and DDL are already declared G16 exemptions on the same grounds.
+OPEN_EXEMPT = {
+    os.path.join("crates", "orxnud-store", "src", "ownership.rs"),
+    os.path.join("crates", "orxnud-store", "src", "recovery.rs"),
+    os.path.join("crates", "orxnud-task", "src", "conformance", "power_loss.rs"),
+}
+
+#: A file-backed `Connection::open*` / `Store::open`. `:memory:` and the test-support
+#: helpers are excluded by the surrounding expressions.
+_FILE_OPEN = re.compile(
+    r"(?:Connection|rusqlite::Connection)::open(?:_with_flags\w*)?\s*\("
+)
+
+
+
+def strip_cfg_test_fns(src: str, count_src: str | None = None) -> str:
+    """Blank the bodies of `#[test]`- and `#[cfg(test)]`-attributed items.
+
+    # How this works
+
+    Structure is taken from :func:`rustscan.delimiter_matches`, which pairs delimiters
+    with a stack over the *code* characters of the source. Strings, raw strings, byte
+    strings, char literals, lifetimes and comments are excluded by the lexer, so a
+    brace inside any of them cannot shift a match.
+
+    Every blank is an offset-length-preserving replacement
+    (:func:`rustscan.blank_range`), so the offsets used later in the pass still point
+    at the same characters, and the code outside the blanked item is untouched
+    byte-for-byte.
+
+    # Why the previous implementations were wrong
+
+    * Counting braces over already-stripped text lost structural braces and
+      desynchronised, blanking 2002 of 2446 lines of `backup.rs`.
+    * Counting braces over pristine text stopped early on `use super::{A, b};`, a
+      balanced group that opens and closes on one line, so the six test-only opens in
+      `runtime.rs` were reported as production.
+    * Matching by indentation blanked *production* code adjacent to a test item, which
+      hid a synthetic `acquire_exclusive_unchecked` route in `backup.rs` from G17.
+
+    The lexer that feeds this was itself wrong for a long time: `_RAW_PREFIX` omitted
+    the standalone `r` prefix, and the raw-string terminator was built as a quote, the
+    hashes and *another* quote -- a three-character sequence that never occurs, so the
+    search for it always failed and the token ran to the end of the file. 216,876
+    characters of `runtime.rs` were classified as string content as a result. Both are
+    fixed and covered by `rustscan`'s own self-tests.
+
+    # Failure behaviour
+
+    If an attribute is recognised but no item body can be located, only the attribute
+    and its item's first line are blanked. Blanking too little risks a false positive,
+    which is visible and cheap; blanking too much hides production code, which is the
+    dangerous direction.
+    """
+    _ = count_src
+    code = rustscan.code_mask(src)
+    matches = rustscan.delimiter_matches(src, code)
+    edits: list[tuple[int, int]] = []
+
+    def blank(a: int, b: int) -> None:
+        a = max(0, a)
+        b = min(len(src), b)
+        if b > a:
+            edits.append((a, b))
+
+    for m in _TEST_ATTR.finditer(src):
+        if not all(code[m.start():m.end()]):
+            continue
+        rest = src[m.end():]
+        kw = _ITEM_KW.search(rest)
+        if kw is None:
+            continue
+        body = m.end() + kw.start()
+        # The body opens at the first code brace at or after the item keyword. A
+        # signature may wrap across lines, so this is not "the brace on this line".
+        j = body
+        semicolon = None
+        while j < len(src):
+            if code[j]:
+                if src[j] == "{":
+                    break
+                if src[j] == ";":
+                    semicolon = j
+                    break
+            j += 1
+        if semicolon is not None:
+            blank(m.start(), semicolon + 1)
+            continue
+        if j < len(src) and src[j] == "{" and j in matches:
+            blank(m.start(), matches[j] + 1)
+        else:
+            # No body could be located. Blanking just the attribute line is the
+            # fail-closed choice: a false positive is visible, a hidden production
+            # open is not.
+            end = src.find("\n", j)
+            blank(m.start(), (len(src) if end == -1 else end))
+    for a_, b_ in sorted(edits, reverse=True):
+        src = rustscan.blank_range(src, a_, b_)
+    return src
+
+
+#: A test-only attribute: `#[test]`, or `#[cfg(...)]` whose predicate mentions `test`.
+_TEST_ATTR = re.compile(r"#\[\s*(?:test|cfg\s*\([^\]]*\btest\b[^\]]*\))\s*\]")
+_ITEM_KW = re.compile(r"\b(?:fn|mod|impl|struct|enum|trait|const|static)\b")
+
+
+def production_view(text: str) -> str:
+    """``text`` with comments stripped and every test-only item removed.
+
+    The single entry point every G17 rule must use. Comments go because a commented-out
+    `Connection::open` must not count as an open; test items go because a test's
+    database is not a production one. Strings are deliberately *kept*: they are where
+    the SQL DDL lives, and the DDL gate needs them.
+    """
+    return rustscan.strip_test_only(strip_cfg_test_fns(strip_comments_only(text)))
+
+
+#: How far above an open to look for the ownership acquisition that makes it legitimate.
+#: The pattern the tree actually uses is `acquire_shared` then `Connection::open` on the
+#: next few lines, so this is a window rather than a scope analysis. It is lexical and can
+#: be fooled by an acquisition in an unrelated statement; the trade is accepted because a
+#: scope-accurate version needs a real parser, and the gate is defence in depth rather than
+#: the primary control.
+_ACQUIRE_WINDOW = 12
+
+_ACQUIRE = re.compile(r"ownership::acquire_(?:shared|exclusive)|(?:^|[^:])acquire_(?:shared|exclusive)\s*\(")
+
+
+#: The internal lease acquisitions that skip the recovery check by design.
+_UNCHECKED = re.compile(r"acquire_(?:shared|exclusive)_unchecked")
+
+#: The recovery operations that write: they publish an intent, install staged content
+#: into the live database, or clear the recovery state.
+#:
+#: These are `pub(crate)` in the Rust source, so the compiler already refuses an
+#: out-of-crate call. This rule is the *second* half of the boundary: it refuses an
+#: in-crate call from a module that does not hold the exclusive ownership the
+#: operation requires. `backup.rs` calls them under a `RestoreGuard`, which holds
+#: the exclusive lease; `recovery.rs` calls them under the exclusive lease it takes
+#: itself.
+_WRITE_CALLS = re.compile(r"\b(?:install_staged|publish_intent|clear_intent)\b")
+
+#: The modules permitted to call the recovery write operations, and why.
+_WRITE_EXEMPT = {
+    # Where they are defined.
+    os.path.join("crates", "orxnud-store", "src", "recovery.rs"),
+    # The restore path, which runs under a `RestoreGuard` holding the exclusive lease.
+    os.path.join("crates", "orxnud-store", "src", "backup.rs"),
+}
+
+#: Production files allowed to use them. `recovery.rs` only -- it is the mechanism that
+#: exists in order to complete a restore without recursing into the check.
+_UNCHECKED_EXEMPT = {
+    # Where they are *defined*; calling them from here is the whole point of the module.
+    os.path.join("crates", "orxnud-store", "src", "ownership.rs"),
+    # The only module permitted to *call* them.
+    os.path.join("crates", "orxnud-store", "src", "recovery.rs"),
+}
+
+
+def unchecked_lease_violations(root: str, sources: list[str]) -> list[Violation]:
+    """Production use of a lease acquisition that bypasses the recovery-intent check.
+
+    # Why this is a separate rule
+
+    G17's first rule proves a production open cannot skip **ownership**. It does not by
+    itself prove an open cannot skip **recovery**: `acquire_*_unchecked` takes the lease
+    with the recovery check deliberately skipped, and any production caller other than the
+    recovery mechanism itself would be able to take a lease and open a half-restored
+    database without ever consulting the intent.
+
+    The two properties are distinct, and only the first was checked. This is the second,
+    and it is structural rather than runtime: `_unchecked` is `pub(crate)`, and this gate
+    confines it to the one module that must use it.
+    """
+    out: list[Violation] = []
+    for path in sources:
+        rel = os.path.relpath(path, root)
+        if rel in _UNCHECKED_EXEMPT:
+            continue
+        text = open(path, encoding="utf-8").read()
+        production = production_view(text)
+        for m in _UNCHECKED.finditer(production):
+            line = rustscan.line_of(production, m.start())
+            out.append(
+                Violation(
+                    path,
+                    line,
+                    "production code takes a lease with the recovery-intent check skipped. "
+                    "`acquire_*_unchecked` exists only so `recovery.rs` can complete a "
+                    "restore without recursing into the check that triggered it; any other "
+                    "caller can take a lease and open a database whose restore intent was "
+                    "never consulted.",
+                )
+            )
+    return out
+
+
+def unguarded_recovery_write_violations(
+    root: str, sources: list[str]
+) -> list[Violation]:
+    """Production calls to the recovery write operations outside the guarded modules.
+
+    # Why this is a rule and not a comment
+
+    `install_staged` overwrites the live database, `publish_intent` publishes the
+    record that authorises doing so, and `clear_intent` removes it. They are
+    `pub(crate)`, so a dependent crate cannot reach them -- but an *in-crate* module
+    can, and a call from a module that does not hold the exclusive lease would write
+    to a live database with nothing coordinating it. Visibility alone does not
+    establish that; this does.
+    """
+    out: list[Violation] = []
+    for path in sources:
+        rel = os.path.relpath(path, root)
+        if rel in _WRITE_EXEMPT:
+            continue
+        text = open(path, encoding="utf-8").read()
+        production = production_view(text)
+        for m in _WRITE_CALLS.finditer(production):
+            line = rustscan.line_of(production, m.start())
+            out.append(
+                Violation(
+                    path,
+                    line,
+                    "production code calls a recovery write operation "
+                    "(`install_staged`, `publish_intent` or `clear_intent`) outside the "
+                    "modules that hold the exclusive lease. These modify the live "
+                    "database or the intent that authorises modifying it, and the "
+                    "coordination they require is the exclusive ownership lease.",
+                )
+            )
+    return out
+
+
+def unguarded_open_violations(root: str, sources: list[str]) -> list[Violation]:
+    """Production opens of a file-backed database that bypass the ownership boundary.
+
+    # Why this is needed at all
+
+    `recovery::complete_outstanding_restore` runs inside
+    `ownership::acquire_shared`/`acquire_exclusive`, so a database with an outstanding
+    restore intent is never handed out usable. That guarantee is only as good as the
+    claim that **every** production open goes through those two functions -- a claim that
+    was found to be false once already, when `Store::open` was assumed to be the only
+    route and `SqliteAuditJournal::open` and `SqliteApprovalLedger::open` turned out to
+    open their own connections. A gate that cannot fail is not a gate, so this checks the
+    claim rather than repeating it.
+
+    # What it does and does not prove
+
+    It proves that this workspace's production sources contain no file-backed SQLite open
+    outside the two exempt modules. It does **not** prove runtime correctness of the
+    recovery protocol; that is the protocol's own tests. This is defence in depth.
+    """
+    out: list[Violation] = []
+    for path in sources:
+        rel = os.path.relpath(path, root)
+        if rel in OPEN_EXEMPT:
+            continue
+        text = open(path, encoding="utf-8").read()
+        production = production_view(text)
+        for m in _FILE_OPEN.finditer(production):
+            line = rustscan.line_of(production, m.start())
+            snippet = production.split("\n")[line - 1].strip()
+            # `:memory:` is not a file; it has no path, no sidecars and nothing to recover.
+            if "memory" in snippet:
+                continue
+            # The legitimate pattern: take the lease, then open. `Store::open` already
+            # does both; a direct open is fine when a lease was taken just above it.
+            window = "\n".join(production.split("\n")[max(0, line - 1 - _ACQUIRE_WINDOW) : line])
+            if _ACQUIRE.search(window):
+                continue
+            out.append(
+                Violation(
+                    path,
+                    line,
+                    "production source opens a file-backed SQLite database directly. An "
+                    "outstanding restore intent is only honoured because "
+                    "`ownership::acquire_shared`/`acquire_exclusive` check for it, so an "
+                    "open that skips ownership can serve a half-restored database. Take "
+                    "the lease first (`Store::open`, or `acquire_shared` followed by "
+                    "`Connection::open`).",
+                )
+            )
+    return out
 
 
 if __name__ == "__main__":

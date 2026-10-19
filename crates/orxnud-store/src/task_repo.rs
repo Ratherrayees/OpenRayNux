@@ -3877,7 +3877,7 @@ impl<'a> TaskRepository<'a> {
     /// The step is part of the lookup, not merely checked afterwards, because
     /// `attempt_no` alone does not name an approval: the counter restarts at 1 for every
     /// logical step, so step 1's first attempt and step 2's first attempt are both
-    /// `(task_id, 1)`. See [`crate::schema::MIGRATION_APPROVAL_STEP_SCOPE`].
+    /// `(task_id, 1)`. See the approval step-scope migration in `schema.rs`.
     pub fn approval_for_attempt(
         &self,
         task_id: &TaskId,

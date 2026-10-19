@@ -2,7 +2,7 @@
 //!
 //! Phase 1 provides the runner and its guarantees; it does not provide a
 //! schema. docs-13 §8 forbids inventing application tables ahead of the engine
-//! that uses them, so [`MIGRATIONS`] contains exactly one entry: `schema_meta`,
+//! that uses them, so the migration list contains exactly one entry: `schema_meta`,
 //! the bookkeeping table the runner itself needs.
 //!
 //! # Guarantees the runner must uphold
@@ -111,8 +111,13 @@ pub struct RestoreFailure {
 }
 
 /// One forward migration.
+///
+/// **Crate-private**, and that is the whole point of the S-11 change: its `sql`
+/// field is a ready-to-run DDL string, so a public `Migration` is a public
+/// schema. Nothing outside this crate needs the type; the only caller that did
+/// was a test, and it is served by [`crate::test_support`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Migration {
+pub(crate) struct Migration {
     /// Monotonic version. Migrations are applied in ascending order, once.
     pub version: u32,
     /// A short name, recorded in `schema_meta` for diagnosis.
@@ -123,10 +128,37 @@ pub struct Migration {
 
 /// Every migration, in the order they must be applied.
 ///
+/// **Not exported at all.** `pub(crate)`, in every build, because this hands out every
+/// `CREATE TABLE` and
+/// `ALTER TABLE` in the schema as a plain `&str`. A caller with one of these and
+/// a `Connection` — and `Store::conn()` is public — can apply any schema change
+/// with no pre-migration snapshot, no verification and no recovery, which is the
+/// whole of F-26.
+///
+/// The gate is the *visibility* rather than a feature: the list is `pub(crate)` in
+/// every build, so no build -- production or test -- can obtain it from outside this
+/// crate. Integration tests in *other* crates need to stage a database at a chosen
+/// version and cannot see `#[cfg(test)]`, so they are served by
+/// [`crate::test_support::stage_schema`], which offers the operation rather than the
+/// SQL.
+///
+/// This is the *accident* route closed. `MigrationRunner::migrate` remains the
+/// production entry point, and gate **G16** is what stops the *deliberate* one.
+///
+/// # What replaced the public export
+///
+/// Integration tests in *other* crates need to stage a database at a chosen
+/// schema version, and `#[cfg(test)]` does not cross a crate boundary. Rather
+/// than re-export the SQL under a feature -- which would put the strings back in
+/// a shipped build the moment anything enabled it -- [`crate::test_support`]
+/// offers a **function** that performs the staging, gated on the same feature.
+/// A caller gets "put this connection at version N", which is what they wanted,
+/// and cannot get the DDL itself.
+///
 /// Migration 1 is Phase 1's `schema_meta` bookkeeping. Migrations 2.. are the
 /// Phase 2 task layer, built from [`crate::schema`] so there is exactly one place
 /// a table can be created.
-pub const MIGRATIONS: &[Migration] = &[
+pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         name: "schema_meta",

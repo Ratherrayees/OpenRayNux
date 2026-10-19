@@ -101,6 +101,7 @@ declare -A NAMES=(
   [G14]="CI toolchain pinning (S-24)"
   [G15]="rustdoc (warnings denied)"
   [G16]="migration snapshot path (S-11/F-26)"
+  [G17]="recovery-aware database opens (F-26b)"
 )
 
 banner() { printf '\n\033[1m== %s: %s\033[0m\n' "$1" "${NAMES[$1]}"; }
@@ -890,15 +891,43 @@ gate_G16() {
   fi
 }
 
-ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14 G15 G16)
+# G17 -- every production SQLite open is recovery-aware.
+#
+# An outstanding restore intent is only honoured because
+# `ownership::acquire_shared`/`acquire_exclusive` check for it before handing out a
+# connection. That guarantee rests on a claim about the whole tree: that no production
+# code opens a file-backed database without taking a lease first. The claim has already
+# been false once -- `Store::open` was assumed to be the only route and the two
+# `security_state.rs` constructors turned out to open their own connections -- so it is
+# checked rather than repeated.
+#
+# Defence in depth: this does not replace the recovery protocol's own tests, and a gate
+# that cannot fail is not a gate, so G13 drives it against injected violations.
+# Enabled in ALL_GATES on the evidence recorded in A-012. The classifier is now
+# offset-based and structural: `rustscan.classify` labels code, string and comment
+# content in one pass, and `rustscan.delimiter_matches` pairs delimiters with a stack
+# over that. Every blank is a length-preserving offset replacement, so code adjacent
+# to a test item is untouched. The two properties are checked separately -- an
+# unguarded file-backed open, and a production call to `acquire_*_unchecked` -- and
+# both are pinned by mutations in `gate-selftest.py`.
+gate_G17() {
+  banner G17
+  if python3 scripts/gate_policy.py g17 --root "$(gate_root)"; then
+    ok "production SQLite opens pass through the recovery-aware ownership boundary"
+  else
+    fail_gate "production code opens a database without the recovery-aware ownership boundary"
+  fi
+}
+
+ALL_GATES=(G1 G2 G2d G3 G4 G5 G6 G7 G8 G9 G10 G11 G12 G13 G14 G15 G16 G17)
 
 run() {
   case "$1" in
 G1) gate_G1 ;;  G2) gate_G2 ;;  G2d) gate_G2d ;;  G3) gate_G3 ;;  G4) gate_G4 ;;
     G5) gate_G5 ;;  G6) gate_G6 ;;  G7) gate_G7 ;;  G8) gate_G8 ;;  G9) gate_G9 ;;
     G10) gate_G10 ;;  G11) gate_G11 ;;  G12) gate_G12 ;;  G13) gate_G13 ;;
-    G14) gate_G14 ;;  G15) gate_G15 ;;  G16) gate_G16 ;;
-    *) printf 'unknown gate: %s (expected G1..G16)\n' "$1" >&2; exit 2 ;;
+    G14) gate_G14 ;;  G15) gate_G15 ;;  G16) gate_G16 ;;  G17) gate_G17 ;;
+    *) printf 'unknown gate: %s (expected G1..G17)\n' "$1" >&2; exit 2 ;;
   esac
 }
 

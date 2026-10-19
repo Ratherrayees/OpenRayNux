@@ -79,6 +79,7 @@ pub mod faults;
 pub mod migration;
 pub mod ownership;
 pub mod pragma;
+pub mod recovery;
 pub mod region;
 pub mod repository;
 pub mod schedule_repo;
@@ -88,7 +89,7 @@ pub mod sqlite;
 pub mod task_repo;
 pub mod tx;
 
-pub use migration::{MIGRATIONS, Migration, MigrationError, MigrationRunner};
+pub use migration::{MigrationError, MigrationRunner};
 pub use pragma::{Pragma, PragmaError};
 pub use region::{RegionRegistry, StateRegion, task_layer_regions};
 pub use repository::{Repository, RepositoryError, SchemaMeta};
@@ -96,3 +97,77 @@ pub use security_state::{SqliteApprovalLedger, SqliteAuditJournal};
 pub use sqlite::{
     MIN_SQLITE_VERSION, SqliteVersion, Store, StoreError, open, verify_sqlite_version,
 };
+
+/// Staging a database at a chosen schema version, for tests in other crates.
+///
+/// # Why this exists rather than a re-exported `MIGRATIONS`
+///
+/// S-11/F-26 required `MIGRATIONS` — and every `schema::MIGRATION_*` DDL string —
+/// to stop being public, because a `Connection` plus a `CREATE TABLE` is a schema
+/// change with no pre-migration snapshot, no verification and no recovery. But
+/// `orxnud-task`'s integration tests genuinely need to build a database at
+/// version 10 to test the version 11–14 migrations, and `#[cfg(test)]` does not
+/// cross a crate boundary.
+///
+/// Two shapes were available. Re-exporting the SQL behind a feature puts the
+/// strings back into any build that enables it, which is the accident route
+/// reopened. Offering a **function** gives a caller the only thing they actually
+/// wanted — "put this connection at version N" — and hands them no DDL to carry
+/// anywhere else.
+///
+/// Resolver 3 does not unify a dev-dependency's features into a normal build, so
+/// `orxnud-task` enables this from `[dev-dependencies]` and no shipped binary
+/// contains it. `tests/test_support_feature_is_not_shipped.rs` is what holds that,
+/// by the same manifest-reading argument as the `fault-injection` test.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use crate::migration::{MIGRATIONS, Migration};
+    use rusqlite::{Connection, Transaction, TransactionBehavior};
+
+    /// Applies migrations 1..=`version` and records them, as an older build would
+    /// have left the database.
+    ///
+    /// # Errors
+    ///
+    /// The underlying SQLite error, with the migration's name in the message where
+    /// one is known.
+    pub fn stage_schema(conn: &Connection, version: u32) -> Result<(), String> {
+        let applied: u32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_meta;",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        for m in MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= version && m.version > applied)
+        {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                .map_err(|e| format!("begin: {e}"))?;
+            tx.execute_batch(m.sql)
+                .map_err(|e| format!("{}: {e}", m.name))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO schema_meta (version, name, applied_at) VALUES (?1,?2,0);",
+                rusqlite::params![m.version, m.name],
+            )
+            .map_err(|e| format!("{}: {e}", m.name))?;
+            tx.commit().map_err(|e| format!("{}: {e}", m.name))?;
+        }
+        Ok(())
+    }
+
+    /// The migration list, for a test that needs to assert on versions or names.
+    ///
+    /// Returns only `(version, name)`. The `sql` is deliberately not reachable
+    /// through this module: a caller that can stage a database at a version is
+    /// doing what it came to do, and one that can *read the DDL* can do it with a
+    /// connection the guard never saw.
+    #[must_use]
+    pub fn migration_versions() -> Vec<(u32, &'static str)> {
+        MIGRATIONS
+            .iter()
+            .map(|m: &Migration| (m.version, m.name))
+            .collect()
+    }
+}

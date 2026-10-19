@@ -961,24 +961,7 @@ fn a_task_that_crashed_before_dispatching_anything_is_recoverable() {
 /// The same technique the store's own migration tests use, and for the same reason: a
 /// full re-run would apply migrations a real runner skips.
 fn migrate_to(conn: &Connection, version: u32) {
-    let applied: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_meta;",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    for m in orxnud_store::migration::MIGRATIONS
-        .iter()
-        .filter(|m| m.version <= version && m.version > applied)
-    {
-        conn.execute_batch(m.sql).expect("migration sql");
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_meta (version, name, applied_at) VALUES (?1, ?2, 0);",
-            rusqlite::params![m.version, m.name],
-        )
-        .expect("record");
-    }
+    orxnud_store::test_support::stage_schema(conn, version).expect("stage schema");
 }
 
 /// **Test 6 — the real upgrade.** A database genuinely stopped at schema 10, with

@@ -6010,7 +6010,8 @@ genuinely safe to repeat are now re-driven through the full path rather than sho
 ## ADR-0057 — Every production schema change holds a verified snapshot, the trusting mode becomes unselectable, and a restore may not be reopened against stale WAL sidecars
 
 **Status.** **D-S11-a and D-S11-b BUILT 2026-10-17 (uncommitted working tree at the time of
-writing). D-S11-c MEASURED and the invariant S-11-RESTORE derived from it; S-30 built and
+writing), and the migration-API boundary was narrowed further in a second 2026-10-17 pass — see
+"A second boundary pass" below. D-S11-c MEASURED and the invariant S-11-RESTORE derived from it; S-30 built and
 closed.** The trust-me APIs are gone from the source: `MigrationRunner::run(bool)` and both
 `snapshot_verified` booleans no longer exist, so there is no unprotected migration for a
 caller to reach, and gate **G16** refuses the remaining unprotected path in production source.
@@ -6068,18 +6069,34 @@ are fixed here rather than left for the next concurrent start to find:
 
 **Still open, and not claimed here:**
 
-* **A residual enforcement gap, deliberately left open.** `MIGRATIONS` remains public, because
-  tests need its SQL to stage a database at a chosen version. Production code can therefore run
-  that SQL directly and reach the schema without `migrate` or `migrate_ephemeral`, and **gate
-  G16 does not police that route** — it checks only for `migrate_ephemeral`. Such code would
-  skip `schema_meta` bookkeeping and the per-migration transaction, and the schema-invariant
-  tests would fail, but it is a real hole. Closing it means narrowing `MIGRATIONS` to
-  `pub(crate)` or extending G16 to detect direct execution of migration SQL; either is a public
-  API change and a decision for whoever owns the rest of S-11.
-  **Consequence for how this record may be cited: it does not establish that the schema can
-  only be changed through the snapshotting path, or that all migration bypasses are impossible.**
-  It establishes that the *trust-me APIs this record names* are gone and that the one remaining
-  protected-path alternative is refused in production source.
+* **F-26b's protocol is BUILT but NOT CLOSED (2026-10-17 working tree; register A-012).**
+  `crates/orxnud-store/src/recovery.rs` stages a verified image, publishes a durable intent, and
+  installs in place, idempotently; recovery runs from `ownership::acquire_shared`/
+  `acquire_exclusive` and is enforced by the new **gate G17**. What is *not* claimed: any
+  Windows runtime evidence (none exists — the target cannot even be built on this host), native
+  Windows directory durability (absent, so the operation **refuses** there rather than
+  proceeding unsafely), and deterministic coverage of nine enumerated failure points. The
+  five-state sequence below was superseded by the measured WAL ordering; it is retained because
+  the measurement is the reason it changed.
+* **The residual enforcement gap recorded above is CLOSED as of 2026-10-17 (uncommitted working
+  tree); what replaces it is narrower than "no bypass exists".** The 2026-10-17 boundary pass
+  made `MIGRATIONS`, `Migration`, and all **14** `schema::MIGRATION_*` DDL constants **crate-private**,
+  so a shipped `orxnud-store` no longer hands out schema SQL at all, and extended gate **G16** to
+  refuse schema-changing DDL in production source rather than only `migrate_ephemeral`. The
+  previous bullet's premise — that `MIGRATIONS` is public — **no longer describes the source**.
+  It is retained in the amendment below rather than deleted, because "narrowing the constant was
+  thought sufficient, and was not" is the more useful record.
+* **Still not a type-system guarantee, and this record must not be cited as one.** `orxnud-store`
+  still publishes live `rusqlite::Connection` values — `Store::conn`, `Store::conn_mut`,
+  `TaskRepository::connection`, `SqliteAuditJournal::conn` — and `orxnud-task` and
+  `orxnud-daemon` depend on `rusqlite` directly. G16 is **lexical enforcement**: it inspects
+  this workspace's production source for DDL keywords, which is a strong check on this tree and
+  no guarantee about any other binary, a build that does not run the gate, or SQL assembled at
+  runtime without those keywords.
+  **What is established:** the schema SQL is no longer reachable through this crate's public API,
+  and a production source file in this workspace that applies schema DDL fails G16.
+  **What is not established:** that every route to the schema is closed, or that the property
+  survives outside this gate.
 * **F-26 stays open** and **F-26b stays open**: a hard-linked alias still produces a second lock
   file and bypasses ownership entirely (ADR-0058; research candidate, not approved).
 * **S-11 is not closed.** What is gone is the trust-me API and the two production callers that
@@ -6097,6 +6114,51 @@ are fixed here rather than left for the next concurrent start to find:
   `orxnud-store`'s tests on Windows — `windows-portability` excludes the crate for a stated
   linker reason — and no CI step was added, because one that cannot be run or verified would turn
   the lane red for reasons unrelated to this work.
+
+### A second boundary pass — 2026-10-17, closing the residual gap recorded above
+
+**Uncommitted working tree. S-11 is still NOT closed and F-26 is still OPEN.** This records what
+changed and, equally, what did not.
+
+**The premise that has to be corrected.** The residual gap recorded above said `MIGRATIONS`
+remains public and that closing it "means narrowing `MIGRATIONS` to `pub(crate)` **or** extending
+G16". That framing was wrong in a way that mattered: **narrowing `MIGRATIONS` alone would have
+closed nothing.** A survey of the workspace found all **14** `schema::MIGRATION_*` DDL constants
+also `pub`, each handing out the same SQL, and `Store::conn()` publishing a live
+`rusqlite::Connection` on which `execute_batch` takes `&self`. Three doors, not one.
+
+**What changed.**
+
+* `MIGRATIONS`, `Migration`, and all 14 `schema::MIGRATION_*` constants are **crate-private**.
+  The public rustdoc for `orxnud_store::schema` now contains **zero** `MIGRATION_*` items.
+* The test-fixture need is met by a **function**, not by re-exporting SQL:
+  `orxnud_store::test_support::stage_schema(conn, version)`, behind a new **`test-support`**
+  feature, enabled only from `orxnud-task`'s `[dev-dependencies]`. Resolver 3 does not unify a
+  dev-dependency's features into a normal build.
+  Re-exporting the strings behind the feature was rejected: it would put every `CREATE TABLE`
+  back into any build that enabled it, which is the accident route reopened.
+* `orxnud-store/tests/test_support_feature_is_not_shipped.rs` holds the boundary by three checks:
+  the feature is enabled only from a `[dev-dependencies]` block, it enables nothing, and
+  `pub mod test_support` is behind a `cfg` gate.
+* **Gate G16 extended** to refuse schema-changing DDL in production source, alongside its
+  existing `migrate_ephemeral` rule.
+
+**Two defects that only the negative controls found, recorded because both would have shipped.**
+
+1. The first DDL rule used `rustscan.code_only`, which blanks string literals — and in Rust
+   **DDL is a string literal**. The rule matched nothing, and the first injected production
+   `CREATE TABLE` **passed the gate**. It now strips comments only.
+2. A measurement made with the mask semantics inverted reported "zero production DDL". Corrected,
+   two files do contain it, both justified: `schema.rs` (the DDL as *data*, consumed only by
+   `migration.rs`) and `power_loss.rs` (the TP-7 crash victim creating its own scratch table,
+   already an explicit G16 exemption). Those are the gate's only two exemptions.
+
+**Demonstrated.** Injected `CREATE TABLE` in `orxnud-store` and `ALTER TABLE` in `orxnud-daemon`
+are both rejected with the exact file and line; `DROP TABLE` and DDL held in a `const` are
+rejected; the clean tree passes. Line-comment prose and `#[cfg(test)]` DDL are correctly not
+violations. G13 self-tests **95/95** (was 90). Workspace `cargo test` 1769 passed / 0 failed /
+7 skipped; `CI=true ./scripts/ci-gates.sh` all 16 gates pass with G12 skipped for want of a
+release tag.
 
 ### A first version of the publication path was wrong, and was corrected here
 
@@ -6322,6 +6384,51 @@ discussion anticipated, and it reached further into the migration flow than "add
 **F-26c REMAINS OPEN**: a hard-linked alias still produces a second lock file and bypasses
 ownership entirely, which is measured and unfixed. **F-26b stays open** on its narrower
 remaining point, and **F-26 stays open**; S-11 remains blocked.
+
+**Feasibility observation, 2026-10-17 — the private-layout dependency is avoidable.**
+This is **feasibility research, not an implementation and not a closure.** The proof above reached
+the real file descriptor by casting `unixFile::h` at a hardcoded LP64 offset (24). That layout is
+undocumented internal SQLite, and depending on it disqualifies the approach for production.
+
+Checked against the bindings this repository actually ships — `libsqlite3-sys` **0.38.2**, the
+`bindgen-bindings/bindgen_3.34.1.rs` set — with `bundled` SQLite (asserted elsewhere as 3.53.2):
+
+| Symbol | Present in the shipped bindings? |
+|---|---|
+| `sqlite3_vfs` | yes |
+| `sqlite3_file` | yes |
+| `sqlite3_io_methods` | yes |
+| `sqlite3_vfs_register` / `sqlite3_vfs_find` | yes |
+| `xOpen`, `xFullPathname` | yes |
+| `unixFile` (the private struct the proof cast) | **no — 0 occurrences** |
+
+**What that means.** The entire VFS interface is **public, documented SQLite API** and is already
+reachable from Rust without touching SQLite's internals. A gate that implements `io_methods`
+itself over POSIX — rather than delegating and then reading the parent's private `h` — would not
+depend on an undocumented layout. That is a genuinely different feasibility position from the one
+this record states above, which is why it is recorded.
+
+**What it does not mean.** It is **not** evidence that the implementation is safe, correct,
+portable or production-ready, and **no VFS has been integrated into this repository.** Whether
+hand-rolled `io_methods` can match SQLite's expectations for WAL, locking and crash recovery is
+exactly the part the delegated proof avoided by construction, and it is now the open risk rather
+than a settled detail. None of the following was attempted or measured in this pass:
+
+* unsafe FFI implementation, and its audit;
+* correct file-descriptor binding and hard-link refusal **across SQLite's actual open path**;
+* WAL and rollback-journal behaviour, **including links created after a connection opens**;
+* a Windows implementation, and any Windows runtime evidence;
+* upstream SQLite regression tests, and a comparison against the unmodified baseline;
+* maintenance cost for the pinned SQLite version and for upgrades;
+* the availability and denial-of-service consequence of **refusing** a hard-linked database, which
+  makes an alias a way to make someone's data unopenable;
+* cross-process and filesystem limitations, including the measured all-or-nothing-per-inode
+  refusal recorded above.
+
+**The smallest remaining decision** is whether to author a public-API VFS gate at all, accepting
+that POSIX lands first and Windows must either gain an equivalent or be refused — which ADR-0058
+Decision 2 already requires, and which is a support decision rather than an engineering detail.
+**F-26c remains OPEN.**
 
 **What this record does not establish.** That any of the three options is correct on this
 codebase — two are argued from shape and one is explicitly unmeasured. That F-26 or F-26b is

@@ -65,6 +65,14 @@ repository. Every Phase 2 migration test drove `run`, which trusts its caller's
 snapshot claim and never takes one — so the snapshot path had **no** coverage at all
 until startup began using it.
 
+> **Update 2026-10-17 — `run` no longer exists.** The paragraph above is the historical
+> record of how the gap was found and it is kept because the bug was only findable through
+> production wiring. As of A-009 the method is deleted: `MigrationRunner::run(bool)` was
+> replaced by `migrate_ephemeral()`, and `Backup::verify_against_source` now takes the
+> emptiness answer as a parameter read **before** the copy. A-011 then closed the separate
+> public-schema-SQL route. What this section must **not** be read as claiming: that S-11 or
+> F-26 is closed. `orxnud-store` still publishes live `Connection` values and G16 is lexical.
+
 It failed immediately, on a **brand-new database**: `Backup::verify` rejected a
 snapshot with no `schema_meta` table, on the grounds that restoring it would erase a
 user's database. Sound reasoning, wrong target — a fresh install has nothing to

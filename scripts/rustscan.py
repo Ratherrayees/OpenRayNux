@@ -176,7 +176,14 @@ def code_mask(src: str) -> list[bool]:
     return mask
 
 
-_RAW_PREFIX = re.compile(r"\b(?:br|rb|cr|rc)?(#+)?\"", re.ASCII)
+# The prefixes Rust actually accepts for a raw string: `r`, `br` and `cr`. `rb` and
+# `rc` are not Rust syntax and were removed. The bare `r` alternative is the one that
+# was missing, and it is what made the whole lexer fail: with it absent, `r#"..."#`
+# could not be recognised, the scanner fell through to the ordinary-string branch, and
+# the `"` that opens the raw string terminated a *normal* string instead. The result
+# was a string run that swallowed the rest of the file -- 216,876 characters of
+# `runtime.rs` were classified as string content, and every `{` in it with them.
+_RAW_PREFIX = re.compile(r"\b(?:br|cr|r)?(#+)?\"", re.ASCII)
 
 
 def _is_char_literal(src: str, i: int) -> bool:
@@ -194,8 +201,15 @@ def _is_char_literal(src: str, i: int) -> bool:
         return True
     if nxt == "'":
         return True
-    # A single character followed by anything other than a quote is not a
-    # one-character literal, so this is a lifetime.
+    # A one-character literal may be any single character, punctuation included:
+    # `'{'` is a char literal, and `'}''` is not a lifetime. The discriminator is
+    # the *closing* quote: if the character after the candidate is `'`, it is a
+    # literal; otherwise it is a lifetime.
+    #
+    # This was wrong before: only `\` and `''` were accepted, so `'{'` was
+    # mis-read as a lifetime and the brace it contained was counted as code.
+    if i + 2 < len(src) and src[i + 2] == "'":
+        return True
     return False
 
 
@@ -564,3 +578,283 @@ def strip_test_only(src: str) -> str:
     for i, line in enumerate(src.split("\n")):
         out.append("" if i < len(masked_lines) and not masked_lines[i] else line)
     return "\n".join(out)
+
+_OPEN = {"(": ")", "[": "]", "{": "}"}
+_CLOSE = {v: k for k, v in _OPEN.items()}
+
+
+def delimiter_matches(src: str, mask: list[bool]) -> dict[int, int]:
+    """Map every opening delimiter index in ``src`` to its matching close index.
+
+    # Why this exists
+
+    Every previous attempt to find the end of a test function counted braces by hand
+    over text that had already been modified, and every one of them was wrong:
+
+    * counting over text blanked by an earlier pass loses the braces that pass removed;
+    * counting over pristine text is confused by ``use super::{A, b};``, which opens and
+      closes on one line;
+    * counting by indentation blanks production code that sits next to a test item.
+
+    The fix is not a better heuristic. It is to stop matching structure in a *derived*
+    string. ``code_mask`` is already a single-pass lexer that tells comments, raw
+    strings, byte strings, c-strings, char literals and lifetimes apart, so the
+    delimiters that matter are exactly the code characters carrying ``(``, ``[``, ``{``.
+    Walking those through a stack gives an exact pairing, and because the walk is over
+    the original source, a match is an *offset* into the original file rather than a
+    position in some intermediate rendering. Callers blank by offset and leave every
+    other character -- and every offset -- exactly where it was.
+
+    Braces inside ordinary and raw strings, escapes, byte and raw-byte strings, nested
+    block comments and char literals are all excluded because ``code_mask`` has already
+    classified them as non-code.
+    """
+    stack: list[tuple[str, int]] = []
+    out: dict[int, int] = {}
+    for i, ch in enumerate(src):
+        if not mask[i]:
+            continue
+        if ch in _OPEN:
+            stack.append((ch, i))
+        elif ch in _CLOSE:
+            want = _CLOSE[ch]
+            # A stray closer with no opener is not our problem to repair; it belongs to
+            # whatever the caller failed to strip. Ignoring it is safe because it can
+            # only appear where there was already an unmatched delimiter.
+            for depth in range(len(stack) - 1, -1, -1):
+                if stack[depth][0] == want:
+                    for _, o in stack[depth + 1:]:
+                        out.pop(o, None)
+                    o = stack[depth][1]
+                    del stack[depth:]
+                    out[o] = i
+                    break
+    return out
+
+
+def blank_range(src: str, start: int, end: int) -> str:
+    """``src`` with ``[start, end)`` replaced by spaces.
+
+    Length, line structure and every offset outside the range are preserved, so a match
+    found in the result still maps to the same line in the original file.
+    """
+    if start < 0 or end > len(src) or start >= end:
+        return src
+    return src[:start] + " " * (end - start) + src[end:]
+
+
+def classify(src: str) -> list[str]:
+    """One label per character: ``"code"``, ``"string"`` or ``"comment"``.
+
+    Newlines are labelled ``"code"`` so that callers counting lines off any mask agree
+    with the original file.
+
+    This is the single lexer the module exposes. The three masks below are all views of
+    it, because deriving one mask from another was how a DDL detector ended up unable to
+    see DDL (it is a string) while a brace walk ended up unable to trust braces (they
+    must ignore strings but honour comments' absence).
+    """
+    n = len(src)
+    kind = ["code"] * n
+    i = 0
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            j = n if j == -1 else j
+            for k in range(i, j):
+                kind[k] = "comment"
+            i = j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            kind[i] = kind[i + 1] = "comment"
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if src.startswith("/*", j):
+                    depth += 1
+                    kind[j] = kind[j + 1] = "comment"
+                    j += 2
+                elif src.startswith("*/", j):
+                    depth -= 1
+                    kind[j] = kind[j + 1] = "comment"
+                    j += 2
+                else:
+                    if src[j] != "\n":
+                        kind[j] = "comment"
+                    j += 1
+            i = j
+            continue
+        m = _RAW_PREFIX.match(src, i)
+        if m:
+            # The terminator of a raw string is a quote followed by the opening
+            # hashes -- `"#` for `r#"..."#`, `"##` for `r##"..."##`. It is *not* a
+            # quote, the hashes, and another quote: that three-character form is what
+            # this code used to build, and because it never occurs in the source, the
+            # `find` below always failed and the token ran to the end of the file.
+            # That single character is the reason 216,876 characters of `runtime.rs`
+            # were classified as string content, and why every `{` in that span with
+            # them -- including the `mod tests {` that started this investigation.
+            term = '"' + (m.group(1) or "")
+            close = src.find(term, m.end())
+            end = n if close == -1 else close + len(term)
+            for k in range(i, min(end, n)):
+                if src[k] != "\n":
+                    kind[k] = "string"
+            i = min(end, n)
+            continue
+        if c == '"' or (c == "b" and i + 1 < n and src[i + 1] == '"'):
+            j = i + 1 if c == '"' else i + 2
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
+                if src[k] != "\n":
+                    kind[k] = "string"
+            i = min(j, n)
+            continue
+        if c == "'" and _is_char_literal(src, i):
+            j = i + 1
+            if j < n and src[j] == "\\":
+                j += 2
+                while j < n and src[j] != "'":
+                    j += 1
+                j += 1
+            else:
+                j += 1
+                if j < n and src[j] == "'":
+                    j += 1
+            for k in range(i, min(j, n)):
+                if src[k] != "\n":
+                    kind[k] = "string"
+            i = min(j, n)
+            continue
+        i += 1
+    return kind
+
+
+def code_mask(src: str) -> list[bool]:
+    """Code only -- comments and string contents are False. Newlines stay True."""
+    return [k == "code" for k in classify(src)]
+
+
+def code_or_string_mask(src: str) -> list[bool]:
+    """Everything except comments. Newlines stay True.
+
+    Use this when a pattern lives *inside* a string literal -- DDL, a JSON key, a SQL
+    keyword. ``code_mask`` would blank the very text being searched for.
+    """
+    return [k != "comment" for k in classify(src)]
+
+
+# --------------------------------------------------------------------------
+# Self-tests for the lexer. Run with `python3 scripts/rustscan.py`.
+# --------------------------------------------------------------------------
+
+def _selftest() -> int:
+    import re as _re
+
+    failures: list[str] = []
+
+    def check(name: str, got: object, want: object) -> None:
+        if got != want:
+            failures.append(f"{name}: got {got!r}, want {want!r}")
+
+    def label(src: str, marker: str) -> str:
+        """The classification of the first occurrence of ``marker``."""
+        return classify(src)[src.index(marker)]
+
+    # -- 1. the prefix expression, in isolation ----------------------------
+    # Each entry is (source, expected span of the raw-string opener).
+    for src, want_span in [
+        ('r#"{"capability":"filesystem/write-text"}"#', (0, 3)),
+        ('r"plain raw string"', (0, 2)),
+        ('br#"raw bytes { }"#', (0, 4)),
+        ('cr#"raw C string { }"#', (0, 4)),
+        ('r##"hashes ## inside"##', (0, 4)),
+    ]:
+        m = _RAW_PREFIX.match(src, 0)
+        check(f"prefix span {src[:12]!r}", None if m is None else m.span(), want_span)
+
+    # The raw opener must be recognised at the `r`, not one character later.
+    m = _RAW_PREFIX.match('r#"x"#', 0)
+    check("raw opener starts at the r", None if m is None else m.group(0), 'r#"')
+
+    # Near-misses: a prefix must not be recognised inside an identifier.
+    for src in ['var"x"', 'crab"x"', 'b"bytes"', 'xr"y"']:
+        m = _RAW_PREFIX.match(src, 0)
+        check(f"near-miss {src!r} is not a raw opener", m is not None, False)
+
+    # -- 2. through classify() ---------------------------------------------
+    # The exact literal that exposed the defect, followed by code.
+    src = 'r#"{"capability":"filesystem/write-text"}"#; let after = 1;'
+    check("raw literal is string", label(src, 'r#"'), "string")
+    check("code after raw literal is code", label(src, "let after"), "code")
+
+    # A raw string containing braces must not desynchronise matching.
+    src = 'fn f() { let s = r##"a { b "# c"##; let after = 1; }'
+    check("brace inside raw string is string", label(src, "{ b "), "string")
+    check("shorter quote/hash inside raw string is string", label(src, '"# c'), "string")
+    check("code after raw string is code", label(src, "let after"), "code")
+
+    # Ordinary escaped strings.
+    src = 'let s = "a \\" b"; let after = 1;'
+    check("escaped quote is string", label(src, chr(92) + ""), "string")
+    check("code after escaped string is code", label(src, "let after"), "code")
+
+    # Byte strings.
+    src = 'let s = b"bytes"; let after = 1;'
+    check("byte string is string", label(src, 'b"'), "string")
+    check("code after byte string is code", label(src, "let after"), "code")
+
+    # Char literal versus lifetime.
+    src = "let c = '{'; fn g<'a>(x: &'a str) { let after = 1; }"
+    check("char literal is string", label(src, "'{'"), "string")
+    check("lifetime is code", label(src, "'a"), "code")
+    check("code after lifetime is code", label(src, "let after"), "code")
+
+    # Nested block comments.
+    src = "/* outer /* inner { */ still comment */ let after = 1;"
+    check("nested comment is comment", label(src, "{"), "comment")
+    check("code after nested comment is code", label(src, "let after"), "code")
+
+    # Line comments.
+    src = "// a comment with { and a quote \"\nlet after = 1;"
+    check("line comment is comment", label(src, "{ and"), "comment")
+    check("code after line comment is code", label(src, "let after"), "code")
+
+    # `use super::{A, B};` is a balanced group, not an item body.
+    src = "use super::{A, B};\nfn f() { let after = 1; }"
+    check("use group braces are code", label(src, "{A"), "code")
+    check("code after use group is code", label(src, "let after"), "code")
+
+    # -- 3. the two mask views ---------------------------------------------
+    ddl = 'const S: &str = "CREATE TABLE t (id TEXT)";'
+    check("DDL hidden from code_mask", "CREATE TABLE" in code_only(ddl, code_mask(ddl)), False)
+    check("DDL visible to code_or_string_mask", "CREATE TABLE" in code_only(ddl, code_or_string_mask(ddl)), True)
+
+    # -- 4. structural matching keeps offsets ------------------------------
+    src = 'fn f() { let s = "}"; }'
+    m = delimiter_matches(src, code_mask(src))
+    check("delimiter count", len(m), 2)
+    check("blank_range preserves length", len(blank_range(src, 3, 7)), len(src))
+    check("blank_range preserves surrounding code", blank_range(src, 3, 7)[8:], src[8:])
+
+    if failures:
+        for f in failures:
+            print(f"FAIL {f}")
+        return 1
+    print("rustscan self-tests: all passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_selftest())

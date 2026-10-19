@@ -272,8 +272,109 @@ pub fn acquire_shared_for_tests(db_path: &Path) -> Result<SharedOwnership, Owner
     acquire_shared(db_path)
 }
 
+/// Test-only: a hook that fires **after** the shared lease is taken and **before** the
+/// recovery state is read.
+///
+/// It exists so the ordering can be proven rather than asserted in a comment: a test
+/// that installs a hook here can attempt to take the exclusive lease, and must fail,
+/// which is only true if the shared lease is already held.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::RefCell;
+
+    std::thread_local! {
+        static AFTER_SHARED_LEASE: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    }
+
+    /// Install `f` to run on this thread once the next shared lease has been taken.
+    pub(crate) fn after_shared_lease(f: impl Fn() + 'static) {
+        AFTER_SHARED_LEASE.with(|s| *s.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(crate) fn fire_after_shared_lease() {
+        let f = AFTER_SHARED_LEASE.with(|s| s.borrow_mut().take());
+        if let Some(f) = f {
+            f();
+        }
+    }
+}
+
+/// Surfaces a recovery failure as an ownership refusal.
+///
+/// Typed rather than a panic or a silent pass: a caller that cannot restore must be told it
+/// cannot open, and the message must name recovery so the refusal is not misread as a lock
+/// contention.
+fn ownership_error(e: crate::recovery::RecoveryError) -> OwnershipError {
+    OwnershipError::Unavailable {
+        path: lock_path_for(std::path::Path::new(""))
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+        source: std::io::Error::other(format!(
+            "an outstanding restore could not be completed: {e}"
+        )),
+    }
+}
+
 /// Acquire a shared lease. Fails fast if an exclusive owner holds the database.
+///
+/// # This is the recovery-aware boundary (F-26b)
+///
+/// **Both** entry points to a live database funnel through here or through
+/// [`acquire_exclusive`]: `Store::open`, `SqliteAuditJournal::open` and
+/// `SqliteApprovalLedger::open` each call `acquire_shared` before opening their own
+/// `Connection`, and `RestoreGuard::acquire_with` calls `acquire_exclusive`. `Store::open`
+/// alone is **not** the choke point — the audit that established that is recorded in
+/// `docs/12-verification-register.md` A-011.
+///
+/// So the outstanding-restore check lives here rather than in `Store::open`, and it runs
+/// **before** the lease is taken, so a database with an outstanding intent is never handed
+/// out usable.
+///
+/// Recursion is avoided by [`crate::recovery::complete_outstanding_restore`] taking its
+/// lease through the `_unchecked` variants below, which perform no recovery check. An
+/// outstanding intent therefore does not make recovery unable to run.
 pub(crate) fn acquire_shared(db_path: &Path) -> Result<SharedOwnership, OwnershipError> {
+    // **The lease is taken before the recovery state is read.** The two used to be
+    // separate operations, in the other order, and that was a race: a reader could
+    // check "no intent", and a restore could then publish an intent and crash before
+    // the reader took its lease, leaving the reader holding a lease on a database
+    // whose restore was outstanding.
+    //
+    // A restore publishes its intent while holding the **exclusive** lease, so a
+    // held shared lease means no new intent can appear. The read below is therefore
+    // not a stale observation that has to be re-taken afterwards.
+    //
+    // Two rounds, never more. The second round covers the case where an intent *was*
+    // outstanding: the shared lease is dropped, recovery completes under the exclusive
+    // lease, and the lease is taken again and the state re-read. If something is still
+    // outstanding after that, the caller is refused rather than served -- this fails
+    // fast and never retries indefinitely.
+    for _ in 0..2 {
+        let lease = acquire_shared_unchecked(db_path)?;
+        // The seam fires with the shared lease held, so a test can prove the ordering
+        // rather than infer it.
+        #[cfg(test)]
+        seams::fire_after_shared_lease();
+        if crate::recovery::restore_state(db_path) == crate::recovery::RestoreState::Idle {
+            return Ok(lease);
+        }
+        // Something is outstanding: an intent, a staging file, or an intent that will
+        // not parse. Release the shared lease so recovery can take the exclusive one,
+        // and let the recovery decide -- including refusing, if the intent is malformed.
+        drop(lease);
+        crate::recovery::complete_outstanding_restore(db_path).map_err(ownership_error)?;
+    }
+    Err(ownership_error(crate::recovery::RecoveryError::Io {
+        what: "the database did not settle: a restore is still outstanding".into(),
+        source: std::io::Error::other("outstanding restore"),
+    }))
+}
+
+/// The shared lease **without** the recovery check.
+///
+/// The lease only. It grants no authority a checked acquisition would refuse.
+pub(crate) fn acquire_shared_unchecked(db_path: &Path) -> Result<SharedOwnership, OwnershipError> {
     let path = lock_path_for(db_path);
     let file = open_lock_file(&path)?;
     file.try_lock_shared().map_err(|e| classify(&path, e))?;
@@ -287,6 +388,25 @@ pub(crate) fn acquire_shared(db_path: &Path) -> Result<SharedOwnership, Ownershi
 /// caller must release its shared lease first — see `TaskService::open`, which drops the
 /// store (and with it the shared lease) before asking for exclusive ownership.
 pub(crate) fn acquire_exclusive(db_path: &Path) -> Result<ExclusiveOwnership, OwnershipError> {
+    // The exclusive lease is taken **first**, and the recovery state is read under it.
+    // Reading first and locking second was the same race as on the shared path: a
+    // restore could publish an intent in between.
+    let lease = acquire_exclusive_unchecked(db_path)?;
+    // Under the exclusive lease, no other process can publish, complete or remove an
+    // intent, so this read is authoritative and the recovery that follows can install
+    // without re-taking the lease.
+    crate::recovery::complete_outstanding_restore_under_lease(db_path).map_err(ownership_error)?;
+    Ok(lease)
+}
+
+/// The exclusive lease **without** the recovery check.
+///
+/// Only recovery itself uses this, so that completing a restore does not recursively
+/// demand that it complete a restore. It grants no authority a checked acquisition would
+/// refuse; the only difference is which caller may ask without the check.
+pub(crate) fn acquire_exclusive_unchecked(
+    db_path: &Path,
+) -> Result<ExclusiveOwnership, OwnershipError> {
     let path = lock_path_for(db_path);
     let file = open_lock_file(&path)?;
     // `File::try_lock` is the *exclusive* non-blocking lock; `lock_shared` is the
