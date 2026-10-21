@@ -305,13 +305,15 @@ fn s31_role_body() {
             }
             drop(lease);
         }
-        "competitor" => match orxnud_store::sqlite::Store::open(&db, true) {
-            Ok(_store) => eprintln!("COMPETITOR: opened the database"),
-            Err(e) => {
-                eprintln!("COMPETITOR: refused — {e}");
-                std::process::exit(3);
+        "competitor" => {
+            match orxnud_store::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity) {
+                Ok(_store) => eprintln!("COMPETITOR: opened the database"),
+                Err(e) => {
+                    eprintln!("COMPETITOR: refused — {e}");
+                    std::process::exit(3);
+                }
             }
-        },
+        }
         "restorer" => {
             let conn = rusqlite::Connection::open(&db).expect("restorer seed");
             conn.pragma_update(None, "journal_mode", "WAL")
@@ -340,7 +342,7 @@ fn s31_role_body() {
             }
 
             snapshot
-                .restore_with_lease_for_tests(&db, lease)
+                .restore_with_lease_for_tests(&db, lease, &orxnud_platform_fs::OsIdentity)
                 .expect("restore must succeed once uncontended");
             eprintln!("RESTORER: restored");
         }

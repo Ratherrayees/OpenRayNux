@@ -107,7 +107,7 @@ Legend — **Cadence**: `event` (re-checked on a named trigger) · `quarterly` �
 phase gate).
 
 | ID | Claim | Verification source | Cadence / trigger | Last verified | Consequence of silent drift |
-| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — research candidate, not approved), and S-11's wider specification. **AMENDED 2026-10-17 (A-011): the public-schema-SQL route described by that residual gap is now closed and G16 also refuses production schema DDL — but F-26 remains OPEN**, because `orxnud-store` still publishes live `Connection` values and G16 is lexical enforcement, not a type-system guarantee. The original 2026-10-14 text follows, retained because it records what was measured.**
+| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — approved 2026-10-14 and implemented in source; Windows runtime unverified), and S-11's wider specification. **AMENDED 2026-10-17 (A-011): the public-schema-SQL route described by that residual gap is now closed and G16 also refuses production schema DDL — but F-26 remains OPEN**, because `orxnud-store` still publishes live `Connection` values and G16 is lexical enforcement, not a type-system guarantee. The original 2026-10-14 text follows, retained because it records what was measured.**
 
 The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
 §7-S30) owns the restore defect; S-11 (§7-S11) owns the six entry points. **S-11 is blocked on
@@ -538,10 +538,23 @@ Recorded here first so the discrepancy is not silent.
 ### A-008 — S-31: cross-process database ownership for the whole restore lifecycle
 
 **F-26c REMAINS OPEN.** The cross-process evidence below is sound for the paths it tests, but
-a follow-up review found a **real ownership bypass that is not fixed**: a database reachable
-through more than one hard link gets a lock file per name, so a competitor opening the alias
-participates in nothing. Until that is rejected, or the safety contract is explicitly narrowed
-and enforced, cross-process ownership is **not fully proven** and the finding stays open.
+a follow-up review found a **real ownership bypass**: a database reachable through more than one
+hard link gets a lock file per name, so a competitor opening the alias participates in nothing.
+Until that is rejected, or the safety contract is explicitly narrowed and enforced, cross-process
+ownership is **not fully proven** and the finding stays open.
+
+**AMENDED 2026-10-21 (A-013): the bypass is now rejected.** Every live-database open refuses a
+database whose inode has more than one name, through a filesystem-identity capability that
+`orxnud-store` depends on as a trait in `orxnud-domain` and the platform layer implements. The
+two-process and controlled-interleaving evidence in this row is **unchanged** and still passes.
+
+**AMENDED 2026-10-21 (A-016): a second ownership bypass is closed — a symlink whose target did
+not exist yet split the lease.** The key was derived from the *name* rather than the *target*,
+so it changed when the database was created, and two processes could hold what they believed
+was one lease. The key is now derived from the target, and is stable across the creation. See
+A-016.
+**F-26c nevertheless remains OPEN**, on the residual window and the platform-support grounds
+recorded in its own row — the bypass being closed is not the same as the finding being closed.
 
 **F-26 and F-26b also remain open.** All three are open; none is closed by this work.
 
@@ -574,11 +587,16 @@ releasing the lease) before calling `Backup::restore_coordinated`. `Store::into_
 returns the connection **and** its lease so the lease follows the connection when the store
 is consumed by the engine.
 
-**Lock identity.** `lock_path_for` canonicalises, resolves symlinks where the target exists,
-and for a not-yet-created database canonicalises the *parent* and joins the file name — so
-identity is absolute and stable rather than derived from the caller's string. The lock file
-is created with `create(true)` and never unlinked or replaced, so two processes racing to
-create it end on the same inode rather than on two lock files.
+**Lock identity.** `lock_path_for` resolves the configured path to the database it *names*:
+the parent is canonicalised, and the final component is followed through its symlink chain
+**even when the destination does not exist yet**, so the key is the same before and after
+the database is created and the same as the key derived from the target's own path. Identity
+is therefore absolute and stable rather than derived from the caller's string, and the
+derivation **fails closed** — a path it cannot settle yields a refusal, never a fallback to
+the caller's own text. (The earlier rule — canonicalise, and on failure canonicalise the
+*parent* and join the file name — is what A-016 corrects.) The lock file is created with
+`create(true)` and never unlinked or replaced, so two processes racing to create it end on
+the same inode rather than on two lock files.
 
 **Evidence.**
 
@@ -631,7 +649,9 @@ it is outside any public API and has its own unit test.
 **A-008 follow-up — review found three boundaries. Two were real defects and are fixed; one is
 an open blocker and is NOT fixed.**
 
-1. **Hard-linked aliases bypass ownership. REAL, and NOT FIXED.** Measured:
+1. **Hard-linked aliases bypass ownership. REAL, and NOW FIXED (A-013, 2026-10-21).** The
+   measurement and the reasoning below are what was true when it was written; the fix and what it
+   does and does not establish are recorded in A-013 and in the F-26c row. Measured:
    `state.db` and `alias.db` are one inode (20445) but `lock_path_for` produces
    `state.db.lock` and `alias.db.lock` — **two locks for one database**, so a competitor
    opening the alias participates in nothing. Keying locks by inode does not fix it:
@@ -645,6 +665,8 @@ an open blocker and is NOT fixed.**
    **unreachable from the crate that takes the lease**. Resolving it needs a design decision —
    an ownership API moved to a platform crate, or a link count carried across the boundary.
    **Until then ownership is not alias-safe**, and this row does not claim otherwise.
+   *(2026-10-21: the "until then" has arrived — see A-013. The residual TOCTOU window that
+   ADR-0058 Decision 2 approved as named-but-not-closed is still named, not closed.)*
 
 2. **The production restore seam was reachable. REAL, and FIXED.** The first seam triggered on
    `ORXNUD_S31_RESTORE_WINDOW` alone and was gated on `#[cfg(not(test))]`, which means it was
@@ -686,9 +708,10 @@ further portability fact was established by measurement.**
   against this toolchain's own `std` documentation (1.98.1): on Windows,
   `MetadataExt::number_of_links`, `file_index` and `volume_serial_number` are **nightly-only
   experimental** (`windows_by_handle #63010`). `identity` needs the latter two, so on stable
-  Windows the capability is unavailable *in full* and the fail-closed rule means the platform
-  implementation must either call native Win32 or **refuse every open on Windows**. That is a
-  support decision and is not this record's to make.
+  Windows the capability was then unavailable *in full*, and the fail-closed rule required either
+  native Win32 or **refusing every open on Windows**. A native Win32 path now exists (A-018), but
+  no Windows platform build or runtime test has verified it; the fail-closed requirement itself
+  is unchanged.
 * **Decision 2 approved — the residual window is not to be called closed.** Stronger enforcement
   (a custom VFS or equivalent) is to be *investigated*, with feasibility **and WAL interaction**
   evidenced, before any descriptor-backed opening is committed to. Nothing is proposed.
@@ -829,9 +852,15 @@ further portability fact was established by measurement.**
   been integrated into OpenRayNux**; Shape A and Shape B remain prototypes and this patch remains a
   research candidate requiring a deliberate production-design and availability decision.
 
-**Windows (decided 2026-10-14): fail closed, defer native.** Stable Windows supplies neither
-`name_count` nor `identity`, so Decision 1 means **every open is refused on Windows** until a
-native `GetFileInformationByHandle` path exists. Recorded as a support decision, not an omission.
+**Windows — historical disposition, decided 2026-10-14 and superseded in source by A-018: fail
+closed, defer native.** At that time stable Windows supplied neither `name_count` nor `identity`,
+so Decision 1 meant **every open was refused on Windows** until a native
+`GetFileInformationByHandle` path existed. That was recorded as a support decision, not an
+omission. A native `CreateFileW`/`GetFileInformationByHandleEx` path and the
+`SQLITE_FCNTL_WIN32_GET_HANDLE` main-handle check now exist. No Windows platform build has
+succeeded and no Windows runtime test has run, so the integration is unverified; unsupported
+filesystems still refuse through `Unknown`; `CreateFileW` long-path behavior is unvalidated
+because no `\\?\` prefix is used; and F-26c remains OPEN.
 
 **Limitations, stated rather than smoothed over.**
 * **Advisory locks coordinate only participants that follow the protocol.** A process opening
@@ -1141,9 +1170,110 @@ unmet: the protocol refuses to restore where directory durability cannot be esta
 and Windows crash durability has no evidence. The table above is retained as the
 pre-roll-forward record it is.
 
-### F-26c — feasibility research only (unchanged, still OPEN)
+### F-26c — the hard-link alias bypass is now rejected (partially closed)
 
-Recorded in ADR-0058 and **not** implemented. Against the shipped `libsqlite3-sys` 0.38.2 bindings,
+**AMENDED 2026-10-21 (A-013). F-26c remains OPEN, but the specific bypass it named is now
+rejected.** The distinction that governs this is the one ADR-0058 drew: *hard-link **detection**
+implemented* is not *hard-link **bypass** eliminated*. What is closed is the bypass; what remains
+open is the residual window and the platform support question, and both are stated below.
+
+**The bypass, and what now rejects it.** A database reachable through more than one hard link got
+one lock file per name, so a competitor opening the alias participated in nothing and could write
+while a restore installed a staged image. Every **ordinary** live-database open is now refused
+when the database's inode has more than one directory entry — **both** names, because the link
+count is a property of the inode and not of the name. (The recovery path's own opens are a
+bounded exception, accounted for below.) The refusal is typed
+(`OwnershipError::AliasUnsafe { reason: AliasRefusal::MultipleNames { name_count } }`) and names
+the count it observed, so an operator is told that a second name exists rather than left to
+guess.
+
+**Scope of "the bypass".** The bypass closed by this work is the **hard-link** alias of the
+**main database**. Two *different* bypasses existed alongside it and were closed separately: a
+symlink whose target did not exist yet splitting the lease (**A-016**), and a hard link to a
+**sidecar** — the `-wal` or `-shm` — giving a second database the protected database's wal-index
+and destroying its contents (**A-017**). The sentence above is not a claim that the ownership
+family has no remaining members.
+
+**Checked code paths.** The check is in `orxnud-store/src/alias.rs`, in two functions —
+`alias::open_shared` and `alias::open_exclusive` — that take the lease, observe the path, open it,
+observe the main-database handle (on Windows), and observe the path again. `Store::open`,
+`SqliteAuditJournal::open`, `SqliteApprovalLedger::open`, `open_and_migrate` and the restore guard
+all go through those two functions, so there is no **ordinary** route that can forget the check.
+Gate **G17** was **not** weakened to accommodate this: the open happens in the same function as
+the lease acquisition, which is the shape G17 already required of a legitimate file-backed open.
+
+**What is NOT checked, stated precisely, because "every open is checked" would be false.**
+
+* *Snapshot and staging files.* `Backup` opens the published snapshot and the staging file
+  directly. They are not the database under ownership, so a second name for one of them does not
+  bypass the ownership lease; and their integrity is covered by the staged-digest verification the
+  restore already performs.
+* *The recovery path's three live-database opens.* `recovery.rs` opens the live database at
+  `install_staged` (`:702`), `finalize_log` (`:785`) and `live_digest` (`:842`), and **none of
+  them is alias-checked**. This is a **deliberate, bounded exception**, and the reasoning is:
+  these opens are made by the **restorer**, which holds the **exclusive** lease and therefore
+  excludes every cooperating participant; the install is **in place**, so it preserves the inode
+  and cannot split the two names apart; and the restore's logical verification is the existing
+  control that catches a concurrent writer — it reports `RestoreUnverified` rather than a wrong
+  success. It is also reachable only for a database that was **not** aliased when the restore
+  started, because the restore path's own open (`alias::open_exclusive`) now refuses an aliased
+  database before any intent is published. Adding the check here would make the recovery
+  **refuse to complete** on an aliased database, leaving it half-restored until an operator
+  removes the alias — less available, and no safer. The residual is recorded rather than closed.
+* *The TP-7 crash verifier* (`orxnud-task/src/conformance/power_loss.rs`) opens the file a
+  `SIGKILL`ed child was working on. It deliberately takes no lease — the point is to inspect what
+  a dead owner left — and it reads rather than writes.
+
+**What the check does not establish — the residual window.** On **Unix**, the two observations
+are observations of a **path**. SQLite opens by filename (`sqlite3_open_v2` takes a path, and
+rusqlite's opening APIs likewise take paths), no public API exposes the Unix connection's
+descriptor, and `SQLITE_FCNTL_WIN32_GET_HANDLE` is a Windows VFS opcode. A path replaced and
+replaced back inside the window is therefore **not** detected there. `SQLITE_OPEN_NOFOLLOW`
+rejects symlinks and is not a hard-link defence. On **Windows**, that specific gap is closed for
+the main database by **A-018**: the store asks the live connection for its native handle,
+`SQLiteMainDatabase` carries the borrow without naming SQLite in the core, and the handle's
+full 128-bit identity must equal the post-open path observation, and the pre-open observation
+where one existed. The sidecars remain path observations on
+every platform, and a hard link created **after** the handle observation is not detected.
+ADR-0058 Decision 2 approved the narrower Unix guarantee rather than claiming it away, and the
+guarantee is stated against the bypass: *a database reached through more than one name is
+refused, and a file replaced during the open is detected unless it is replaced and restored
+inside the window* on Unix, or unless it is created after the Windows handle check. A path
+identity check is **not** verified connection identity on Unix, and this row does not claim it.
+
+**Platforms actually verified.** Linux (this host) only. The store's alias-safety suite
+(`crates/orxnud-store/tests/s31_alias_safety.rs`) creates a **real** hard link and asserts that
+the **real** platform implementation refuses it; the platform adapter's own suite
+(`orxnud-platform-fs`) asserts the link count and identity it reports. **No Windows behaviour has
+been verified on this host.** The native Windows implementation exists (A-018) and the CI lane
+now runs the focused Windows suites, but those results are **pending** until the lane runs.
+
+**Windows — current status.** The 2026-10-14 disposition answered `Unknown` for every existing
+file, because stable `MetadataExt::number_of_links`, `file_index` and `volume_serial_number` are
+nightly-only (`windows_by_handle` #63010). **A-018 supersedes that consequence**: the platform
+now opens the path with `CreateFileW`, queries `FILE_ID_INFO` and `FILE_STANDARD_INFO` through
+`GetFileInformationByHandleEx`, and inspects the file behind SQLite's actual main-database handle
+with `SQLITE_FCNTL_WIN32_GET_HANDLE`. The old `Unknown`-for-everything behaviour is gone, but
+the new path is **not yet verified at runtime** and no general Windows filesystem claim is made.
+`FileIdInfo` is not universal; a filesystem or redirector that cannot supply it is `Unknown`,
+and the store refuses, which is the intended fail-closed direction.
+
+**Relation to the neighbouring findings — none of them closes.**
+
+* **F-26b / S-30 remain OPEN.** The stale-`-wal` roll-forward protocol and the recovery-aware
+  opening boundary are untouched by this work. What changed is one more thing that has to be true
+  before a restore is safe: the database being restored must not be reachable through a second
+  name. Closing a prerequisite is not closing its dependent.
+* **S-11 remains OPEN.** Schema-changing migrations still require a verified recovery snapshot;
+  this work neither supplies one nor verifies one.
+* **S-31 remains implemented but NOT complete.** ADR-0058 Decision 3 requires S-31 to stay open
+  while a known bypass **or an unaccepted residual window** remains. The bypass is closed; the
+  residual window is named, not closed, and no explicit acceptance of the narrowed threat model
+  has been recorded. S-31 therefore stays open.
+* **F-26 remains OPEN** on its own terms (the six-entry-point requirement).
+
+**The earlier feasibility record is retained below, because it is what the research established
+and this work did not change it.** Against the shipped `libsqlite3-sys` 0.38.2 bindings,
 `sqlite3_vfs`, `sqlite3_file`, `sqlite3_io_methods`, `sqlite3_vfs_register`, `xOpen` and
 `xFullPathname` are all present, while `unixFile` — the private struct the 2026-10-14 proof cast at
 a hardcoded offset — is **not** exposed. A gate implementing `io_methods` over POSIX could
@@ -1151,17 +1281,801 @@ therefore avoid the undocumented-layout dependency.
 
 **That is feasibility, not safety.** No VFS has been integrated. Unsafe FFI and its audit;
 file-descriptor binding across SQLite's actual open path; WAL and rollback-journal behaviour
-including links created after a connection opens; a Windows implementation and Windows runtime
-evidence; upstream SQLite regression tests against an unmodified baseline; maintenance cost for
-the pinned SQLite version and upgrades; the availability/denial-of-service consequence of refusing
-a hard-linked database; and cross-process and filesystem limitations are all **unattempted and
+including links created after a connection opens; a Windows implementation (now written outside
+the VFS, see **A-018**) and Windows runtime evidence (still absent); upstream SQLite regression
+tests against an unmodified baseline; maintenance cost for the pinned SQLite version and
+upgrades; the availability/denial-of-service consequence of refusing a hard-linked database; and
+cross-process and filesystem limitations. The VFS-specific items are still **unattempted and
 unmeasured**.
 
 **F-26c remains OPEN.**
 
+### A-013 — F-26c: the filesystem-identity capability, and the alias-safety refusal it enables
+
+**F-26c remains OPEN (see its row for what is still open). F-26b, S-30, S-11, S-31 and F-26 are
+untouched by this work and none of them closes.**
+
+**The contract, in `orxnud-domain`.** `platform::FilesystemIdentity` is a trait, defined in the
+portable core and implemented by the platform layer — the direction every other contract in that
+module follows, and the only one that lets `orxnud-store` require the capability without naming an
+operating system. It answers **one** observation: `observe(path) -> FileFacts`, where `FileFacts`
+is `Absent` (the path does not exist), `Known { name_count, identity }` (the platform established
+the facts), or `Unknown { platform }` (it could not). Three states rather than two, because the
+ADR's own sketch — `Option<u64>` for the link count — cannot distinguish "the database does not
+exist yet" from "the platform cannot say", and Decision 2 would then have refused every fresh
+install. One observation rather than two, because two separate `stat` calls are two resolutions of
+the same path and can describe two different files while looking like one answer.
+
+**The implementation, in `orxnud-platform-fs`.** `OsIdentity` answers `Absent` for a path that
+does not exist (portable: `ErrorKind::NotFound`), and on Unix answers the real `st_nlink`, `st_dev`
+and `st_ino` from **one** `stat`. On every other platform it answered `Unknown` **at the time of
+this amendment**; **A-018 supersedes that on Windows**, where the native
+`CreateFileW`/`GetFileInformationByHandleEx` path now answers real facts. `hard_link_count` is
+unchanged and still the single implementation of the link count.
+
+**The enforcement, in `orxnud-store/src/alias.rs`.** `alias::open_shared` and
+`alias::open_exclusive` are the only places an **ordinary** live database is opened in the crate.
+Each takes the lease, observes the path, opens it, observes it again, and compares. The recovery
+path's three live-database opens are a deliberate exception and are accounted for in the F-26c
+row. The lease and the open are
+**one operation on purpose**: "own the database, then open it" and "check it is safe to own, then
+open it" are two properties that must hold for every open, and a caller that had to remember both
+would eventually forget one. Gate **G17** was **not** changed to accommodate this — the open
+happens in the same function as the lease acquisition, which is the shape G17 already required of a
+legitimate file-backed open. (G17's *scanner* was repaired on 2026-10-21, for a defect that had
+been hiding production code from it; see **A-014** below. The repair did not change this
+arrangement.)
+
+**The injection.** The capability is required: `Store::open`, `SqliteAuditJournal::open`,
+`SqliteApprovalLedger::open`, `open_and_migrate`, `recover_from_snapshot`,
+`Backup::restore_coordinated` and `TaskService::open` all take it as an argument, and there is no
+default and no convenience constructor that omits it. The production implementation is
+`orxnud_platform_fs::OsIdentity`, held by the daemon's composition root
+(`Components::identity`) and passed down. `orxnud-store` gained **no production** dependency on a
+platform crate: its only new production edge is `orxnud-domain` (the trait), and
+`orxnud-platform-fs` is a development dependency for tests.
+
+**The six planned cases, and where each one is.** ADR-0058's test plan has six rows: five new
+tests, named exactly as the ADR names them, and one preservation requirement.
+
+| # | Test | Source | Result |
+|---|---|---|---|
+| 1 | `an_ordinary_single_name_database_opens_normally` | `crates/orxnud-store/tests/s31_alias_safety.rs` | **pass** |
+| 2 | `a_database_reachable_through_two_names_is_refused` | same | **pass** |
+| 3 | `the_two_names_would_have_had_two_locks` | same | **pass** |
+| 4 | `an_unknowable_filesystem_is_refused_not_assumed_safe` | same | **pass** |
+| 5 | `a_file_replaced_during_the_open_is_detected` | same | **pass** |
+| 6 | `a_competing_process_is_excluded_during_the_restore_lifecycle`, `b_a_competitor_cannot_act_inside_the_checkpoint_to_restore_window`, `c_two_processes_may_both_hold_the_database_open_normally` | `crates/orxnud-store/tests/s31_two_process.rs` | **pass, unchanged** |
+
+Cases 1–3 use the **real** platform implementation against a **real** hard link, because a fake
+would prove the store's logic and nothing about the implementation that ships. Cases 4 and 5 need
+capabilities that cannot exist on a real filesystem — one that cannot answer, and one whose answer
+changes between calls — so they use a local scripted capability. **Case 6 is the preserved set and
+is the reason the two-process and controlled-interleaving evidence still stands**: the alias check
+was added *around* the ownership protocol, not instead of it.
+
+**Four cases beyond the plan, and why they exist.** The five planned tests do not distinguish
+"refused before the open" from "refused after it", and do not cover every side of the two-sided
+check. `a_database_aliased_when_the_open_begins_is_refused_before_it_is_opened`,
+`a_second_name_that_appears_during_the_open_is_refused`,
+`a_database_created_by_the_open_must_have_exactly_one_name` and
+`an_unanswerable_platform_is_refused_on_either_side_of_the_open` close those gaps. They are
+**additions, not plan entries**, and are named as such in the source.
+
+**One case at the composition root.** `crates/orxnud-daemon/tests/alias_safety.rs` drives
+`Daemon::attach_durable_security_state` — the daemon's own start-up path — against a real hard
+link, and asserts the refusal reaches the daemon's error surface and leaves the daemon unstarted.
+The store's suite proves the mechanism; this one proves the **composition root supplies the real
+capability**, which the store's suite cannot.
+
+**Mutation-checked.** Every check in the alias path was mutated and the suite re-run. **All were
+caught**, and each by a test that fails for the right reason:
+
+| Mutation | Caught by |
+|---|---|
+| pre-open link-count check removed | `a_database_aliased_when_the_open_begins_is_refused_before_it_is_opened` |
+| post-open link-count check removed (present-file arm) | `a_second_name_that_appears_during_the_open_is_refused` |
+| post-open link-count check removed (created-file arm) | `a_database_created_by_the_open_must_have_exactly_one_name` |
+| "unknown" treated as "absent" before the open | `an_unanswerable_platform_is_refused_on_either_side_of_the_open` |
+| "unknown" treated as safe after the open | `an_unanswerable_platform_is_refused_on_either_side_of_the_open` |
+| identity comparison removed | `a_file_replaced_during_the_open_is_detected` |
+| post-open check removed entirely | three tests |
+| pre-open check removed entirely | four tests |
+| the lease not taken before the open | `s31_entry_points.rs`: `c_task_service_open_refuses_through_its_own_opener`, `c_every_entry_point_participates_in_the_ownership_rule` |
+
+The first attempt at this mutation battery **missed** two of them — removing the pre-open
+link-count check was not caught, because with a real hard link the post-open check refuses too, and
+the two are indistinguishable from the outcome. That is a property of the *tests*, not of the code,
+and the two additional cases above were added because of it. The misses are recorded here rather
+than quietly fixed.
+
+**Commands and results, on this host (Linux).**
+
+```
+cargo fmt --all --check                                     clean
+cargo clippy --workspace --all-targets -- -D warnings       clean, exit 0
+cargo build --workspace --all-targets                        clean
+git diff --check                                             clean
+cargo nextest run --workspace --no-fail-fast                 1897 run, 1897 passed, 6 skipped, 2 leaky
+cargo test -p orxnud-store --test s31_alias_safety          10 run, 10 passed, 0 failed
+CI=true ./scripts/ci-gates.sh                                all gates pass (A-015 remediated G8/G11)
+```
+
+The **two leaky** tests are `orxnud-platform-sandbox::enforcement::a_repeated_kill_stays_deterministic`
+and `orxnud-platform-sandbox::resources::cgroup_kill_terminates_a_member_that_forked_a_descendant`.
+They are **not** related to this work and were not introduced by it.
+
+**The two failing gates are pre-existing and are not this work.** **G8** fails on
+`rustls-webpki 0.103.15` (RUSTSEC-2026-0382) and **G11** on `rustls-webpki 0.103.15`,
+`zbus_names 4.3.4`, `zvariant 5.15.0` and `zvariant_derive 5.15.0` (RUSTSEC-2026-0382,
+-0370, -0371, -0372). All four versions are pinned by **HEAD's** `Cargo.lock` and none was
+changed here: this work's only `Cargo.lock` change is two added dependency *edges*
+(`orxnud-platform-fs` as a dev-dependency of `orxnud-store` and `orxnud-task`), with no version
+change to any package. **G12** is skipped for want of a release tag, as it is in every run.
+
+**Tool versions.** `rustc 1.98.1`; `cargo-nextest 0.9.148` locally. The CI configuration pins
+**0.9.146** (`.github/workflows/ci.yml`, `scripts/install-nextest-verified.sh`); the local run used
+a newer patch release, so the nextest result above is from 0.9.148 and not from the pinned
+version.
+
+**What is not claimed.**
+
+* **Not a Windows claim.** No Windows behaviour was tested, and none is claimed. At the time of
+  A-013 the platform answered `Unknown` and every open of an existing database was refused — a
+  support decision (ADR-0058, 2026-10-14), not an accident. **A-018 supersedes that platform
+  behaviour on Windows; the runtime evidence it still lacks is the reason this remains unclaimed.**
+* **Not a claim that the connection is bound to the checked inode.** The observations are of a
+  path. See the F-26c row.
+* **Not a claim that S-31, S-30, S-11, F-26 or F-26b is closed.**
+* **Not a release-readiness claim.** The F-26c finding itself remains open, and its residual
+  TOCTOU window is named rather than closed. (The two dependency gates that were red at the time
+  of this row — G8 and G11 — were remediated afterwards; see **A-015**.)
+
+### A-014 — the scanner blind spot in G17, and the provenance of the G8/G11 failures
+
+**This is a verification-infrastructure amendment. It changes no F-26c behaviour, closes no
+finding, and narrows no threat model. F-26c, F-26b/S-30, S-11, S-31 and F-26 are all exactly as
+they were.**
+
+**The defect.** Gate **G17** requires that every production open of a file-backed SQLite database
+be preceded by an ownership acquisition, so that a database with an outstanding restore intent is
+never handed out usable. It finds those opens by scanning a *production view* of each source file:
+comments removed, and test-only items blanked. G17 is a structural lease check, not the two-sided
+alias check: `recovery.rs`'s three direct live-database opens take the exclusive lease through the
+`_unchecked` helpers and are deliberate exceptions to `alias::open_shared`/`open_exclusive` (see
+the F-26c row), not evidence that the connection-verification helper ran.
+
+The view was built by finding the item an attribute applies to **by searching forwards for an item
+keyword** (`fn`, `mod`, `impl`, `struct`, `enum`, `trait`, `const`, `static`). That silently
+attributes an attribute to a **later, unrelated** item whenever the item it really applies to is
+not one of those keywords — a `use` item, a macro invocation, or a statement — and then blanks
+**that later item's body**.
+
+The consequence was not cosmetic. In `crates/orxnud-store/src/backup.rs` the line
+`#[cfg(test)] use std::cell::RefCell;` sits immediately above `impl Backup { ... }`. The keyword
+search skipped the `use` item, found `impl`, and blanked the whole block. **608 lines of production
+code, including every `Connection::open` in it, were absent from G17's input**, and G17 had never
+inspected that file at all.
+
+| | Before | After |
+|---|---|---|
+| `backup.rs` production-view lines | 470 | 1,052 |
+| `backup.rs` production-view non-blank lines | 176 | 423 |
+| **File-backed opens visible to G17 in `backup.rs`** | **0** | **6** |
+| Production-view lines across all 112 production sources | 53,887 | 55,015 |
+
+Four files changed at all: `backup.rs` (+582), `crates/orxnud-daemon/src/runtime.rs` (+377),
+`crates/orxnud-store/src/recovery.rs` (+145), `crates/orxnud-store/src/ownership.rs` (+24).
+
+**The correction** is `rustscan.attributed_item_span`: the item is found from the text that
+*immediately follows* the attribute, and its extent is the matching `}` of the first `{` at depth 0
+(for a body-bearing item) or the first `;` at depth 0 (for a `use`, a `let`, or a statement). A
+`use` item's braces are a use tree, not a body, so a `use` ends at its `;` even though it contains
+braces. Depth is tracked over `()`, `[]` and `{}`, and the lexer still excludes strings, raw
+strings, character literals and comments, so a brace inside any of them cannot move a boundary.
+Both places that encoded the defective rule — `rustscan.test_only_regions` and
+`gate_policy.strip_cfg_test_fns` — now use that one helper.
+
+**The six sites G17 now sees.** All six are in `backup.rs`, and **none of them is the live
+database**: **three** open the published pre-migration snapshot
+(`<db>.pre-migration.bak` — `backup.rs:592`, `:727`, `:753`), **one** opens the snapshot staging
+file (`<db>.pre-migration.bak.staging-<pid>-<n>` — `backup.rs:412`), and **two** open the restore
+staging file (`<db>.restore-staging` — `backup.rs:731`, `:759`). Three plus one plus two is the six
+the gate reports, and each of the six is a distinct site with a distinct path expression.
+
+**A correction to an earlier statement of this breakdown.** It was reported as three published
+snapshot opens, **two** snapshot staging opens and two restore staging opens — which sums to seven,
+not to the six the gate reports. The scanner's own output settles it: there is **one** snapshot
+staging open (`backup.rs:412`, `dst_path`, inside `Backup::take_into`), because `Backup::take` writes
+the snapshot to a single staging name and `Backup::staging_path` is called once. The correct
+breakdown is 3 / 1 / 2. The count of *sites* was never in doubt; the split between the two kinds of
+staging file was.
+
+They are *copies* the crate creates
+and verifies — by `integrity_check` plus `schema_meta`, and by the staged-digest comparison — and
+they are neither under ownership nor subject to a restore intent. The live database's own open is
+in `crates/orxnud-store/src/alias.rs`, lease-adjacent, and checked.
+
+They are therefore accepted by a **per-site exemption**, keyed by (file, the path expression passed
+to `open`), with a prose reason for each: `dst_path`, `path`, `&self.path`, `&staging`. The
+exemption is deliberately **not** per-file: a file-level exemption would switch the rule off for
+every open in that file, including a future open of the live database there. The live database's
+path expression (`db_path`) is **not** among the exempted ones, so such an open in the same file is
+still refused — and `gate-selftest.py` pins that in both directions.
+
+**Regression tests.** `scripts/rustscan.py`'s own self-tests gained four cases for the item
+attribution (a `use` item, a macro invocation, a statement, and nested braces), and
+`scripts/gate-selftest.py` gained seven G17 cases: a production open after a `cfg(test)` macro
+invocation, after a `cfg(test)` `use` item and after a `cfg(test)` statement must all still be
+caught; a `cfg(test)` macro invocation's opens must still be excluded; an open of a derived file
+must be accepted; and an open of the live database in the same file must still be refused.
+
+**Negative controls — the tests fail when the defect is restored.** With the original
+keyword-search rule reinstated, `rustscan.py`'s self-tests report **4 failures** and
+`gate-selftest.py` reports **3 failures** (the `use`-item, the statement and the keyword-free
+macro cases). With the correction in place: **all rustscan self-tests pass** and **all 131
+boundary-gate self-tests pass**.
+
+**G8 and G11 — investigated, not inferred.** The F-26c report recorded that these two gates fail
+and concluded they were pre-existing because the `Cargo.lock` package set was unchanged. That
+conclusion is *correct*, but it was an inference, and it is replaced here by a direct measurement.
+
+* **What the gates check.** **G8** runs `cargo deny check licenses` and
+  `cargo deny check bans sources advisories`; **G11** runs `cargo audit`. Both read `Cargo.lock`
+  and `deny.toml`; neither reads the scanner.
+* **The failure.** `cargo deny`: `rustls-webpki 0.103.15` — **RUSTSEC-2026-0382**
+  ("Certificate verification may accept distrusted intermediates"), via `rustls v0.23.46` →
+  `orxnuctl` (dev) / `orxnud-daemon` (dev) / `tokio-rustls`. `advisories FAILED, bans ok,
+  sources ok`. `cargo audit`: the same vulnerability, plus three *allowed* unmaintained warnings —
+  **RUSTSEC-2026-0370** (`zvariant`), **-0371** (`zbus_names`), **-0372** (`zvariant_derive`).
+  Both exit 1.
+* **The baseline.** An isolated copy of HEAD was made with `git archive HEAD` into
+  `/tmp/opencode/head-baseline`, and **the same gate commands, the same tool versions
+  (`cargo-deny 0.20.2`, `cargo-audit 0.22.2`) and the same advisory database
+  (`~/.cargo/advisory-db`, fetched 2026-10-21)** were run there. **G8 fails identically
+  (`exit 1`, the same RUSTSEC-2026-0382) and G11 fails identically (`exit 1`, the same advisory
+  set).** A diff of the advisory blocks is empty apart from the file path and one extra
+  reverse-dependency line.
+* **That extra line, and where it comes from.** The current tree reaches `rustls` through one
+  more path, `orxnuctl (dev) → rustls v0.23.46`. `rustls` was **not** a dependency of `orxnuctl`
+  at HEAD; it was added to that crate's `[dev-dependencies]` by the **previous** session, for the
+  CLI's synthetic-TLS provider, and it is **not** part of the F-26c work.
+* **This task's own dependency edges, isolated.** A second isolated baseline was made with **only**
+  the two dev-dependency edges this work added (`orxnud-platform-fs` as a dev-dependency of
+  `orxnud-store` and of `orxnud-task`). `cargo deny` and `cargo audit` produce an **identical**
+  advisory set and identical exit codes. `orxnud-platform-fs` was already in the graph, and the
+  `Cargo.lock` package set is byte-identical to HEAD's (276 packages, no version changed).
+* **Conclusion.** **Both failures existed at HEAD.** The current tree adds one more *path* to a
+  package that was already fatally exposed, and **no new violation**. No advisory exception, licence
+  change or lockfile regeneration was made here.
+* **Superseded.** The advisory itself was **remediated** afterwards, by the lockfile-only bump to
+  `rustls-webpki 0.103.16` recorded in **A-015**. The provenance analysis above is unchanged and
+  is retained: it is the reason the bump was treated as a remediation rather than as a
+  no-op, and it is why "the package was already at HEAD" was never an answer on its own.
+
+**Status of the findings after this amendment.** Unchanged: **F-26c remains OPEN** (the residual
+TOCTOU window and the Windows limitation), **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**,
+**S-31 remains implemented but not complete**, and **F-26 remains OPEN**. Nothing here is a
+release-readiness claim.
+
+### A-015 — RUSTSEC-2026-0382 remediated: `rustls-webpki 0.103.15 -> 0.103.16`, and G8/G11 are clean
+
+**This closes the `rustls-webpki` advisory and nothing else.** No F-26c behaviour changed, no
+finding closed, no threat model narrowed: **F-26c remains OPEN** (residual TOCTOU window and the
+Windows limitation), **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**, **S-31 remains implemented
+but not complete**, and **F-26 remains OPEN**. The scanner correction and its regression tests are
+untouched by this work.
+
+**The advisory.** **RUSTSEC-2026-0382** / **CVE-2026-111943**, "Certificate verification may accept
+distrusted intermediates", package `rustls-webpki`, category `crypto-failure`, reported and issued
+2026-10-20. Patched ranges, read from the advisory itself (RustSec advisory database entry
+`crates/rustls-webpki/RUSTSEC-2026-0382.md`, and the published advisory page): `>= 0.103.16,
+< 0.104.0-alpha.1` and `>= 0.104.0-alpha.8`.
+
+**The exposure.** Affected versions may accept certificate paths containing distrusted emSign
+intermediate public keys when the configured trust anchors allow such paths; the private keys
+corresponding to those intermediates are now known.
+
+**Reverse dependency paths, before the update.** `rustls-webpki 0.103.15` was reached through
+`rustls 0.23.46`, and through it:
+
+| Parent | Kind | Through |
+|---|---|---|
+| `orxnud-daemon` | **production** | `rustls 0.23.46` directly |
+| `orxnud-daemon` | **production** | `tokio-rustls 0.26.6` |
+| `orxnud-daemon` | dev-dependency | `rustls 0.23.46` |
+| `orxnuctl` | dev-dependency | `rustls 0.23.46` |
+
+Exactly **one** resolved version of `rustls-webpki` existed anywhere in the workspace — there is no
+second copy to leave behind. (`cargo tree -i rustls-webpki --edges normal,build,dev --workspace`.)
+
+**The fix, and why nothing else had to change.** `rustls 0.23.46` declares
+`rustls-webpki = { version = "0.103.14", features = ["alloc"], default-features = false }`. That is
+a caret requirement — `>= 0.103.14, < 0.104.0` — so **0.103.16 is already inside the permitted
+range** and no parent crate, direct manifest constraint or `Cargo.toml` edit was needed. The
+resolution was a **lockfile-only** targeted update:
+
+```
+cargo update -p rustls-webpki --precise 0.103.16
+```
+
+**The exact lockfile delta — two lines, version and checksum:**
+
+```
+-name = "rustls-webpki"
+-version = "0.103.15"
++version = "0.103.16"
+-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
++checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
+```
+
+The new checksum matches the crates.io index entry for `rustls-webpki 0.103.16`, and the version is
+**not yanked** in the index. The workspace package set is unchanged at 276 packages: exactly one
+`(name, version)` pair changed (`rustls-webpki 0.103.15 -> 0.103.16`), **no** package was added or
+removed, **no** other version moved, and **no** other checksum changed. `rustls`, `tokio-rustls` and
+`rustls-pki-types` are all untouched.
+
+**Evidence that every affected path now resolves to a patched version.** `cargo tree -i
+rustls-webpki --edges normal,build,dev --workspace` after the update reports `rustls-webpki
+v0.103.16` as the single version, with the same four parent paths as before. 0.103.16 is inside the
+advisory's patched range `>= 0.103.16, < 0.104.0-alpha.1`. **Verified by inspection of the
+resolved graph, not assumed from the intent of the command.**
+
+**Reachability, assessed rather than assumed.** The advisory's precondition is that *the configured
+trust anchors allow* paths containing the distrusted emSign intermediates. In this repository:
+
+* The **production** client (`crates/orxnud-daemon/src/transport.rs:329`, `:345-347`) builds its
+  root store from `rustls_native_certs::load_native_certs()` — the **host's** trust store. Whether
+  that store contains such a path is a property of the host, which this repository does not
+  control, so the precondition **cannot be ruled out from the source**.
+* The **synthetic** HTTPS provider used by the CLI end-to-end suite
+  (`crates/orxnuctl/tests/cli_e2e.rs:3155-3163`) builds an **empty** `RootCertStore` and adds only
+  the test CA. The distrusted intermediates are not present, so the precondition **cannot hold**
+  there.
+
+The bump was made anyway, for the reason this register used for the four `rustls 0.23.45` advisories
+above: the fix is a patch release inside an already-permitted range, it costs nothing, and "no
+advisory is currently reachable" would be a statement about today's configuration rather than a
+property that survives someone changing the provider's trust anchors.
+
+**Gate evidence — G8 and G11 run separately.** Tools: `cargo-deny 0.20.2`, `cargo-audit 0.22.2`,
+`rustc 1.98.1`.
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| G8 (licences) | `cargo deny check licenses` | exit 0 | exit 0 — `licenses ok` |
+| G8 (supply chain) | `cargo deny check bans sources advisories` | **exit 1** — `advisories FAILED, bans ok, sources ok`, RUSTSEC-2026-0382 | **exit 0** — `advisories ok, bans ok, sources ok`, zero error blocks |
+| G11 | `cargo audit` | **exit 1** — 1 vulnerability + 3 allowed warnings | **exit 0** — 3 allowed warnings, no vulnerability |
+
+**The advisory database changed during this validation, and the fact is recorded.** The before-state
+was measured against advisory-db commit `e6f94f3760d5e6c54c1b05f204002263bc025524` (2026-10-20
+19:07:46 UTC). The after-state was measured against commit
+`4b587f00996ebe5c05a73eaef105ef241e876414` (2026-10-20 22:54:18 +0100), fetched 2026-10-21
+12:15:14 +0530, 1348 advisories loaded. The two intervening commits (`8c254009`, `4b587f00`) both
+classify the `webpki-roots` / `webpki-root-certs` compatibility wrapper, and
+`git diff e6f94f3 4b587f00 -- crates/rustls-webpki/` is **empty**: the advisory this work acts on
+did not change.
+
+**The verdict change is attributable to the version bump, not to the database refresh.** Control: the
+*current* advisory database was run against the *pre-update* `Cargo.lock` in an isolated copy of the
+working tree (`/tmp/opencode/preupdate`, the tree as it stood before the update with the old
+lockfile restored). It reported `rustls-webpki 0.103.15` / RUSTSEC-2026-0382 and **exited 1** with
+1348 advisories loaded. Same database, old lockfile, failure; new lockfile, same database, pass.
+
+**What was deliberately not done.** No advisory exception was added. `deny.toml` was not modified.
+No gate behaviour was changed. `scripts/rustscan.py`, `scripts/gate_policy.py` and
+`scripts/gate-selftest.py` were not touched. No direct dependency on `rustls-webpki` was added — the
+resolver selects the patched version on its own, so a manifest entry would have been a workaround
+for a constraint that does not exist. The three **unmaintained** warnings (`zvariant` 5.15.0 /
+RUSTSEC-2026-0370, `zbus_names` 4.3.4 / -0371, `zvariant_derive` 5.15.0 / -0372) were **not** acted
+on: they are allowed by policy (`unmaintained = "workspace"`) and silencing them would need a
+separate impact and maintenance assessment of the `keyring`/`secret-service` subtree.
+
+**Validation performed (2026-10-21).**
+
+```
+cargo update -p rustls-webpki --precise 0.103.16      exit 0 — two-line lockfile delta
+cargo tree -i rustls-webpki --edges normal,build,dev  single version: 0.103.16
+cargo deny check licenses                             exit 0
+cargo deny check bans sources advisories              exit 0 — advisories ok, bans ok, sources ok
+cargo audit                                           exit 0 — 3 allowed warnings, 0 vulnerabilities
+cargo fmt --all --check                               exit 0
+cargo clippy --workspace --all-targets -- -D warnings exit 0
+cargo build --workspace --all-targets                 exit 0
+cargo build -p orxnud-daemon --bin orxnud             exit 0 — daemon binary refreshed for the CLI suite
+cargo test -p orxnud-daemon --test http_provider      24 passed, 0 failed
+cargo test -p orxnud-daemon --test https_provider     11 passed, 0 failed
+cargo test -p orxnud-daemon --test credential_hygiene 10 passed, 0 failed
+cargo test -p orxnuctl --test cli_e2e                 42 passed, 0 failed
+CI=true ./scripts/ci-gates.sh (nextest 0.9.146)       exit 0 — all selected gates passed (G12 skipped)
+cargo nextest run --workspace                         1897 run, 1897 passed, 6 skipped
+cargo test --workspace --all-targets                  exit 0, 0 failed
+git diff --check                                       exit 0
+```
+
+The `orxnud` daemon binary was rebuilt before the CLI end-to-end suite, because that suite
+refuses to run against a daemon binary older than the daemon's source.
+
+**Not claimed.** No Windows validation was performed; this is a Linux host. The three unmaintained
+warnings remain. The two "leaky" sandbox tests (`orxnud-platform-sandbox::enforcement::
+a_repeated_kill_stays_deterministic` and `::resources::cgroup_kill_terminates_a_member_that_forked_a
+_descendant`) are unrelated to this work and were not introduced by it. **No release-readiness is
+claimed.**
+
+### A-016 — the dangling-symlink ownership bypass: the lease key is now derived from the target, and is stable
+
+**This closes one demonstrated S-31 ownership bypass and nothing else.** F-26c remains OPEN, and
+so do F-26b/S-30, S-11, S-31 and F-26. The pathname-to-SQLite-connection race, the Windows
+identity limitation and the sidecar questions are all untouched — see "What this does not
+close" below.
+
+**The failure.** The ownership lease is keyed by a path-derived lock file. The key was derived by
+canonicalising the configured path and, when that failed, falling back to the canonicalised
+**parent** plus the file name.
+
+`canonicalize` fails when the final component does not exist — and a database that does not
+exist yet is the *normal* state of a database about to be created. So the fallback decided the
+key from the *name* rather than from the *target*, and therefore **changed when the database
+was created**:
+
+```text
+state.db -> victim.db        (victim.db does not exist yet)
+
+first process   canonicalize fails    ->  state.db.lock
+(the open creates victim.db)
+second process  canonicalize succeeds ->  victim.db.lock
+
+=> TWO lock files for one database
+```
+
+**Why it mattered.** It is the same class of bypass as the hard-link alias ADR-0058 refuses: the
+lease is keyed by name, so a second name reaches a second lock file, and a process holding it
+participates in nothing. A restore's **exclusive** lease therefore did not exclude it. The
+attacker capability is the same as for the hard-link alias — the ability to create a name in the
+state directory — and the alias check did not catch it, because the symlink resolves to a
+single-name file.
+
+**The correction.** `lock_path_for` now resolves the database a configured path *names*, rather
+than the name it was given:
+
+* the **parent** is canonicalised, so `.`, `..` and symlinked parent directories are settled
+  once;
+* the **final component** is followed through its symlink chain **even when the destination
+  does not exist**, so the key is the file the path will name once the database is there;
+* a final component that is not a symlink keeps its name, whether or not it exists.
+
+The derivation is now **fallible**, and it fails closed. `lock_path_for` returns
+`Result<PathBuf, OwnershipError>`; the refusal is `OwnershipError::Unavailable` — the variant
+that already meant "the ownership lock could not be established" — and it is raised for an
+unresolvable parent, an unreadable symlink destination, a destination whose parent directory
+does not exist, and a symlink loop. The old "last resort" branch, which fell back to the
+caller's own string, **is gone**: a key derived from an unresolved path is not a stable
+identity, and two processes would not meet on it.
+
+One incidental repair came with it. The recovery-error mapper reported a path derived from an
+**empty** path — a fabricated name that named nothing the caller could act on. It now reports
+the path it was working on.
+
+**What was tested.** Six new tests, in `crates/orxnud-store/tests/s31_lease_key.rs`:
+
+| Test | Establishes | Result |
+|---|---|---|
+| `a_dangling_symlink_target_keeps_one_lease_key` | the exact reproduction: the key before the target exists, after it exists, and from the target's own path are **one** key | **pass** |
+| `an_exclusive_lease_through_a_dangling_symlink_excludes_the_direct_target` | actual exclusion: with the exclusive lease held through the symlink, a competing open through the **direct target** is refused with `OwnershipError::Conflicted`, and succeeds once the lease is released | **pass** |
+| `a_symlink_to_an_existing_database_shares_the_lease` | the pre-existing semantics are preserved: an alias of an existing database shares the lease, and the alias cannot bypass an exclusive lease | **pass** |
+| `a_missing_database_in_an_existing_directory_keeps_one_lease_key` | the ordinary case the old fallback existed for: an absolute key, unchanged by the database's creation | **pass** |
+| `an_unresolvable_database_path_is_refused_rather_than_guessed` | a symlink loop and a destination whose directory does not exist are **refused**, not guessed, and the refusal names the database | **pass** |
+| `a_hard_linked_database_gets_two_lease_keys_and_is_refused` | the hard-link case is unchanged: two names keep two lease keys, which is why the alias check — and not the lease — is what refuses the alias | **pass** |
+
+At the time of this amendment the existing S-31 suites were **unchanged and passing**:
+`s31_entry_points.rs` (3 tests), `s31_two_process.rs` (4 tests), `s31_alias_safety.rs` (10 tests
+then; A-018 later added four cases, for 14 now), and the `ownership` unit tests (352 in the
+store's lib target, 0 failed).
+
+**The negative control.** With the pre-fix algorithm reinstated as a temporary mutation — the
+`canonicalize`-then-fallback rule, restored verbatim — **three of the six fail**:
+`a_dangling_symlink_target_keeps_one_lease_key`,
+`an_exclusive_lease_through_a_dangling_symlink_excludes_the_direct_target` and
+`an_unresolvable_database_path_is_refused_rather_than_guessed`. The other three still pass,
+which is the point: they assert semantics the fix must *preserve*, not semantics it introduces.
+The mutation was reverted immediately and the restored file's SHA-256 verified against the
+pre-mutation hash.
+
+**The architectural boundary is unchanged.** The derivation lives in one place —
+`ownership::lock_path_for` — and the only production consumers of it are
+`acquire_shared_unchecked` and `acquire_exclusive_unchecked`, so no caller can derive a lock
+path by another route. `alias.rs` does not compute lock paths at all, and no new algorithm was
+added beside the old one. No new **production** dependency was added (the store's
+`orxnud-platform-fs` edge is development-only), no `unsafe` was introduced, no SQLite mechanism
+was touched, and gate **G17**'s view of the tree is unchanged: the same thirteen file-backed
+opens, the same six per-site exemptions, and the same result.
+
+**What this does NOT close.**
+
+* **The pathname-to-SQLite-connection race was untouched at the time of this amendment.** The
+  alias-safety check observed a *path* before and after `Connection::open`; it did not establish
+  that SQLite's connection referred to the file those observations saw. A path changed and
+  changed back inside the window was not detected, and ADR-0058 Decision 2's approved limitation
+  stood. **A-018 closes this for the Windows main database** by inspecting the live connection's
+  native handle; the Unix path and every sidecar remain path observations.
+* **Windows identity was untouched at the time of this amendment.** The platform implementation
+  answered `Unknown` on stable Windows, and every open of an existing database was refused.
+  **A-018 supersedes this**: `GetFileInformationByHandleEx`, `SQLITE_FCNTL_WIN32_GET_HANDLE` and
+  the native Windows identity path now exist. Runtime verification is still pending.
+* **The sidecar questions were open when this row was written, and were closed afterwards.**
+  A hard link to the `-wal` or `-shm` file was not detected, because SQLite's own
+  `verifyDbFile` skips every file that is not the main database. See **A-017**.
+* **The threat model is unchanged.** This removed one bypass; it did not narrow what an attacker
+  may attempt.
+* **No decision record was changed.** ADR-0058 describes S-31's mechanism as "a stable
+  per-database lock file", which remains true and is now stable in a stronger sense. Its
+  Decisions 1–4 are unaffected. **No ADR update is required by this correction**; the one place
+  the old rule was written down — A-008's "Lock identity" paragraph — is corrected above.
+
+### A-017 — F-26c: an aliased `-wal` or `-shm` is refused, and the restore path is protected
+
+**This closes one demonstrated sidecar bypass and nothing else.** F-26c remains OPEN, and so do
+F-26b/S-30, S-11, S-31 and F-26. At the time of A-017 the pathname-to-SQLite-connection race, the
+Windows identity limitation and the WAL-content vector were all untouched. **A-018 afterwards
+supersedes the Windows identity limitation and closes the main-database half of the pathname
+race on Windows**; the sidecar race and the WAL-content vector remain.
+
+**The reproduction.** The main database's link-count check does not cover the sidecars, and
+cannot: a hard link to the live `-shm` gives a **second database** a valid wal-index. The two
+databases then share one index over one log, and the demonstrated consequence is that the
+protected database's contents disappear — while `PRAGMA integrity_check` still answers `ok`:
+
+```text
+hard link  state.db-shm -> evil.db-shm
+open evil.db; write to it
+-> state.db's rows are gone, and integrity_check says ok
+```
+
+The control without the alias preserved the contents. The same shape was reproduced for the
+write-ahead log: the alias made the second database's write land in the **live** database's WAL
+inode, though no content impact was demonstrated in that case.
+
+**Why SQLite does not help.** From the bundled **3.53.2** amalgamation: `sqlite3.c:46962` sets
+`noLock = eType!=SQLITE_OPEN_MAIN_DB;`, and `sqlite3.c:41836` is the first line of
+`verifyDbFile` — `if( pFile->ctrlFlags & UNIXFILE_NOLOCK ) return;`. Every open that is not the
+main database is NOLOCK, so SQLite's own hard-link, unlink and movement checks **never** reach the
+WAL, the shared-memory index, the rollback journal or a temporary file.
+
+**What was built.** `crates/orxnud-store/src/alias.rs` gained a `SidecarGuard` over the three
+sidecar names SQLite derives from a database path — `-wal`, `-shm` and `-journal`. The guard uses
+the **existing** domain contract (`FilesystemIdentity`, `FileFacts`) and the existing platform
+implementation; no second identity API was introduced, no new **production** dependency was
+added (the store's `orxnud-platform-fs` edge is development-only), and no `unsafe` was written.
+
+**The lifecycle boundaries.** The guard is applied at three points, all of them in the production
+opening path rather than in a helper:
+
+| Boundary | What it does | Why there |
+|---|---|---|
+| **Before the lease** (`alias::open_shared`, `alias::open_exclusive`) | link count of every sidecar that exists | it precedes any roll-forward install the lease acquisition may perform, and it is where the demonstrated attack is caught — the alias exists before the second database is opened |
+| **After the open and after WAL activation** (`Store::open`, `SqliteAuditJournal::open`, `SqliteApprovalLedger::open`) | link count again, of the sidecars that exist | SQLite materialises the sidecars when the journal mode is applied, so a check immediately after `Connection::open` would look at a directory that did not have them yet |
+| **Before the restore's checkpoint** (`RestoreGuard::acquire_with`) | link count again | the restore checkpoints the live database, installs a staged image in place and removes the sidecars; an aliased sidecar must be refused before any of that |
+
+The logic lives in **one** place — `SidecarGuard` — and every boundary calls it. No call site
+implements its own metadata check.
+
+**Unknown metadata fails closed.** A sidecar whose link count the platform cannot report is
+**refused**, with the platform named. `FileFacts::Unknown` is never read as "one name". At the
+time of A-017 the Windows adapter answered `Unknown` for every existing file, so the sidecar
+guard refused there; **A-018 supersedes that** by making the native adapter answer real link
+counts. A Windows filesystem whose `FileIdInfo`/`FileStandardInfo` query fails still answers
+`Unknown` and is refused. The sidecar check remains a **path** observation on every platform, so
+A-017's residual window is unchanged.
+
+**A missing sidecar is not an error.** SQLite creates and removes the sidecars around a
+connection's life, so a first open sees no sidecar at all and a later open may see a different
+one. `FileFacts::Absent` is accepted, and only an *existing* sidecar is examined.
+
+**The restore behaviour with an aliased sidecar.** The restore is refused **before** the
+checkpoint, before anything is staged or installed, and before any sidecar is removed. The
+protected database is left with its original content and its sidecars as they were, and it remains
+readable and `PRAGMA integrity_check` still answers `ok`. The restore succeeds once the alias is
+gone. The alias is caught by the **pre-lease** check, so the refusal happens before the exclusive
+lease is taken and there is no ownership state to finalise; a refusal from the later
+post-open check would drop the lease with the error, as every other failure on that path does.
+
+**What is deliberately *not* checked, and why.** The sidecar's **identity** is not compared across
+the two observations. **SQLite manages the sidecars' lifetimes**, not this crate: a hot
+write-ahead log recovered at open time is checkpointed and the log is then deleted and recreated,
+so the file at `state.db-wal` after an open is routinely a *different* file from the one there
+before. Comparing the two refuses every crash recovery — the daemon's own
+`a_crash_after_expiry_and_before_reapproval_still_recovers` is exactly that case, and it was caught
+by the test suite while the check was in place. A recreation and an attack are not distinguishable
+by identity alone, so identity is not used as a signal for the sidecars. The **link count** is,
+and it is the one that catches the attack. The **main database's** identity continuity is
+unaffected: that file is not recreated by SQLite, and its two-sided check still applies to it.
+
+**What remains unprotected by this check.**
+
+* **It is a path check.** The sidecar is observed by name, and nothing here proves which
+  descriptor SQLite used. A sidecar relinked *inside* the window between the observation and
+  SQLite's use of it is not detected — the same pathname race that applies to the main database.
+* **The WAL-content vector.** The alias lets a second database's write land in the live
+  write-ahead log's inode. No content impact was demonstrated, because the injected frames sat
+  past the live database's own frame count and were discarded when the last connection closed; a
+  crash that made them reachable was not reproduced.
+* **The derived files.** The snapshot staging file and the restore staging file are opened
+  directly and are in the rollback-journal mode a fresh file gets. They are not the database under
+  ownership, and their integrity is covered by the staged-digest comparison.
+* **The threat model is unchanged.** This removed one bypass; it did not narrow what an attacker
+  may attempt. The attacker still needs the ability to create a hard link to the sidecar, which
+  means the same user as the daemon, or write access to the sidecar itself.
+
+**The tests.** `crates/orxnud-store/tests/s31_sidecar_alias.rs`, five tests:
+
+| Test | Establishes | Result |
+|---|---|---|
+| `an_aliased_shm_sidecar_is_refused_by_the_store` | the reproduced attack: the aliased `-shm` is refused through the real `Store::open`, the refusal names the sidecar and the count, the protected rows survive, and the protected database's *own* aliased `-shm` is refused too | **pass** |
+| `an_aliased_wal_sidecar_is_refused_by_the_store` | the same for the live `-wal` | **pass** |
+| `the_restore_path_refuses_an_aliased_sidecar` | the real restore path (`Backup::take` / `restore_coordinated`) refuses before the checkpoint, leaves the database intact and `integrity_check` `ok`, and succeeds once the alias is gone | **pass** |
+| `the_ordinary_wal_lifecycle_is_accepted` | the ordinary lifecycle — first open with no sidecar, write, checkpoint, close, reopen, write, reopen — is never reported as an alias | **pass** |
+| `unknown_sidecar_metadata_fails_closed` | a capability that cannot answer for a sidecar is refused, naming the platform and the sidecar | **pass** |
+
+**The negative control.** With the guard disabled — a temporary, reversible mutation, reverted
+immediately and the restored file's SHA-256 verified — **four of the five fail**: the two alias
+cases, the restore case and the unknown-metadata case. The lifecycle test still passes, because it
+asserts the *absence* of false refusals.
+
+**The architecture is unchanged.** `orxnud-store` still depends on the domain contract and has no
+production dependency on `orxnud-platform-fs`; no platform-specific logic left the platform
+crates; no `unsafe` was added; this sidecar pass added no production dependency and changed no
+dependency version; gates **G2d**, **G3**, **G4**, **G16** and **G17** all pass; and **G17's**
+per-site exemption list is untouched. The scanner's view of the changed files
+was inspected: `alias.rs` is entirely visible to it (586 of 586 lines, and the two
+lease-adjacent opens in it are seen), and the six snapshot and staging opens in `backup.rs` remain
+visible and still exempt.
+
+**Why F-26c remains OPEN.** The alias is refused at the open, but the refusal is a **path**
+observation: it does not establish that SQLite's connection refers to the file that was observed.
+The residual pathname-to-connection race is unchanged **at the time of A-012**, and the Windows
+identity limitation is unchanged **at that time**; **A-018 later closes the Windows main-database
+half and leaves the Unix half and the sidecars open**. ADR-0058 Decision 2's approved limitation
+still stands. Closing F-26c needs the residual window closed or explicitly accepted, and neither
+has happened.
+
+### A-018 — F-26c: native Windows file identity and the actual SQLite main-database handle
+
+**This removes the "Windows cannot answer" consequence and closes one half of the
+pathname-to-connection gap. F-26c remains OPEN**, because the Unix main database is still
+observed only by path, every sidecar is still observed only by path, a hard link created
+after the handle observation is not detected, and Windows runtime evidence is pending.
+F-26b/S-30, S-11, S-31 and F-26 are untouched.
+
+**What was wrong.** The 2026-10-14 Windows disposition made Windows fail closed by answering
+`Unknown` for every existing file: stable `std::fs::Metadata` exposes neither the link count
+nor a stable file identifier (`windows_by_handle` #63010). That was safe and unusable. It
+also left the pathname-to-connection race untouched on every platform: the two observations
+are observations of a path, and `sqlite3_open_v2` takes a path, so a file swapped between
+the pre-check and SQLite's own open was not seen.
+
+**The identity representation, and why it changed shape.** `FileId` is now an enum:
+`FileId::Unix { dev, ino }` for the POSIX pair and `FileId::Windows { volume_serial,
+file_id: [u8; 16] }` for the native Windows identity. The Windows fields come from
+`FILE_ID_INFO`, whose `FileId.Identifier` is **128 bits**. The full value is kept. It is not
+truncated to a 64-bit `ino`, and it is not hashed, because either would turn an exact
+"same file" comparison into a collision question. The two variants are not convertible, so
+an identity observed on one platform cannot be mistaken for one observed on another.
+
+**The native path observation, in `orxnud-platform-fs/src/windows.rs`.** `OsIdentity::observe`
+now calls that module on Windows. It:
+
+1. converts the path to NUL-terminated UTF-16 (refusing an interior NUL rather than letting
+   `CreateFileW` silently observe a different path);
+2. calls `CreateFileW` with `FILE_READ_ATTRIBUTES`, share modes read/write/delete,
+   `OPEN_EXISTING`, `FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS`;
+3. queries that one handle with `GetFileInformationByHandleEx(FileIdInfo)` and
+   `GetFileInformationByHandleEx(FileStandardInfo)`, so the identity and the link count are
+   two facts about one resolution of the path;
+4. closes the handle through an RAII wrapper before returning.
+
+`ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND` are `FileFacts::Absent`. Every other
+failure — access denied, an unsupported filesystem, a handle query that fails — is
+`FileFacts::Unknown`, which the store refuses. No safe-looking default is substituted.
+
+**The actual connection handle.** The portable contract gained
+`FilesystemIdentity::observe_sqlite_main(SqliteMainDatabase<'_>) -> SqliteMainFacts`, with
+three states: `NotApplicable` (the platform has no such API), `Known { name_count, identity }`,
+and `Unknown { platform }`. `SqliteMainDatabase` is a borrowed `dyn Any` wrapper, so
+`orxnud-domain` does not gain a `rusqlite` dependency or name an operating system. The
+Windows implementation downcasts it to `rusqlite::Connection`, calls the unsafe
+`Connection::handle()`, then
+`sqlite3_file_control(db, "main", SQLITE_FCNTL_WIN32_GET_HANDLE, &mut handle)`. It requires
+`SQLITE_OK` and a usable handle, queries that **borrowed** handle for the same two native
+facts, and **never closes it** — the handle belongs to SQLite. An in-memory connection, a
+failed file-control, or a handle query that fails is `Unknown`, not `NotApplicable`.
+
+**The enforcement, in `orxnud-store/src/alias.rs`.** Immediately after
+`rusqlite::Connection::open` and before any `PRAGMA` or WAL work, `open_shared` and
+`open_exclusive` observe the main handle. They then take the post-open path observation and
+compare all three:
+
+* the handle's `name_count` must be exactly one;
+* if the path existed before the open, the handle's identity must equal the pre-open identity;
+* the handle's identity must equal the post-open identity always.
+
+A failure is a typed `AliasRefusal`: `MainDatabaseUnknown { platform }`,
+`MainDatabaseIdentityChanged`, or `MainDatabaseMultipleNames { name_count }`. None is
+converted into an open. `NotApplicable` is the only accepted "no handle evidence" answer,
+and it is returned only by platforms with no such API; Windows never returns it.
+
+**The unsafe boundary.** `orxnud-platform-fs` changed from `#![forbid(unsafe_code)]` to
+`#![deny(unsafe_code)]` with one local `#[allow(unsafe_code)]` module and `SAFETY` comments
+on every block. That is the same arrangement `orxnud-platform-ipc` already uses for
+`SO_PEERCRED`, and gate G4 already permits `unsafe` in `orxnud-platform-*`. No other crate
+gained `unsafe`, no **production** dependency was added to `orxnud-store` (its
+`orxnud-platform-fs` edge is development-only), and `orxnud-domain` still does not depend on a
+platform crate or on SQLite. `windows-sys 0.61.2` and `rusqlite` are
+target-specific dependencies of `orxnud-platform-fs`; the lockfile version of
+`windows-sys` is the one already present.
+
+**What was verified on this host, and what was not.** Linux only:
+
+* `cargo test -p orxnud-platform-fs` — **16 passed, 0 failed, 0 ignored**.
+* `cargo test -p orxnud-store` — **401 passed, 0 failed, 1 ignored** across the unit and
+  integration targets, plus one ignored doc test. The focused suites were
+  `s31_alias_safety` (14 passed, including four new main-handle cases) and
+  `s31_sidecar_alias` (5 passed).
+* `cargo clippy -p orxnud-domain -p orxnud-platform-fs -p orxnud-store --all-targets -- -D warnings`
+  — clean.
+* `RUSTDOCFLAGS="-D warnings" cargo doc -p orxnud-domain -p orxnud-platform-fs -p orxnud-store --no-deps`
+  — clean.
+* `cargo fmt --all --check` — clean.
+* `scripts/gate_policy.py` `g2d`, `g3`, `g4`, `g17` — exit 0.
+
+**Windows is not verified by any of that.** The Windows-only tests were not compiled or
+run on this Linux host. `cargo check --target x86_64-pc-windows-msvc -p orxnud-domain`
+succeeds, which proves the portable contract compiles for Windows. Compiling
+`orxnud-platform-fs` for either Windows target on this host is **blocked by the missing C
+toolchain**: `x86_64-pc-windows-msvc` fails in `cc-rs` with `failed to find tool "lib.exe"`,
+and `x86_64-pc-windows-gnu` fails with `failed to find tool
+"x86_64-w64-mingw32-gcc"`. Both failures occur in `cc-rs` before the Windows Rust implementation
+is compiled. They are caused by the missing host C toolchain, and the attempt neither proves nor
+disproves that the Windows Rust code compiles; source compilation remains unverified. The CI lane
+`windows-portability` now runs `cargo test -p orxnud-store --test s31_alias_safety --test
+s31_windows_identity` on `windows-2025`; it does **not** select `s31_sidecar_alias`. Its existing
+`-p orxnud-platform-fs` step runs the three native unit tests (`s31`-style integration tests
+are under `tests/s31_windows_identity.rs`, which is `#![cfg(windows)]`). Those results are
+**pending** until the lane runs at least once, and the job's 20-minute timeout has not been
+validated with the new bundled-SQLite build.
+
+**Filesystems.** No general Windows filesystem claim is made. The tests require NTFS (or
+another filesystem that supports hard links); if the scratch filesystem cannot create one,
+the hard-link test fails with that reason instead of passing without measuring it.
+`FileIdInfo` is not universal: a filesystem or network redirector that does not supply a
+128-bit file id makes the observation `Unknown`, and the store refuses. That is the intended
+fail-closed direction. A filesystem that reports a link count of zero or omits it also
+refuses. This row does not claim that every Windows filesystem supports the check.
+
+**Residual windows after this work.**
+
+* **Unix main database.** No equivalent of `SQLITE_FCNTL_WIN32_GET_HANDLE` is used, so the
+  Unix open still compares path observations only. `NotApplicable` names that state; it is
+  not a pass and it is not a claim that the connection was verified.
+* **Every sidecar, on every platform.** `-wal`, `-shm` and `-journal` remain path
+  observations. The main handle says nothing about which sidecar SQLite opened.
+* **A hard link created after the handle observation.** The link count is a snapshot. A
+  second name created after that instant is not detected by this check.
+* **Long paths.** `CreateFileW` is called without the extended `\\?\` prefix, so behavior beyond
+  `MAX_PATH` has not been validated. A path that cannot be opened or queried is `Unknown`, and
+  the store refuses.
+* **Windows runtime evidence.** None yet on the authoring host; the CI step is the first
+  intended producer.
+
+**Why F-26c remains OPEN.** Windows is no longer refused by construction, and the main
+database's connection identity is now checked on Windows, but three of the four residual
+items above are live, the Windows evidence is pending, and S-31 still awaits an explicit
+acceptance of the narrowed threat model. The bypass this finding named remains closed; the
+guarantee is still narrower than "detection".
+
 ### A-012 — F-26b: durable roll-forward recovery, recovery-aware opening, and a durability refusal
 
-**F-26b remains OPEN. S-11 and F-26 remain OPEN and are untouched. F-26c is untouched.**
+**F-26b remains OPEN. S-11 and F-26 remain OPEN and are untouched. F-26c was untouched at the
+time of A-012; A-013, A-017 and A-018 later changed it, and it remains OPEN.**
 
 **What was built.** `crates/orxnud-store/src/recovery.rs` implements a durable roll-forward: a
 verified staged image beside the database, a published `<db>.restore-intent` naming target,
@@ -1482,9 +2396,11 @@ It now makes the target read-only, which is a real failure.
 
 **Update 2026-10-14, after S-31: the cross-process gap recorded here is enforced by a stable
 per-database lock file held across the whole restore lifecycle, with two-process evidence —
-but F-26c REMAINS OPEN**, because a hard-linked alias still bypasses ownership (A-008
-follow-up). **F-26b remains open** on the narrower point below; **F-26 remains open** and
-belongs to S-11.
+but F-26c REMAINS OPEN**, because at that time a hard-linked alias still bypassed ownership
+(A-008 follow-up). Later evidence rejects the pre-existing alias in the tested paths (A-013,
+A-018); the Unix pathname-to-connection race, the sidecar pathname-to-open race and Windows
+runtime verification remain open. **F-26b remains open** on the narrower point below; **F-26
+remains open** and belongs to S-11.
 
 **F-26b stays open on a *different* ground, now F-26c.** The
 in-process evidence above is sound and is not discounted: it establishes that a stale log no

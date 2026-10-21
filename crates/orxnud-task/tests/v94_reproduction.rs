@@ -575,7 +575,8 @@ fn p1_18_the_spent_approval_ledger_records_the_time_it_was_given() {
     let consumed_at = NOW;
 
     {
-        let mut ledger = SqliteApprovalLedger::open(&path).expect("ledger");
+        let mut ledger =
+            SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity).expect("ledger");
         ledger
             .consume_at(&digest, consumed_at)
             .expect("first consume must succeed");
@@ -603,7 +604,8 @@ fn p1_18_the_spent_approval_ledger_records_the_time_it_was_given() {
     // A refused replay must not overwrite the winner's timestamp: the column records
     // when the approval was *first* spent, which is the fact an incident review needs.
     {
-        let mut ledger = SqliteApprovalLedger::open(&path).expect("ledger");
+        let mut ledger =
+            SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity).expect("ledger");
         let replay = ledger
             .consume_at(&digest, NOW + 60_000)
             .expect_err("a replay must be refused");
@@ -639,7 +641,8 @@ fn p1_18_two_concurrent_consumes_yield_exactly_one_winner() {
         .map(|t| {
             let p = path.clone();
             std::thread::spawn(move || {
-                let mut l = SqliteApprovalLedger::open(&p).expect("ledger");
+                let mut l = SqliteApprovalLedger::open(&p, &orxnud_platform_fs::OsIdentity)
+                    .expect("ledger");
                 l.consume_at(&digest, NOW + t).is_ok()
             })
         })
@@ -668,13 +671,15 @@ fn p1_18_the_audit_journal_still_works_alongside_the_approval_ledger() {
     let d = dir("p1-18-audit");
     let path = db_in(&d);
     {
-        let mut ledger = SqliteApprovalLedger::open(&path).expect("ledger");
+        let mut ledger =
+            SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity).expect("ledger");
         ledger
             .consume_at(&orxnud_domain::ApprovalDigest::from_bytes([1u8; 32]), NOW)
             .expect("consume");
     }
     // Opened on the same file the approval ledger migrated: the two must coexist.
-    let journal = SqliteAuditJournal::open(&path).expect("journal");
+    let journal =
+        SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity).expect("journal");
     assert!(
         journal
             .is_empty()

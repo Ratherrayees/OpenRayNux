@@ -250,6 +250,7 @@ mod tests {
                         revision: None,
                         prompt_hash: "h".into(),
                         request_id: crate::ids::RequestId::new("q-2"),
+                        destination_fingerprint: None,
                     },
                 },
                 ..base.clone()

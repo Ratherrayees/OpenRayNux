@@ -120,7 +120,7 @@ impl Drop for Daemon {
 
 /// Injects a failure into the task-domain approval consumption.
 fn block_task_approval_consumption(db: &std::path::Path) {
-    orxnud_store::Store::open(db, false)
+    orxnud_store::Store::open(db, false, &orxnud_platform_fs::OsIdentity)
         .expect("open")
         .conn()
         .execute_batch(

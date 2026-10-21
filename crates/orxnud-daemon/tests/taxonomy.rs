@@ -941,8 +941,11 @@ fn task_with_proposal(s: &Serving, id: &str) -> String {
 }
 
 fn conn(root: &Path) -> orxnud_store::security_state::SqliteAuditJournal {
-    orxnud_store::security_state::SqliteAuditJournal::open(&root.join("state.db"))
-        .expect("open the store the runtime wrote")
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &root.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the store the runtime wrote")
 }
 
 /// Every class V-90 names is reachable for its own reason, over a real socket.

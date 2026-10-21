@@ -59,6 +59,13 @@ tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sy
 # this platform; named here so the platform crate depends on it directly rather than on
 # a transitive it does not own.
 libc = "0.2.189"
+# Native Windows file identity: `CreateFileW` plus
+# `GetFileInformationByHandleEx(FileIdInfo/FileStandardInfo)`. Declared here at
+# the version already in the lock, with only the features `orxnud-platform-fs`
+# uses; the dependency itself is target-specific there, so a Linux build does not
+# compile it. `Win32_Security` is part of `CreateFileW`'s signature even though
+# the security-attributes argument is null.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt", "std"] }
 clap = { version = "4.6.7", features = ["derive"] }
@@ -83,6 +90,8 @@ jiff = "0.2.37"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = "1"
+# The pseudo-terminal the CLI end-to-end harness needs, as safe calls.
+rustix = { version = "1.1.5", features = ["pty"] }
 rustls-native-certs = "0.8"
 # Test-only: generates the self-signed certificate the TLS tests need. A committed PEM
 # would fail G10 (no private keys in the tree) and a hand-rolled generator would be a

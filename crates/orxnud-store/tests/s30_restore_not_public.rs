@@ -28,7 +28,7 @@ use std::process::Command;
 /// deliberate part of the mechanism.
 const PROBE: &str = r#"
 fn bypass(b: &orxnud_store::backup::Backup, db: &std::path::Path) {
-    let guard = orxnud_store::backup::RestoreGuard::acquire(db).unwrap();
+    let guard = orxnud_store::backup::RestoreGuard::acquire(db, &orxnud_platform_fs::OsIdentity).unwrap();
     b.restore(&guard).unwrap();
 }
 fn main() {}
@@ -42,12 +42,23 @@ fn restoring_from_outside_the_crate_does_not_compile() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&src).expect("probe dir");
 
+    // The probe names the platform adapter as well, because the guard's real
+    // signature takes the filesystem-identity capability (ADR-0058 Decision 1) and a
+    // probe that called it with the wrong arity would fail for the wrong reason --
+    // exactly the mistake this file's own comment warns about.
+    let platform_fs = crate_dir
+        .parent()
+        .expect("the crates directory")
+        .join("orxnud-platform-fs");
+
     std::fs::write(
         dir.join("Cargo.toml"),
         format!(
             "[package]\nname = \"orxnud-s30-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\norxnud-store = {{ path = \"{}\" }}\n",
-            crate_dir.display()
+             [dependencies]\norxnud-store = {{ path = \"{}\" }}\n\
+             orxnud-platform-fs = {{ path = \"{}\" }}\n",
+            crate_dir.display(),
+            platform_fs.display()
         ),
     )
     .expect("write manifest");

@@ -336,8 +336,11 @@ fn a_multi_step_task_advances_across_a_verified_step_boundary() {
         assert_eq!(state_of(&s.endpoint, "t1"), "completed");
 
         // Two step results, one row per logical step however many proposals it took.
-        let db = orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-            .expect("open");
+        let db = orxnud_store::security_state::SqliteAuditJournal::open(
+            &d.join("state.db"),
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("open");
         let conn = db.conn();
         let n: i64 = conn
             .query_row(
@@ -525,8 +528,11 @@ fn a_boundary_is_claimed_by_exactly_one_worker() {
         );
 
         // Exactly one proposal for step 2 exists. Two would mean two claims both wrote.
-        let db = orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-            .expect("open");
+        let db = orxnud_store::security_state::SqliteAuditJournal::open(
+            &d.join("state.db"),
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("open");
         let conn = db.conn();
         let n: i64 = conn
             .query_row(

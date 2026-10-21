@@ -671,8 +671,12 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         // 4. The task subsystem: opened, migrated under a snapshot, and every lease
         //    orphaned by a dead predecessor reclaimed -- before a peer can ask for
         //    work, so a request never arrives at an unrecovered queue.
-        let tasks = TaskService::open(&paths.database, EngineLimits::default())
-            .map_err(|e| RuntimeError::TaskSubsystem(e.to_string()))?;
+        let tasks = TaskService::open(
+            &paths.database,
+            EngineLimits::default(),
+            &daemon.components().identity,
+        )
+        .map_err(|e| RuntimeError::TaskSubsystem(e.to_string()))?;
 
         daemon
             .start()
@@ -1307,7 +1311,10 @@ async fn route<S: SecretsContract>(
             schedule(method, request, authenticated, governed).await
         }
         Method::CapabilityDispatch => dispatch(request, &actor, governed).await,
-        Method::CapabilityApprove => approve(request, &actor, governed).await,
+        Method::CapabilityApprove => approve(request, &actor, governed, provider).await,
+        // Read-only: it shows a human what an approval would authorise, and
+        // authorises nothing itself.
+        Method::CapabilityPreview => preview_proposal(request, &actor, governed, provider).await,
         // First-party durable state, not capability execution. These go to the
         // TaskService and to nothing else.
         // First-party durable state, not capability execution. These go to the
@@ -1637,12 +1644,23 @@ async fn ai_propose<S: SecretsContract>(
                 )
                 .map_err(task_fault)?;
             return Ok(json!({
-                "completed": true,
-                "summary": summary,
-                "state": finished.state.as_wire_str(),
-                "proposed_by": delegated_actor(&delegated_by, &task_id, provider.model_id()).label(),
-                "model": provider.model_id(),
-            }));
+                    "completed": true,
+                    "summary": summary,
+                    "state": finished.state.as_wire_str(),
+                    "proposed_by": delegated_actor(
+                        &delegated_by,
+                        &task_id,
+                        provider.model_id(),
+                        destination_fingerprint_of(provider),
+                    ).label(),
+                    "model": provider.model_id(),
+            "recipient": recipient_label(provider),
+            "recipient_status": recipient_status(provider),
+                    // The safe recipient description. Never the raw endpoint: it may carry
+                    // user information, a query parameter or a fragment.
+                    "recipient": recipient_label(provider),
+                    "recipient_status": recipient_status(provider),
+                }));
         }
     };
 
@@ -1651,7 +1669,12 @@ async fn ai_propose<S: SecretsContract>(
     // The provider instance that just answered is the only authority on which model
     // produced this text. Read from it rather than from configuration, so the audit cannot
     // name a model that did not answer.
-    let proposer = delegated_actor(&delegated_by, &task_id, provider.model_id());
+    let proposer = delegated_actor(
+        &delegated_by,
+        &task_id,
+        provider.model_id(),
+        destination_fingerprint_of(provider),
+    );
     let proposed = persist_proposal(
         &mut g,
         ProposalWrite {
@@ -1673,6 +1696,8 @@ async fn ai_propose<S: SecretsContract>(
         // the reply rather than only in the database.
         "proposed_by": proposer.label(),
         "model": provider.model_id(),
+        "recipient": recipient_label(provider),
+        "recipient_status": recipient_status(provider),
         // Content that left the machine with this request, named and counted. An empty list
         // here is the normal case and is not an error: most proposals carry no content.
         "disclosed": disclosed_json,
@@ -2126,24 +2151,40 @@ async fn continue_task<S: SecretsContract>(
                 )
                 .map_err(task_fault)?;
             Ok(json!({
-                "continued": false,
-                "completed": true,
-                "step": step,
-                "steps_completed": finished.steps_completed,
-                "summary": summary,
-                "state": finished.state.as_wire_str(),
-                // Restated for the caller: a task that ends because a model said so must
-                // be attributable to that model in the reply, not only in the database.
-                "proposed_by": delegated_actor(&delegated_by, &task_id, provider.model_id()).label(),
-                "model": provider.model_id(),
-                // Content went with this request even though no proposal was made from it.
-                "disclosed": disclosed_json,
-            }))
+                    "continued": false,
+                    "completed": true,
+                    "step": step,
+                    "steps_completed": finished.steps_completed,
+                    "summary": summary,
+                    "state": finished.state.as_wire_str(),
+                    // Restated for the caller: a task that ends because a model said so must
+                    // be attributable to that model in the reply, not only in the database.
+                    "proposed_by": delegated_actor(
+                        &delegated_by,
+                        &task_id,
+                        provider.model_id(),
+                        destination_fingerprint_of(provider),
+                    ).label(),
+                    "model": provider.model_id(),
+            "recipient": recipient_label(provider),
+            "recipient_status": recipient_status(provider),
+                    // The safe recipient description. Never the raw endpoint: it may carry
+                    // user information, a query parameter or a fragment.
+                    "recipient": recipient_label(provider),
+                    "recipient_status": recipient_status(provider),
+                    // Content went with this request even though no proposal was made from it.
+                    "disclosed": disclosed_json,
+                }))
         }
         crate::proposer::ProposalOutcome::Step(validated) => {
             let canonical = orxnud_policy::canonical_params(&validated.params);
             let proposal_id = format!("p-{task_id}-{now}");
-            let proposer = delegated_actor(&delegated_by, &task_id, provider.model_id());
+            let proposer = delegated_actor(
+                &delegated_by,
+                &task_id,
+                provider.model_id(),
+                destination_fingerprint_of(provider),
+            );
             let proposed = match persist_proposal(
                 &mut g,
                 ProposalWrite {
@@ -2164,16 +2205,22 @@ async fn continue_task<S: SecretsContract>(
                 }
             };
             Ok(json!({
-                "continued": true,
-                "step": step,
-                "steps_completed": before.steps_completed,
-                "max_steps": before.max_steps,
-                "proposal": proposal_json(&proposed),
-                "waiting_for": "human-approval",
-                "proposed_by": proposer.label(),
-                "model": provider.model_id(),
-                "disclosed": disclosed_json,
-            }))
+                    "continued": true,
+                    "step": step,
+                    "steps_completed": before.steps_completed,
+                    "max_steps": before.max_steps,
+                    "proposal": proposal_json(&proposed),
+                    "waiting_for": "human-approval",
+                    "proposed_by": proposer.label(),
+                    "model": provider.model_id(),
+            "recipient": recipient_label(provider),
+            "recipient_status": recipient_status(provider),
+                    // The safe recipient description. Never the raw endpoint: it may carry
+                    // user information, a query parameter or a fragment.
+                    "recipient": recipient_label(provider),
+                    "recipient_status": recipient_status(provider),
+                    "disclosed": disclosed_json,
+                }))
         }
     }
 }
@@ -2870,8 +2917,18 @@ fn delegated_actor(
     delegated_by: &orxnud_domain::ids::UserId,
     task_id: &str,
     model: &str,
+    destination_fingerprint: Option<String>,
 ) -> orxnud_domain::Actor {
     use orxnud_domain::actor::ModelProvenance;
+    let mut provenance = ModelProvenance::new(
+        model,
+        "phase-2",
+        orxnud_domain::ids::RequestId::new(task_id),
+    );
+    // The destination this proposal is bound to, taken from the provider that
+    // produced it. A provider that cannot name its destination leaves this `None`,
+    // which is the fail-closed answer: an unbound proposal is not disclosable.
+    provenance.destination_fingerprint = destination_fingerprint;
     orxnud_domain::Actor::Ai {
         // The delegating human, taken from the authenticated principal at the call site.
         //
@@ -2885,12 +2942,52 @@ fn delegated_actor(
         delegated_by: delegated_by.clone(),
         run: orxnud_domain::ids::RunId::new(task_id),
         task: orxnud_domain::ids::TaskId::new(task_id),
-        provenance: ModelProvenance::new(
-            model,
-            "phase-2",
-            orxnud_domain::ids::RequestId::new(task_id),
-        ),
+        provenance,
     }
+}
+
+/// The safe recipient description for an AI-generated proposal.
+///
+/// Two fields, and the second matters as much as the first: a recipient that cannot
+/// be displayed safely must not be represented as an unknown string either, because
+/// "unknown" reads as "probably fine". The status says plainly that file-content
+/// disclosure is unavailable.
+///
+/// The label is the **configured** destination. It is not evidence of which downstream
+/// inference service processes a request, and the scripted test provider is named as
+/// such rather than as a model endpoint.
+fn recipient_label(provider: &Arc<dyn crate::proposer::ProposalProvider>) -> Option<String> {
+    provider
+        .destination()
+        .as_ref()
+        .and_then(crate::observation::destination_display)
+        .map(|display| display.label())
+}
+
+/// Whether the disclosure destination could be identified safely.
+fn recipient_status(provider: &Arc<dyn crate::proposer::ProposalProvider>) -> &'static str {
+    if recipient_label(provider).is_some() {
+        "identified"
+    } else {
+        "unavailable"
+    }
+}
+
+/// The fingerprint of a provider's configured destination, when it has one.
+///
+/// Taken from the provider **instance** that is being asked, so the binding is to the
+/// destination that actually produced the proposal.
+fn destination_fingerprint_of(
+    provider: &Arc<dyn crate::proposer::ProposalProvider>,
+) -> Option<String> {
+    provider.destination().as_ref().and_then(|identity| {
+        // A destination that cannot be displayed safely does not get a fingerprint, so
+        // it can never become a disclosure recipient. The fingerprint is a binding
+        // check, not a display check, and an endpoint we cannot safely represent must
+        // not be made eligible by being bound.
+        crate::observation::destination_display(identity)?;
+        Some(crate::observation::destination_fingerprint(identity))
+    })
 }
 
 /// What verification established about the side effect.
@@ -3182,6 +3279,32 @@ async fn execute_proposal<S: SecretsContract>(
             })?;
     let record = approval_record_from_row(&approval_row, actor, &proposer, &proposal)?;
 
+    // **A read must also carry a daemon-issued authorisation.**
+    //
+    // The digest proves this approval covers this action; it does not prove the daemon
+    // issued it through a permitted path. The registry does, and this is the route that
+    // actually executes an approved proposal -- the raw `capability/dispatch` route
+    // recomputes the digest against the *authenticated caller*, so a proposal-issued
+    // tuple legitimately cannot be honoured there.
+    //
+    // The policy's own verdict comes first: an approval that is already expired keeps
+    // the policy's established refusal rather than being masked by the registry's, so
+    // the registry is consulted only for an approval the policy would otherwise honour.
+    if record.capability == READ_TEXT_CAPABILITY && record.is_valid_at(now) {
+        let digest = digest_hex(&record.digest);
+        let mono_now = g.0.read_clock.now_ms();
+        if !g.0.read_authorizations.claim(&digest, mono_now) {
+            return Err(RequestError::Forbidden {
+                reason: "read-not-authorized".to_owned(),
+                detail: Some(
+                    "this read approval was not issued by this daemon through a \
+                     reviewed proposal path, so it cannot authorise a read."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
     // 3. Refuse an expired approval *before* taking the execution lease.
     //
     // This used to be left entirely to the policy stage, which does refuse it correctly and
@@ -3369,6 +3492,14 @@ async fn execute_proposal<S: SecretsContract>(
     // would deadlock rather than queue, because a `tokio::sync::Mutex` is not reentrant.
     let outcome = {
         let (daemon, secrets, _tasks) = &mut *g;
+        // **A file read needs a daemon-issued authorization as well as a digest-valid
+        // approval.** The digest proves the operation was approved; the registry proves the
+        // daemon issued that approval through a permitted proposal-approval path. A
+        // standalone-issued, fabricated, expired or legacy tuple has no entry here, so it
+        // cannot dispatch -- even though its digest recomputes correctly.
+        //
+        // The entry is claimed, not merely read, so two concurrent dispatches cannot both
+        // use one authorization. The policy's own consumed-digest ledger still governs
         let mut d: Dispatcher<'_, S> = daemon.dispatcher(secrets);
         d.dispatch(
             action,
@@ -3734,7 +3865,27 @@ fn asking_provider_identity(
     if provenance.model != provider.model_id() {
         return None;
     }
-    provider.destination()
+
+    // **The destination must be the one that produced the proposal.**
+    //
+    // The model name alone does not identify a recipient: two configured endpoints can
+    // serve the same model name. So the proposal carries a fingerprint of the
+    // destination that generated it, and the destination being asked now must produce
+    // the same fingerprint.
+    //
+    // A proposal with no fingerprint -- one that predates the field, or one from a
+    // provider that cannot name its destination -- does not qualify. Neither does a
+    // current provider with no destination. And a mismatch is not a warning: it is
+    // `None`, which stops the observation being retained and therefore stops the
+    // disclosure.
+    let current = provider.destination()?;
+    if !crate::observation::destination_matches(
+        provenance.destination_fingerprint.as_deref(),
+        Some(&current),
+    ) {
+        return None;
+    }
+    Some(current)
 }
 
 /// The execution output that may be written to durable step state, if any.
@@ -3865,10 +4016,144 @@ fn approval_record_from_row(
 ///
 /// [`RequestError::Invalid`] for a malformed request, or a proposal that is unknown or
 /// already decided.
+/// Issues an approval for one proposed invocation.
+///
+/// # What this does and does not do
+///
+/// It canonicalises the parameters, computes the digest, and returns the tuple. It
+/// grants nothing: no policy is consulted, no capability is enabled, and no ledger is
+/// touched. The result is an *artefact*, and whether it is honoured is decided later at
+/// dispatch, by recomputing the digest from the action that is actually about to run
+/// and comparing. That is what makes an approval bound to one operation rather than to
+/// a capability -- and it is why a caller cannot use this to widen its own authority:
+/// the worst it can do is produce an approval for something policy would refuse anyway.
+///
+/// # `ttl_ms`
+///
+/// Relative, and `0` is meaningful: it produces an approval that is already expired,
+/// which is how the expiry property is tested without sleeping. The daemon does not
+/// clamp it, because the caller approving its own action is the party the expiry exists
+/// to inform, not a party to overrule. A future consenting principal would decide the
+/// ceiling here rather than accepting one.
+///
+/// # Errors
+///
+/// The persistence step a test makes fail.
+///
+/// Compiled out of every build but the crate's own tests, so no release binary
+/// has a way to induce a storage fault, and no environment variable or flag can
+/// either.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceFault {
+    /// The approval row cannot be written.
+    ApprovalRow,
+    /// The proposal cannot be decided.
+    ProposalDecision,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The persistence step the current test wants to fail, if any.
+    ///
+    /// **Thread-scoped, and consumed once.**
+    ///
+    /// The test harness runs each test on its own thread inside one process, so a
+    /// thread-local fault is seen only by the test that armed it. A process-global
+    /// fault would not be: any other test that reaches an instrumented operation
+    /// would consume it, so the capacity test could be handed a storage failure
+    /// instead of the capacity refusal it is about, and a test that panicked
+    /// between arming and clearing would poison every later approval in the
+    /// process.
+    ///
+    /// Consuming the fault when it fires makes the second half of that safe as
+    /// well: an armed fault fires exactly once, so the operation that follows it
+    /// in the same test -- the retry with a fresh challenge -- is unaffected even
+    /// if the test never got to clear it.
+    static PERSISTENCE_FAULT: std::cell::RefCell<Option<PersistenceFault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms a persistence fault for the current test.
+#[cfg(test)]
+fn arm_persistence_fault(fault: PersistenceFault) {
+    PERSISTENCE_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
+}
+
+/// Disarms any armed persistence fault.
+#[cfg(test)]
+fn clear_persistence_fault() {
+    PERSISTENCE_FAULT.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Whether the named persistence step should fail. Does not consume it.
+#[cfg(test)]
+fn persistence_fault(fault: PersistenceFault) -> bool {
+    PERSISTENCE_FAULT.with(|slot| slot.borrow().is_some_and(|armed| armed == fault))
+}
+
+/// Whether the named persistence step should fail, consuming the fault if it does.
+///
+/// The consumption is what keeps a fault from firing twice: the operation it
+/// names fails once, and everything after it behaves normally.
+#[cfg(test)]
+fn take_persistence_fault(fault: PersistenceFault) -> bool {
+    PERSISTENCE_FAULT.with(|slot| {
+        let mut armed = slot.borrow_mut();
+        if *armed == Some(fault) {
+            *armed = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Writes the approval row for a proposal that is about to be decided.
+///
+/// A thin seam over the task service, so a test can make **this** write fail, at
+/// this point in the handler, deterministically -- and so the handler's own
+/// failure path is what runs, rather than a re-implementation of it.
+fn record_approval_row(
+    tasks: &mut TaskService,
+    row: &orxnud_store::task_repo::ApprovalRow,
+    now: i64,
+) -> Result<orxnud_store::task_repo::ApprovalOutcome, TaskFault> {
+    #[cfg(test)]
+    if take_persistence_fault(PersistenceFault::ApprovalRow) {
+        return Err(TaskFault::Engine {
+            cause: orxnud_task::TaskCause::Storage,
+            detail: "the injected fault: the approval row could not be written".to_owned(),
+        });
+    }
+    tasks.record_approval_replacing_expired(row, now)
+}
+
+/// Records the proposal's decision.
+///
+/// A thin seam over the task service, for the same reason as
+/// [`record_approval_row`].
+fn decide_proposal_status(
+    tasks: &mut TaskService,
+    proposal_id: &str,
+    status: &'static str,
+    now: i64,
+) -> Result<orxnud_store::task_repo::ProposalRow, TaskFault> {
+    #[cfg(test)]
+    if take_persistence_fault(PersistenceFault::ProposalDecision) {
+        return Err(TaskFault::Engine {
+            cause: orxnud_task::TaskCause::Storage,
+            detail: "the injected fault: the proposal could not be decided".to_owned(),
+        });
+    }
+    tasks.decide_proposal(proposal_id, status, now)
+}
+
 async fn approve_proposal<S: SecretsContract>(
     request: &Request,
     actor: &orxnud_domain::Actor,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
     let proposal_id = required_str(&params, "proposal")?;
@@ -3965,6 +4250,101 @@ async fn approve_proposal<S: SecretsContract>(
     // `actor` is the authenticated principal's actor, threaded down from `route`. This
     // used to be `local_actor()` called here, so the approver was a constant: real
     // authority, attributed to whoever happened to hold the socket.
+    // **An AI-generated file read may only be approved through the reviewed path.**
+    //
+    // A read on a model's behalf discloses the file's contents to the model provider.
+    // The approval digest binds the *operation*; it does not prove a human saw what
+    // the read would disclose. So an AI read proposal requires a challenge from a
+    // fresh, eligible preview, plus an explicit acknowledgement, and the challenge is
+    // checked against the **stored** proposal and the **currently configured**
+    // provider -- never against anything the request said.
+    //
+    // The challenge is consumed whether or not the rest of the request is acceptable:
+    // a failed attempt costs a fresh preview, so a challenge is never reusable.
+    // The challenge is required when the **model** asked for the read.
+    //
+    // The origin is read from the persisted provenance, not inferred from the
+    // fingerprint. A proposal that names no model was made directly by a human
+    // (`NO_MODEL_PROPOSED`); one that names a model came from that model. The
+    // fingerprint's *absence* therefore says nothing about origin -- it says the
+    // recipient cannot be verified, and a model-initiated proposal in that state must
+    // fail closed rather than slip through the challenge on a technicality.
+    let model_initiated = matches!(
+        &proposer,
+        orxnud_domain::Actor::Ai { provenance, .. }
+            if provenance.model != NO_MODEL_PROPOSED
+    );
+    if proposal.capability == READ_TEXT_CAPABILITY && model_initiated {
+        let challenge_id = params
+            .get("challenge")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if challenge_id.is_empty() {
+            return Err(RequestError::Conflict {
+                reason: "read-approval-requires-a-preview-challenge".to_owned(),
+                detail: Some(
+                    "approving an AI-generated filesystem/read-text proposal requires a \
+                     challenge from a fresh preview, and the acknowledgement that the \
+                     file's contents may be disclosed to the model provider."
+                        .to_owned(),
+                ),
+            });
+        }
+        // The expected binding is reconstructed from authoritative state, by the same
+        // function that built the one the preview issued.
+        let expected = expected_challenge_binding(&proposal, provider.as_ref(), actor);
+        let Some(expected) = expected else {
+            return Err(RequestError::Conflict {
+                reason: "read-approval-recipient-cannot-be-identified".to_owned(),
+                detail: Some(
+                    "the recipient of this read could not be identified safely, so it \
+                     cannot be approved."
+                        .to_owned(),
+                ),
+            });
+        };
+        // Consumed first. A challenge that does not match is gone anyway.
+        g.0.challenges
+            .redeem(challenge_id, &expected)
+            .map_err(|e| RequestError::Conflict {
+                reason: "preview-challenge-invalid".to_owned(),
+                detail: Some(e.to_string()),
+            })?;
+        let confirmed = params
+            .get("confirmed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !confirmed {
+            return Err(RequestError::Conflict {
+                reason: "read-approval-not-confirmed".to_owned(),
+                detail: Some(
+                    "the disclosure of the file's contents to the model provider was \
+                     not explicitly acknowledged."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
+    // **A read dispatch needs a daemon-issued authorization**, not only a digest-valid
+    // approval. Capacity is reserved here -- after every check that may legitimately
+    // refuse the approval, and before the approval record is created -- so that a
+    // failure between the two gives the capacity back and leaves nothing dispatchable.
+    let registry_now = g.0.read_clock.now_ms();
+    let mut read_reservation = if proposal.capability == READ_TEXT_CAPABILITY {
+        match g.0.read_authorizations.reserve(registry_now) {
+            Ok(reservation) => Some(reservation),
+            Err(e) => {
+                return Err(RequestError::Conflict {
+                    reason: "read-authorization-unavailable".to_owned(),
+                    detail: Some(e.to_string()),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     let canonical = orxnud_domain::NormalizedParams::canonical(proposal.params.clone());
     let record = orxnud_policy::issue_approval(
         actor,
@@ -4011,9 +4391,15 @@ async fn approve_proposal<S: SecretsContract>(
         });
     }
 
-    let outcome =
-        g.2.record_approval_replacing_expired(&approval_row, now)
-            .map_err(task_fault)?;
+    let outcome = match record_approval_row(&mut g.2, &approval_row, now) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            if let Some(r) = read_reservation.take() {
+                g.0.read_authorizations.release(r);
+            }
+            return Err(task_fault(e));
+        }
+    };
     match outcome {
         orxnud_store::task_repo::ApprovalOutcome::Recorded
         | orxnud_store::task_repo::ApprovalOutcome::ReplacedExpired => {}
@@ -4023,6 +4409,9 @@ async fn approve_proposal<S: SecretsContract>(
         // used" it is looking at, and one deterministic answer is worth more than a
         // transparent retry here.
         orxnud_store::task_repo::ApprovalOutcome::Refused(r) => {
+            if let Some(res) = read_reservation.take() {
+                g.0.read_authorizations.release(res);
+            }
             return Err(RequestError::Declined {
                 reason: r.as_str().to_owned(),
                 detail: Some(match r {
@@ -4043,15 +4432,72 @@ async fn approve_proposal<S: SecretsContract>(
     // proposal that somehow lost its approval row is reported by the check above rather than
     // papered over here.
     let decided = if was_pending {
-        g.2.decide_proposal(&proposal_id, "approved", now)
-            .map_err(task_fault)?
+        match decide_proposal_status(&mut g.2, &proposal_id, "approved", now) {
+            Ok(decided) => decided,
+            Err(e) => {
+                if let Some(r) = read_reservation.take() {
+                    g.0.read_authorizations.release(r);
+                }
+                // The approval row was written **before** the decision, because a
+                // proposal that says `approved` with no approval behind it is a
+                // dead end. If the decision fails, that row would otherwise
+                // remain: live, unconsumed, and belonging to a proposal that is
+                // still pending.
+                //
+                // Such a row cannot be dispatched -- a dispatch needs the proposal
+                // decided *and* a registry entry activated after the decision -- but
+                // it would refuse a later, legitimate approval with "an approval
+                // for this attempt is valid until ...", leaving the task unable to
+                // proceed until the row expired on its own.
+                //
+                // So it is removed, and the two statements stay one statement: an
+                // approval exists if and only if its proposal was decided. A
+                // failure to remove it is not reported as the decision's failure:
+                // the decision's failure is what happened, and the leftover row is
+                // exactly the state this compensation exists to prevent.
+                let _ =
+                    g.2.delete_approval(&proposal.task_id, proposal.step_no, proposal.attempt_no);
+                return Err(task_fault(e));
+            }
+        }
     } else {
         proposal
     };
 
+    // The durable operations have all succeeded: the approval row is written and the
+    // proposal is decided. Only now does the read authorization become live. If
+    // anything above had failed, the reservation guard would have released the capacity
+    // and no digest would be dispatchable.
+    if let Some(reservation) = read_reservation.take() {
+        // The approval's expiry is wall-clock; the registry's clock is monotonic. The two
+        // absolute values are not comparable, so the approval's **remaining lifetime**
+        // is computed against the current wall clock and re-based onto the monotonic
+        // one. An approval with no safe remaining lifetime is not registered at all.
+        match monotonic_expiry(registry_now, now, record.expires_at_ms) {
+            Some(expires_at_ms) => g.0.read_authorizations.activate(
+                reservation,
+                digest_hex(&record.digest),
+                expires_at_ms,
+            ),
+            None => {
+                g.0.read_authorizations.release(reservation);
+                return Err(RequestError::Conflict {
+                    reason: "read-authorization-expired".to_owned(),
+                    detail: Some(
+                        "the approval has no remaining lifetime, so it authorises no read"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(json!({
         "approval": {
             "actor_label": record.actor_label,
+            // The step this approval was issued for. A client must present it back
+            // unchanged, because the digest was computed over it.
+            "step_no": record.step_no,
             "approver": record.approver.label(),
             "authority_root": record.approver.authority_root().map(|u| u.as_str()),
             "capability": record.capability,
@@ -4065,39 +4511,363 @@ async fn approve_proposal<S: SecretsContract>(
     }))
 }
 
-/// Issues an approval for one proposed invocation.
+/// Assembles the preview body from a persisted proposal.
 ///
-/// # What this does and does not do
+/// Split from the handler so the contract can be tested against a proposal row without
+/// a running daemon, and so the handler stays a lookup plus a call.
+fn build_preview(
+    proposal: &orxnud_store::task_repo::ProposalRow,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+    actor: &orxnud_domain::Actor,
+) -> Result<
+    (
+        serde_json::Value,
+        Option<crate::read_approval_challenge::ChallengeBinding>,
+    ),
+    RequestError,
+> {
+    // The preview answers for **every** pending proposal, so a client can tell an
+    // ordinary proposal from one that needs a reviewed disclosure confirmation. It used
+    // to refuse anything that was not an AI-generated file read, which left a client
+    // unable to distinguish "this proposal needs no disclosure confirmation" from
+    // "this preview failed" -- and a client that cannot tell those apart must not
+    // approve.
+    let is_read = proposal.capability == READ_TEXT_CAPABILITY;
+    let proposer = proposal
+        .proposer()
+        .map_err(|e| RequestError::Invalid(format!("proposal proposer unusable: {e}")))?;
+    // The origin comes from the **persisted model identifier**, never from the presence
+    // of a destination fingerprint. A missing or legacy fingerprint says the recipient
+    // cannot be verified; it does not say a human made the proposal, and treating it as
+    // if it did would let an ambiguous model-originated read slip past the guard.
+    let model_initiated = matches!(
+        &proposer,
+        orxnud_domain::Actor::Ai { provenance, .. } if provenance.model != NO_MODEL_PROPOSED
+    );
+    let provenance = match &proposer {
+        orxnud_domain::Actor::Ai { provenance, .. } => Some(provenance),
+        _ => None,
+    };
+    // Only a model-initiated file read discloses file contents to the model provider,
+    // so only one needs the reviewed confirmation.
+    let requires_confirmation = is_read && model_initiated;
+
+    // The recipient: the **current** configured destination, checked against the
+    // fingerprint stored with the proposal. A mismatch, a missing fingerprint, a
+    // provider with no destination, or a destination that cannot be displayed safely
+    // all leave the preview **blocked** -- the operator is told the recipient could
+    // not be identified, and approval is not currently permitted. The raw endpoint is
+    // never returned.
+    let current = provider.as_ref().and_then(|p| p.destination());
+    let recorded = provenance.and_then(|p| p.destination_fingerprint.as_deref());
+    let matched = current
+        .as_ref()
+        .zip(recorded)
+        .is_some_and(|(identity, recorded)| {
+            crate::observation::destination_matches(Some(recorded), Some(identity))
+        });
+    let label = current
+        .as_ref()
+        .and_then(crate::observation::destination_display)
+        .map(|display| display.label());
+    let blocked_reason: Option<&'static str> = if !requires_confirmation {
+        // Nothing is disclosed to a model provider on this path, so there is nothing
+        // to block. The direct and non-read paths keep their established behaviour.
+        None
+    } else if current.is_none() {
+        Some("no provider is configured, so there is no destination to identify")
+    } else if recorded.is_none() {
+        Some("this proposal records no destination, so its recipient cannot be identified")
+    } else if label.is_none() {
+        Some("the configured destination cannot be displayed safely")
+    } else if !matched {
+        Some("the configured destination no longer matches the one that produced this proposal")
+    } else {
+        None
+    };
+
+    // The path, from the stored parameters.
+    let stored: serde_json::Value = serde_json::from_str(&proposal.params)
+        .map_err(|e| RequestError::Invalid(format!("proposal params unusable: {e}")))?;
+    let path = stored
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    // The limits, from the definitions the implementation actually uses.
+    let read_ceiling = orxnud_capability::read_text::MAX_READ_BYTES;
+    let disclosure_ceiling = crate::observation::DEFAULT_MAX_CONTENT_BYTES as u64;
+    let max_entries = crate::observation::DEFAULT_MAX_ENTRIES;
+    // The effective per-request capacity is the lesser of the store ceiling and the
+    // budget the next request actually has. The store's own per-request budget is not
+    // knowable before the request is made, so the effective figure is reported as the
+    // store ceiling and the budget is named as the other bound rather than guessed at.
+    let effective = disclosure_ceiling.min(read_ceiling);
+
+    //
+    // Every value comes from the **stored** proposal and the **currently configured**
+    // provider. Nothing here is taken from the request.
+    let binding = expected_challenge_binding(proposal, provider, actor);
+    // A preview that claims eligibility but cannot bind a challenge is not
+    // eligible: without a binding there is nothing an approval could be
+    // checked against, so it must be reported as blocked.
+    let blocked_reason = if blocked_reason.is_none() && binding.is_none() {
+        Some("the recipient could not be identified safely")
+    } else {
+        blocked_reason
+    };
+
+    Ok((
+        json!({
+            "preview": {
+                "proposal_id": proposal.proposal_id,
+                // Whether approving this proposal discloses file contents to a model
+                // provider, and therefore whether a client must obtain an explicit
+                // confirmation before it approves.
+                "requires_confirmation": requires_confirmation,
+                "proposal_kind": if requires_confirmation {
+                    "model-initiated-file-read"
+                } else if model_initiated {
+                    "model-initiated"
+                } else {
+                    "direct-proposal"
+                },
+                // How the operation affects the world, so a client can say "this reads
+                // a file" without inferring it from the capability's name.
+                "operation": match proposal.capability.as_str() {
+                    "filesystem/read-text" => "file-read",
+                    "filesystem/write-text" => "file-write",
+                    _ => "other",
+                },
+                "task_id": proposal.task_id.as_str(),
+                "attempt_no": proposal.attempt_no,
+                "step_no": proposal.step_no,
+                "status": proposal.status,
+                "capability": proposal.capability,
+                "target": proposal.target,
+                "path": path,
+                "proposed_by": proposer.label(),
+                "model": provenance.map(|p| p.model.clone()).unwrap_or_default(),
+                // The safe label, or absent. Never the raw endpoint.
+                "recipient": label,
+                "recipient_status": if blocked_reason.is_none() { "identified" } else { "unavailable" },
+                "approval_allowed": blocked_reason.is_none(),
+                "blocked_reason": blocked_reason,
+                "disclosure": {
+                    "read_ceiling_bytes": read_ceiling,
+                    "observation_ceiling_bytes": disclosure_ceiling,
+                    "max_entries": max_entries,
+                    "effective_bytes": effective,
+                    "read_only": true,
+                    "disclosure_possible": true,
+                    "summary": "filesystem/read-text reads a file and does not write one. \
+                                 The file's contents may be disclosed to the model provider \
+                                 that asked for the read, for the immediately following AI \
+                                 request only.",
+                    "limits": format!(
+                        "A read returns at most {read_ceiling} bytes. An observation is \
+                         released whole: at most {disclosure_ceiling} bytes across at most \
+                         {max_entries} entries per provider request. An observation that \
+                         does not fit the applicable budget is skipped entirely, not \
+                         truncated, so a file between those sizes may be read without \
+                         being disclosed at all."
+                    ),
+                    "timing": "Eligibility is limited to the immediately following logical \
+                               step. A later disclosure is not guaranteed.",
+                },
+            }
+        }),
+        binding,
+    ))
+}
+
+/// A read-only preview of a pending AI-generated file-read proposal.
 ///
-/// It canonicalises the parameters, computes the digest, and returns the tuple. It
-/// grants nothing: no policy is consulted, no capability is enabled, and no ledger is
-/// touched. The result is an *artefact*, and whether it is honoured is decided later at
-/// dispatch, by recomputing the digest from the action that is actually about to run
-/// and comparing. That is what makes an approval bound to one operation rather than to
-/// a capability -- and it is why a caller cannot use this to widen its own authority:
-/// the worst it can do is produce an approval for something policy would refuse anyway.
+/// **This authorises nothing.** It creates no approval, executes no capability, opens
+/// no file, and changes no task state. Its whole purpose is to let a human see what
+/// they would be authorising -- including the possible disclosure of the file's
+/// contents to the model provider that asked for the read -- before an approval is
+/// issued by a separate command.
 ///
-/// # `ttl_ms`
+/// # What it reads
 ///
-/// Relative, and `0` is meaningful: it produces an approval that is already expired,
-/// which is how the expiry property is tested without sleeping. The daemon does not
-/// clamp it, because the caller approving its own action is the party the expiry exists
-/// to inform, not a party to overrule. A future consenting principal would decide the
-/// ceiling here rather than accepting one.
+/// Only the **persisted** proposal, fetched by id from the task repository. Nothing
+/// about the capability, the path, the proposer or the recipient is taken from the
+/// request: a caller that asked for a preview of proposal A must get a preview of
+/// proposal A, not of whatever it also said.
+async fn preview_proposal<S: SecretsContract>(
+    request: &Request,
+    actor: &orxnud_domain::Actor,
+    governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
+) -> Result<serde_json::Value, RequestError> {
+    let params = request.params.clone().unwrap_or(json!({}));
+    let proposal_id = required_str(&params, "proposal")?;
+    check_len("proposal", &proposal_id, MAX_TASK_ID_BYTES)?;
+
+    let mut g = governed.lock().await;
+    let proposal =
+        g.2.proposal(&proposal_id)
+            .map_err(task_fault)?
+            .ok_or_else(|| RequestError::NotFound {
+                reason: "proposal-not-found".to_owned(),
+                detail: Some(format!("no proposal {proposal_id:?}")),
+            })?;
+    if !proposal.is_pending() {
+        return Err(RequestError::Conflict {
+            reason: "proposal-not-pending".to_owned(),
+            detail: Some("only a pending proposal can be previewed".to_owned()),
+        });
+    }
+    let (mut preview, binding) = build_preview(&proposal, provider.as_ref(), actor)?;
+    // Who asked. The preview is read-only, so this is not an authority claim, but it
+    // makes the requester visible in the response rather than invisible.
+    preview["preview"]["requested_by"] = json!(actor.label());
+    // A challenge, for an eligible preview only. It grants nothing: it records what
+    // was shown, so that an approval which follows can be checked against exactly that.
+    // It is ephemeral state, and the only thing this preview changes.
+    // **Inspection mode.** A client that only wants to *look* -- to classify the
+    // proposal before deciding whether it needs an interactive confirmation -- must not
+    // mint a challenge and then abandon it. An inspection request asks for the same
+    // authoritative classification and the same safe preview information, and simply
+    // does not take a challenge.
+    //
+    // It changes nothing else: the recipient is still verified, `approval_allowed` and
+    // `blocked_reason` mean exactly what they meant, and the binding is still built
+    // (and discarded) rather than the path being taken on trust.
+    let inspect_only = params
+        .get("inspect_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if let Some(binding) = binding {
+        if inspect_only {
+            return Ok(preview);
+        }
+        let id =
+            g.0.challenges
+                .allocate(binding)
+                .map_err(|e| RequestError::Conflict {
+                    reason: "preview-challenge-unavailable".to_owned(),
+                    detail: Some(e.to_string()),
+                })?;
+        preview["preview"]["challenge"] = json!(id);
+    }
+    Ok(preview)
+}
+
+/// The refusal for a standalone approval of a capability that must not be approved
+/// without a review.
+///
+/// A standalone approval is one the *caller* names: it names the capability and the
+/// parameters, and the daemon issues a tuple for them with no proposal, no preview and
+/// no human seeing what the read would disclose. The digest binds the operation -- it
+/// proves the read is the approved read -- but it does not prove that anyone reviewed
+/// the disclosure, and the digest is not secret. Issuing one would leave a path where a
+/// client obtains a valid read authorisation and dispatches a disclosed read without a
+/// human ever being asked.
+///
+/// The refusal is unconditional: it does not depend on whether a provider is
+/// configured, because the missing thing is the reviewed path, not a provider.
+fn standalone_approval_refusal(capability: &str) -> Option<RequestError> {
+    if capability != READ_TEXT_CAPABILITY {
+        return None;
+    }
+    Some(RequestError::Conflict {
+        reason: "read-approval-requires-a-reviewed-path".to_owned(),
+        detail: Some(
+            "standalone approval of filesystem/read-text is unavailable: a read \
+             discloses file contents to the model provider, and the reviewed approval \
+             path that would show an operator that disclosure is not implemented yet. \
+             Approve a read through its proposal."
+                .to_owned(),
+        ),
+    })
+}
+
+/// The monotonic-clock expiry for an approval with a wall-clock expiry.
+///
+/// The approval's expiry is a wall-clock instant; the registry compares against a
+/// monotonic, runtime-relative clock. Comparing the two absolute values would be
+/// meaningless, so the approval's **remaining lifetime** is computed against the
+/// current wall clock and then re-based onto the monotonic one. The approval's lifetime
+/// is therefore neither lengthened nor shortened.
+///
+/// Returns `None` when no safe remaining lifetime can be established — an approval
+/// that is already expired, or one whose expiry cannot be related to the current wall
+/// clock. The caller must then register nothing.
+fn monotonic_expiry(registry_now_ms: i64, wall_now_ms: i64, wall_expiry_ms: i64) -> Option<i64> {
+    let remaining = wall_expiry_ms.checked_sub(wall_now_ms)?;
+    if remaining <= 0 {
+        return None;
+    }
+    Some(registry_now_ms.saturating_add(remaining))
+}
+
+/// The capability this preview covers.
+const READ_TEXT_CAPABILITY: &str = "filesystem/read-text";
+
+/// Approve an action: either a named proposal, or a standalone capability invocation.
 ///
 /// # Errors
 ///
 /// [`RequestError::Invalid`] for a malformed request.
+/// The binding a challenge for this proposal must carry, if one may be issued at all.
+///
+/// **The same function** builds the binding when a preview issues a challenge and when
+/// an approval redeems one, so the two cannot drift into different readings of the same
+/// proposal. It reads only the stored proposal and the currently configured provider:
+/// nothing about the proposal, the recipient or the path comes from the request.
+///
+/// `None` means no challenge may exist for this proposal right now -- no provider, no
+/// destination, an unrepresentable destination, a proposal with no stored fingerprint, or
+/// a stored fingerprint that no longer matches the configured one.
+fn expected_challenge_binding(
+    proposal: &orxnud_store::task_repo::ProposalRow,
+    provider: Option<&Arc<dyn crate::proposer::ProposalProvider>>,
+    actor: &orxnud_domain::Actor,
+) -> Option<crate::read_approval_challenge::ChallengeBinding> {
+    let current = provider.and_then(|p| p.destination())?;
+    // The destination must be safely representable, or it is not a recipient an
+    // operator could have been shown.
+    crate::observation::destination_display(&current)?;
+    let proposer = proposal.proposer().ok()?;
+    let orxnud_domain::Actor::Ai { provenance, .. } = &proposer else {
+        return None;
+    };
+    let stored = provenance.destination_fingerprint.clone()?;
+    if !crate::observation::destination_matches(Some(&stored), Some(&current)) {
+        return None;
+    }
+    Some(crate::read_approval_challenge::ChallengeBinding {
+        proposal_id: proposal.proposal_id.clone(),
+        task_id: proposal.task_id.clone(),
+        attempt_no: proposal.attempt_no,
+        step_no: proposal.step_no,
+        capability: proposal.capability.clone(),
+        target: proposal.target.clone(),
+        canonical_params: orxnud_domain::NormalizedParams::canonical(proposal.params.clone())
+            .as_str()
+            .to_owned(),
+        proposer_identity: crate::read_approval_challenge::actor_identity(&proposer),
+        original_fingerprint: stored,
+        current_fingerprint: crate::observation::destination_fingerprint(&current),
+        actor_identity: crate::read_approval_challenge::actor_identity(actor),
+        policy_version: crate::read_approval_challenge::DISCLOSURE_POLICY_VERSION.to_owned(),
+    })
+}
+
 async fn approve<S: SecretsContract>(
     request: &Request,
     actor: &orxnud_domain::Actor,
     governed: &tokio::sync::Mutex<(Daemon, S, TaskService)>,
+    provider: &Option<Arc<dyn crate::proposer::ProposalProvider>>,
 ) -> Result<serde_json::Value, RequestError> {
     let params = request.params.clone().unwrap_or(json!({}));
     // A named proposal takes a different path entirely: the caller supplies no action at
     // all, so there is nothing for it to have substituted.
     if params.get("proposal").is_some() {
-        return approve_proposal(request, actor, governed).await;
+        return approve_proposal(request, actor, governed, provider).await;
     }
     let capability = params
         .get("capability")
@@ -4115,6 +4885,22 @@ async fn approve<S: SecretsContract>(
     let g = governed.lock().await;
     let now_ms = g.2.clock_now_ms();
     drop(g);
+
+    // **A standalone file-read approval is refused.**
+    //
+    // A standalone approval is one the *caller* names: it names the capability and the
+    // parameters, and the daemon issues a tuple for them without any proposal, any
+    // preview, or any human seeing what the read would disclose. The digest binds the
+    // operation -- it proves the read is the approved read -- but it does not prove
+    // that anyone reviewed the disclosure. Issuing one would leave a path where a
+    // client obtains a valid read authorisation and dispatches a disclosed read without
+    // a human ever being asked.
+    //
+    // The refusal is unconditional: it does not depend on whether a provider is
+    // configured, because the missing thing is the reviewed path, not a provider.
+    if let Some(refusal) = standalone_approval_refusal(capability) {
+        return Err(refusal);
+    }
 
     let capability_id = orxnud_domain::CapabilityId::new(capability);
     // Canonicalised through the one function dispatch canonicalises with. Building the
@@ -4189,6 +4975,7 @@ fn digest_from_hex(text: &str) -> Option<orxnud_domain::ApprovalDigest> {
 fn approval_from_json(
     value: &serde_json::Value,
     approver: &orxnud_domain::Actor,
+    _request_step: u32,
 ) -> Result<orxnud_domain::ApprovalRecord, RequestError> {
     let bad = |why: &str| RequestError::Invalid(format!("`approval` {why}"));
     let object = value.as_object().ok_or_else(|| bad("must be an object"))?;
@@ -4224,9 +5011,17 @@ fn approval_from_json(
         expires_at_ms: number("expires_at_ms")?,
         // Carried for display only; `authorise` derives risk from the declaration.
         risk: orxnud_domain::enums::RiskClass::High,
-        // Not read from the JSON. This approval governs no task and therefore has one
-        // step; letting the caller name the step would let it claim authority it was
-        // never granted for any other.
+        // The step this approval was issued for.
+        //
+        // It is read from the approval the client presents, and it is the **only**
+        // thing that can make the digest match: the digest was computed over the step
+        // that was approved, so a caller naming a different step produces a different
+        // digest and is refused. It has to be carried at all, because an approval
+        // issued for a proposal's step cannot be presented under any other step --
+        // and refusing to carry it meant such an approval could never be dispatched.
+        //
+        // A record that does not say which step it was issued for falls back to the
+        // step the request named, which is the standalone approval's own step.
         step_no: STANDALONE_APPROVAL_STEP,
         digest,
     })
@@ -4524,7 +5319,7 @@ async fn tasks<S: SecretsContract>(
             // The proposer is **delegated**, and is built from the task identity rather
             // than from the worker. That separation is V-71 as code: the caller controls
             // the worker string, and the worker cannot reach the actor.
-            let proposer = delegated_actor(&delegated_by, &task_id, NO_MODEL_PROPOSED);
+            let proposer = delegated_actor(&delegated_by, &task_id, NO_MODEL_PROPOSED, None);
             let canonical = orxnud_policy::canonical_params(&inner);
             // Derived from the task and the instant, so two proposals for one attempt in
             // the same millisecond collide in the primary key rather than both existing.
@@ -4795,7 +5590,11 @@ async fn dispatch<S: SecretsContract>(
         .map(str::to_owned);
     let approval = match params.get("approval") {
         None | Some(serde_json::Value::Null) => None,
-        Some(value) => Some(approval_from_json(value, actor)?),
+        Some(value) => Some(approval_from_json(
+            value,
+            actor,
+            u32::try_from(step).unwrap_or(u32::MAX),
+        )?),
     };
     let context = orxnud_domain::InvocationContext::new(
         format!("ipc-{task}-{step}"),
@@ -4805,6 +5604,42 @@ async fn dispatch<S: SecretsContract>(
 
     let mut g = governed.lock().await;
     let (daemon, secrets, _tasks) = &mut *g;
+
+    // **A file read needs a daemon-issued authorization as well as a digest-valid
+    // approval.** The digest proves the operation was approved; the registry proves the
+    // daemon issued that approval through a permitted proposal-approval path. A
+    // standalone-issued, fabricated, expired or legacy tuple has no entry here, so it
+    // cannot dispatch -- even though its digest recomputes correctly.
+    //
+    // The entry is claimed, not merely read, so two concurrent dispatches cannot both
+    // use one authorization. The policy's own consumed-digest ledger still governs
+    // whether the *approval* may be used at all.
+    if action.capability.as_str() == READ_TEXT_CAPABILITY {
+        let Some(approval) = approval.as_ref() else {
+            return Err(RequestError::Forbidden {
+                reason: "read-approval-required".to_owned(),
+                detail: Some(
+                    "a file read must be authorised by an approval this daemon issued \
+                     through a reviewed proposal path."
+                        .to_owned(),
+                ),
+            });
+        };
+        let digest = digest_hex(&approval.digest);
+        if !daemon
+            .read_authorizations
+            .claim(&digest, daemon.read_clock.now_ms())
+        {
+            return Err(RequestError::Forbidden {
+                reason: "read-not-authorized".to_owned(),
+                detail: Some(
+                    "this read approval was not issued by this daemon through a \
+                     reviewed proposal path, so it cannot authorise a read."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
     let mut d: Dispatcher<'_, S> = daemon.dispatcher(secrets);
     // Derived before `action` is moved into the call below.
     let approval_params = approval_params(&action);
@@ -4881,6 +5716,721 @@ pub(crate) async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-dispatch registry's capacity is a fail-closed refusal, and it is
+    /// refused **before** the approval is created and before anything durable changes.
+    ///
+    /// The registry's own capacity test proves the bound; this proves the *handler*:
+    /// that a full registry is discovered before `issue_approval()`, before the
+    /// approval row is written, and before the proposal is decided.
+    mod read_dispatch_capacity {
+        use super::*;
+        use crate::observation::ProviderIdentity;
+        use crate::read_dispatch_authorization::MAX_READ_AUTHORIZATIONS;
+        use std::sync::Arc;
+
+        /// A secrets store that holds nothing, so the test never touches a real one.
+        struct NoSecrets;
+
+        impl orxnud_domain::platform::SecretsContract for NoSecrets {
+            type Error = std::io::Error;
+
+            fn get(
+                &self,
+                _reference: &orxnud_domain::platform::SecretRef,
+            ) -> Result<orxnud_domain::platform::SecretLookup, Self::Error> {
+                Ok(orxnud_domain::platform::SecretLookup::Absent)
+            }
+
+            fn set(
+                &self,
+                _reference: &orxnud_domain::platform::SecretRef,
+                _value: &str,
+            ) -> Result<(), Self::Error> {
+                Err(std::io::Error::other("read-only"))
+            }
+
+            fn delete(
+                &self,
+                _reference: &orxnud_domain::platform::SecretRef,
+            ) -> Result<(), Self::Error> {
+                Err(std::io::Error::other("read-only"))
+            }
+
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        /// A provider that names its destination and proposes a model-initiated read.
+        struct ReadProvider {
+            model: String,
+            destination: ProviderIdentity,
+        }
+
+        impl crate::proposer::ProposalProvider for ReadProvider {
+            fn model_id(&self) -> &str {
+                &self.model
+            }
+
+            fn destination(&self) -> Option<ProviderIdentity> {
+                Some(self.destination.clone())
+            }
+
+            fn complete(
+                &self,
+                _ctx: &crate::proposer::ProposalContext,
+            ) -> Result<String, crate::proposer::ProviderError> {
+                Ok(
+                    r#"{"capability":"filesystem/read-text","target":"a.txt","params":{"path":"a.txt"}}"#
+                        .to_owned(),
+                )
+            }
+        }
+
+        /// A disposable state root for one test.
+        fn root(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "orxnud-daemon-capacity-{}-{tag}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            dir
+        }
+
+        /// A protocol request, built the way a client would send one.
+        fn request(method: &str, params: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            }))
+            .expect("a request")
+        }
+
+        /// A daemon, a claimed task, a genuine model-initiated read proposal, and a
+        /// provider that names its destination.
+        struct Fixture {
+            root: std::path::PathBuf,
+            paths: Paths,
+            governed: tokio::sync::Mutex<(Daemon, NoSecrets, TaskService)>,
+            provider: Arc<dyn crate::proposer::ProposalProvider>,
+            task_id: orxnud_domain::ids::TaskId,
+            proposal_id: String,
+        }
+
+        impl Fixture {
+            async fn start(tag: &str) -> Self {
+                let root = root(tag);
+                let paths = Paths::under(&root);
+                let mut daemon = Daemon::compose(paths.clone());
+                daemon
+                    .attach_durable_security_state(&paths.database)
+                    .expect("durable security state");
+                let mut tasks = TaskService::open(
+                    &paths.database,
+                    EngineLimits::default(),
+                    &daemon.components().identity,
+                )
+                .expect("the task subsystem");
+                daemon.start().expect("the daemon starts");
+                let now = tasks.clock_now_ms();
+
+                let task_id = orxnud_domain::ids::TaskId::new("t-fault");
+                tasks
+                    .create(
+                        &orxnud_store::task_repo::NewTask {
+                            id: task_id.clone(),
+                            kind: orxnud_domain::task_state::TaskKind::Workflow,
+                            priority: 0,
+                            max_attempts: 1,
+                            run_after_ms: now,
+                            schedule_id: None,
+                            fire_time_ms: None,
+                            catch_up: false,
+                            payload: None,
+                            max_steps: 1,
+                        },
+                        now,
+                    )
+                    .expect("the task");
+                tasks.claim_task(&task_id, "w1", now).expect("the claim");
+
+                let governed = tokio::sync::Mutex::new((daemon, NoSecrets, tasks));
+                let observations =
+                    std::sync::Mutex::new(crate::observation::ObservationStore::new());
+                let provider: Arc<dyn crate::proposer::ProposalProvider> = Arc::new(ReadProvider {
+                    model: "test-model".to_owned(),
+                    destination: ProviderIdentity::new(
+                        "https://api.example.invalid/v1",
+                        "test-model",
+                    ),
+                });
+                let provider_ref: Option<&Arc<dyn crate::proposer::ProposalProvider>> =
+                    Some(&provider);
+
+                // The proposal, made by the real path.
+                let proposed = ai_propose(
+                    &request(
+                        "task/ai-propose",
+                        serde_json::json!({"task": task_id.to_string(), "worker": "w1"}),
+                    ),
+                    AuthenticatedPrincipal::InstallationOwner,
+                    &governed,
+                    provider_ref,
+                    &observations,
+                )
+                .await
+                .expect("the proposal");
+                let proposal_id = proposed
+                    .pointer("/proposal/proposal_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| proposed.get("proposal_id").and_then(|v| v.as_str()))
+                    .expect("a proposal id")
+                    .to_owned();
+
+                Self {
+                    root,
+                    paths,
+                    governed,
+                    provider,
+                    task_id,
+                    proposal_id,
+                }
+            }
+
+            /// A fresh, eligible challenge, from the real preview path.
+            async fn challenge(&self) -> String {
+                let provider_owned = Some(Arc::clone(&self.provider));
+                let preview = preview_proposal(
+                    &request(
+                        "capability/preview",
+                        serde_json::json!({"proposal": self.proposal_id}),
+                    ),
+                    &local_actor(),
+                    &self.governed,
+                    &provider_owned,
+                )
+                .await
+                .expect("the preview");
+                preview
+                    .pointer("/preview/challenge")
+                    .and_then(|c| c.as_str())
+                    .expect("a challenge from the preview")
+                    .to_owned()
+            }
+
+            /// The approval request for this proposal, with a challenge.
+            fn approval(&self, challenge: &str) -> Request {
+                request(
+                    "capability/approve",
+                    serde_json::json!({
+                        "proposal": self.proposal_id,
+                        "challenge": challenge,
+                        "confirmed": true,
+                        "ttl_ms": 60_000,
+                    }),
+                )
+            }
+
+            /// The daemon's durable state.
+            fn state(&self) -> rusqlite::Connection {
+                rusqlite::Connection::open(self.paths.database.clone()).expect("the state database")
+            }
+
+            /// The proposal's status in the durable state.
+            fn proposal_status(&self) -> String {
+                self.state()
+                    .query_row(
+                        "SELECT status FROM task_proposals WHERE proposal_id = ?1",
+                        [&self.proposal_id],
+                        |row| row.get(0),
+                    )
+                    .expect("the proposal row")
+            }
+
+            /// How many approval rows exist for this task.
+            fn approval_count(&self) -> i64 {
+                self.state()
+                    .query_row(
+                        "SELECT COUNT(*) FROM task_approvals WHERE task_id = ?1",
+                        [self.task_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .expect("the approval rows")
+            }
+
+            /// How many effect records exist for this task.
+            fn effect_count(&self) -> i64 {
+                self.state()
+                    .query_row(
+                        "SELECT COUNT(*) FROM task_effects WHERE task_id = ?1",
+                        [self.task_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .expect("the effect rows")
+            }
+
+            /// The registry's clock, in the registry's own domain.
+            async fn registry_now(&self) -> i64 {
+                self.governed.lock().await.0.read_clock.now_ms()
+            }
+        }
+
+        /// An armed fault belongs to the test that armed it.
+        ///
+        /// The harness runs each test on its own thread inside one process, so a
+        /// thread-scoped fault cannot be seen by another test. This pins that: a
+        /// fault armed here is invisible to another thread, and it is not consumed
+        /// by an operation that is not the one it names.
+        #[test]
+        fn an_armed_fault_is_not_seen_by_another_thread() {
+            arm_persistence_fault(PersistenceFault::ApprovalRow);
+            let seen = std::thread::spawn(|| {
+                // Another thread: neither the named operation nor the other one may
+                // see the fault this thread armed.
+                (
+                    persistence_fault(PersistenceFault::ApprovalRow),
+                    persistence_fault(PersistenceFault::ProposalDecision),
+                )
+            })
+            .join()
+            .expect("the other thread");
+            assert_eq!(
+                seen,
+                (false, false),
+                "an armed fault must not cross threads"
+            );
+            // The arming thread still has it.
+            assert!(persistence_fault(PersistenceFault::ApprovalRow));
+            // And it is consumed by the operation it names, exactly once.
+            assert!(take_persistence_fault(PersistenceFault::ApprovalRow));
+            assert!(
+                !take_persistence_fault(PersistenceFault::ApprovalRow),
+                "a fault must fire once"
+            );
+            clear_persistence_fault();
+        }
+
+        /// A failure to write the approval row is refused, and leaves nothing
+        /// behind: no approval, no decision, and no dispatchable authorization.
+        #[tokio::test]
+        async fn a_failed_approval_write_releases_the_reservation_and_writes_nothing() {
+            let fixture = Fixture::start("approval-write").await;
+
+            // One pre-existing live authorization, to prove it is not evicted.
+            let registry_now = fixture.registry_now().await;
+            {
+                let mut g = fixture.governed.lock().await;
+                let reservation =
+                    g.0.read_authorizations
+                        .reserve(registry_now)
+                        .expect("a reservation");
+                g.0.read_authorizations.activate(
+                    reservation,
+                    "pre-existing-digest".to_owned(),
+                    registry_now + 60_000,
+                );
+            }
+            let live_before = fixture.governed.lock().await.0.read_authorizations.live();
+
+            // The write fails, at the write.
+            let challenge = fixture.challenge().await;
+            arm_persistence_fault(PersistenceFault::ApprovalRow);
+            let refused = approve_proposal(
+                &fixture.approval(&challenge),
+                &local_actor(),
+                &fixture.governed,
+                &Some(Arc::clone(&fixture.provider)),
+            )
+            .await
+            .expect_err("a failed write must refuse the approval");
+            clear_persistence_fault();
+
+            assert!(
+                matches!(
+                    &refused,
+                    RequestError::Internal { .. } | RequestError::Conflict { .. }
+                ),
+                "a storage fault must not look like a policy decision: {refused:?}"
+            );
+
+            // Nothing durable happened.
+            assert_eq!(fixture.proposal_status(), "pending");
+            assert_eq!(fixture.approval_count(), 0);
+            assert_eq!(fixture.effect_count(), 0);
+
+            // The reservation was released and the registry is as it was.
+            {
+                let mut g = fixture.governed.lock().await;
+                assert_eq!(
+                    g.0.read_authorizations.live(),
+                    live_before,
+                    "the reservation must have been released"
+                );
+                assert_eq!(
+                    g.0.read_authorizations.reserved(),
+                    0,
+                    "no reservation may be left behind"
+                );
+                assert!(
+                    g.0.read_authorizations
+                        .claim("pre-existing-digest", registry_now),
+                    "a pre-existing live authorization must survive"
+                );
+            }
+
+            // The challenge was consumed by the attempt, so a fresh preview is
+            // required -- and with it, the retry succeeds.
+            let spent = approve_proposal(
+                &fixture.approval(&challenge),
+                &local_actor(),
+                &fixture.governed,
+                &Some(Arc::clone(&fixture.provider)),
+            )
+            .await
+            .expect_err("a spent challenge must not be accepted");
+            assert!(
+                matches!(&spent, RequestError::Conflict { reason, .. }
+                    if reason == "preview-challenge-invalid"),
+                "the challenge must be consumed by the attempt: {spent:?}"
+            );
+
+            let fresh = fixture.challenge().await;
+            let approved = approve_proposal(
+                &fixture.approval(&fresh),
+                &local_actor(),
+                &fixture.governed,
+                &Some(Arc::clone(&fixture.provider)),
+            )
+            .await
+            .expect("the retry with a fresh challenge must succeed");
+            assert!(
+                approved.get("approval").is_some(),
+                "the retry must issue an approval: {approved:?}"
+            );
+            assert_eq!(fixture.proposal_status(), "approved");
+            assert_eq!(fixture.approval_count(), 1);
+
+            let _ = std::fs::remove_dir_all(&fixture.root);
+        }
+
+        /// A failure to decide the proposal is refused, and the approval row that
+        /// had already been written is removed: an approval exists if and only if
+        /// its proposal was decided.
+        #[tokio::test]
+        async fn a_failed_proposal_decision_removes_the_approval_it_had_written() {
+            let fixture = Fixture::start("proposal-decision").await;
+
+            // One pre-existing live authorization, to prove it is not evicted.
+            let registry_now = fixture.registry_now().await;
+            {
+                let mut g = fixture.governed.lock().await;
+                let reservation =
+                    g.0.read_authorizations
+                        .reserve(registry_now)
+                        .expect("a reservation");
+                g.0.read_authorizations.activate(
+                    reservation,
+                    "pre-existing-digest".to_owned(),
+                    registry_now + 60_000,
+                );
+            }
+            let live_before = fixture.governed.lock().await.0.read_authorizations.live();
+
+            let challenge = fixture.challenge().await;
+            arm_persistence_fault(PersistenceFault::ProposalDecision);
+            let refused = approve_proposal(
+                &fixture.approval(&challenge),
+                &local_actor(),
+                &fixture.governed,
+                &Some(Arc::clone(&fixture.provider)),
+            )
+            .await
+            .expect_err("a failed decision must refuse the approval");
+            clear_persistence_fault();
+
+            assert!(
+                matches!(
+                    &refused,
+                    RequestError::Internal { .. } | RequestError::Conflict { .. }
+                ),
+                "a storage fault must not look like a policy decision: {refused:?}"
+            );
+
+            // The proposal was not decided, and the approval it had been given is
+            // gone: the two are the same statement.
+            assert_eq!(fixture.proposal_status(), "pending");
+            assert_eq!(
+                fixture.approval_count(),
+                0,
+                "an approval must not outlive the decision that failed"
+            );
+            assert_eq!(fixture.effect_count(), 0);
+
+            // The reservation was released, and no dispatchable entry exists.
+            {
+                let mut g = fixture.governed.lock().await;
+                assert_eq!(
+                    g.0.read_authorizations.live(),
+                    live_before,
+                    "the reservation must have been released"
+                );
+                assert_eq!(g.0.read_authorizations.reserved(), 0);
+                assert!(
+                    g.0.read_authorizations
+                        .claim("pre-existing-digest", registry_now),
+                    "a pre-existing live authorization must survive"
+                );
+            }
+
+            // The challenge was consumed, and a fresh one lets the retry through:
+            // the durable state permits it, because the failed attempt left none.
+            let spent = approve_proposal(
+                &fixture.approval(&challenge),
+                &local_actor(),
+                &fixture.governed,
+                &Some(Arc::clone(&fixture.provider)),
+            )
+            .await
+            .expect_err("a spent challenge must not be accepted");
+            assert!(
+                matches!(&spent, RequestError::Conflict { reason, .. }
+                    if reason == "preview-challenge-invalid"),
+                "the challenge must be consumed by the attempt: {spent:?}"
+            );
+
+            let fresh = fixture.challenge().await;
+            let approved = approve_proposal(
+                &fixture.approval(&fresh),
+                &local_actor(),
+                &fixture.governed,
+                &Some(Arc::clone(&fixture.provider)),
+            )
+            .await
+            .expect("the retry with a fresh challenge must succeed");
+            assert!(
+                approved.get("approval").is_some(),
+                "the retry must issue an approval: {approved:?}"
+            );
+            assert_eq!(fixture.proposal_status(), "approved");
+            assert_eq!(fixture.approval_count(), 1);
+
+            let _ = std::fs::remove_dir_all(&fixture.root);
+        }
+
+        /// A full registry refuses the approval, and refuses it before anything
+        /// durable happens.
+        #[tokio::test]
+        async fn a_full_registry_refuses_the_approval_before_anything_is_written() {
+            let root = root("full");
+            let paths = Paths::under(&root);
+            let mut daemon = Daemon::compose(paths.clone());
+            daemon
+                .attach_durable_security_state(&paths.database)
+                .expect("durable security state");
+            let mut tasks = TaskService::open(
+                &paths.database,
+                EngineLimits::default(),
+                &daemon.components().identity,
+            )
+            .expect("the task subsystem");
+            daemon.start().expect("the daemon starts");
+            let now = tasks.clock_now_ms();
+
+            // A task, claimed by a worker, so a proposal can be made for it.
+            let task_id = orxnud_domain::ids::TaskId::new("t-capacity");
+            tasks
+                .create(
+                    &orxnud_store::task_repo::NewTask {
+                        id: task_id.clone(),
+                        kind: orxnud_domain::task_state::TaskKind::Workflow,
+                        priority: 0,
+                        max_attempts: 1,
+                        run_after_ms: now,
+                        schedule_id: None,
+                        fire_time_ms: None,
+                        catch_up: false,
+                        payload: None,
+                        max_steps: 1,
+                    },
+                    now,
+                )
+                .expect("the task");
+            tasks.claim_task(&task_id, "w1", now).expect("the claim");
+
+            let governed = tokio::sync::Mutex::new((daemon, NoSecrets, tasks));
+            let observations = std::sync::Mutex::new(crate::observation::ObservationStore::new());
+            let provider: Arc<dyn crate::proposer::ProposalProvider> = Arc::new(ReadProvider {
+                model: "test-model".to_owned(),
+                destination: ProviderIdentity::new("https://api.example.invalid/v1", "test-model"),
+            });
+            // Two shapes, because the handlers differ: the proposal path takes a
+            // borrowed option, the preview and approval paths a borrowed owned one.
+            let provider_ref: Option<&Arc<dyn crate::proposer::ProposalProvider>> = Some(&provider);
+            let provider_owned: Option<Arc<dyn crate::proposer::ProposalProvider>> =
+                Some(Arc::clone(&provider));
+            let actor = local_actor();
+
+            // A genuine model-initiated read proposal, made by the real path.
+            let proposed = ai_propose(
+                &request(
+                    "task/ai-propose",
+                    serde_json::json!({"task": task_id.to_string(), "worker": "w1"}),
+                ),
+                AuthenticatedPrincipal::InstallationOwner,
+                &governed,
+                provider_ref,
+                &observations,
+            )
+            .await
+            .expect("the proposal");
+            let proposal_id = proposed
+                .pointer("/proposal/proposal_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| proposed.get("proposal_id").and_then(|v| v.as_str()))
+                .expect("a proposal id")
+                .to_owned();
+
+            // Fill the registry through its own API, in its own clock domain: no
+            // durable approval cycles, and nothing is evicted to make room.
+            let registry_now = governed.lock().await.0.read_clock.now_ms();
+            for index in 0..MAX_READ_AUTHORIZATIONS {
+                let reservation = governed
+                    .lock()
+                    .await
+                    .0
+                    .read_authorizations
+                    .reserve(registry_now)
+                    .expect("a reservation");
+                governed.lock().await.0.read_authorizations.activate(
+                    reservation,
+                    format!("synthetic-digest-{index}"),
+                    registry_now + 60_000,
+                );
+            }
+            {
+                let g = governed.lock().await;
+                assert_eq!(
+                    g.0.read_authorizations.live(),
+                    MAX_READ_AUTHORIZATIONS,
+                    "the registry must be full"
+                );
+            }
+
+            // A fresh, eligible preview, and the challenge it issues.
+            let preview = preview_proposal(
+                &request(
+                    "capability/preview",
+                    serde_json::json!({"proposal": proposal_id}),
+                ),
+                &actor,
+                &governed,
+                &provider_owned,
+            )
+            .await
+            .expect("the preview");
+            let challenge = preview
+                .pointer("/preview/challenge")
+                .and_then(|c| c.as_str())
+                .expect("a challenge from the preview")
+                .to_owned();
+
+            // The approval. It must be refused, because there is no capacity.
+            let refused = approve_proposal(
+                &request(
+                    "capability/approve",
+                    serde_json::json!({
+                        "proposal": proposal_id,
+                        "challenge": challenge,
+                        "confirmed": true,
+                        "ttl_ms": 60_000,
+                    }),
+                ),
+                &actor,
+                &governed,
+                &provider_owned,
+            )
+            .await
+            .expect_err("a full registry must refuse the approval");
+            assert!(
+                matches!(&refused, RequestError::Conflict { reason, .. }
+                    if reason == "read-authorization-unavailable"),
+                "the refusal must name the capacity: {refused:?}"
+            );
+
+            // The durable state: nothing was approved, and nothing was decided.
+            let connection =
+                rusqlite::Connection::open(paths.database.clone()).expect("the state database");
+            let status: String = connection
+                .query_row(
+                    "SELECT status FROM task_proposals WHERE proposal_id = ?1",
+                    [&proposal_id],
+                    |row| row.get(0),
+                )
+                .expect("the proposal row");
+            assert_eq!(status, "pending", "the proposal must still be pending");
+            let approvals: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM task_approvals WHERE task_id = ?1",
+                    [task_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("the approval rows");
+            assert_eq!(approvals, 0, "no approval may have been written");
+            let effects: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM task_effects WHERE task_id = ?1",
+                    [task_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("the effect rows");
+            assert_eq!(effects, 0, "no capability may have run");
+
+            // The registry is still full, and nothing live was evicted.
+            {
+                let mut g = governed.lock().await;
+                assert_eq!(
+                    g.0.read_authorizations.live(),
+                    MAX_READ_AUTHORIZATIONS,
+                    "a refused approval must not change the registry"
+                );
+                assert!(
+                    g.0.read_authorizations
+                        .claim("synthetic-digest-0", registry_now),
+                    "a pre-existing live authorization must still be there"
+                );
+            }
+
+            // The challenge was consumed by the failed attempt, so a fresh preview
+            // is required for the next one.
+            let again = approve_proposal(
+                &request(
+                    "capability/approve",
+                    serde_json::json!({
+                        "proposal": proposal_id,
+                        "challenge": challenge,
+                        "confirmed": true,
+                        "ttl_ms": 60_000,
+                    }),
+                ),
+                &actor,
+                &governed,
+                &provider_owned,
+            )
+            .await
+            .expect_err("a spent challenge must not be accepted");
+            assert!(
+                matches!(&again, RequestError::Conflict { reason, .. }
+                    if reason == "preview-challenge-invalid"),
+                "the challenge must be consumed by the attempt: {again:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 
     /// The effect critical section never suspends, so a request deadline cannot interrupt
     /// a reserved-but-unsettled effect.
@@ -5283,11 +6833,25 @@ mod tests {
                     delegated_by: orxnud_domain::ids::UserId::new("local"),
                     run: orxnud_domain::ids::RunId::new("t1"),
                     task: TaskId::new("t1"),
-                    provenance: orxnud_domain::actor::ModelProvenance::new(
-                        model,
-                        "ph",
-                        orxnud_domain::ids::RequestId::new("r"),
-                    ),
+                    provenance: {
+                        let mut provenance = orxnud_domain::actor::ModelProvenance::new(
+                            model,
+                            "ph",
+                            orxnud_domain::ids::RequestId::new("r"),
+                        );
+                        // A proposal is bound to the destination that produced it. The
+                        // scripted provider names `scripted://local` as its destination,
+                        // so that is what the proposal carries -- otherwise the read
+                        // would not be disclosable, which is the point of the binding.
+                        provenance.destination_fingerprint =
+                            Some(crate::observation::destination_fingerprint(
+                                &crate::observation::ProviderIdentity::new(
+                                    "scripted://local",
+                                    model,
+                                ),
+                            ));
+                        provenance
+                    },
                 })
                 .expect("an actor serialises"),
                 authority_root: Some("local".to_owned()),
@@ -6873,4 +8437,785 @@ fn the_disclosure_field_is_present_when_something_is_exposed() {
         Some("c"),
         "the inserted field must carry the exposure, not merely exist; got {status}"
     );
+}
+
+/// The recipient-binding rules, pinned where the decision is made.
+///
+/// A proposal is bound to the **destination that produced it**, and a change to either
+/// the endpoint or the model must stop the content being disclosed. The model name alone
+/// was not enough: two configured endpoints can serve the same model name.
+#[cfg(test)]
+mod destination_fingerprint_tests {
+    use crate::observation::{ProviderIdentity, destination_fingerprint};
+
+    fn identity(endpoint: &str, model: &str) -> ProviderIdentity {
+        ProviderIdentity::new(endpoint, model)
+    }
+
+    /// A matching destination produces the same fingerprint, and a fingerprint never
+    /// contains the endpoint it covers.
+    #[test]
+    fn a_matching_destination_has_the_same_fingerprint_and_leaks_no_url() {
+        let id = identity("https://example.invalid/v1", "some-model");
+        let fp = destination_fingerprint(&id);
+        assert_eq!(
+            fp,
+            destination_fingerprint(&identity("https://example.invalid/v1", "some-model"))
+        );
+        assert!(
+            !fp.contains("example.invalid"),
+            "the fingerprint must not contain the endpoint: {fp}"
+        );
+        assert!(
+            !fp.contains("some-model"),
+            "the fingerprint must not contain the model: {fp}"
+        );
+    }
+
+    /// The endpoint and the model are both covered, separately.
+    #[test]
+    fn a_changed_endpoint_or_a_changed_model_changes_the_fingerprint() {
+        let base = destination_fingerprint(&identity("https://a.invalid/v1", "m"));
+        assert_ne!(
+            base,
+            destination_fingerprint(&identity("https://b.invalid/v1", "m")),
+            "a changed endpoint must change the fingerprint"
+        );
+        assert_ne!(
+            base,
+            destination_fingerprint(&identity("https://a.invalid/v1", "m2")),
+            "a changed model must change the fingerprint"
+        );
+    }
+
+    /// The encoding is unambiguous: no two distinct pairs may encode alike.
+    #[test]
+    fn the_fingerprint_encoding_is_unambiguous() {
+        assert_ne!(
+            destination_fingerprint(&identity("https://ab.invalid/v1", "c")),
+            destination_fingerprint(&identity("https://a.invalid/v1", "bc")),
+            "a naive concatenation would let these collide"
+        );
+    }
+
+    /// A proposal whose provenance predates the field deserialises safely, and carries
+    /// no fingerprint -- which is the fail-closed answer.
+    #[test]
+    fn provenance_without_a_destination_fingerprint_deserialises_and_is_unbound() {
+        let legacy = r#"{"model":"m","revision":null,"prompt_hash":"p","request_id":"q"}"#;
+        let parsed: orxnud_domain::actor::ModelProvenance =
+            serde_json::from_str(legacy).expect("legacy provenance must deserialise");
+        assert_eq!(parsed.model, "m");
+        assert!(
+            parsed.destination_fingerprint.is_none(),
+            "a proposal that predates the field must be unbound, not guessed at"
+        );
+    }
+
+    /// The safe display projection, and what it refuses.
+    ///
+    /// `ProviderIdentity::endpoint()` is a comparison form and keeps user information,
+    /// query parameters and fragments. It is never printed. The projection below either
+    /// represents a destination it fully understands, or refuses.
+    #[test]
+    fn the_destination_display_is_safe_and_refuses_what_it_cannot_represent() {
+        use crate::observation::{DestinationDisplay, ProviderIdentity, destination_display};
+
+        // 1. A conventional HTTPS endpoint: scheme, host, port, path prefix.
+        let https = destination_display(&ProviderIdentity::new(
+            "https://api.example.invalid:8443/v1",
+            "some-model",
+        ))
+        .expect("a conventional https endpoint must be displayable");
+        assert_eq!(https.scheme, "https");
+        assert_eq!(https.host, "api.example.invalid");
+        assert_eq!(https.port, Some(8443));
+        assert_eq!(https.path_prefix.as_deref(), Some("/v1"));
+        assert!(
+            https
+                .label()
+                .contains("https://api.example.invalid:8443/v1")
+        );
+        assert!(https.label().contains("some-model"));
+
+        // 2. A plaintext HTTP endpoint is shown as plaintext, never as TLS.
+        let http = destination_display(&ProviderIdentity::new(
+            "http://localhost.invalid:9000/v1",
+            "m",
+        ))
+        .expect("a plaintext endpoint is displayable");
+        assert_eq!(http.scheme, "http");
+        assert!(http.label().starts_with("http://"), "{}", http.label());
+
+        // 3. The scripted test provider is named as such.
+        let scripted =
+            destination_display(&ProviderIdentity::new("scripted://local", "scripted/none"))
+                .expect("the scripted provider is displayable");
+        assert!(scripted.local_scripted);
+        assert!(
+            scripted.label().contains("local scripted test provider"),
+            "{}",
+            scripted.label()
+        );
+
+        // 4. Everything unrepresentable is refused outright.
+        for rejected_endpoint in [
+            "https://user:secret@host.invalid/v1",  // user information
+            "https://host.invalid/v1?token=abc123", // query parameter
+            "https://host.invalid/v1#frag",         // fragment
+            r"https://host.invalid/v1\evil",        // backslash
+            "https://host.invalid/v1\u{7}x",        // control character
+            "ftp://host.invalid/v1",                // unsupported scheme
+            "https://",                             // no host
+            "https:///v1",                          // no host
+            "https://host.invalid:99999/v1",        // port out of range
+            "https://host.invalid:xy/v1",           // port is not a number
+        ] {
+            assert_eq!(
+                destination_display(&ProviderIdentity::new(rejected_endpoint, "m")),
+                None,
+                "an endpoint that cannot be safely represented must be refused, not \
+                 sanitised: {rejected_endpoint:?}"
+            );
+        }
+
+        // 5. A model label that is empty or carries a control character is refused.
+        assert!(destination_display(&ProviderIdentity::new("https://host.invalid", "")).is_none());
+        assert!(destination_display(&ProviderIdentity::new("https://host.invalid", " ")).is_none());
+        assert!(
+            destination_display(&ProviderIdentity::new("https://host.invalid", "m\u{7}")).is_none()
+        );
+
+        // 6. No secret material appears in a refusal or a label.
+        let secret = "s3cr3t-token-value";
+        for rejected_endpoint in [
+            format!("https://user:{secret}@host.invalid/v1"),
+            format!("https://host.invalid/v1?token={secret}"),
+            format!("https://host.invalid/v1#{secret}"),
+        ] {
+            let display = destination_display(&ProviderIdentity::new(&rejected_endpoint, "m"));
+            assert!(display.is_none(), "{rejected_endpoint:?} must be refused");
+            // Nothing that could carry the secret is produced at all.
+            assert!(
+                !rejected_endpoint.contains(secret) || display.is_none(),
+                "a refused endpoint must not be partially rendered"
+            );
+        }
+
+        // 7. A valid destination still matches its fingerprint, and a changed endpoint or
+        //    model still blocks disclosure.
+        let identity = ProviderIdentity::new("https://api.example.invalid/v1", "m");
+        let recorded = destination_fingerprint(&identity);
+        assert!(crate::observation::destination_matches(
+            Some(&recorded),
+            Some(&identity)
+        ));
+        assert!(!crate::observation::destination_matches(
+            Some(&recorded),
+            Some(&ProviderIdentity::new("https://other.invalid/v1", "m"))
+        ));
+        assert!(!crate::observation::destination_matches(
+            Some(&recorded),
+            Some(&ProviderIdentity::new(
+                "https://api.example.invalid/v1",
+                "m2"
+            ))
+        ));
+
+        // 8. An identity that cannot be displayed is not disclosure-eligible, even when
+        //    its fingerprint matches -- including a historical proposal carrying one.
+        let rejected_identity = ProviderIdentity::new("https://user:secret@host.invalid/v1", "m");
+        let rejected_recorded = destination_fingerprint(&rejected_identity);
+        assert!(
+            !crate::observation::destination_matches(
+                Some(&rejected_recorded),
+                Some(&rejected_identity)
+            ),
+            "an undisplayable destination must not be disclosure-eligible"
+        );
+
+        // The type is used, so the import is not dead.
+        let _: DestinationDisplay = https;
+    }
+
+    /// The response fields an AI-generated proposal carries about its recipient.
+    ///
+    /// A synthetic provider with a chosen destination, so the label and the status are
+    /// exercised through the same helpers the reply assembly uses.
+    mod recipient_fields {
+        use crate::observation::ProviderIdentity;
+        use std::sync::Arc;
+
+        struct Stub {
+            model: String,
+            destination: Option<ProviderIdentity>,
+        }
+
+        fn stub(endpoint: Option<&str>, model: &str) -> Arc<dyn crate::proposer::ProposalProvider> {
+            Arc::new(Stub {
+                model: model.to_owned(),
+                destination: endpoint.map(|e| ProviderIdentity::new(e, model)),
+            })
+        }
+
+        impl crate::proposer::ProposalProvider for Stub {
+            fn model_id(&self) -> &str {
+                &self.model
+            }
+            fn destination(&self) -> Option<ProviderIdentity> {
+                self.destination.clone()
+            }
+            fn complete(
+                &self,
+                _ctx: &crate::proposer::ProposalContext,
+            ) -> Result<String, crate::proposer::ProviderError> {
+                Ok(String::new())
+            }
+        }
+
+        /// An identified destination yields the label and the `identified` status.
+        #[test]
+        fn an_identified_destination_yields_a_label_and_the_identified_status() {
+            let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+            let label = crate::runtime::recipient_label(&provider).expect("a label");
+            assert!(label.contains("https://api.example.invalid/v1"), "{label}");
+            assert!(label.contains("some-model"), "{label}");
+            assert_eq!(crate::runtime::recipient_status(&provider), "identified");
+        }
+
+        /// A scripted provider is named as a local scripted test provider.
+        #[test]
+        fn a_scripted_provider_is_named_as_a_local_test_provider() {
+            let provider = stub(Some("scripted://local"), "scripted/none");
+            let label = crate::runtime::recipient_label(&provider).expect("a label");
+            assert!(label.contains("local scripted test provider"), "{label}");
+            assert!(
+                !label.contains("model: scripted/none"),
+                "a scripted provider must not be shown as a model endpoint: {label}"
+            );
+        }
+
+        /// An unsafe destination yields no label, and the `unavailable` status.
+        #[test]
+        fn an_unsafe_destination_yields_no_label_and_the_unavailable_status() {
+            let provider = stub(Some("https://user:secret@host.invalid/v1"), "m");
+            assert!(crate::runtime::recipient_label(&provider).is_none());
+            assert_eq!(crate::runtime::recipient_status(&provider), "unavailable");
+        }
+
+        /// A provider with no destination is unavailable too.
+        #[test]
+        fn a_provider_without_a_destination_is_unavailable() {
+            let provider = stub(None, "m");
+            assert!(crate::runtime::recipient_label(&provider).is_none());
+            assert_eq!(crate::runtime::recipient_status(&provider), "unavailable");
+        }
+
+        /// An undisplayable destination cannot obtain a disclosure-eligible fingerprint.
+        #[test]
+        fn an_undisplayable_destination_cannot_obtain_a_fingerprint() {
+            let unsafe_endpoint = "https://user:secret@host.invalid/v1";
+            let provider = stub(Some(unsafe_endpoint), "m");
+            assert!(
+                crate::runtime::destination_fingerprint_of(&provider).is_none(),
+                "an undisplayable destination must not become disclosure-eligible"
+            );
+            let safe = stub(Some("https://api.example.invalid/v1"), "m");
+            assert!(crate::runtime::destination_fingerprint_of(&safe).is_some());
+        }
+    }
+
+    /// The decision itself, in every direction.
+    ///
+    /// A proposal is bound to the destination that produced it. A changed endpoint, a
+    /// changed model, a proposal that predates the field, and a provider that cannot
+    /// name its destination all block disclosure.
+    #[test]
+    fn only_the_original_destination_qualifies() {
+        let original = identity("https://a.invalid/v1", "m");
+        let recorded = destination_fingerprint(&original);
+
+        // Matching endpoint and model: qualified.
+        assert!(
+            crate::observation::destination_matches(Some(&recorded), Some(&original)),
+            "the destination that produced the proposal must qualify"
+        );
+
+        // Endpoint changed, model unchanged: blocked.
+        assert!(
+            !crate::observation::destination_matches(
+                Some(&recorded),
+                Some(&identity("https://b.invalid/v1", "m"))
+            ),
+            "a changed endpoint must block disclosure"
+        );
+
+        // Model changed, endpoint unchanged: blocked.
+        assert!(
+            !crate::observation::destination_matches(
+                Some(&recorded),
+                Some(&identity("https://a.invalid/v1", "m2"))
+            ),
+            "a changed model must block disclosure"
+        );
+
+        // A proposal that predates the field: blocked.
+        assert!(
+            !crate::observation::destination_matches(None, Some(&original)),
+            "an unbound proposal must not qualify"
+        );
+
+        // A malformed recorded fingerprint: blocked.
+        assert!(
+            !crate::observation::destination_matches(Some("not-a-fingerprint"), Some(&original)),
+            "a malformed fingerprint must not qualify"
+        );
+
+        // A provider that cannot name its destination: blocked.
+        assert!(
+            !crate::observation::destination_matches(Some(&recorded), None),
+            "a provider with no destination must not qualify"
+        );
+    }
+
+    /// The fingerprint survives the serialised form the proposal row stores.
+    #[test]
+    fn the_fingerprint_survives_the_persisted_proposer_representation() {
+        let mut provenance = orxnud_domain::actor::ModelProvenance::new(
+            "m",
+            "p",
+            orxnud_domain::ids::RequestId::new("q"),
+        );
+        provenance.destination_fingerprint = Some(destination_fingerprint(&identity(
+            "https://example.invalid/v1",
+            "m",
+        )));
+
+        let actor = orxnud_domain::Actor::Ai {
+            delegated_by: orxnud_domain::ids::UserId::new("local"),
+            run: orxnud_domain::ids::RunId::new("t"),
+            task: orxnud_domain::ids::TaskId::new("t"),
+            provenance: provenance.clone(),
+        };
+        // Round-trip through the same JSON the proposal row stores.
+        let text = serde_json::to_string(&actor).expect("serialise");
+        let back: orxnud_domain::Actor = serde_json::from_str(&text).expect("deserialise");
+        let orxnud_domain::Actor::Ai { provenance, .. } = &back else {
+            panic!("the actor must stay an AI actor");
+        };
+        assert_eq!(
+            provenance.destination_fingerprint,
+            Some(destination_fingerprint(&identity(
+                "https://example.invalid/v1",
+                "m"
+            ))),
+            "the binding must survive the persisted representation"
+        );
+        assert!(
+            !text.contains("example.invalid"),
+            "no raw endpoint may reach durable state: {text}"
+        );
+    }
+}
+
+/// The read-only preview contract.
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::observation::{ProviderIdentity, destination_fingerprint};
+    use std::sync::Arc;
+
+    /// A provider with a chosen destination.
+    struct Stub {
+        model: String,
+        destination: Option<ProviderIdentity>,
+    }
+
+    impl crate::proposer::ProposalProvider for Stub {
+        fn model_id(&self) -> &str {
+            &self.model
+        }
+        fn destination(&self) -> Option<ProviderIdentity> {
+            self.destination.clone()
+        }
+        fn complete(
+            &self,
+            _ctx: &crate::proposer::ProposalContext,
+        ) -> Result<String, crate::proposer::ProviderError> {
+            Ok(String::new())
+        }
+    }
+
+    /// The authenticated principal a preview is taken for.
+    fn actor() -> orxnud_domain::Actor {
+        orxnud_domain::Actor::Human {
+            user: orxnud_domain::ids::UserId::new("local"),
+            via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+        }
+    }
+
+    fn stub(endpoint: Option<&str>, model: &str) -> Arc<dyn crate::proposer::ProposalProvider> {
+        Arc::new(Stub {
+            model: model.to_owned(),
+            destination: endpoint.map(|e| ProviderIdentity::new(e, model)),
+        })
+    }
+
+    /// A pending AI proposal for `filesystem/read-text`, with the given fingerprint.
+    fn proposal(fingerprint: Option<String>) -> orxnud_store::task_repo::ProposalRow {
+        let mut provenance = orxnud_domain::actor::ModelProvenance::new(
+            "some-model",
+            "ph",
+            orxnud_domain::ids::RequestId::new("r"),
+        );
+        provenance.destination_fingerprint = fingerprint;
+        orxnud_store::task_repo::ProposalRow {
+            proposal_id: "p-1".to_owned(),
+            task_id: orxnud_domain::ids::TaskId::new("t1"),
+            attempt_no: 1,
+            step_no: 2,
+            capability: READ_TEXT_CAPABILITY.to_owned(),
+            target: Some("a.txt".to_owned()),
+            params: r#"{"path":"a.txt"}"#.to_owned(),
+            proposer_json: serde_json::to_string(&orxnud_domain::Actor::Ai {
+                delegated_by: orxnud_domain::ids::UserId::new("local"),
+                run: orxnud_domain::ids::RunId::new("t1"),
+                task: orxnud_domain::ids::TaskId::new("t1"),
+                provenance,
+            })
+            .expect("actor"),
+            authority_root: Some("local".to_owned()),
+            created_at_ms: 0,
+            status: "pending".to_owned(),
+            decided_at_ms: None,
+        }
+    }
+
+    /// A matching recipient produces an identified, approvable preview.
+    #[test]
+    fn a_matching_recipient_yields_an_approvable_preview() {
+        let identity = ProviderIdentity::new("https://api.example.invalid/v1", "some-model");
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+        let row = proposal(Some(destination_fingerprint(&identity)));
+
+        let (preview, _binding) =
+            build_preview(&row, Some(&provider), &actor()).expect("a preview");
+        let p = &preview["preview"];
+        assert_eq!(p["proposal_id"], "p-1");
+        assert_eq!(p["capability"], READ_TEXT_CAPABILITY);
+        assert_eq!(p["path"], "a.txt");
+        assert_eq!(p["attempt_no"], 1);
+        assert_eq!(p["step_no"], 2);
+        assert_eq!(p["status"], "pending");
+        assert_eq!(p["recipient_status"], "identified");
+        assert_eq!(p["approval_allowed"], true);
+        assert!(
+            p["recipient"]
+                .as_str()
+                .unwrap_or("")
+                .contains("api.example.invalid")
+        );
+        assert_eq!(p["disclosure"]["read_ceiling_bytes"], 64 * 1024);
+        assert_eq!(p["disclosure"]["observation_ceiling_bytes"], 32 * 1024);
+        assert_eq!(p["disclosure"]["max_entries"], 8);
+        assert_eq!(p["disclosure"]["read_only"], true);
+        // The whole-observation rule and the timing limit are stated.
+        let limits = p["disclosure"]["limits"].as_str().unwrap_or("");
+        assert!(limits.contains("skipped"), "{limits}");
+        let timing = p["disclosure"]["timing"].as_str().unwrap_or("");
+        assert!(timing.contains("immediately following"), "{timing}");
+    }
+
+    /// Every way the recipient can fail leaves the preview blocked, and the raw
+    /// endpoint never appears.
+    #[test]
+    fn a_failed_recipient_blocks_approval_and_leaks_nothing() {
+        let canary_userinfo = "user:CANARY-USERINFO-4b1e";
+        let canary_query = "CANARY-QUERY-TOKEN-9d2c";
+        let canary_fragment = "CANARY-FRAGMENT-77aa";
+
+        // No provider at all.
+        let row = proposal(Some("deadbeef".to_owned()));
+        let (preview, _binding) = build_preview(&row, None, &actor()).expect("a preview");
+        assert_eq!(preview["preview"]["approval_allowed"], false);
+        assert_eq!(preview["preview"]["recipient_status"], "unavailable");
+        assert!(preview["preview"]["recipient"].is_null());
+
+        // A proposal with no stored fingerprint.
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+        let row = proposal(None);
+        let (preview, _binding) =
+            build_preview(&row, Some(&provider), &actor()).expect("a preview");
+        assert_eq!(preview["preview"]["approval_allowed"], false);
+
+        // The endpoint changed.
+        let identity = ProviderIdentity::new("https://api.example.invalid/v1", "some-model");
+        let other = stub(Some("https://other.invalid/v1"), "some-model");
+        let row = proposal(Some(destination_fingerprint(&identity)));
+        let (preview, _binding) = build_preview(&row, Some(&other), &actor()).expect("a preview");
+        assert_eq!(preview["preview"]["approval_allowed"], false);
+        assert_eq!(preview["preview"]["recipient_status"], "unavailable");
+
+        // The model changed.
+        let other = stub(Some("https://api.example.invalid/v1"), "other-model");
+        let (preview, _binding) = build_preview(&row, Some(&other), &actor()).expect("a preview");
+        assert_eq!(preview["preview"]["approval_allowed"], false);
+
+        // An unsafe destination, carrying canaries.
+        for endpoint in [
+            format!("https://{canary_userinfo}@host.invalid/v1"),
+            format!("https://host.invalid/v1?token={canary_query}"),
+            format!("https://host.invalid/v1#{canary_fragment}"),
+        ] {
+            let provider = stub(Some(&endpoint), "some-model");
+            let row = proposal(Some(destination_fingerprint(&ProviderIdentity::new(
+                &endpoint,
+                "some-model",
+            ))));
+            let (preview, _binding) =
+                build_preview(&row, Some(&provider), &actor()).expect("a preview");
+            assert_eq!(preview["preview"]["approval_allowed"], false);
+            let text = preview.to_string();
+            for canary in [canary_userinfo, canary_query, canary_fragment] {
+                assert!(
+                    !text.contains(canary),
+                    "a canary reached the preview: {text}"
+                );
+            }
+        }
+    }
+
+    /// Every pending proposal can be previewed, and the preview says what kind it is.
+    ///
+    /// The preview used to refuse anything that was not an AI-generated file read,
+    /// which left a client unable to tell "no confirmation needed" from "the preview
+    /// failed". A client that cannot tell those apart must not approve, so the preview
+    /// now answers for every proposal and classifies it.
+    #[test]
+    fn every_proposal_is_classified_and_only_a_model_initiated_read_needs_confirmation() {
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+
+        // A model-initiated write: a model asked, but it is not a read, so no
+        // file-content disclosure and no challenge.
+        let mut write = proposal(None);
+        write.capability = "filesystem/write-text".to_owned();
+        let (preview, binding) =
+            build_preview(&write, Some(&provider), &actor()).expect("a preview");
+        assert_eq!(preview["preview"]["proposal_kind"], "model-initiated");
+        assert_eq!(preview["preview"]["requires_confirmation"], false);
+        assert_eq!(preview["preview"]["operation"], "file-write");
+        assert!(
+            binding.is_none(),
+            "a write must not be given a file-read challenge"
+        );
+
+        // A direct proposal: no model asked, so no provider disclosure is expected
+        // and the established human workflow is untouched.
+        let mut direct = proposal(None);
+        direct.proposer_json = serde_json::to_string(&orxnud_domain::Actor::Human {
+            user: orxnud_domain::ids::UserId::new("local"),
+            via: orxnud_domain::actor::AuthChannel::LocalInteractive,
+        })
+        .expect("actor");
+        let (preview, binding) =
+            build_preview(&direct, Some(&provider), &actor()).expect("a preview");
+        assert_eq!(preview["preview"]["proposal_kind"], "direct-proposal");
+        assert_eq!(preview["preview"]["requires_confirmation"], false);
+        assert!(
+            binding.is_none(),
+            "a direct proposal must not be given a file-read challenge"
+        );
+    }
+
+    /// A model-initiated read stays model-initiated when its fingerprint is missing.
+    ///
+    /// The fingerprint says whether the *recipient* can be verified. It says nothing
+    /// about *who* asked, and using its absence to conclude that a human asked would let
+    /// an ambiguous model-originated read slip past the challenge guard. The origin
+    /// comes from the persisted model identifier alone.
+    #[test]
+    fn a_model_initiated_read_without_a_fingerprint_is_still_model_initiated_and_blocked() {
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+        let row = proposal(None); // model-initiated, no fingerprint
+        let (preview, binding) = build_preview(&row, Some(&provider), &actor()).expect("a preview");
+        assert_eq!(
+            preview["preview"]["proposal_kind"],
+            "model-initiated-file-read"
+        );
+        assert_eq!(
+            preview["preview"]["requires_confirmation"], true,
+            "a missing fingerprint must not reclassify a model-originated read"
+        );
+        assert_eq!(preview["preview"]["approval_allowed"], false);
+        assert!(
+            preview["preview"]["blocked_reason"].is_string(),
+            "the blocked reason must be reported"
+        );
+        assert!(
+            binding.is_none(),
+            "a read whose recipient cannot be verified must not get a challenge"
+        );
+    }
+
+    /// An eligible model-initiated read is previewed, classified, and challenged.
+    #[test]
+    fn an_eligible_model_initiated_read_reports_its_kind_and_a_usable_challenge() {
+        let identity = ProviderIdentity::new("https://api.example.invalid/v1", "some-model");
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+        let row = proposal(Some(destination_fingerprint(&identity)));
+        let (preview, binding) = build_preview(&row, Some(&provider), &actor()).expect("a preview");
+        assert_eq!(
+            preview["preview"]["proposal_kind"],
+            "model-initiated-file-read"
+        );
+        assert_eq!(preview["preview"]["requires_confirmation"], true);
+        assert_eq!(preview["preview"]["operation"], "file-read");
+        assert_eq!(preview["preview"]["approval_allowed"], true);
+        assert!(
+            binding.is_some(),
+            "an eligible read must be able to carry a challenge"
+        );
+    }
+
+    /// An unrelated capability is unaffected.
+    #[test]
+    fn an_unrelated_standalone_capability_is_unaffected() {
+        assert!(
+            standalone_approval_refusal("text/word-count").is_none(),
+            "an unrelated standalone approval must still be issued"
+        );
+        assert!(standalone_approval_refusal("filesystem/write-text").is_none());
+    }
+
+    /// An eligible preview binds a challenge to the stored proposal, the current
+    /// recipient, and the principal it was taken for.
+    #[test]
+    fn an_eligible_preview_binds_the_stored_proposal_the_current_recipient_and_the_actor() {
+        let identity = ProviderIdentity::new("https://api.example.invalid/v1", "some-model");
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+        let row = proposal(Some(destination_fingerprint(&identity)));
+
+        let (_preview, binding) =
+            build_preview(&row, Some(&provider), &actor()).expect("a preview");
+        let binding = binding.expect("an eligible preview must produce a binding");
+
+        assert_eq!(binding.proposal_id, "p-1");
+        assert_eq!(binding.task_id.as_str(), "t1");
+        assert_eq!(binding.attempt_no, 1);
+        assert_eq!(binding.step_no, 2);
+        assert_eq!(binding.capability, READ_TEXT_CAPABILITY);
+        assert_eq!(binding.target.as_deref(), Some("a.txt"));
+        assert!(
+            binding.canonical_params.contains("a.txt"),
+            "the canonical parameters must be bound: {}",
+            binding.canonical_params
+        );
+        assert_eq!(
+            binding.proposer_identity, "ai:some-model",
+            "the persisted proposer identity must be bound"
+        );
+        assert_eq!(
+            binding.original_fingerprint,
+            destination_fingerprint(&identity)
+        );
+        assert_eq!(
+            binding.current_fingerprint,
+            destination_fingerprint(&identity)
+        );
+        assert_eq!(
+            binding.actor_identity, "human:local",
+            "the confirming principal must be bound"
+        );
+        assert_eq!(
+            binding.policy_version,
+            crate::read_approval_challenge::DISCLOSURE_POLICY_VERSION
+        );
+    }
+
+    /// A blocked preview produces no binding, and therefore no challenge.
+    #[test]
+    fn a_blocked_preview_produces_no_binding() {
+        let provider = stub(Some("https://api.example.invalid/v1"), "some-model");
+
+        // No provider.
+        let row = proposal(Some("deadbeef".to_owned()));
+        let (_preview, binding) = build_preview(&row, None, &actor()).expect("a preview");
+        assert!(binding.is_none(), "a blocked preview must bind nothing");
+
+        // A changed endpoint.
+        let identity = ProviderIdentity::new("https://api.example.invalid/v1", "some-model");
+        let other = stub(Some("https://other.invalid/v1"), "some-model");
+        let row = proposal(Some(destination_fingerprint(&identity)));
+        let (_preview, binding) = build_preview(&row, Some(&other), &actor()).expect("a preview");
+        assert!(
+            binding.is_none(),
+            "a changed endpoint must produce no binding"
+        );
+
+        // A changed model.
+        let other = stub(Some("https://api.example.invalid/v1"), "other-model");
+        let (_preview, binding) = build_preview(&row, Some(&other), &actor()).expect("a preview");
+        assert!(binding.is_none(), "a changed model must produce no binding");
+
+        // A missing fingerprint.
+        let row = proposal(None);
+        let (_preview, binding) =
+            build_preview(&row, Some(&provider), &actor()).expect("a preview");
+        assert!(
+            binding.is_none(),
+            "a missing fingerprint must produce no binding"
+        );
+    }
+
+    /// An unsafe destination produces no binding, and no canary reaches the preview.
+    #[test]
+    fn an_unsafe_destination_produces_no_binding_and_leaks_no_canary() {
+        let canary_userinfo = "user:CANARY-USERINFO-4b1e";
+        let canary_query = "CANARY-QUERY-TOKEN-9d2c";
+        let canary_fragment = "CANARY-FRAGMENT-77aa";
+        for endpoint in [
+            format!("https://{canary_userinfo}@host.invalid/v1"),
+            format!("https://host.invalid/v1?token={canary_query}"),
+            format!("https://host.invalid/v1#{canary_fragment}"),
+        ] {
+            let identity = ProviderIdentity::new(&endpoint, "some-model");
+            let provider = stub(Some(&endpoint), "some-model");
+            let row = proposal(Some(destination_fingerprint(&identity)));
+            let (preview, binding) =
+                build_preview(&row, Some(&provider), &actor()).expect("a preview");
+            assert!(
+                binding.is_none(),
+                "an unsafe destination must produce no binding"
+            );
+            let text = preview.to_string();
+            for canary in [canary_userinfo, canary_query, canary_fragment] {
+                assert!(
+                    !text.contains(canary),
+                    "a canary reached the preview: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// The standalone file-read approval refusal.
+#[cfg(test)]
+mod standalone_read_refusal_tests {
+    use super::standalone_approval_refusal;
+
+    /// A standalone `filesystem/read-text` approval is refused, with a typed reason.
+    #[test]
+    fn a_standalone_read_approval_is_refused() {
+        let err = standalone_approval_refusal("filesystem/read-text")
+            .expect("a standalone read approval must be refused");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("read-approval-requires-a-reviewed-path"),
+            "the refusal must be typed and attributable: {text}"
+        );
+        assert!(
+            text.contains("filesystem/read-text"),
+            "the refusal must name the capability: {text}"
+        );
+    }
 }

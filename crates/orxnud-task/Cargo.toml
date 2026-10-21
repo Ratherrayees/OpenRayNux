@@ -39,3 +39,9 @@ trybuild = { workspace = true }
 # normal build, so this cannot ship; `orxnud-store`'s
 # tests/test_support_feature_is_not_shipped.rs is what holds that.
 orxnud-store = { workspace = true, features = ["test-support"] }
+# Dev-only: the store's open requires a filesystem-identity capability (ADR-0058
+# Decision 2), and the conformance harness opens a real database. The capability
+# belongs to whoever composes the run, so the *test* supplies the real
+# platform implementation rather than this crate naming one. G2 reads
+# `[dependencies]` only, so this cannot widen the shipped layer graph.
+orxnud-platform-fs = { workspace = true }

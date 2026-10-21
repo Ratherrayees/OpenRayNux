@@ -38,4 +38,19 @@ orxnud-platform-ipc = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+# A pseudo-terminal, so the CLI's own `stdin.is_terminal()` check runs
+# unchanged in the interactive approval test. Test-only; the binary has no use
+# for it. `rustix` rather than `libc`, because it offers the whole
+# pseudo-terminal through safe calls and the repository's rule is that `unsafe`
+# lives in the platform crates and nowhere else.
+rustix = { workspace = true }
+# The synthetic provider speaks TLS: the shipped daemon refuses a plaintext
+# provider and has no opt-in, so the fake serves HTTPS with a certificate the
+# daemon is told to trust through the host trust store it already reads.
+rcgen = { workspace = true }
+# The refusal scenarios read the daemon's durable state directly, so that a
+# refusal is proven by what was *not* written rather than by an exit code.
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 proptest = { workspace = true }

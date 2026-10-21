@@ -37,6 +37,11 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 /// The `orxnud` binary, next to this test executable in `target/<profile>/deps/`.
+///
+/// The binary belongs to another package, so `cargo test -p orxnuctl` does **not**
+/// rebuild it: the suite would otherwise run against whatever was last built,
+/// and a stale daemon would quietly become the thing under test. The check below
+/// refuses that, rather than letting a green suite certify the wrong binary.
 fn daemon_bin() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     // deps/ -> <profile>/ ; the binaries are siblings of deps/.
@@ -45,7 +50,55 @@ fn daemon_bin() -> PathBuf {
         .expect("deps directory")
         .parent()
         .expect("profile");
-    profile.join("orxnud")
+    let binary = profile.join("orxnud");
+    assert_the_daemon_binary_is_current(&binary);
+    binary
+}
+
+/// Whether the daemon binary is at least as new as the daemon's own source.
+///
+/// Skipped when the daemon crate cannot be found, which is the case in a
+/// packaged build; there is nothing to compare against.
+fn assert_the_daemon_binary_is_current(binary: &std::path::Path) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("orxnud-daemon").join("src"));
+    let Some(source) = source else { return };
+    if !source.is_dir() {
+        return;
+    }
+    let newest = |dir: &std::path::Path| -> Option<std::time::SystemTime> {
+        let mut newest = None;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                    newest =
+                        Some(newest.map_or(modified, |n: std::time::SystemTime| n.max(modified)));
+                }
+            }
+        }
+        newest
+    };
+    let (Ok(binary_time), Some(source_time)) = (
+        std::fs::metadata(binary).and_then(|m| m.modified()),
+        newest(&source),
+    ) else {
+        return;
+    };
+    assert!(
+        binary_time >= source_time,
+        "the daemon binary at {} is older than the daemon's source: run \
+         `cargo build -p orxnud-daemon --bin orxnud` before this suite, or the \
+         tests will certify a stale daemon",
+        binary.display()
+    );
 }
 
 /// The `orxnuctl` binary, same directory.
@@ -180,8 +233,24 @@ impl Daemon {
     /// answers `provider-not-configured` — the same as a production daemon started
     /// without the two provider flags.
     fn start_with_provider(root: &Path, provider: Option<&FakeProvider>, extra: &[&str]) -> Self {
+        Self::start_with_env(root, &[], provider, extra)
+    }
+
+    /// Starts a daemon with extra environment variables.
+    ///
+    /// The variables belong to this child process only. Nothing global is changed,
+    /// so a developer's own session, credential store and bus are untouched.
+    fn start_with_env(
+        root: &Path,
+        env: &[(&str, &str)],
+        provider: Option<&FakeProvider>,
+        extra: &[&str],
+    ) -> Self {
         let mut command = Command::new(daemon_bin());
         command.arg("--state-root").arg(root);
+        for (name, value) in env {
+            command.env(name, value);
+        }
         if let Some(p) = provider {
             command
                 .arg("--provider-base-url")
@@ -214,6 +283,87 @@ impl Daemon {
         };
         d.await_ready();
         d
+    }
+
+    /// Starts a daemon pointed at a TLS provider.
+    ///
+    /// The provider's certificate is handed to the daemon through `SSL_CERT_FILE`,
+    /// which is where the platform keeps the roots it already trusts. The daemon's
+    /// own transport rules are untouched.
+    fn start_with_tls_provider(
+        root: &Path,
+        provider: &TlsProvider,
+        credential_file: &Path,
+    ) -> Self {
+        Self::start_with_tls_provider_at(root, provider, credential_file, "/v1", false).0
+    }
+
+    /// Starts a daemon pointed at a TLS provider, at `path` after the authority.
+    ///
+    /// `path` is the provider's path prefix, so a scenario can configure an
+    /// endpoint the safe-label projection refuses without touching the transport.
+    /// With `capture_stderr`, the daemon's own standard error is collected.
+    fn start_with_tls_provider_at(
+        root: &Path,
+        provider: &TlsProvider,
+        credential_file: &Path,
+        path: &str,
+        capture_stderr: bool,
+    ) -> (Self, Option<CapturedStderr>) {
+        Self::start_with_tls_provider_base(
+            root,
+            provider,
+            credential_file,
+            &format!("https://{}{path}", provider.address),
+            capture_stderr,
+        )
+    }
+
+    /// Starts a daemon pointed at `base_url`, exactly as configured.
+    ///
+    /// The URL is used as given: the daemon's configuration is not the thing under
+    /// test here, only what the daemon says about it.
+    fn start_with_tls_provider_base(
+        root: &Path,
+        provider: &TlsProvider,
+        credential_file: &Path,
+        base_url: &str,
+        capture_stderr: bool,
+    ) -> (Self, Option<CapturedStderr>) {
+        let mut command = Command::new(daemon_bin());
+        command
+            .arg("--state-root")
+            .arg(root)
+            .arg("--provider-base-url")
+            .arg(base_url)
+            .arg("--provider-model")
+            .arg("fake-model-1")
+            .arg("--provider-credential-file")
+            .arg(credential_file)
+            .arg("--permit-argv-payload-exposure-for-tests")
+            .env("SSL_CERT_FILE", &provider.cert_file)
+            // The ambient credential store is made unreachable for this process, so
+            // the test does not depend on the machine holding a usable secret. The
+            // variable belongs to this child alone.
+            .env("DBUS_SESSION_BUS_ADDRESS", BROKEN_SESSION_BUS)
+            .stdout(Stdio::null());
+        if capture_stderr {
+            command.stderr(Stdio::piped());
+        } else {
+            command.stderr(Stdio::null());
+        }
+        let mut child = command.spawn().expect("spawn orxnud");
+        let captured = if capture_stderr {
+            child.stderr.take().map(CapturedStderr::collect)
+        } else {
+            None
+        };
+        let d = Self {
+            child,
+            root: root.to_path_buf(),
+        };
+        d.await_ready();
+        (d, captured)
     }
 
     fn endpoint(&self) -> PathBuf {
@@ -2234,5 +2384,1527 @@ fn an_impossible_max_steps_is_refused_rather_than_clamped() {
         stdout_of(&listed)
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// A pseudo-terminal, so the CLI's own terminal check runs unchanged.
+//
+// The CLI refuses to take a disclosure confirmation unless `stdin.is_terminal()`.
+// A pipe is not a terminal, so the interactive path cannot be reached without one --
+// and the production check must not be weakened to reach it. `script(1)` is not
+// available everywhere, so the pair is allocated here.
+// ---------------------------------------------------------------------------
+
+/// What a CLI run under a pseudo-terminal printed, and how it ended.
+struct PtyRun {
+    /// Everything the child wrote to the terminal.
+    output: String,
+    /// The child's exit code, when it exited normally.
+    code: Option<i32>,
+}
+
+/// Runs `command` with its standard streams attached to a pseudo-terminal.
+///
+/// Waits until `prompt` appears, writes `answer`, and returns everything printed.
+///
+/// # Descriptors
+///
+/// The master is allocated by `rustix` and owned by a `File`, so it is closed exactly
+/// once when this function returns. The slave is opened by path and handed to the
+/// child as its standard streams, so the child owns those descriptors from the moment
+/// it is spawned and this function never touches them again.
+///
+/// # Timeouts
+///
+/// A broken prompt or a stalled child cannot hang the suite: the wait is bounded, and a
+/// child that has not exited by the deadline is killed.
+fn run_under_pty(
+    command: &mut std::process::Command,
+    prompt: &str,
+    answer: &str,
+    timeout: std::time::Duration,
+) -> PtyRun {
+    use rustix::pty::{OpenptFlags, openpt, ptsname, unlockpt};
+    use std::io::{Read as _, Write as _};
+
+    // --- the master/slave pair -------------------------------------------
+    // `rustix` offers the whole pseudo-terminal through safe calls, so this
+    // helper contains no `unsafe` at all: the repository's rule is that `unsafe`
+    // lives in the platform crates and nowhere else, and there is no reason for
+    // a test helper to break it.
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a pty master");
+    unlockpt(&master).expect("unlock the pty");
+    // The master is owned by this `File`, so it is closed exactly once, when
+    // this helper returns.
+    let master = std::fs::File::from(master);
+    let slave_path = ptsname(&master, Vec::new()).expect("the pty slave name");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(std::path::PathBuf::from(
+            slave_path.to_string_lossy().into_owned(),
+        ))
+        .expect("open the pty slave");
+    // The child owns the slave as its three standard streams from the moment it is
+    // spawned; these clones are only to hand one descriptor to each stream.
+    command.stdin(std::process::Stdio::from(
+        slave.try_clone().expect("clone slave"),
+    ));
+    command.stdout(std::process::Stdio::from(
+        slave.try_clone().expect("clone slave"),
+    ));
+    command.stderr(std::process::Stdio::from(slave));
+
+    let mut child = command.spawn().expect("spawn the CLI under a pty");
+    let mut writer = master
+        .try_clone()
+        .expect("clone the pty master for writing");
+
+    // --- read until the prompt, answer, read the rest --------------------
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let mut reader = master
+        .try_clone()
+        .expect("clone the pty master for reading");
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = String::new();
+    let mut answered = false;
+    let mut exited = false;
+    // A short tick, so a child that ends is noticed at once rather than when the
+    // whole deadline expires.
+    let tick = std::time::Duration::from_millis(100);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        match rx.recv_timeout(tick) {
+            Ok(chunk) => {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                if !answered && seen.contains(prompt) {
+                    answered = true;
+                    writer
+                        .write_all(answer.as_bytes())
+                        .expect("write the confirmation");
+                    writer.flush().expect("flush the confirmation");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            exited = true;
+            // Drain what the child left in the terminal before it ended.
+            while let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            break;
+        }
+    }
+    if !exited {
+        let _ = child.kill();
+    }
+    let status = child.wait().expect("wait for the CLI");
+    PtyRun {
+        output: seen,
+        code: status.code(),
+    }
+}
+
+/// A session bus that does not exist.
+///
+/// Set on the daemon this test spawns, so the platform credential store cannot be
+/// reached from it. It is a per-process variable: nothing outside the test's own
+/// child processes is affected, and the developer's credential store is neither
+/// read nor modified.
+const BROKEN_SESSION_BUS: &str = "unix:path=/nonexistent-orxnud-e2e-session-bus";
+
+/// A credential generated for this test.
+///
+/// Random, synthetic, and never a real secret: it is written to a file under the
+/// test's own temporary directory, it is never stored anywhere a user would find
+/// it, and it is worthless outside this run.
+fn synthetic_credential() -> String {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 24];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("the kernel's random source");
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("orxnud-e2e-synthetic-{hex}")
+}
+
+/// Writes the synthetic credential where the daemon can read it, and nowhere else.
+fn write_credential_file(path: &std::path::Path, credential: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, credential).expect("write the synthetic credential");
+    let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions).expect("restrict the credential file");
+}
+
+/// Sends one request to the provider **without** a credential, and returns the
+/// response head.
+///
+/// The provider is supposed to refuse this. A provider that answered it would
+/// prove nothing about the daemon's credential handling.
+fn probe_without_credential(provider: &TlsProvider) -> String {
+    use std::io::{Read as _, Write as _};
+    let config = provider.client_config();
+    let address = provider
+        .address
+        .parse::<std::net::SocketAddr>()
+        .expect("the provider address");
+    let socket = std::net::TcpStream::connect(address).expect("connect to the provider");
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").expect("a server name");
+    let connection = rustls::ClientConnection::new(config, name).expect("a TLS client");
+    let mut tls = rustls::StreamOwned::new(connection, socket);
+    tls.write_all(
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+    )
+    .expect("write the probe request");
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        match tls.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.len() > 16 {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// A daemon pointed at a credential file that is not there must refuse to start.
+///
+/// This is the proof that the file is the *only* source: there is no fallback to
+/// the platform store, so a test that cannot establish isolation fails loudly
+/// instead of quietly using the machine's own secret.
+fn a_daemon_with_an_unusable_credential_file_refuses_to_start(root: &std::path::Path) {
+    use std::io::Read as _;
+    let mut command = std::process::Command::new(daemon_bin());
+    command
+        .arg("--state-root")
+        .arg(root.join("refused-state"))
+        .arg("--provider-base-url")
+        .arg("https://127.0.0.1:1/v1")
+        .arg("--provider-model")
+        .arg("fake-model-1")
+        .arg("--provider-credential-file")
+        .arg(root.join("absent-credential"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("spawn the daemon");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the daemon neither started nor refused");
+    };
+    assert!(
+        !status.success(),
+        "a daemon with no usable credential file must not start"
+    );
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    assert!(
+        stderr.contains("refusing to start"),
+        "the refusal must be loud: {stderr}"
+    );
+}
+
+/// The model-proposal the synthetic provider answers with.
+///
+/// The same shape the daemon's proposal parser reads from a model's answer, and the
+/// same shape the daemon's own disclosure tests use for a read.
+const READ_PROPOSAL_JSON: &str =
+    r#"{"capability":"filesystem/read-text","target":"a.txt","params":{"path":"a.txt"}}"#;
+
+/// The proposal id in a `task ai-propose` reply.
+fn model_proposal_id(out: &Output) -> String {
+    let text = stdout_of(out);
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("id: "))
+        .map(|v| v.trim().trim_matches('"').to_owned())
+        .or_else(|| {
+            let marker = "\"proposal_id\": \"";
+            let start = text.find(marker)? + marker.len();
+            let rest = &text[start..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_owned())
+        })
+        .unwrap_or_else(|| panic!("a proposal id in the output: {text}"))
+}
+
+/// A model-initiated file read, approved through the real interactive confirmation.
+///
+/// The real `orxnuctl` binary, the real daemon binary, the real Unix socket, and a
+/// synthetic HTTP provider on loopback. The CLI's own `stdin.is_terminal()` check runs
+/// unchanged, because the confirmation is typed into a real pseudo-terminal.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
+#[test]
+fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
+    use std::time::Duration;
+
+    let root = dir("read-pty");
+    let ws = workspace(&root);
+    std::fs::create_dir_all(&ws).expect("mkdir the workspace");
+    let sentinel = "PTY-READ-SENTINEL-4b7e2a";
+    std::fs::write(ws.join("a.txt"), sentinel).expect("seed the file");
+
+    // An isolated, synthetic credential, written under this test's own temporary
+    // directory. The daemon reads it from there and nowhere else.
+    let credential = synthetic_credential();
+    let credential_file = root.join("provider-credential");
+    write_credential_file(&credential_file, &credential);
+
+    // The synthetic provider, answering with a model-initiated read proposal. It
+    // requires the credential, so a daemon that used anything else would be refused.
+    let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
+    let daemon = Daemon::start_with_tls_provider(&root, &provider, &credential_file);
+
+    // The provider refuses an unauthenticated request.
+    let refused = probe_without_credential(&provider);
+    assert!(
+        refused.starts_with("HTTP/1.1 401"),
+        "the provider must refuse a request without the credential: {refused}"
+    );
+    assert_eq!(
+        provider.rejected(),
+        vec!["<none>".to_owned()],
+        "the refusal must be recorded"
+    );
+
+    // A daemon that cannot establish the credential refuses to start, rather than
+    // falling back to whatever the machine's own credential store holds.
+    a_daemon_with_an_unusable_credential_file_refuses_to_start(&root);
+
+    // The other half of the isolation claim. A daemon with **no** credential file,
+    // in a process where the ambient credential store is unreachable, cannot
+    // authenticate at all -- so the daemon above succeeded because of the
+    // synthetic credential, and not because the machine happened to hold a usable
+    // secret.
+    let ambient_root = root.join("ambient");
+    std::fs::create_dir_all(&ambient_root).expect("mkdir the ambient daemon's root");
+    let ambient = Daemon::start_with_env(
+        &ambient_root,
+        &[("DBUS_SESSION_BUS_ADDRESS", BROKEN_SESSION_BUS)],
+        None,
+        &[
+            "--provider-base-url",
+            "https://127.0.0.1:1/v1",
+            "--provider-model",
+            "fake-model-1",
+        ],
+    );
+    ambient.cli(&["task", "create", "--id", "ambient-1"]);
+    ambient.cli(&["task", "claim", "--id", "ambient-1", "--worker", "w1"]);
+    let refused = ambient.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "ambient-1",
+        "--worker",
+        "w1",
+    ]);
+    assert!(
+        !refused.status.success(),
+        "a daemon with no credential and no ambient store must not propose"
+    );
+    let said = format!("{}{}", stdout_of(&refused), stderr_of(&refused));
+    assert!(
+        said.contains("credential"),
+        "the refusal must name the credential: {said}"
+    );
+
+    // Create and claim a task, then ask the model for a proposal.
+    let created = daemon.cli(&["task", "create", "--id", "pty-1"]);
+    assert!(created.status.success(), "{}", stderr_of(&created));
+    let claimed = daemon.cli(&["task", "claim", "--id", "pty-1", "--worker", "w1"]);
+    assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+    let proposed = daemon.cli(&["task", "ai-propose", "--task", "pty-1", "--worker", "w1"]);
+    assert!(
+        proposed.status.success(),
+        "the model must propose: {}\n{}",
+        stdout_of(&proposed),
+        stderr_of(&proposed)
+    );
+    let proposal_id = model_proposal_id(&proposed);
+    eprintln!("proposal id: {proposal_id}");
+
+    // The interactive leg, on a real pseudo-terminal.
+    let mut command = std::process::Command::new(cli_bin());
+    command
+        .args(["capability", "approve", "--proposal", &proposal_id])
+        .arg("--endpoint")
+        .arg(daemon.endpoint());
+    let run = run_under_pty(&mut command, "[y/N]", "yes\n", Duration::from_secs(60));
+    eprintln!("--- the approval on the terminal ---\n{}", run.output);
+    assert_eq!(run.code, Some(0), "the CLI must succeed: {}", run.output);
+    let out = run.output;
+
+    // The rendered preview, from the fresh challenge-bearing response.
+    assert!(
+        out.contains(&proposal_id),
+        "the proposal id must be shown: {out}"
+    );
+    assert!(
+        out.contains("filesystem/read-text"),
+        "the capability must be shown: {out}"
+    );
+    assert!(
+        out.contains("path:       a.txt"),
+        "the exact path must be shown: {out}"
+    );
+    assert!(
+        out.contains("this READS a file; it does not write one."),
+        "the read-versus-write distinction must be shown: {out}"
+    );
+    assert!(
+        out.contains("MAY BE DISCLOSED"),
+        "the disclosure consequence must be shown: {out}"
+    );
+    assert!(
+        out.contains("recipient:"),
+        "the recipient must be shown: {out}"
+    );
+    assert!(
+        out.contains("at most 65536 bytes"),
+        "the 64 KiB read ceiling must be shown: {out}"
+    );
+    assert!(
+        out.contains("at most 32768 bytes"),
+        "the 32 KiB observation ceiling must be shown: {out}"
+    );
+    assert!(
+        out.contains("at most 8 entries"),
+        "the eight-entry maximum must be shown: {out}"
+    );
+    assert!(
+        out.contains("skipped entirely, not truncated"),
+        "the whole-observation skip rule must be shown: {out}"
+    );
+    assert!(
+        out.contains("one too large for the budget is skipped whole"),
+        "the whole-observation rule must be shown: {out}"
+    );
+    assert!(
+        out.contains(
+            "eligible content is available only to the immediately following logical step"
+        ),
+        "the next-step limitation must be shown: {out}"
+    );
+    assert!(
+        out.contains("Eligibility is limited to the immediately following logical step"),
+        "the server's timing statement must be shown: {out}"
+    );
+    // The recipient is the safe label the daemon produced: the origin of the
+    // provider, with no userinfo, no query and no fragment in it.
+    let recipient = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("recipient:"))
+        .expect("the recipient line");
+    for forbidden in ['@', '?', '#'] {
+        assert!(
+            !recipient.contains(forbidden),
+            "the recipient label must not carry {forbidden:?}: {recipient}"
+        );
+    }
+    for canary in ["query_token", "fragment"] {
+        assert!(
+            !out.contains(canary),
+            "a canary reached the terminal: {out}"
+        );
+    }
+    // The human's affirmative is on the record, and nothing else was typed.
+    assert!(
+        out.contains("yes"),
+        "the typed confirmation must be shown: {out}"
+    );
+    // The approval was issued to a human, for an AI originator.
+    assert!(out.contains("\"approver\": \"human\""), "{out}");
+    assert!(out.contains("\"actor_label\": \"ai\""), "{out}");
+    // No file contents on the terminal, and no raw endpoint.
+    assert!(
+        !out.contains(sentinel),
+        "the file's contents reached the terminal: {out}"
+    );
+    for canary in ["userinfo", "query_token", "fragment"] {
+        assert!(
+            !out.contains(canary),
+            "a canary reached the terminal: {out}"
+        );
+    }
+
+    // Execute the approved read through the supported command.
+    let executed = daemon.cli(&[
+        "task",
+        "execute",
+        "--proposal",
+        &proposal_id,
+        "--worker",
+        "w1",
+    ]);
+    eprintln!(
+        "--- the execution ---\n{}\n{}",
+        stdout_of(&executed),
+        stderr_of(&executed)
+    );
+    assert!(
+        executed.status.success(),
+        "the approved read must execute: {}\n{}",
+        stdout_of(&executed),
+        stderr_of(&executed)
+    );
+
+    // The approval is single-use: a second approval of the same proposal must be
+    // refused, so exactly one approval can exist for it.
+    let again = daemon.cli(&["capability", "approve", "--proposal", &proposal_id]);
+    assert!(
+        !again.status.success(),
+        "a second approval must be refused: {}\n{}",
+        stdout_of(&again),
+        stderr_of(&again)
+    );
+    assert!(
+        !format!("{}{}", stdout_of(&again), stderr_of(&again)).contains("\"approver\": \"human\""),
+        "a second approval must not be issued"
+    );
+
+    // The proposal reached a decided state.
+    let listed = daemon.cli(&["task", "list"]);
+    assert!(
+        stdout_of(&listed).contains("completed"),
+        "the task must be completed: {}",
+        stdout_of(&listed)
+    );
+
+    // Durable state: the approval is there, and the file's contents are not.
+    let state = state_bytes(&root);
+    assert!(
+        state.contains(&proposal_id),
+        "the proposal must be in the durable state"
+    );
+    assert!(
+        !state.contains(sentinel),
+        "the file's contents must not be in the durable state"
+    );
+    // The provider was really contacted: this was a model-originated proposal, and
+    // it went over the ordinary OpenAI-compatible request the product makes.
+    assert!(
+        provider.was_contacted(),
+        "the synthetic provider must have been asked"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "one provider request: {requests:?}");
+    let request = &requests[0];
+    assert!(
+        request.contains("POST /v1/chat/completions"),
+        "the ordinary provider path must be used: {request}"
+    );
+    assert!(
+        request.contains("fake-model-1"),
+        "the configured model must be asked for: {request}"
+    );
+    assert!(
+        !request.contains(sentinel),
+        "the model must not have been given the file's contents: {request}"
+    );
+    // The daemon authenticated with the synthetic credential, and only that one.
+    assert!(
+        request.contains(&format!("Authorization: Bearer {credential}")),
+        "the daemon must have authenticated with the synthetic credential: {request}"
+    );
+    assert_eq!(
+        provider.rejected(),
+        vec!["<none>".to_owned()],
+        "nothing else may have been refused: {:?}",
+        provider.rejected()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// A synthetic provider that speaks TLS.
+//
+// The shipped daemon refuses a plaintext provider, and it has no opt-in: a flag
+// that turns off a transport guarantee is not a test affordance, it is a hole.
+// So the fake provider serves HTTPS with a certificate it generates itself, and
+// the daemon is told to trust it the way the platform already tells it to trust
+// roots -- through the host trust store, which `rustls-native-certs` reads from
+// `SSL_CERT_FILE` on Linux. Nothing in the product changes, and no test-only
+// switch is added to it.
+// ---------------------------------------------------------------------------
+
+/// A synthetic OpenAI-compatible provider on a loopback TLS port.
+struct TlsProvider {
+    /// `host:port` of the loopback listener.
+    address: String,
+    /// The certificate, in PEM, for the daemon to trust.
+    cert_file: std::path::PathBuf,
+    /// Whether anything has connected.
+    contacted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Every request the provider received, verbatim.
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every credential the provider was offered and refused.
+    rejected: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The provider's certificate, for a client that has to trust it.
+    certificate_der: Vec<u8>,
+    /// The accept loop.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TlsProvider {
+    /// Starts a provider that answers every request with `content`.
+    ///
+    /// The provider **requires** the credential: a request that does not carry
+    /// `Authorization: Bearer {credential}` is answered `401` and recorded as
+    /// rejected. A provider that answered an unauthenticated request would prove
+    /// nothing about the daemon's credential handling.
+    fn answering(content: &str, credential: &str) -> Self {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use std::io::{Read as _, Write as _};
+
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate parameters");
+        // The daemon dials an IP, so the certificate must carry an IP subject
+        // alternative name: a DNS name would not verify for `127.0.0.1`.
+        params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))];
+        let key = KeyPair::generate().expect("a key pair");
+        let certificate = params.self_signed(&key).expect("a self-signed certificate");
+
+        let certificate_der = certificate.der().to_vec();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            certificate_der.clone(),
+        )];
+        let signing_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+        );
+        let config = std::sync::Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, signing_key)
+                .expect("a TLS server configuration"),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("an address").to_string();
+        // Unique per provider: the tests run in parallel in one process, and two
+        // providers sharing one certificate file would trust each other's.
+        let cert_file = std::env::temp_dir().join(format!(
+            "orxnuctl-e2e-{}-provider-{}.pem",
+            std::process::id(),
+            address.rsplit(':').next().expect("a port")
+        ));
+        std::fs::write(&cert_file, certificate.pem()).expect("write the provider certificate");
+
+        let contacted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&contacted);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&requests);
+        let rejected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refusals = std::sync::Arc::clone(&rejected);
+        let content = content.to_owned();
+        let expected = format!("Bearer {credential}");
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let Ok(connection) = rustls::ServerConnection::new(std::sync::Arc::clone(&config))
+                else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                    }
+                    if raw.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&raw).into_owned();
+                let presented = head
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_owned())
+                    })
+                    .unwrap_or_default();
+                if presented != expected {
+                    // No credential, or the wrong one: refuse it, and say so in the
+                    // log rather than answering a request nobody authenticated.
+                    refusals
+                        .lock()
+                        .expect("the rejection log")
+                        .push(if presented.is_empty() {
+                            "<none>".to_owned()
+                        } else {
+                            presented
+                        });
+                    let response = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
+                                    Connection: close\r\n\r\n";
+                    let _ = tls.write_all(response.as_bytes());
+                    let _ = tls.flush();
+                    let _ = tls.sock.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                recorded.lock().expect("the request log").push(head);
+                let body = serde_json::json!({
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion",
+                    "model": "fake-model-1",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": content },
+                        "finish_reason": "stop",
+                    }],
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(response.as_bytes());
+                let _ = tls.flush();
+                // The client asked for a close; end the session rather than
+                // holding the connection open against a one-shot provider.
+                let _ = tls.sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        Self {
+            address,
+            cert_file,
+            certificate_der,
+            contacted,
+            requests,
+            rejected,
+            handle: Some(handle),
+        }
+    }
+
+    /// Whether anything has connected.
+    fn was_contacted(&self) -> bool {
+        self.contacted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Every request the provider received, verbatim.
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("the request log").clone()
+    }
+
+    /// The literal request line of every request the provider received.
+    ///
+    /// The first line of an HTTP request is the request line, and it carries the
+    /// request-target: the bytes the client actually put on the wire. Reading it
+    /// here is how a test states what was sent, rather than what was configured.
+    fn request_lines(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .map(|head| head.lines().next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Every credential the provider was offered and refused.
+    fn rejected(&self) -> Vec<String> {
+        self.rejected.lock().expect("the rejection log").clone()
+    }
+
+    /// A client configuration that trusts this provider's certificate.
+    fn client_config(&self) -> std::sync::Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                self.certificate_der.clone(),
+            ))
+            .expect("the provider certificate is a certificate");
+        std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }
+}
+
+impl Drop for TlsProvider {
+    fn drop(&mut self) {
+        let _ = self.handle.take();
+        let _ = std::fs::remove_file(&self.cert_file);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The refusal paths, through the real CLI and the real daemon.
+//
+// Each scenario is independent: its own state root, its own workspace, its own
+// synthetic credential, its own certificate, its own proposal and its own
+// challenge. A challenge minted by one scenario can never be mistaken for
+// another's, and a refusal in one is never evidence about another.
+// ---------------------------------------------------------------------------
+
+/// The daemon's standard error, collected while it runs.
+///
+/// A pipe nobody reads would fill and block the daemon, so it is drained by a
+/// thread for as long as the daemon lives.
+struct CapturedStderr {
+    text: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Held so the draining thread outlives the daemon's standard error.
+    _handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CapturedStderr {
+    fn collect(mut stderr: std::process::ChildStderr) -> Self {
+        use std::io::Read as _;
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&text);
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .expect("the stderr log")
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
+        Self {
+            text,
+            _handle: Some(handle),
+        }
+    }
+
+    /// Everything the daemon has said so far.
+    fn text(&self) -> String {
+        self.text.lock().expect("the stderr log").clone()
+    }
+}
+
+/// A recording proxy in front of the daemon's socket.
+///
+/// The CLI connects here. Every byte is forwarded to the real daemon unchanged,
+/// and the method of each request and the value of each reply are recorded on
+/// the way past.
+///
+/// This is how a scenario proves a request was **not** sent, and what the daemon
+/// actually answered. An error message says what the client concluded; this says
+/// what crossed the wire.
+struct RecordingProxy {
+    path: std::path::PathBuf,
+    methods: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    replies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RecordingProxy {
+    /// Starts a proxy in front of `target`.
+    fn start(target: &std::path::Path, tag: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("orxnuctl-e2e-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&path).expect("bind the proxy socket");
+        let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_methods = std::sync::Arc::clone(&methods);
+        let recorded_replies = std::sync::Arc::clone(&replies);
+        let target = target.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(client) = stream else { break };
+                let Ok(server) = std::os::unix::net::UnixStream::connect(&target) else {
+                    continue;
+                };
+                let mut server_write = server.try_clone().expect("clone the server socket");
+                let mut server_read = server;
+                let mut client_write = client.try_clone().expect("clone the client socket");
+                let mut client_read = client;
+                let up_methods = std::sync::Arc::clone(&recorded_methods);
+                // Client to server: the request, recorded on the way past.
+                let up = std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut buf = [0_u8; 8192];
+                    let mut pending: Vec<u8> = Vec::new();
+                    loop {
+                        match client_read.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                pending.extend_from_slice(&buf[..n]);
+                                // The local transport frames one JSON value per line.
+                                while let Some(i) = pending.iter().position(|b| *b == b'\n') {
+                                    let line: Vec<u8> = pending.drain(..=i).collect();
+                                    let Ok(value) =
+                                        serde_json::from_slice::<serde_json::Value>(&line)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(method) = value.get("method").and_then(|m| m.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    up_methods
+                                        .lock()
+                                        .expect("the method log")
+                                        .push(method.to_owned());
+                                }
+                                if server_write.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                // Server to client: the reply, recorded and passed on untouched.
+                let down_replies = std::sync::Arc::clone(&recorded_replies);
+                let down = std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut buf = [0_u8; 8192];
+                    let mut pending: Vec<u8> = Vec::new();
+                    loop {
+                        match server_read.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                pending.extend_from_slice(&buf[..n]);
+                                while let Some(i) = pending.iter().position(|b| *b == b'\n') {
+                                    let line: Vec<u8> = pending.drain(..=i).collect();
+                                    if let Ok(value) =
+                                        serde_json::from_slice::<serde_json::Value>(&line)
+                                    {
+                                        down_replies.lock().expect("the reply log").push(value);
+                                    }
+                                }
+                                if client_write.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                let _ = up.join();
+                let _ = down.join();
+            }
+        });
+        Self {
+            path,
+            methods,
+            replies,
+            handle: Some(handle),
+        }
+    }
+
+    /// The method of every request that crossed the wire.
+    fn methods(&self) -> Vec<String> {
+        self.methods.lock().expect("the method log").clone()
+    }
+
+    /// Every reply the daemon gave.
+    fn replies(&self) -> Vec<serde_json::Value> {
+        self.replies.lock().expect("the reply log").clone()
+    }
+
+    /// Every reply that carried a preview.
+    fn previews(&self) -> Vec<serde_json::Value> {
+        self.replies()
+            .into_iter()
+            .filter(|reply| reply.pointer("/result/preview").is_some())
+            .map(|reply| {
+                reply
+                    .pointer("/result/preview")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect()
+    }
+}
+
+impl Drop for RecordingProxy {
+    fn drop(&mut self) {
+        let _ = self.handle.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A daemon, a task, and a genuine model-initiated read proposal.
+struct RefusalScenario {
+    root: std::path::PathBuf,
+    /// Held so the daemon outlives the scenario.
+    _daemon: Daemon,
+    provider: TlsProvider,
+    proxy: RecordingProxy,
+    task_id: String,
+    proposal_id: String,
+    sentinel: String,
+    credential: String,
+    stderr: Option<CapturedStderr>,
+}
+
+impl RefusalScenario {
+    /// Starts an isolated daemon and produces a model-initiated read proposal.
+    fn start(tag: &str, provider_path: &str) -> Self {
+        Self::start_with(tag, provider_path, false)
+    }
+
+    fn start_with(tag: &str, provider_path: &str, capture_stderr: bool) -> Self {
+        let root = dir(tag);
+        let workspace = workspace(&root);
+        std::fs::create_dir_all(&workspace).expect("mkdir the workspace");
+        let sentinel = format!("REFUSAL-SENTINEL-{tag}-a91c");
+        std::fs::write(workspace.join("a.txt"), &sentinel).expect("seed the file");
+        let credential = synthetic_credential();
+        let credential_file = root.join("provider-credential");
+        write_credential_file(&credential_file, &credential);
+        let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
+        let (daemon, stderr) = Daemon::start_with_tls_provider_at(
+            &root,
+            &provider,
+            &credential_file,
+            provider_path,
+            capture_stderr,
+        );
+        let proxy = RecordingProxy::start(&daemon.endpoint(), tag);
+        let task_id = format!("task-{tag}");
+        daemon.cli(&["task", "create", "--id", &task_id]);
+        let claimed = daemon.cli(&["task", "claim", "--id", &task_id, "--worker", "w1"]);
+        assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+        let proposed = daemon.cli(&["task", "ai-propose", "--task", &task_id, "--worker", "w1"]);
+        assert!(
+            proposed.status.success(),
+            "the model must propose: {}\n{}",
+            stdout_of(&proposed),
+            stderr_of(&proposed)
+        );
+        let proposal_id = model_proposal_id(&proposed);
+        Self {
+            root,
+            _daemon: daemon,
+            provider,
+            proxy,
+            task_id,
+            proposal_id,
+            sentinel,
+            credential,
+            stderr,
+        }
+    }
+
+    /// The durable state, opened against the daemon's own database.
+    fn state(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.root.join("state.db")).expect("open the state database")
+    }
+
+    /// The proposal's status in the durable state.
+    fn proposal_status(&self) -> String {
+        self.state()
+            .query_row(
+                "SELECT status FROM task_proposals WHERE proposal_id = ?1",
+                [&self.proposal_id],
+                |row| row.get(0),
+            )
+            .expect("the proposal must be in the durable state")
+    }
+
+    /// How many approvals exist for this scenario's task.
+    fn approval_count(&self) -> i64 {
+        self.state()
+            .query_row(
+                "SELECT COUNT(*) FROM task_approvals WHERE task_id = ?1",
+                [&self.task_id],
+                |row| row.get(0),
+            )
+            .expect("count the approvals")
+    }
+
+    /// How many effect records exist for this scenario's task.
+    ///
+    /// The effect ledger is where a performed read is recorded, so this is the
+    /// marker that the read helper did not run.
+    fn effect_count(&self) -> i64 {
+        self.state()
+            .query_row(
+                "SELECT COUNT(*) FROM task_effects WHERE task_id = ?1",
+                [&self.task_id],
+                |row| row.get(0),
+            )
+            .expect("count the effects")
+    }
+
+    /// The task's state in the durable state.
+    fn task_state(&self) -> String {
+        self.state()
+            .query_row(
+                "SELECT state FROM tasks WHERE id = ?1",
+                [&self.task_id],
+                |row| row.get(0),
+            )
+            .expect("the task must be in the durable state")
+    }
+
+    /// The method of every request the CLI sent.
+    fn methods(&self) -> Vec<String> {
+        self.proxy.methods()
+    }
+
+    /// Every reply the daemon gave.
+    fn replies(&self) -> Vec<serde_json::Value> {
+        self.proxy.replies()
+    }
+
+    /// Every reply that carried a preview.
+    fn previews(&self) -> Vec<serde_json::Value> {
+        self.proxy.previews()
+    }
+
+    /// Whether an approval was submitted.
+    fn approval_was_sent(&self) -> bool {
+        self.methods().iter().any(|m| m == "capability/approve")
+    }
+
+    /// Everything the daemon said, if it was captured.
+    fn daemon_stderr(&self) -> String {
+        self.stderr
+            .as_ref()
+            .map_or_else(String::new, CapturedStderr::text)
+    }
+}
+
+/// The operator declines. Nothing is approved, and nothing is read.
+#[test]
+fn an_operator_who_declines_leaves_the_read_unapproved() {
+    let scenario = RefusalScenario::start("decline", "/v1");
+    let mut command = std::process::Command::new(cli_bin());
+    command
+        .args(["capability", "approve", "--proposal", &scenario.proposal_id])
+        .arg("--endpoint")
+        .arg(scenario.proxy.path.clone());
+    let run = run_under_pty(
+        &mut command,
+        "[y/N]",
+        "n\n",
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(
+        run.code,
+        Some(0),
+        "declining is a choice, not a failure: {}",
+        run.output
+    );
+    assert!(
+        run.output.contains("Declined"),
+        "the decline must be reported: {}",
+        run.output
+    );
+    // The disclosure really was shown before the question was asked.
+    assert!(
+        run.output.contains("MAY BE DISCLOSED"),
+        "the preview must be rendered: {}",
+        run.output
+    );
+    // The wire: no approval was submitted.
+    assert!(
+        !scenario.approval_was_sent(),
+        "no approval may be sent: {:?}",
+        scenario.methods()
+    );
+    // And the durable state agrees.
+    assert_eq!(scenario.proposal_status(), "pending");
+    assert_eq!(scenario.approval_count(), 0);
+    assert_eq!(scenario.effect_count(), 0);
+    assert_ne!(scenario.task_state(), "completed");
+    // Nothing was disclosed to the provider beyond the proposal request itself.
+    assert_eq!(scenario.provider.requests().len(), 1);
+    // No secret and no file content on the terminal.
+    assert!(!run.output.contains(&scenario.credential));
+    assert!(!run.output.contains(&scenario.sentinel));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// The operator's input reaches end-of-file. The CLI declines, and nothing is
+/// approved.
+#[test]
+fn end_of_input_at_the_prompt_declines_without_approving_anything() {
+    let scenario = RefusalScenario::start("eof", "/v1");
+    let mut command = std::process::Command::new(cli_bin());
+    command
+        .args(["capability", "approve", "--proposal", &scenario.proposal_id])
+        .arg("--endpoint")
+        .arg(scenario.proxy.path.clone());
+    // Ctrl-D is the terminal's end-of-input character. On a canonical terminal it
+    // makes the line discipline deliver a zero-length read to the waiting process,
+    // which is what `read_line` reports as end-of-file -- not a line, and not a
+    // closed process.
+    let run = run_under_pty(
+        &mut command,
+        "[y/N]",
+        "\u{4}",
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(
+        run.code,
+        Some(0),
+        "end of input declines, it does not fail: {}",
+        run.output
+    );
+    assert!(
+        run.output.contains("Declined"),
+        "the decline must be reported: {}",
+        run.output
+    );
+    // The prompt was really reached, and nothing was typed.
+    assert!(run.output.contains("[y/N]"), "{}", run.output);
+    assert!(
+        !run.output.contains("[y/N] yes"),
+        "nothing was typed: {}",
+        run.output
+    );
+    // The wire: no approval was submitted.
+    assert!(
+        !scenario.approval_was_sent(),
+        "no approval may be sent: {:?}",
+        scenario.methods()
+    );
+    assert_eq!(scenario.proposal_status(), "pending");
+    assert_eq!(scenario.approval_count(), 0);
+    assert_eq!(scenario.effect_count(), 0);
+    assert_ne!(scenario.task_state(), "completed");
+    assert_eq!(scenario.provider.requests().len(), 1);
+    assert!(!run.output.contains(&scenario.credential));
+    assert!(!run.output.contains(&scenario.sentinel));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// A caller with no terminal is refused, and it is refused **before** a
+/// challenge-bearing preview is asked for.
+#[test]
+fn a_non_interactive_caller_is_refused_before_a_challenge_is_asked_for() {
+    let scenario = RefusalScenario::start("non-interactive", "/v1");
+    let mut command = std::process::Command::new(cli_bin());
+    command
+        .args(["capability", "approve", "--proposal", &scenario.proposal_id])
+        .arg("--endpoint")
+        .arg(scenario.proxy.path.clone())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = command.output().expect("run the CLI");
+    assert!(
+        !out.status.success(),
+        "a non-interactive approval must fail"
+    );
+    let said = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        said.contains("interactive confirmation"),
+        "the refusal must be explicit: {said}"
+    );
+    // The wire: exactly one preview, and it was the inspection. No
+    // challenge-bearing preview was asked for, and no approval was sent.
+    let methods = scenario.methods();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| *m == "capability/preview")
+            .count(),
+        1,
+        "only the inspection may be requested: {methods:?}"
+    );
+    assert!(
+        !scenario.approval_was_sent(),
+        "no approval may be sent: {methods:?}"
+    );
+    assert_eq!(scenario.proposal_status(), "pending");
+    assert_eq!(scenario.approval_count(), 0);
+    assert_eq!(scenario.effect_count(), 0);
+    assert_ne!(scenario.task_state(), "completed");
+    assert_eq!(scenario.provider.requests().len(), 1);
+    assert!(!said.contains(&scenario.credential));
+    assert!(!said.contains(&scenario.sentinel));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// A recipient that cannot be safely identified blocks the approval.
+#[test]
+fn a_recipient_that_cannot_be_identified_blocks_the_approval() {
+    const CANARY: &str = "UNSAFE-DESTINATION-CANARY-4d19";
+    // The transport is untouched: the provider is still local, still TLS, still
+    // authenticated. Only the *path* of the endpoint is one the safe-label
+    // projection refuses to show, because a query string is not something a URL
+    // we are willing to display may carry.
+    let scenario = RefusalScenario::start_with("blocked-recipient", &format!("/v1?{CANARY}"), true);
+
+    // The proposal was produced: the transport and the credential are intact.
+    assert!(!scenario.proposal_id.is_empty());
+
+    // The CLI refuses, and it refuses without asking the operator anything.
+    let mut command = std::process::Command::new(cli_bin());
+    command
+        .args(["capability", "approve", "--proposal", &scenario.proposal_id])
+        .arg("--endpoint")
+        .arg(scenario.proxy.path.clone());
+    let run = run_under_pty(
+        &mut command,
+        "[y/N]",
+        "yes\n",
+        std::time::Duration::from_secs(60),
+    );
+
+    // The daemon's own answers, as they crossed the wire.
+    let previews = scenario.previews();
+    assert!(
+        !previews.is_empty(),
+        "the proposal must have been previewed: {:?}",
+        scenario.replies()
+    );
+    let inspection = &previews[0];
+    assert_eq!(
+        inspection.get("proposal_kind").and_then(|k| k.as_str()),
+        Some("model-initiated-file-read"),
+        "the classification must not change: {inspection}"
+    );
+    assert_eq!(
+        inspection
+            .get("requires_confirmation")
+            .and_then(|r| r.as_bool()),
+        Some(true),
+        "a model-originated read must still require a confirmation: {inspection}"
+    );
+    assert_eq!(
+        inspection.get("approval_allowed").and_then(|a| a.as_bool()),
+        Some(false),
+        "the proposal must be blocked: {inspection}"
+    );
+    let blocked = inspection
+        .get("blocked_reason")
+        .and_then(|b| b.as_str())
+        .expect("a blocked reason");
+    // The reason says the recipient cannot be identified, and it does not say it
+    // by quoting the endpoint it could not identify.
+    assert!(
+        !blocked.is_empty(),
+        "a blocked proposal must say why: {inspection}"
+    );
+    assert!(
+        blocked.contains("recipient") || blocked.contains("cannot be displayed safely"),
+        "the reason must name what is wrong: {blocked}"
+    );
+    assert!(
+        !blocked.contains(CANARY),
+        "the reason must not quote the unsafe destination: {blocked}"
+    );
+    // No recipient was shown, because none could be shown safely.
+    assert!(
+        !inspection
+            .get("recipient")
+            .and_then(|r| r.as_str())
+            .unwrap_or_default()
+            .contains(CANARY),
+        "the unsafe destination must not be shown: {inspection}"
+    );
+    // The fresh preview, if one was asked for, carried no challenge: a blocked
+    // proposal mints none.
+    for preview in previews.iter().skip(1) {
+        assert!(
+            preview.get("challenge").is_none(),
+            "a blocked proposal must not mint a challenge: {preview}"
+        );
+    }
+
+    assert!(
+        !run.output.contains("[y/N]"),
+        "a blocked proposal must not be put to the operator: {}",
+        run.output
+    );
+    assert!(
+        run.output.contains(blocked),
+        "the reason must reach the operator: {}",
+        run.output
+    );
+    assert!(
+        !scenario.approval_was_sent(),
+        "no approval may be sent: {:?}",
+        scenario.methods()
+    );
+    assert_eq!(scenario.proposal_status(), "pending");
+    assert_eq!(scenario.approval_count(), 0);
+    assert_eq!(scenario.effect_count(), 0);
+    assert_ne!(scenario.task_state(), "completed");
+    assert_eq!(scenario.provider.requests().len(), 1);
+
+    // The canary appears nowhere it must not: not on the operator's console, not
+    // in the durable state, and not in any daemon error.
+    assert!(
+        !run.output.contains(CANARY),
+        "the canary reached the console: {}",
+        run.output
+    );
+    let state = std::fs::read(scenario.root.join("state.db")).unwrap_or_default();
+    let state = String::from_utf8_lossy(&state).into_owned();
+    assert!(
+        !state.contains(CANARY),
+        "the canary reached the durable state"
+    );
+    let said = scenario.daemon_stderr();
+    assert!(
+        !said.contains(CANARY),
+        "the canary must not appear in the daemon's output: {said}"
+    );
+    assert!(
+        said.contains("destination withheld (unsafe to display)"),
+        "the daemon must withhold a destination it cannot show: {said}"
+    );
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// The daemon's startup output never carries a destination it cannot show.
+///
+/// A configured provider URL may carry user information, a query string or a
+/// fragment. The daemon's own startup banner is read by whoever is watching the
+/// machine, so the destination it prints is the safe projection -- and a
+/// destination the projection refuses is withheld whole, not partly shown.
+#[test]
+fn the_daemons_startup_output_never_carries_a_destination_it_cannot_show() {
+    const USERINFO: &str = "USERINFO-CANARY-7c1";
+    const QUERY: &str = "QUERY-CANARY-4d19";
+    const FRAGMENT: &str = "FRAGMENT-CANARY-2b8";
+    const WITHHELD: &str = "destination withheld (unsafe to display)";
+
+    // A destination with user information in it.
+    let root = dir("startup-userinfo");
+    let credential = synthetic_credential();
+    let credential_file = root.join("provider-credential");
+    write_credential_file(&credential_file, &credential);
+    let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
+    let base = format!("https://{USERINFO}@{}/v1", provider.address);
+    let (daemon, stderr) =
+        Daemon::start_with_tls_provider_base(&root, &provider, &credential_file, &base, true);
+    // The daemon starts: the configuration is accepted.
+    assert!(daemon.cli(&["task", "list"]).status.success());
+    let said = stderr
+        .expect("the daemon's standard error was captured")
+        .text();
+    assert!(
+        !said.contains(USERINFO),
+        "the user information reached the startup output: {said}"
+    );
+    assert!(
+        said.contains(WITHHELD),
+        "the destination must be withheld: {said}"
+    );
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&root);
+
+    // A destination with a query string and a fragment. The daemon starts, the
+    // banner withholds the destination, and the configured request is still made
+    // exactly as configured: the query and the fragment are not removed from it.
+    let root = dir("startup-query");
+    let credential = synthetic_credential();
+    let credential_file = root.join("provider-credential");
+    write_credential_file(&credential_file, &credential);
+    let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
+    let base = format!("https://{}/v1?{QUERY}#{FRAGMENT}", provider.address);
+    let (daemon, stderr) =
+        Daemon::start_with_tls_provider_base(&root, &provider, &credential_file, &base, true);
+    let said = stderr
+        .expect("the daemon's standard error was captured")
+        .text();
+    for canary in [QUERY, FRAGMENT] {
+        assert!(
+            !said.contains(canary),
+            "the canary reached the startup output: {said}"
+        );
+    }
+    assert!(
+        said.contains(WITHHELD),
+        "the destination must be withheld: {said}"
+    );
+
+    // The request still happens, and it carries the configured path, query and
+    // fragment: the configuration was not changed to make it printable.
+    daemon.cli(&["task", "create", "--id", "s1"]);
+    assert!(
+        daemon
+            .cli(&["task", "claim", "--id", "s1", "--worker", "w1"])
+            .status
+            .success()
+    );
+    let proposed = daemon.cli(&["task", "ai-propose", "--task", "s1", "--worker", "w1"]);
+    assert!(
+        proposed.status.success(),
+        "the model must be asked: {}\n{}",
+        stdout_of(&proposed),
+        stderr_of(&proposed)
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "one provider request: {requests:?}");
+
+    // What was actually put on the wire. The request-target is the configured
+    // path and the configured query, and the fragment is not transmitted: a
+    // fragment identifies a secondary resource in the representation the server
+    // returns, and it is not part of the request-target (RFC 9110 section 7.1).
+    let lines = provider.request_lines();
+    assert_eq!(lines.len(), 1, "one request line: {lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.starts_with("POST /v1/chat/completions?"),
+        "the request-target must be the configured path and query: {line}"
+    );
+    assert!(
+        line.contains(QUERY),
+        "the configured query must be sent: {line}"
+    );
+    assert!(
+        !line.contains(FRAGMENT),
+        "the fragment must not be transmitted: {line}"
+    );
+    assert!(
+        !requests[0].contains(FRAGMENT),
+        "the fragment must not appear anywhere in the request: {requests:?}"
+    );
+    // The request is still an authenticated TLS request with the synthetic
+    // credential: nothing about the transport was relaxed.
+    assert!(
+        requests[0].contains(&format!("Authorization: Bearer {credential}")),
+        "the synthetic credential must still be sent: {requests:?}"
+    );
+    drop(daemon);
     let _ = std::fs::remove_dir_all(&root);
 }

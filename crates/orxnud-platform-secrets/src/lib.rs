@@ -230,12 +230,57 @@ fn probe() -> Probe {
     // Write then delete a probe entry: existence alone cannot be tested, because
     // reading requires a key to already exist. A backend that cannot be written to
     // is not usable, which is the honest test.
-    let written = keyring::Entry::new(SERVICE, "probe").and_then(|e| e.set_password("probe"));
-    let cleaned = keyring::Entry::new(SERVICE, "probe").and_then(|e| e.delete_credential());
-    probe_verdict(
+    //
+    // The entry is named uniquely, so two probes never write the same item. With
+    // one fixed name they did: a second probe's write landed on an item the first
+    // had just removed, the backend refused it as locked, and a working store was
+    // reported as absent. That is not only a test hazard -- two daemons starting
+    // at the same moment probe the same keyring, and one of them used to refuse
+    // to start.
+    let entry = probe_entry_name();
+    let written = keyring::Entry::new(SERVICE, &entry).and_then(|e| e.set_password("probe"));
+    // The removal targets the entry this probe created, and only that one.
+    let cleaned = keyring::Entry::new(SERVICE, &entry).and_then(|e| e.delete_credential());
+    let verdict = probe_verdict(
         written.as_ref().map(|_| ()).map_err(|e| e.to_string()),
         cleaned.as_ref().map(|_| ()).map_err(|e| e.to_string()),
-    )
+    );
+    match verdict {
+        // The name is in the message: a leftover entry is otherwise unfindable,
+        // because the user is told to remove it and not where it is.
+        Probe::AvailableWithStaleProbeEntry(why) => {
+            Probe::AvailableWithStaleProbeEntry(format!("{why} (the entry was named {entry})"))
+        }
+        other => other,
+    }
+}
+
+/// The name of the entry one probe writes and then removes.
+///
+/// # Why it is unique per invocation
+///
+/// A probe proves the store is writable by writing an entry and removing it
+/// again. With a single fixed name, two probes -- in two processes, or two
+/// threads -- write the *same* item, one of them removes the other's, and the
+/// backend refuses a write against an item that has just been deleted. A working
+/// store is then reported as absent, which is the worst possible answer.
+///
+/// The name therefore carries the wall-clock nanoseconds, a per-process counter
+/// and the process id: unique among live processes, and unique within one.
+///
+/// # Why it is safe against a user's own entries
+///
+/// The name is not guessable and is not a credential name, so the probe can only
+/// ever remove the entry it created. A probe entry left behind by a crash is
+/// named in the message the daemon prints, so it can be removed.
+fn probe_entry_name() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("probe-{nanos}-{n}-{}", std::process::id())
 }
 
 /// Decides what a write/cleanup pair means.
@@ -407,6 +452,28 @@ mod tests {
     /// The regression that mattered: `Default` used to manufacture an *unavailable* store
     /// without probing, so every production call site silently had no credential store.
     ///
+    /// Every probe names its own entry, so two probes cannot collide.
+    ///
+    /// The probe writes an item into the platform keyring and removes it again.
+    /// With one shared name, two probes -- in two processes, or two threads --
+    /// write the same item and remove each other's, and a working store is
+    /// reported as absent. The names are therefore unique per invocation, and the
+    /// probe can only ever remove the entry it created.
+    #[test]
+    fn each_probe_names_its_own_entry() {
+        let first = probe_entry_name();
+        let second = probe_entry_name();
+        assert_ne!(
+            first, second,
+            "two probes must never share an entry name: {first} {second}"
+        );
+        assert!(first.starts_with("probe-"), "{first}");
+        // Short enough to be a keyring attribute, and long enough not to be a
+        // name a user would have chosen.
+        assert!(first.len() < 128, "{first}");
+        assert!(first.len() > 16, "{first}");
+    }
+
     /// Asserted structurally -- `Default` must not exist -- because a test that called it
     /// and checked the field would be asserting the behaviour rather than its absence.
     #[test]

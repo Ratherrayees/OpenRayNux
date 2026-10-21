@@ -533,8 +533,11 @@ fn the_audit_records_the_uncertainty_rather_than_a_completion() {
     );
 
     let events = {
-        let db = orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-            .expect("open the store the daemon wrote");
+        let db = orxnud_store::security_state::SqliteAuditJournal::open(
+            &d.join("state.db"),
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("open the store the daemon wrote");
         let mut stmt = db
             .conn()
             .prepare("SELECT kind, from_state, to_state FROM task_events WHERE task_id = 'a1' ORDER BY seq;")
@@ -851,8 +854,12 @@ fn a_worker_whose_lease_ended_cannot_settle_the_outcome() {
 /// `idempotent` rather than a bool, so a value outside `0`/`1` is visible here instead
 /// of being silently folded into a `false`.
 fn effects(root: &std::path::Path) -> Vec<(String, String, i64)> {
-    let store =
-        orxnud_store::Store::open(&root.join("state.db"), false).expect("open the daemon database");
+    let store = orxnud_store::Store::open(
+        &root.join("state.db"),
+        false,
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the daemon database");
     let conn = store.conn();
     let mut stmt = conn
         .prepare("SELECT step_key, status, idempotent FROM task_effects ORDER BY reserved_at_ms;")

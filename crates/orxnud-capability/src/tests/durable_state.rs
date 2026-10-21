@@ -265,13 +265,17 @@ fn cleanup(dir: &Path) {
 /// The adapters open their own connections, exactly as the daemon does, so what is
 /// under test is the production arrangement rather than a test-only one.
 fn durable_engine_from(db: &Path, mut engine: PolicyEngine) -> PolicyEngine {
-    let journal = SqliteAuditJournal::open(db).expect("audit journal");
+    let journal =
+        SqliteAuditJournal::open(db, &orxnud_platform_fs::OsIdentity).expect("audit journal");
     engine
         .restore(&journal)
         .expect("the journal must load and verify");
     engine.with_security_state(
         Box::new(journal),
-        Box::new(SqliteApprovalLedger::open(db).expect("approval ledger")),
+        Box::new(
+            SqliteApprovalLedger::open(db, &orxnud_platform_fs::OsIdentity)
+                .expect("approval ledger"),
+        ),
     )
 }
 
@@ -341,7 +345,7 @@ fn an_audit_record_written_before_a_restart_is_readable_after_it() {
     assert!(before >= 2, "an authorisation and a terminal record");
 
     // A brand new process, opening the same file.
-    let journal = SqliteAuditJournal::open(&db).expect("reopen");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
     assert_eq!(
         journal.len().expect("durable length"),
         before as u64,
@@ -376,7 +380,8 @@ fn a_reloaded_chain_verifies_across_three_successive_processes() {
         drop(d);
 
         // Every process must see a chain that verifies and one that grew.
-        let journal = SqliteAuditJournal::open(&db).expect("reopen");
+        let journal =
+            SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
         let chain = orxnud_audit::AuditChain::restore(&journal).expect("reload");
         chain.verify().expect("verify after reload");
         assert!(
@@ -386,7 +391,8 @@ fn a_reloaded_chain_verifies_across_three_successive_processes() {
         );
     }
 
-    let journal = SqliteAuditJournal::open(&db).expect("final reopen");
+    let journal =
+        SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("final reopen");
     let chain = orxnud_audit::AuditChain::restore(&journal).expect("final reload");
     assert_eq!(chain.len(), 6, "three processes, two records each");
     // Strictly increasing across process boundaries: what makes the hash linkage
@@ -427,7 +433,8 @@ fn a_tampered_hash_is_detected_when_the_chain_reloads() {
     }
     // Replace the stored hash of record 0. The row survives; the chain does not.
     {
-        let journal = SqliteAuditJournal::open(&db).expect("open for tamper");
+        let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("open for tamper");
         journal
             .conn()
             .execute(
@@ -436,7 +443,7 @@ fn a_tampered_hash_is_detected_when_the_chain_reloads() {
             )
             .expect("tamper");
     }
-    let journal = SqliteAuditJournal::open(&db).expect("reopen");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
     assert!(
         orxnud_audit::AuditChain::restore(&journal).is_err(),
         "a substituted hash must break verification"
@@ -467,7 +474,8 @@ fn a_tampered_record_body_is_detected_by_its_content_hash() {
     // Edit the content and leave the hash alone: the common case, and the one
     // `verify` exists for.
     {
-        let journal = SqliteAuditJournal::open(&db).expect("open for tamper");
+        let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("open for tamper");
         journal
             .conn()
             .execute(
@@ -476,7 +484,7 @@ fn a_tampered_record_body_is_detected_by_its_content_hash() {
             )
             .expect("tamper");
     }
-    let journal = SqliteAuditJournal::open(&db).expect("reopen");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
     let err = orxnud_audit::AuditChain::restore(&journal)
         .expect_err("editing a record body must break its hash");
     assert!(
@@ -506,7 +514,7 @@ fn a_terminal_record_is_persisted_and_correlates_after_a_restart() {
         )
         .expect("dispatch");
     }
-    let journal = SqliteAuditJournal::open(&db).expect("reopen");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
     let chain = orxnud_audit::AuditChain::restore(&journal).expect("reload");
     let records = chain.entries();
     assert_eq!(records.len(), 2, "authorisation plus terminal");
@@ -551,7 +559,8 @@ fn an_unverifiable_journal_is_refused_rather_than_appended_to() {
         .expect("dispatch");
     }
     {
-        let journal = SqliteAuditJournal::open(&db).expect("open for tamper");
+        let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("open for tamper");
         journal
             .conn()
             .execute(
@@ -562,7 +571,7 @@ fn an_unverifiable_journal_is_refused_rather_than_appended_to() {
     }
 
     // An engine must never continue from an unverified head.
-    let journal = SqliteAuditJournal::open(&db).expect("reopen");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
     let mut engine = gated_policy();
     let err = engine.restore(&journal).expect_err("must refuse");
     assert!(
@@ -586,11 +595,11 @@ fn a_terminal_record_that_cannot_be_persisted_is_not_reported_as_success() {
     let db = dir.join("state.db");
     // Create a real, migrated journal so the schema is genuine, then replace it with
     // the refusing double for the write.
-    SqliteAuditJournal::open(&db).expect("real journal first");
+    SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("real journal first");
 
     let mut engine = ungated_policy().with_security_state(
         Box::new(RefusingJournal),
-        Box::new(SqliteApprovalLedger::open(&db).expect("ledger")),
+        Box::new(SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity).expect("ledger")),
     );
     let secrets = NoSecrets;
     let mut d = Dispatcher::new(&mut engine, &secrets, bundles());
@@ -696,7 +705,8 @@ fn two_processes_racing_for_one_digest_produce_exactly_one_success() {
                 // subprocess would produce. What races here is the `consume`; what
                 // also has to survive is both opens contending for the journal-mode
                 // transition and the migrations on a fresh file.
-                let mut ledger = SqliteApprovalLedger::open(&db).expect("open");
+                let mut ledger =
+                    SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity).expect("open");
                 barrier.wait();
                 ledger.consume_at(&digest, 1_000)
             })
@@ -797,7 +807,8 @@ fn a_dispatch_persists_its_terminal_audit_and_a_restart_refuses_the_replay() {
 
     // What the first process left behind, read independently.
     {
-        let journal = SqliteAuditJournal::open(&db).expect("reopen");
+        let journal =
+            SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
         let chain = orxnud_audit::AuditChain::restore(&journal).expect("reload");
         chain.verify().expect("verify");
         let records = chain.entries();
@@ -842,7 +853,8 @@ fn a_dispatch_persists_its_terminal_audit_and_a_restart_refuses_the_replay() {
 
     // And the refusal is itself durably audited, so the journal shows the attempt
     // that was turned away rather than nothing at all.
-    let journal = SqliteAuditJournal::open(&db).expect("reopen for refusal audit");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+        .expect("reopen for refusal audit");
     let chain = orxnud_audit::AuditChain::restore(&journal).expect("reload");
     chain.verify().expect("verify");
     let denials = chain
@@ -893,7 +905,7 @@ fn a_restart_continues_the_chain_rather_than_restarting_it() {
 
     // And the persisted prev_hash of the second process's first record is the first
     // process's head — read straight out of storage, not inferred.
-    let journal = SqliteAuditJournal::open(&db).expect("reopen");
+    let journal = SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
     let rows = journal.entries().expect("rows");
     assert_eq!(rows.len(), 4);
     assert_eq!(

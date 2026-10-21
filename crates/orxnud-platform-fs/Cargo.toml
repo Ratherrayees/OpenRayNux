@@ -17,6 +17,15 @@ publish.workspace = true
 thiserror = { workspace = true }
 orxnud-domain = { workspace = true }
 
+# Windows file identity and the actual SQLite main-database handle. These are
+# target-specific so a Linux build compiles neither SQLite nor Win32; the `cfg`
+# lives here because this crate is one of the three gate G3 permits it in.
+# `rusqlite` is already the store's dependency, so the Windows build adds no new
+# SQLite version to the graph.
+[target.'cfg(windows)'.dependencies]
+rusqlite = { workspace = true }
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = "3.27.0"

@@ -32,8 +32,8 @@ fn seeded(tag: &str) -> (PathBuf, PathBuf) {
     // `Store::open` alone does not migrate — it applies pragmas and verifies SQLite.
     // The schema is produced by `open_and_migrate`, which is the production path for
     // "create this database if it is not there yet".
-    let store =
-        orxnud_store::migration::open_and_migrate(&db).expect("create a real migrated store");
+    let store = orxnud_store::migration::open_and_migrate(&db, &orxnud_platform_fs::OsIdentity)
+        .expect("create a real migrated store");
     drop(store);
     (d, db)
 }
@@ -64,31 +64,38 @@ fn c_every_entry_point_participates_in_the_ownership_rule() {
     let lease = hold_exclusive(&db);
 
     // 1. `Store::open` — the central opener the others funnel through.
-    let store = orxnud_store::sqlite::Store::open(&db, true).expect_err("Store::open must refuse");
+    let store = orxnud_store::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+        .expect_err("Store::open must refuse");
     assert!(
         refused_for_ownership(&store.to_string()),
         "Store::open must refuse for ownership, got: {store}"
     );
 
     // 2. `open_and_migrate` — a second, distinct way into the store.
-    let migrate =
-        orxnud_store::migration::open_and_migrate(&db).expect_err("open_and_migrate must refuse");
+    let migrate = orxnud_store::migration::open_and_migrate(&db, &orxnud_platform_fs::OsIdentity)
+        .expect_err("open_and_migrate must refuse");
     assert!(
         refused_for_ownership(&migrate.to_string()),
         "open_and_migrate must refuse for ownership, got: {migrate}"
     );
 
     // 3. `SqliteAuditJournal::open`.
-    let journal = orxnud_store::security_state::SqliteAuditJournal::open(&db)
-        .expect_err("SqliteAuditJournal::open must refuse");
+    let journal = orxnud_store::security_state::SqliteAuditJournal::open(
+        &db,
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect_err("SqliteAuditJournal::open must refuse");
     assert!(
         refused_for_ownership(&journal.to_string()),
         "SqliteAuditJournal::open must refuse for ownership, got: {journal}"
     );
 
     // 4. `SqliteApprovalLedger::open`.
-    let ledger = orxnud_store::security_state::SqliteApprovalLedger::open(&db)
-        .expect_err("SqliteApprovalLedger::open must refuse");
+    let ledger = orxnud_store::security_state::SqliteApprovalLedger::open(
+        &db,
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect_err("SqliteApprovalLedger::open must refuse");
     assert!(
         refused_for_ownership(&ledger.to_string()),
         "SqliteApprovalLedger::open must refuse for ownership, got: {ledger}"
@@ -98,11 +105,18 @@ fn c_every_entry_point_participates_in_the_ownership_rule() {
 
     // With ownership released every one of them works, so the refusals above were about
     // ownership and not about a database that happens to be unusable.
-    let _ = orxnud_store::sqlite::Store::open(&db, true).expect("Store::open works once free");
-    let _ = orxnud_store::security_state::SqliteAuditJournal::open(&db)
-        .expect("journal works once free");
-    let _ = orxnud_store::security_state::SqliteApprovalLedger::open(&db)
-        .expect("ledger works once free");
+    let _ = orxnud_store::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+        .expect("Store::open works once free");
+    let _ = orxnud_store::security_state::SqliteAuditJournal::open(
+        &db,
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("journal works once free");
+    let _ = orxnud_store::security_state::SqliteApprovalLedger::open(
+        &db,
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("ledger works once free");
 }
 
 /// `TaskService::open` lives in the daemon crate, so it is exercised here through the
@@ -113,7 +127,8 @@ fn c_task_service_open_refuses_through_its_own_opener() {
     let lease = hold_exclusive(&db);
 
     // `TaskService::open` calls `Store::open` first, so this is the gate it must pass.
-    let store = orxnud_store::sqlite::Store::open(&db, true).expect_err("must refuse");
+    let store = orxnud_store::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+        .expect_err("must refuse");
     assert!(
         refused_for_ownership(&store.to_string()),
         "TaskService::open's opener must refuse for ownership, got: {store}"
@@ -150,7 +165,7 @@ fn d_restore_refuses_without_exclusive_ownership_and_recovers_when_free() {
     // Another owner: the restore must refuse rather than proceed.
     let other = hold_exclusive(&db);
     let refused = snapshot
-        .restore_coordinated(&db)
+        .restore_coordinated(&db, &orxnud_platform_fs::OsIdentity)
         .expect_err("a restore attempted while another owner holds the database must fail");
     assert!(
         refused_for_ownership(&refused.to_string()),
@@ -160,7 +175,7 @@ fn d_restore_refuses_without_exclusive_ownership_and_recovers_when_free() {
 
     drop(other);
     snapshot
-        .restore_coordinated(&db)
+        .restore_coordinated(&db, &orxnud_platform_fs::OsIdentity)
         .expect("the same restore must succeed once the owner is gone");
     // The **same** query as the one that recorded `expected`. The first version read a
     // bare `version` here against a `MAX(version)` there and compared 14 with 1 — a

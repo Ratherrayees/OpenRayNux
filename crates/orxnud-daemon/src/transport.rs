@@ -75,6 +75,15 @@ impl Scheme {
         }
     }
 
+    /// The scheme word, as it appears in a URL.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlainHttp => "http",
+            Self::Tls => "https",
+        }
+    }
+
     /// Whether this scheme may carry a credential.
     ///
     /// Only TLS. A plaintext connection is allowed to exist for a local test server, but it
@@ -88,7 +97,7 @@ impl Scheme {
 }
 
 /// The host, port and path prefix a base URL addresses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Target {
     /// `host` or `host:port`.
     pub authority: String,
@@ -98,7 +107,34 @@ pub struct Target {
     pub scheme: Scheme,
 }
 
+impl std::fmt::Debug for Target {
+    /// Never prints the authority or the path verbatim.
+    ///
+    /// The authority may carry user information and the path a query string, so
+    /// the safe projection is printed instead -- and an endpoint that cannot be
+    /// shown is withheld whole.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("scheme", &self.scheme)
+            .field(
+                "destination",
+                &crate::observation::redacted_endpoint(&self.endpoint_string()),
+            )
+            .finish()
+    }
+}
+
 impl Target {
+    /// The endpoint as a URL string.
+    fn endpoint_string(&self) -> String {
+        format!(
+            "{}://{}{}",
+            self.scheme.as_str(),
+            self.authority,
+            self.prefix
+        )
+    }
+
     /// Parses a base URL.
     ///
     /// # Errors
@@ -141,6 +177,46 @@ impl Target {
             };
             format!("{}:{}", self.authority, port)
         }
+    }
+
+    /// The request-target for a request to `path` on this endpoint.
+    ///
+    /// # The fragment is not sent
+    ///
+    /// A fragment identifies a secondary resource inside the representation the
+    /// server returns; it is not part of the request-target and is never
+    /// transmitted (RFC 9110 section 7.1, and RFC 3986 section 3.5 for the URI
+    /// itself). A configured endpoint that carries one still has it -- the
+    /// configured URL, the provider's identity and the fingerprint are all
+    /// unchanged -- but the fragment does not go on the wire.
+    ///
+    /// # The query stays at the end
+    ///
+    /// A configured query belongs to the request, so it follows the whole path
+    /// rather than sitting in the middle of it. Appending the request path to a
+    /// prefix that already carries a query would put the request path *inside*
+    /// the query string, and the server would be asked for a different resource
+    /// than the one configured.
+    #[must_use]
+    pub fn request_target(&self, path: &str) -> String {
+        // The prefix is the path the configured base URL carries, and it may
+        // carry a query and a fragment after it.
+        let without_fragment = match self.prefix.split_once('#') {
+            Some((before, _fragment)) => before,
+            None => self.prefix.as_str(),
+        };
+        let (base_path, query) = match without_fragment.split_once('?') {
+            Some((before, query)) => (before, Some(query)),
+            None => (without_fragment, None),
+        };
+        let mut target = String::with_capacity(base_path.len() + path.len() + 8);
+        target.push_str(base_path);
+        target.push_str(path);
+        if let Some(query) = query {
+            target.push('?');
+            target.push_str(query);
+        }
+        target
     }
 
     /// The name TLS verifies the certificate against.
@@ -511,5 +587,55 @@ mod tests {
                 "{reason} is not a transport reason"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod request_target_tests {
+    use super::Target;
+
+    /// The request-target is the path and the query, and never the fragment.
+    ///
+    /// A fragment identifies a secondary resource inside the representation the
+    /// server returns. It is not part of the request-target and is not
+    /// transmitted (RFC 9110 section 7.1).
+    #[test]
+    fn the_request_target_excludes_the_fragment_and_ends_with_the_query() {
+        let plain = Target::parse("https://api.example.test/v1", "a-model").expect("a target");
+        assert_eq!(
+            plain.request_target("/chat/completions"),
+            "/v1/chat/completions"
+        );
+
+        let queried =
+            Target::parse("https://api.example.test/v1?token=QUERY", "a-model").expect("a target");
+        assert_eq!(
+            queried.request_target("/chat/completions"),
+            "/v1/chat/completions?token=QUERY",
+            "the query must follow the whole path, not sit inside it"
+        );
+
+        let fragmented =
+            Target::parse("https://api.example.test/v1#FRAGMENT", "a-model").expect("a target");
+        assert_eq!(
+            fragmented.request_target("/chat/completions"),
+            "/v1/chat/completions",
+            "a fragment must not be transmitted"
+        );
+
+        let both = Target::parse(
+            "https://api.example.test/v1?token=QUERY#FRAGMENT",
+            "a-model",
+        )
+        .expect("a target");
+        assert_eq!(
+            both.request_target("/chat/completions"),
+            "/v1/chat/completions?token=QUERY",
+            "the query is sent and the fragment is not"
+        );
+
+        // The configured endpoint is unchanged: the fragment is still in it, so
+        // the identity and the fingerprint still bind to what was configured.
+        assert_eq!(both.prefix, "/v1?token=QUERY#FRAGMENT");
     }
 }

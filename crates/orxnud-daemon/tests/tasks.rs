@@ -208,8 +208,11 @@ impl Serving {
 /// which is both the convention the rest of this suite follows and a check in its own
 /// right: if the runtime had left the database unmigrated, this would refuse.
 fn conn(root: &Path) -> orxnud_store::security_state::SqliteAuditJournal {
-    orxnud_store::security_state::SqliteAuditJournal::open(&root.join("state.db"))
-        .expect("open the store the runtime wrote")
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &root.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the store the runtime wrote")
 }
 
 /// Reads the durable task rows straight out of the file.

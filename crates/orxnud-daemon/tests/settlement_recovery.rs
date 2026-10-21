@@ -159,7 +159,8 @@ fn plant_orphan(db: &Path) -> u64 {
     use orxnud_domain::ids::{RequestId, TaskId, UserId};
     use orxnud_domain::{Actor, AuthChannel, DataClass, RiskClass};
 
-    let journal = orxnud_store::SqliteAuditJournal::open(db).expect("open the journal");
+    let journal = orxnud_store::SqliteAuditJournal::open(db, &orxnud_platform_fs::OsIdentity)
+        .expect("open the journal");
     let mut chain = orxnud_audit::AuditChain::restore(&journal).expect("the journal must load");
 
     let orphan = AuditRecord::authorised(
@@ -304,7 +305,8 @@ fn settling_the_authorisation_clears_the_startup_report() {
         use orxnud_audit::{AuditRecord, OutcomeKind};
         use orxnud_domain::ids::{RequestId, TaskId, UserId};
         use orxnud_domain::{Actor, AuthChannel, DataClass, RiskClass};
-        let journal = orxnud_store::SqliteAuditJournal::open(&db).expect("open");
+        let journal = orxnud_store::SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("open");
         let mut chain = orxnud_audit::AuditChain::restore(&journal).expect("load");
         let closing = AuditRecord::authorised(
             Actor::Human {

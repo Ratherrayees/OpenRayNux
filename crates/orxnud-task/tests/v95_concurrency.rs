@@ -162,7 +162,19 @@ fn on_busy(_count: i32) -> bool {
             let _ = gate.blocked.send(Ev::Blocked);
         }
         if gate.released.load(Ordering::SeqCst) {
-            return false;
+            // The rival has committed and the write lock is free, so the retry
+            // can now proceed -- and it must: returning `false` here **aborts**
+            // the statement, handing the caller an unclassified busy error.
+            // That is precisely the outcome this file exists to forbid, and it
+            // is what made this test fail intermittently: the release is set
+            // immediately after the rival commits, so whenever the contender's
+            // next busy-handler invocation landed after that release, the
+            // statement was aborted even though the lock was free.
+            //
+            // `true` lets SQLite retry, and the busy timeout (the production
+            // pragma's five seconds) bounds the wait. No assertion is weakened:
+            // a busy error reaching the caller still fails the test.
+            return true;
         }
         std::thread::sleep(Duration::from_millis(1));
         true

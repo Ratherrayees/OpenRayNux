@@ -32,6 +32,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use orxnud_domain::ApprovalDigest;
+use orxnud_domain::platform::FilesystemIdentity;
 use orxnud_domain::security_state::{
     ApprovalLedger, AuditJournal, JournalEntry, JournalError, LedgerError,
 };
@@ -69,11 +70,23 @@ impl SqliteAuditJournal {
     /// Opens the journal on an existing database file, applying any pending
     /// migration so a caller cannot read a table that does not exist yet.
     ///
+    /// # The filesystem-identity capability is required
+    ///
+    /// `identity` is not optional and has no default. ADR-0058 Decision 2 requires
+    /// every open of a database to present the capability that can say how many
+    /// names reach it, and requires a platform that cannot answer to be a
+    /// **refusal** rather than a pass. The audit journal is the record of what the
+    /// system did, so it is exactly the thing that must not be reachable through
+    /// a second name.
+    ///
     /// # Errors
     ///
     /// [`JournalError::Unavailable`] if the database cannot be opened, migrated,
-    /// or given the critical pragmas.
-    pub fn open(path: &std::path::Path) -> Result<Self, JournalError> {
+    /// given the critical pragmas, or shown to be alias-safe.
+    pub fn open(
+        path: &std::path::Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Self, JournalError> {
         let unavailable = |e: String| JournalError::Unavailable(e);
         // Read *before* the file is opened or created. Only a file this call created may
         // be removed after a failed first migration.
@@ -85,10 +98,13 @@ impl SqliteAuditJournal {
         }
         // S-31: ownership before the connection. The audit journal is the record of
         // what the system did; it is exactly the thing that must not be writable
-        // behind a restore's back.
-        let ownership =
-            crate::ownership::acquire_shared(path).map_err(|e| unavailable(e.to_string()))?;
-        let conn = Connection::open(path).map_err(|e| unavailable(e.to_string()))?;
+        // behind a restore's back. The lease and the guarded open are one
+        // operation, so neither can be forgotten.
+        //
+        // The open is guarded: the database's link count and identity are checked
+        // before SQLite is asked to open anything, and again afterwards.
+        let (conn, ownership, sidecars) =
+            crate::alias::open_shared(path, identity).map_err(|e| unavailable(e.to_string()))?;
         // `critical`, not `derived`: a lost audit record is a lost record, and
         // this table is the `critical` region ADR-0028 names for exactly this.
         let pragma = Pragma::critical();
@@ -98,6 +114,15 @@ impl SqliteAuditJournal {
         pragma
             .verify(&conn)
             .map_err(|e| unavailable(e.to_string()))?;
+        // The sidecars are verified after WAL mode has been applied, because that
+        // is when SQLite materialises them.
+        sidecars.verify_after_open(identity).map_err(|f| {
+            unavailable(format!(
+                "refusing to open {}: {}",
+                f.path.display(),
+                f.reason
+            ))
+        })?;
         // The whole database's schema is migrated here, not just the journal's: every
         // migration in `MIGRATIONS` creates tables in this one file, and this function
         // runs **before** `TaskService::open` does. So this is the site's first shot at
@@ -120,7 +145,7 @@ impl SqliteAuditJournal {
                 // at the end of the function.
                 drop(conn);
                 drop(ownership);
-                crate::migration::recover_from_snapshot(path, &snapshot)
+                crate::migration::recover_from_snapshot(path, &snapshot, identity)
                     .map_err(|e| unavailable(e.to_string()))?;
                 Err(unavailable(source.to_string()))
             }
@@ -299,11 +324,20 @@ impl SqliteApprovalLedger {
     /// supported. Concurrent writes are serialised by the write lock and the primary key,
     /// not by a transaction mode -- this type opens no transaction at all.
     ///
+    /// # The filesystem-identity capability is required
+    ///
+    /// As [`SqliteAuditJournal::open`]: ADR-0058 Decision 2 requires every open to
+    /// present the capability that can say how many names reach the database, and
+    /// requires "the platform cannot say" to be a refusal.
+    ///
     /// # Errors
     ///
     /// [`LedgerError::Unavailable`] if the database cannot be opened, migrated,
-    /// or given the critical pragmas.
-    pub fn open(path: &std::path::Path) -> Result<Self, LedgerError> {
+    /// given the critical pragmas, or shown to be alias-safe.
+    pub fn open(
+        path: &std::path::Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Self, LedgerError> {
         let unavailable = |e: String| LedgerError::Unavailable(e);
         // Read *before* the file is opened or created; see `Journal::open`.
         let pre_existing = path.exists();
@@ -312,9 +346,10 @@ impl SqliteApprovalLedger {
         {
             std::fs::create_dir_all(parent).map_err(|e| unavailable(e.to_string()))?;
         }
-        let ownership =
-            crate::ownership::acquire_shared(path).map_err(|e| unavailable(e.to_string()))?;
-        let conn = Connection::open(path).map_err(|e| unavailable(e.to_string()))?;
+        // As with the audit journal: the lease and the guarded open are one
+        // operation.
+        let (conn, ownership, sidecars) =
+            crate::alias::open_shared(path, identity).map_err(|e| unavailable(e.to_string()))?;
         let pragma = Pragma::critical();
         pragma
             .apply(&conn)
@@ -322,6 +357,15 @@ impl SqliteApprovalLedger {
         pragma
             .verify(&conn)
             .map_err(|e| unavailable(e.to_string()))?;
+        // The sidecars are verified after WAL mode has been applied, because that
+        // is when SQLite materialises them.
+        sidecars.verify_after_open(identity).map_err(|f| {
+            unavailable(format!(
+                "refusing to open {}: {}",
+                f.path.display(),
+                f.reason
+            ))
+        })?;
         // As with `SqliteAuditJournal::open`: this migrates the whole database, and this
         // is the site's first attempt at it. The approval ledger is the replay gate that
         // stops one approval being presented twice across restarts, so a half-applied
@@ -334,7 +378,7 @@ impl SqliteApprovalLedger {
             Err(crate::migration::MigrationError::RecoveryRequired { source, snapshot }) => {
                 drop(conn);
                 drop(ownership);
-                crate::migration::recover_from_snapshot(path, &snapshot)
+                crate::migration::recover_from_snapshot(path, &snapshot, identity)
                     .map_err(|e| unavailable(e.to_string()))?;
                 Err(unavailable(source.to_string()))
             }
@@ -441,7 +485,7 @@ mod tests {
     #[test]
     fn the_migration_creates_both_tables_at_the_current_version() {
         let path = db_path("mig");
-        let j = SqliteAuditJournal::open(&path).expect("open");
+        let j = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity).expect("open");
         assert_eq!(
             MigrationRunner::new(j.conn())
                 .applied_version()
@@ -481,8 +525,8 @@ mod tests {
     fn a_second_writer_at_the_same_position_is_refused() {
         // The mechanism that stops a stale chain head from forking the journal.
         let path = db_path("collide");
-        let a = SqliteAuditJournal::open(&path).expect("open a");
-        let b = SqliteAuditJournal::open(&path).expect("open b");
+        let a = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity).expect("open a");
+        let b = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity).expect("open b");
         a.append(&entry(0, [1u8; 32])).expect("first writer");
         let err = b.append(&entry(0, [2u8; 32])).expect_err("second writer");
         assert!(
@@ -497,7 +541,8 @@ mod tests {
     #[test]
     fn the_ledger_refuses_a_replay_and_accepts_a_distinct_digest() {
         let path = db_path("ledger");
-        let mut l = SqliteApprovalLedger::open(&path).expect("open");
+        let mut l =
+            SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity).expect("open");
         l.consume_at(&digest(1), 0).expect("first");
         assert!(l.is_consumed(&digest(1)).expect("read"));
         assert!(matches!(
@@ -513,10 +558,11 @@ mod tests {
     fn a_spent_approval_survives_the_process() {
         let path = db_path("restart");
         {
-            let mut l = SqliteApprovalLedger::open(&path).expect("open");
+            let mut l =
+                SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity).expect("open");
             l.consume_at(&digest(9), 0).expect("consume");
         }
-        let l = SqliteApprovalLedger::open(&path).expect("reopen");
+        let l = SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity).expect("reopen");
         assert!(
             l.is_consumed(&digest(9)).expect("read"),
             "a consumed approval must still be consumed after a restart"
@@ -535,8 +581,10 @@ mod tests {
         // failure — which is exactly what an earlier version of this test
         // asserted.
         let db = dir.join("state.db");
-        let first = SqliteApprovalLedger::open(&db).expect("open a");
-        let second = SqliteApprovalLedger::open(&db).expect("open b");
+        let first =
+            SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity).expect("open a");
+        let second =
+            SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity).expect("open b");
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = [first, second]
@@ -563,7 +611,8 @@ mod tests {
         assert_eq!(wins, 1, "exactly one consumer may succeed: {outcomes:?}");
         assert_eq!(replays, 1, "the other must see a replay: {outcomes:?}");
 
-        let check = SqliteApprovalLedger::open(&db).expect("reopen");
+        let check =
+            SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
         assert!(check.is_consumed(&digest(42)).expect("read"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -629,10 +678,10 @@ mod tests {
         let path = db_path("head");
         let hash = [5u8; 32];
         {
-            let j = SqliteAuditJournal::open(&path).expect("open");
+            let j = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity).expect("open");
             j.append(&entry(0, hash)).expect("append");
         }
-        let j = SqliteAuditJournal::open(&path).expect("reopen");
+        let j = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity).expect("reopen");
         assert_eq!(j.entries().expect("entries")[0].hash, hash);
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -687,7 +736,7 @@ mod tests {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    SqliteAuditJournal::open(&db).map(|_| ())
+                    SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).map(|_| ())
                 })
             })
             .collect();
@@ -705,7 +754,8 @@ mod tests {
         );
 
         // The shared database is still usable, and the chain is intact.
-        let journal = SqliteAuditJournal::open(&db).expect("reopen");
+        let journal =
+            SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity).expect("reopen");
         journal.append(&entry(0, [3u8; 32])).expect("append");
         assert_eq!(journal.entries().expect("entries").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -731,11 +781,11 @@ mod tests {
                     // point of the test is *that* the open succeeds, not which
                     // adapter it was.
                     if i % 2 == 0 {
-                        SqliteAuditJournal::open(&db)
+                        SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
                             .map(|_| ())
                             .map_err(|e| e.to_string())
                     } else {
-                        SqliteApprovalLedger::open(&db)
+                        SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity)
                             .map(|_| ())
                             .map_err(|e| e.to_string())
                     }
@@ -755,11 +805,11 @@ mod tests {
             failures.first()
         );
         // And both regions exist and work afterwards.
-        SqliteAuditJournal::open(&db)
+        SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
             .expect("journal afterwards")
             .append(&entry(0, [4u8; 32]))
             .expect("append afterwards");
-        SqliteApprovalLedger::open(&db)
+        SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity)
             .expect("ledger afterwards")
             .consume_at(&digest(1), 0)
             .expect("consume afterwards");
@@ -876,7 +926,7 @@ mod tests {
             "precondition: staged at version 13 with one audit row and one spent approval"
         );
 
-        let Err(err) = SqliteAuditJournal::open(&path) else {
+        let Err(err) = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity) else {
             panic!("migration 14 must refuse the conflicting proposals");
         };
         let text = err.to_string();
@@ -904,7 +954,7 @@ mod tests {
         let path = stage_pre_migration("ledger-recover", 13);
         seed_conflicting_proposals(&path);
 
-        let Err(err) = SqliteApprovalLedger::open(&path) else {
+        let Err(err) = SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity) else {
             panic!("migration 14 must refuse the conflicting proposals");
         };
         assert!(
@@ -928,7 +978,8 @@ mod tests {
     #[test]
     fn the_journal_constructor_opens_when_the_migration_succeeds() {
         let path = stage_pre_migration("journal-ok", 13);
-        let journal = SqliteAuditJournal::open(&path).expect("no conflict, so this must open");
+        let journal = SqliteAuditJournal::open(&path, &orxnud_platform_fs::OsIdentity)
+            .expect("no conflict, so this must open");
         let (audits, spent, version) = audit_and_approval_rows(&path);
         assert_eq!(
             (audits, spent, version),
@@ -953,7 +1004,8 @@ mod tests {
     #[test]
     fn the_ledger_constructor_opens_when_the_migration_succeeds() {
         let path = stage_pre_migration("ledger-ok", 13);
-        let _ledger = SqliteApprovalLedger::open(&path).expect("no conflict, so this must open");
+        let _ledger = SqliteApprovalLedger::open(&path, &orxnud_platform_fs::OsIdentity)
+            .expect("no conflict, so this must open");
         assert_eq!(
             audit_and_approval_rows(&path).2,
             crate::migration::CURRENT_VERSION

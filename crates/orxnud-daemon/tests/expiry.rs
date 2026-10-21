@@ -156,8 +156,11 @@ fn workspace(root: &Path) -> PathBuf {
 }
 
 fn conn(root: &Path) -> orxnud_store::security_state::SqliteAuditJournal {
-    orxnud_store::security_state::SqliteAuditJournal::open(&root.join("state.db"))
-        .expect("open the store the runtime wrote")
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &root.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the store the runtime wrote")
 }
 
 /// The durable approval row for one task, as `(step, attempt, digest, expires, consumed)`.

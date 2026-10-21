@@ -28,14 +28,183 @@
 //! atomic on every platform we support, which is why the temporary file must be a
 //! *sibling* — a temporary file in `/tmp` would cross a filesystem boundary and
 //! make the rename a copy.
+//!
+//! # The one exception to "no unsafe here", and why it is here
+//!
+//! `deny` rather than `forbid`, with a single Windows-only module: stable Rust
+//! cannot report a file's 128-bit identity, its link count, or the native handle
+//! behind an open SQLite main database, and the safe wrappers do not expose any
+//! of them. ADR-0058's Windows disposition needs those three facts, so the
+//! Windows-only `windows` module calls `CreateFileW`,
+//! `GetFileInformationByHandleEx` and `sqlite3_file_control`. Every block has a
+//! `SAFETY` comment, the module is compiled only on Windows, and nothing above
+//! this crate can name a handle.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
+
+#[cfg(windows)]
+mod windows;
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use orxnud_domain::platform::FsContract;
+use orxnud_domain::platform::{
+    FileFacts, FilesystemIdentity, FsContract, SqliteMainDatabase, SqliteMainFacts,
+};
+
+/// The number of directory entries that name this inode, or `None` where the platform
+/// does not expose the count.
+///
+/// # Why this is here and not in a caller
+///
+/// The portable core may not branch on the platform -- gate G3 enforces that, and this
+/// crate is where every `cfg` the project needs lives. A caller that needs to know
+/// whether a file is reachable under a second name asks this question here.
+///
+/// # The unsupported-platform case
+///
+/// `None` means **"not established"**, never "one". A caller that needs the count must
+/// treat `None` as a refusal: reading a file whose link count was never checked is
+/// reading a file whose containment was never checked. On Unix the count is
+/// `st_nlink`; on Windows this helper cannot answer, because stable
+/// `std::fs::Metadata` does not expose the count. That is a limit of *this helper*,
+/// not of the platform adapter: [`OsIdentity::observe`] uses the native Windows
+/// query and does report the count. A caller that reaches for this free function on
+/// Windows is asking the wrong one.
+///
+/// # What a count of one does and does not mean
+///
+/// A count of exactly one means the inode has a single directory entry, so no second
+/// name can reach it. It does not say the file is *inside* any particular directory --
+/// that is a separate question, answered by the caller's own path rules.
+#[must_use]
+pub fn hard_link_count(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.nlink())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// The platform this build is running on, named for a refusal message.
+///
+/// Not a `cfg` and not a compile-time constant: it is the *runtime* target, which
+/// is what an operator reading a refusal needs to see.
+const PLATFORM: &str = std::env::consts::OS;
+
+/// The filesystem-identity capability, implemented for this platform.
+///
+/// # What it answers
+///
+/// One observation, one resolution of the path: how many names reach the file,
+/// and which file it is. On Unix both come from a single `stat`, so they cannot
+/// describe two different files. On Windows both come from one handle opened by
+/// `windows::observe` and queried for `FILE_ID_INFO` and `FILE_STANDARD_INFO`,
+/// which is the native equivalent of the same single resolution.
+///
+/// # What it refuses to answer
+///
+/// Where the platform cannot establish the facts, it says so. That is not a
+/// fallback to a permissive answer — it is the answer, and ADR-0058 Decision 2
+/// requires the caller to refuse on it.
+///
+/// # Windows
+///
+/// Stable Rust's `MetadataExt::number_of_links`, `file_index` and
+/// `volume_serial_number` are nightly-only (`windows_by_handle` #63010), so this
+/// implementation does not use them. It calls `CreateFileW` with
+/// `FILE_READ_ATTRIBUTES` and asks `GetFileInformationByHandleEx` for
+/// `FileIdInfo` (the volume serial number and full 128-bit file identifier) and
+/// `FileStandardInfo` (the link count). The handle is opened with read, write and
+/// delete sharing and is closed before return; no handle outlives the call.
+///
+/// A path that does not exist is [`FileFacts::Absent`]. Every other failure —
+/// access denied, an unsupported filesystem, a handle query that fails — is
+/// [`FileFacts::Unknown`], which the store refuses. Windows was previously
+/// unsupported on this path; that disposition is superseded by the native
+/// implementation, not widened into a permissive default.
+///
+/// # The SQLite main-database handle
+///
+/// On Windows, [`FilesystemIdentity::observe_sqlite_main`] asks the connection for
+/// the handle SQLite is actually using (`SQLITE_FCNTL_WIN32_GET_HANDLE`), queries
+/// that handle for the same two facts, and never closes it. On platforms without
+/// that API the answer is [`SqliteMainFacts::NotApplicable`], which leaves the
+/// pathname observation as the only identity evidence and says so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OsIdentity;
+
+impl FilesystemIdentity for OsIdentity {
+    fn observe(&self, path: &Path) -> FileFacts {
+        // The absence check is portable: `ErrorKind::NotFound` is a portable
+        // classification, so a database that does not exist yet is reported as
+        // absent on every platform rather than as unknown. That distinction
+        // matters — it is the difference between "nothing to check yet" and
+        // "the platform cannot tell", and treating the second as the first would
+        // refuse every fresh install.
+        #[cfg(windows)]
+        {
+            windows::observe(path)
+        }
+        #[cfg(not(windows))]
+        {
+            let meta = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return FileFacts::Absent,
+                Err(_) => return FileFacts::Unknown { platform: PLATFORM },
+            };
+
+            #[cfg(unix)]
+            {
+                use orxnud_domain::platform::FileId;
+                use std::os::unix::fs::MetadataExt;
+                // `hard_link_count` is the same helper the rest of the crate uses, so
+                // the count has exactly one implementation.
+                let Some(name_count) = hard_link_count(&meta) else {
+                    return FileFacts::Unknown { platform: PLATFORM };
+                };
+                FileFacts::Known {
+                    name_count,
+                    identity: Some(FileId::Unix {
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    }),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // A target that is neither Unix nor Windows: the crate has no
+                // native backend for it, and inventing one would be the
+                // permissive default ADR-0058 forbids.
+                let _ = meta;
+                FileFacts::Unknown { platform: PLATFORM }
+            }
+        }
+    }
+
+    fn observe_sqlite_main(&self, connection: SqliteMainDatabase<'_>) -> SqliteMainFacts {
+        #[cfg(windows)]
+        {
+            windows::observe_sqlite_main(connection)
+        }
+        #[cfg(not(windows))]
+        {
+            // There is no equivalent of `SQLITE_FCNTL_WIN32_GET_HANDLE` on these
+            // targets, and the Unix VFS's own change detection is a warning, not
+            // a refusal. Saying `NotApplicable` records that the path check is
+            // the only identity evidence rather than pretending the handle was
+            // verified.
+            let _ = connection;
+            SqliteMainFacts::NotApplicable
+        }
+    }
+}
 
 /// A filesystem error.
 #[derive(Debug, thiserror::Error)]
@@ -316,6 +485,58 @@ pub fn restrict_to_owner(dir: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::hard_link_count;
+
+    /// A freshly created file has exactly one name, and a hard link gives it a second.
+    ///
+    /// The count is what the helper's containment check asks, so the API it asks
+    /// through is pinned here rather than only in a consumer. The hard-link case is
+    /// Unix-only, which is a property of this crate -- the one place a platform branch
+    /// is allowed to live.
+    #[test]
+    fn the_link_count_of_a_file_is_one_until_it_is_hard_linked() {
+        let dir = std::env::temp_dir().join(format!(
+            "orxnud-platfs-links-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"one").expect("write");
+
+        let meta = std::fs::metadata(&file).expect("stat");
+        assert_eq!(
+            hard_link_count(&meta),
+            Some(1),
+            "a file with a single name must report one link"
+        );
+
+        // Where the platform does not expose the count, `None` is the answer and the
+        // test says so rather than asserting a number the platform cannot give.
+        #[cfg(unix)]
+        {
+            let alias = dir.join("b.txt");
+            std::fs::hard_link(&file, &alias).expect("hard link");
+            let alias_meta = std::fs::metadata(&alias).expect("stat alias");
+            assert_eq!(
+                hard_link_count(&alias_meta),
+                Some(2),
+                "a hard-linked inode has two names and must report two links"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(
+                hard_link_count(&meta),
+                None,
+                "a platform that cannot count links must answer None, never one"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -480,6 +701,202 @@ mod tests {
         assert_eq!(
             fs2.root(),
             root.canonicalize().unwrap_or(root.clone()).as_path()
+        );
+    }
+
+    /// **The filesystem-identity capability answers about real files.**
+    ///
+    /// Three facts, and the third is the one that must never be confused with
+    /// the second:
+    ///
+    /// * a path that does not exist is **absent** — on every platform, because
+    ///   both backends classify "not found" separately from "cannot tell";
+    /// * a file with one name has one link and a stable identity;
+    /// * a file with a second name has two links, and the identity is the same
+    ///   file's.
+    ///
+    /// The Unix branch below exercises the POSIX backend. The Windows backend is
+    /// exercised by [`windows_tests`], which asserts the native `FILE_ID_INFO`
+    /// identity and the link count rather than a number the platform cannot give.
+    /// A target with neither backend answers `Unknown`, and never `Absent` and
+    /// never a safe-looking number. The caller refuses on `Unknown` (ADR-0058
+    /// Decision 2), so this is the difference between "refused" and "silently
+    /// unprotected".
+    #[test]
+    fn the_identity_capability_answers_about_real_files() {
+        use orxnud_domain::platform::FilesystemIdentity as _;
+
+        let dir = temp_root("identity");
+        let file = dir.join("one.txt");
+        std::fs::write(&file, b"one").expect("write");
+        let missing = dir.join("not-there.txt");
+
+        let identity = OsIdentity;
+
+        // Absent, on every platform.
+        assert_eq!(
+            identity.observe(&missing),
+            FileFacts::Absent,
+            "a path that does not exist must be reported absent, not unknown: they \
+             are different facts and conflating them would refuse every fresh install"
+        );
+
+        #[cfg(unix)]
+        {
+            match identity.observe(&file) {
+                FileFacts::Known {
+                    name_count,
+                    identity: id,
+                } => {
+                    assert_eq!(name_count, 1, "a file with one name has one link");
+                    assert!(
+                        id.is_some(),
+                        "a platform that can report an identity must report one; \
+                         'no identity' would be a refusal the caller cannot act on"
+                    );
+                }
+                other => panic!("expected known facts, got {other:?}"),
+            }
+
+            // The second name. This is the whole finding: the link count is a
+            // property of the inode, so it goes up for *every* name.
+            let alias = dir.join("two.txt");
+            std::fs::hard_link(&file, &alias).expect("hard link");
+            let before = identity.observe(&file);
+            let after = identity.observe(&alias);
+            match (before, after) {
+                (
+                    FileFacts::Known {
+                        name_count: 2,
+                        identity: a,
+                    },
+                    FileFacts::Known {
+                        name_count: 2,
+                        identity: b,
+                    },
+                ) => {
+                    assert_eq!(
+                        a, b,
+                        "two names for one inode must report the same identity: the \
+                         link count is a property of the inode, not of the name"
+                    );
+                }
+                other => panic!("expected two links through both names, got {other:?}"),
+            }
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            assert_eq!(
+                identity.observe(&file),
+                FileFacts::Unknown {
+                    platform: std::env::consts::OS
+                },
+                "a target with no native backend must answer Unknown, never Absent \
+                 and never a number that reads as safe"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Windows-only tests: the native identity and the actual SQLite handle.
+///
+/// These run on the Windows CI job, not on a Linux host. They are unit tests of
+/// this crate because the thing under test is the adapter's native path; the
+/// store's Windows integration suite separately proves that a real `Store::open`
+/// uses it.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use orxnud_domain::platform::{FileId, SqliteMainFacts};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("orxnud-fs-win-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create root");
+        dir
+    }
+
+    fn known(facts: FileFacts) -> (u64, FileId) {
+        match facts {
+            FileFacts::Known {
+                name_count,
+                identity: Some(identity),
+            } => (name_count, identity),
+            other => panic!("expected known facts with an identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_native_identity_reports_a_file_and_its_hard_link() {
+        let dir = temp_root("identity");
+        let file = dir.join("one.txt");
+        std::fs::write(&file, b"one").expect("write");
+
+        let (name_count, identity) = known(OsIdentity.observe(&file));
+        assert_eq!(name_count, 1, "a freshly created file has one name");
+        assert!(
+            matches!(identity, FileId::Windows { .. }),
+            "the native backend must report the full Windows identity, got {identity:?}"
+        );
+
+        let alias = dir.join("two.txt");
+        std::fs::hard_link(&file, &alias).expect(
+            "the scratch filesystem must support hard links; if it does not, the \
+             hard-link property cannot be established here and this test must fail \
+             rather than pass without measuring it",
+        );
+        let (count_file, id_file) = known(OsIdentity.observe(&file));
+        let (count_alias, id_alias) = known(OsIdentity.observe(&alias));
+        assert_eq!(count_file, 2, "the link count is a property of the file");
+        assert_eq!(count_alias, 2, "both names must report the same count");
+        assert_eq!(
+            id_file, id_alias,
+            "both names must report the same volume serial number and 128-bit id"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_native_main_handle_check_agrees_with_the_path() {
+        let dir = temp_root("main-handle");
+        let db = dir.join("state.db");
+        let conn = rusqlite::Connection::open(&db).expect("open the database");
+
+        let (path_count, path_identity) = known(OsIdentity.observe(&db));
+        match OsIdentity.observe_sqlite_main(SqliteMainDatabase::new(&conn)) {
+            SqliteMainFacts::Known {
+                name_count,
+                identity,
+            } => {
+                assert_eq!(
+                    name_count, path_count,
+                    "the live connection and the path must report the same link count"
+                );
+                assert_eq!(
+                    identity, path_identity,
+                    "the live connection must hold the file the path names"
+                );
+            }
+            other => panic!("expected the native handle to be known, got {other:?}"),
+        }
+        drop(conn);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_in_memory_connection_has_no_file_handle_to_check() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in memory");
+        assert_eq!(
+            OsIdentity.observe_sqlite_main(SqliteMainDatabase::new(&conn)),
+            SqliteMainFacts::Unknown {
+                platform: "windows"
+            },
+            "an in-memory main database has no native file; the check must refuse \
+             rather than report that there is nothing to check"
         );
     }
 }

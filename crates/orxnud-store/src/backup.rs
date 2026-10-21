@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use orxnud_domain::platform::FilesystemIdentity;
+
 /// Pages copied per step. Positive because `run_to_completion` rejects zero, and
 /// large enough that a personal daemon's database is copied in one step.
 const PAGES_PER_STEP: i32 = 64;
@@ -175,6 +177,31 @@ pub enum BackupError {
         /// The restore target.
         path: String,
     },
+}
+
+/// A refusal to open a database carries its own cause.
+///
+/// An alias refusal is reported through [`BackupError::Ownership`], because it is
+/// the same fact as "this database is not safely openable": its ownership is keyed
+/// by path, and a database reachable through a second name is one whose ownership
+/// cannot be expressed. A SQLite refusal keeps its own variant, because "the
+/// platform says the file is safe but SQLite could not open it" and "the file is
+/// not safe" send an operator to different places.
+impl From<crate::alias::OpenFailure> for BackupError {
+    fn from(e: crate::alias::OpenFailure) -> Self {
+        match e {
+            crate::alias::OpenFailure::Ownership(source) => BackupError::Ownership {
+                reason: source.to_string(),
+            },
+            crate::alias::OpenFailure::Alias { path, reason } => BackupError::Ownership {
+                reason: format!("{}: {reason}", path.display()),
+            },
+            crate::alias::OpenFailure::Sqlite { path, source } => BackupError::Unreadable {
+                path: path.display().to_string(),
+                source,
+            },
+        }
+    }
 }
 
 /// What a verification established about a snapshot.
@@ -794,8 +821,9 @@ impl Backup {
         &self,
         db_path: &Path,
         lease: crate::ownership::ExclusiveOwnership,
+        identity: &dyn FilesystemIdentity,
     ) -> Result<(), BackupError> {
-        let guard = RestoreGuard::acquire_with(db_path, Some(lease))?;
+        let guard = RestoreGuard::acquire_with(db_path, Some(lease), identity)?;
         self.restore(&guard)
     }
 
@@ -816,8 +844,19 @@ impl Backup {
     ///
     /// Everything the crate-private restore primitive can return, plus
     /// [`BackupError::Busy`] when another connection is reading the target.
-    pub fn restore_coordinated(&self, db_path: &Path) -> Result<(), BackupError> {
-        let guard = RestoreGuard::acquire(db_path)?;
+    ///
+    /// The filesystem-identity capability is **required** and has no default:
+    /// ADR-0058 Decision 2 requires every open of a database to present the
+    /// capability that can say how many names reach it, and requires a platform
+    /// that cannot answer to be a refusal. A restore that overwrote a database
+    /// reachable through a second name would leave the two names pointing at
+    /// different content.
+    pub fn restore_coordinated(
+        &self,
+        db_path: &Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<(), BackupError> {
+        let guard = RestoreGuard::acquire(db_path, identity)?;
         self.restore(&guard)
     }
 
@@ -957,10 +996,15 @@ impl RestoreGuard {
     ///
     /// # Errors
     ///
-    /// [`BackupError::Busy`] if a reader holds the database open, and
-    /// [`BackupError::Unreadable`] if the target cannot be opened or checkpointed.
-    pub(crate) fn acquire(db_path: &Path) -> Result<Self, BackupError> {
-        Self::acquire_with(db_path, None)
+    /// [`BackupError::Busy`] if a reader holds the database open,
+    /// [`BackupError::Unreadable`] if the target cannot be opened or checkpointed,
+    /// and [`BackupError::Ownership`] if the target cannot be shown to be
+    /// alias-safe.
+    pub(crate) fn acquire(
+        db_path: &Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Self, BackupError> {
+        Self::acquire_with(db_path, None, identity)
     }
 
     /// Acquire using a lease the caller already holds.
@@ -973,6 +1017,7 @@ impl RestoreGuard {
     pub(crate) fn acquire_with(
         db_path: &Path,
         held: Option<crate::ownership::ExclusiveOwnership>,
+        identity: &dyn FilesystemIdentity,
     ) -> Result<Self, BackupError> {
         // S-31: exclusive ownership across processes, taken **before** the checkpoint
         // and held through the copy and the logical verification below.
@@ -983,19 +1028,22 @@ impl RestoreGuard {
         // lease on the same database -- including this process's own -- is refused
         // rather than accommodated, which is why `TaskService::open` drops its store
         // before migrating.
-        let exclusive = match held {
-            Some(lease) => lease,
-            None => crate::ownership::acquire_exclusive(db_path).map_err(|e| {
-                BackupError::Ownership {
-                    reason: e.to_string(),
-                }
-            })?,
-        };
-
-        let conn = Connection::open(db_path).map_err(|source| BackupError::Unreadable {
-            path: db_path.display().to_string(),
-            source,
-        })?;
+        // The open is guarded too: the target's link count and identity are checked
+        // before SQLite is asked to open anything, and again afterwards. A target
+        // reachable through a second name is refused before the checkpoint, because
+        // the restore writes **through** the existing file and a second name would
+        // then reach different content than the one being restored.
+        let (conn, exclusive, sidecars) = crate::alias::open_exclusive(db_path, held, identity)?;
+        // The sidecars are verified **before** the checkpoint and before anything
+        // is staged or installed. A restore that runs against an aliased
+        // sidecar would be writing through a write-ahead log or a wal-index
+        // that another database is also using, so the restore must refuse
+        // before it destroys anything.
+        sidecars
+            .verify_after_open(identity)
+            .map_err(|f| BackupError::Ownership {
+                reason: format!("{}: {}", f.path.display(), f.reason),
+            })?;
 
         // (busy, log_frames, checkpointed_frames)
         let busy: i64 = conn
@@ -1536,7 +1584,7 @@ mod tests {
         // 3. And it is still restorable, which is the only reason any of this matters.
         drop(conn);
         Backup::existing(canonical.clone())
-            .restore_coordinated(&path)
+            .restore_coordinated(&path, &orxnud_platform_fs::OsIdentity)
             .expect("the surviving snapshot must still restore");
         let restored =
             crate::migration::MigrationRunner::new(&Connection::open(&path).expect("reopen"))
@@ -1834,7 +1882,8 @@ mod tests {
                 Err(BackupError::NoSchemaMeta { .. })
             ));
             // S-30: a restore is only reachable with a permit.
-            let guard = RestoreGuard::acquire(&db).expect("acquire");
+            let guard =
+                RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
             snapshot.restore(&guard).expect("restore");
         }
         let after = Connection::open(&db).expect("reopen");
@@ -1937,7 +1986,8 @@ mod tests {
         // Re-stage the stale log exactly as a crashed previous run would leave it.
         std::fs::copy(d.join("stale-wal"), db.with_file_name("state.db-wal")).expect("replay -wal");
 
-        let guard = RestoreGuard::acquire(&db).expect("acquire: quiescing must succeed");
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("acquire: quiescing must succeed");
         snapshot.restore(&guard).expect("restore");
 
         let after = rows(&db).expect("restored database must be readable");
@@ -1966,7 +2016,7 @@ mod tests {
         std::fs::copy(d.join("stale-wal"), db.with_file_name("state.db-wal")).expect("replay -wal");
         std::fs::copy(d.join("stale-shm"), db.with_file_name("state.db-shm")).expect("replay -shm");
 
-        let guard = RestoreGuard::acquire(&db).expect("acquire");
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
         snapshot.restore(&guard).expect("restore");
 
         let after = rows(&db).expect("restored database must be readable");
@@ -2002,7 +2052,7 @@ mod tests {
         std::fs::write(snapshot.path(), b"this is not a sqlite database at all")
             .expect("corrupt snapshot");
 
-        let guard = RestoreGuard::acquire(&db).expect("acquire");
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
         let outcome = snapshot.restore(&guard);
 
         match outcome {
@@ -2099,7 +2149,7 @@ mod tests {
 
         // Before the guard exists this path did nothing about the log and returned
         // Ok. Acquiring is what removes the hazard.
-        let guard = RestoreGuard::acquire(&db).expect("acquire");
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
         let wal = db.with_file_name("state.db-wal");
         assert!(
             !wal.exists() || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) == 0,
@@ -2143,7 +2193,7 @@ mod tests {
             "the control: the independent handle sees the post-snapshot state"
         );
 
-        let guard = RestoreGuard::acquire(&db).expect(
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect(
             "an idle handle must not block a restore; if it does, the mechanism is \
              refusing more than it needs to",
         );
@@ -2176,7 +2226,7 @@ mod tests {
             .execute_batch("BEGIN; SELECT COUNT(*) FROM notes;")
             .expect("hold a read transaction open");
 
-        let refused = RestoreGuard::acquire(&db);
+        let refused = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity);
         assert!(
             matches!(refused, Err(BackupError::Busy { .. })),
             "with a reader inside a transaction, authority cannot be established and the \
@@ -2229,7 +2279,10 @@ mod tests {
             .execute_batch("BEGIN; SELECT COUNT(*) FROM notes;")
             .expect("hold a read transaction");
         assert!(
-            matches!(RestoreGuard::acquire(&db), Err(BackupError::Busy { .. })),
+            matches!(
+                RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity),
+                Err(BackupError::Busy { .. })
+            ),
             "without acquiring authority there is no permit, and the state that would \
              need one is refused"
         );
@@ -2238,7 +2291,7 @@ mod tests {
         // reachable entry point. Dropping the reader makes the state safe again,
         // which shows the refusal is about the reader and not a blanket deny.
         drop(independent);
-        RestoreGuard::acquire(&db).expect(
+        RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect(
             "once the reader is gone the same restore must be permitted; a mechanism \
              that refuses everything is not a coordination mechanism",
         );
@@ -2262,7 +2315,7 @@ mod tests {
             .expect("post");
         drop(conn);
 
-        let guard = RestoreGuard::acquire(&db).expect("acquire");
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
 
         // A realistic interruption: the target becomes unwritable between taking
         // authority and completing the copy. Deleting the file was tried first and
@@ -2346,7 +2399,7 @@ mod tests {
             .execute_batch("BEGIN; SELECT COUNT(*) FROM notes;")
             .expect("hold a read transaction");
 
-        let outcome = snapshot.restore_coordinated(&db);
+        let outcome = snapshot.restore_coordinated(&db, &orxnud_platform_fs::OsIdentity);
         assert!(
             matches!(outcome, Err(BackupError::Busy { .. })),
             "the public entry point must refuse exactly as the primitive does;              got: {outcome:?}"
@@ -2354,7 +2407,7 @@ mod tests {
 
         drop(reader);
         snapshot
-            .restore_coordinated(&db)
+            .restore_coordinated(&db, &orxnud_platform_fs::OsIdentity)
             .expect("and must succeed once the reader is gone");
         assert_eq!(rows(&db).expect("readable"), "PRE-SNAPSHOT-ONLY");
         drop(conn);
@@ -2432,7 +2485,8 @@ mod tests {
         let d = restore_dir("missing-snap");
         let target = d.join("target.db");
         Connection::open(&target).expect("create target");
-        let guard = RestoreGuard::acquire(&target).expect("acquire");
+        let guard =
+            RestoreGuard::acquire(&target, &orxnud_platform_fs::OsIdentity).expect("acquire");
         let err = b.restore(&guard).expect_err("must fail");
         assert!(matches!(err, BackupError::Missing(_)), "{err}");
     }

@@ -489,17 +489,15 @@ gate_G2() {
 # count so a regression is visible in review rather than only in CI output.
 gate_G4() {
   banner G4
-  local hits
-  # Comment lines and the `unsafe_code` attribute are excluded: both mention the
-  # word without using it, and every crate legitimately carries
-  # `#![forbid(unsafe_code)]` precisely *because* the count must be zero.
-  hits="$(grep -RInE '\bunsafe\b' crates --include='*.rs' \
-    | grep -vE '^crates/orxnud-platform-[a-z]+/' \
-    | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!|\*|/)' || true)"
-  if [ -z "$hits" ]; then
+  # The same lexical scanner the other boundary gates use, so that a string
+  # literal or a comment which happens to contain the word "unsafe" is prose
+  # rather than a declaration. The rule is unchanged: the keyword may appear
+  # only in the platform crates, where the platform work belongs. The previous
+  # shell `grep` over raw text flagged ordinary sentences -- including the word
+  # inside a diagnostic message -- as unsafe code.
+  if python3 scripts/gate_policy.py g4 --root "$(gate_root)"; then
     ok "zero unsafe outside orxnud-platform-*"
   else
-    printf '%s\n' "$hits" | sed 's/^/     /'
     fail_gate "unsafe appears outside orxnud-platform-*"
   fi
 }

@@ -6120,8 +6120,11 @@ are fixed here rather than left for the next concurrent start to find:
   and a production source file in this workspace that applies schema DDL fails G16.
   **What is not established:** that every route to the schema is closed, or that the property
   survives outside this gate.
-* **F-26 stays open** and **F-26b stays open**: a hard-linked alias still produces a second lock
-  file and bypasses ownership entirely (ADR-0058; research candidate, not approved).
+* **F-26 stays open** and **F-26b stays open**: at the time of this pass a hard-linked alias
+  produced a second lock file and bypassed ownership entirely. ADR-0058 (approved 2026-10-14 and
+  implemented) now rejects that pre-existing alias in the tested paths, but the Unix
+  pathname-to-connection window, the sidecars and Windows runtime evidence remain open, so
+  ownership is not established against every alias.
 * **S-11 is not closed.** What is gone is the trust-me API and the two production callers that
   used it. S-11's wider specification in the remediation plan is not fully discharged by this.
 * The ordering in `Backup::take` — reading the source's emptiness before the copy — **was**
@@ -6404,9 +6407,12 @@ longer restores — it returns `MigrationError::RecoveryRequired { source, snaps
 `TaskService::open` drops the store before recovering. This is the restructuring the design
 discussion anticipated, and it reached further into the migration flow than "add a lock".
 
-**F-26c REMAINS OPEN**: a hard-linked alias still produces a second lock file and bypasses
-ownership entirely, which is measured and unfixed. **F-26b stays open** on its narrower
-remaining point, and **F-26 stays open**; S-11 remains blocked.
+**F-26c REMAINS OPEN**: at the time of this record a hard-linked alias produced a second lock
+file and bypassed ownership entirely, which was measured and, at that time, unfixed. That
+pre-existing-alias case is now rejected in the tested paths by the implemented ADR-0058 check,
+but the Unix pathname-to-connection window, the sidecars and Windows runtime evidence remain
+open. **F-26b stays open** on its narrower remaining point, and **F-26 stays open**; S-11
+remains blocked.
 
 **Feasibility observation, 2026-10-17 — the private-layout dependency is avoidable.**
 This is **feasibility research, not an implementation and not a closure.** The proof above reached
@@ -6440,7 +6446,9 @@ than a settled detail. None of the following was attempted or measured in this p
 * unsafe FFI implementation, and its audit;
 * correct file-descriptor binding and hard-link refusal **across SQLite's actual open path**;
 * WAL and rollback-journal behaviour, **including links created after a connection opens**;
-* a Windows implementation, and any Windows runtime evidence;
+* a Windows implementation (written 2026-10-21; see the Windows implementation note below) and
+  any Windows runtime evidence (none on the authoring host; the CI lane is the first intended
+  producer);
 * upstream SQLite regression tests, and a comparison against the unmodified baseline;
 * maintenance cost for the pinned SQLite version and for upgrades;
 * the availability and denial-of-service consequence of **refusing** a hard-linked database, which
@@ -6448,20 +6456,23 @@ than a settled detail. None of the following was attempted or measured in this p
 * cross-process and filesystem limitations, including the measured all-or-nothing-per-inode
   refusal recorded above.
 
-**The smallest remaining decision** is whether to author a public-API VFS gate at all, accepting
-that POSIX lands first and Windows must either gain an equivalent or be refused — which ADR-0058
-Decision 2 already requires, and which is a support decision rather than an engineering detail.
+**The remaining design decision this note identifies** is whether to author a public-API VFS gate
+at all, accepting that POSIX lands first. Windows no longer has to be refused for want of an
+identity implementation: a native Windows path was written on 2026-10-21. That implementation is
+not runtime-verified, is not a descriptor-backed VFS gate, and does not close F-26c.
 **F-26c remains OPEN.**
 
 **What this record does not establish.** That any of the three options is correct on this
 codebase — two are argued from shape and one is explicitly unmeasured. That F-26 or F-26b is
 fixed. That S-30 is closed. That S-11 is implemented. That S-29 may begin.
 
-## ADR-0058 — RESEARCH CANDIDATE, NOT APPROVED FOR INTEGRATION — a filesystem-identity capability `orxnud-store` can require, so a hard-link alias cannot bypass ownership
+## ADR-0058 — APPROVED 2026-10-14; IMPLEMENTED (WINDOWS RUNTIME UNVERIFIED) — a filesystem-identity capability `orxnud-store` can require, so a hard-link alias cannot bypass ownership
 
-**Status.** **The three open decisions are APPROVED (2026-10-14). Nothing is implemented.**
-The boundary, the enforcement points and the test plan below are settled; the code is not
-written. F-26c, F-26b and F-26 all remain open, and S-31 is **implemented but not complete**.
+**Status.** **The three open decisions are APPROVED (2026-10-14). The capability, the two-sided
+check and a native Windows path are now implemented; the implementation notes at the end record
+what exists and what remains unverified.** The boundary, the enforcement points and the test
+plan below are settled. F-26c, F-26b and F-26 all remain open, and S-31 is **implemented but not
+complete**.
 
 | Decision | Disposition |
 |---|---|
@@ -7016,11 +7027,18 @@ and sits exactly where a subtle bug corrupts data rather than failing loudly.
 **What even a successful proof would not cover:** it would not stop a **non-participating**
 process from manipulating filesystem links. That threat boundary stays explicit either way.
 
-**Windows — disposition decided (2026-10-14): fail closed, defer native.** Stable Windows cannot
-supply `name_count` or `identity` (see the portability qualification above), so the Decision 1
-fail-closed rule means the platform implementation **refuses every open on Windows** until a
-native `GetFileInformationByHandle` implementation exists. Windows is unsupported on this path by
-decision, not by accident, and it is recorded as such.
+**Windows — disposition at 2026-10-14: fail closed, defer native (historical; the native
+implementation followed on 2026-10-21).** At that time stable Windows could not supply
+`name_count` or `identity` (see the portability qualification above), so the Decision 1
+fail-closed rule meant the platform implementation **refused every open on Windows** until a
+native `GetFileInformationByHandle` implementation existed. That was the disposition then.
+A native `CreateFileW`/`GetFileInformationByHandleEx` path now exists in source, and the
+`SQLITE_FCNTL_WIN32_GET_HANDLE` check is implemented. The Windows platform build has not
+succeeded on this host: it is blocked before the Windows Rust code compiles by the missing
+`lib.exe` (MSVC) and `x86_64-w64-mingw32-gcc` (GNU) toolchains. Windows runtime behavior is
+unverified; unsupported filesystems remain fail-closed through `Unknown`; long-path behavior is
+unvalidated because `CreateFileW` is called without the extended `\\?\` prefix; and F-26c
+remains OPEN.
 
 **Decision 3 — S-31 remains implemented but NOT complete.** While a known bypass or an
 unaccepted residual window remains, S-31 does not close, and S-30 is not declared fully closed.
@@ -7036,3 +7054,129 @@ narrower guarantee is sufficient.
 **Stop.** The boundary, the enforcement points, the honest scope of the guarantee, the three
 approved dispositions and the six tests are settled. Implementation follows only on a further
 authorisation, and it will not close S-31 on its own.
+
+---
+
+## ADR-0058 — IMPLEMENTATION NOTE (2026-10-21) — the capability exists; the bypass is closed; the window is not
+
+**This note records what was built. It does not change any of the four decisions above, and it
+does not close anything.** The authority for the design is still the record above; the evidence
+is in the Verification Register (A-013 and the F-26c row).
+
+**What was built.**
+
+* The capability is a trait in `orxnud-domain` (`platform::FilesystemIdentity`), implemented by
+  `orxnud-platform-fs` (`OsIdentity`), and **required** by every **ordinary** open of a live
+  database in `orxnud-store`. The three direct live-database opens in `recovery.rs` are deliberate
+  exceptions, made by the restorer under the exclusive lease. Decision 1's dependency direction
+  holds: the store gained **no production dependency** on a platform crate (its
+  `orxnud-platform-fs` edge is a development dependency for tests), and the platform
+  implementation is injected by the daemon's composition root.
+* Decision 2's fail-closed rule is implemented as written. `None`-equivalent — the platform
+  answering `Unknown` — is a **refusal**, never a pass, and there is no default, no optional
+  parameter and no convenience constructor that omits the capability.
+* Decision 3's two-sided check is implemented: observe, open, observe again, compare. The lease
+  and the open are one operation, so "own it" and "check it is safe to own" cannot be separated
+  by a caller.
+* Decision 4's wording is the wording used: *a database reached through more than one name is
+  refused, and a file replaced during the open is detected unless it is replaced and restored
+  inside the window.*
+
+**Two refinements to the illustrative sketch, and why.** The sketch above shows two methods
+(`name_count` and `identity`) returning `Option`. The implementation uses **one** method returning
+a three-state observation, for two reasons that are defects in the sketch rather than changes of
+decision:
+
+1. `Option<u64>` cannot distinguish *the database does not exist yet* from *the platform cannot
+   say*. Under Decision 2 those two would be treated alike, and **every fresh install would be
+   refused**. The implementation distinguishes them (`Absent` versus `Unknown`).
+2. Two methods are two resolutions of the same path. The file could change between them, and the
+   pair would then describe two different files while looking like one observation. One call is
+   one resolution.
+
+**The Windows disposition was followed at the time of A-013, not reinterpreted.** Stable Windows
+could not supply the link count or the identity through `std::fs::Metadata`, so the platform
+implementation answered `Unknown` and **every open of an existing database was refused on
+Windows**. That was the disposition decided on 2026-10-14, and it was recorded in the register
+rather than discovered at the next Windows run. No native Win32 implementation was written then;
+the Windows note below records the implementation that followed.
+
+**What was deliberately not done at the time of A-013.** No descriptor-backed opening, no SQLite
+VFS, no `unsafe`, no patched SQLite. The residual window this record names remains for Unix and
+the sidecars and is still named. S-31 is **still open**, as Decision 3 requires, and S-30 and
+S-11 are untouched: a prerequisite being safer is not a dependent being closed.
+
+---
+
+## ADR-0058 — IMPLEMENTATION NOTE (2026-10-21) — native Windows identity and the actual main-database handle
+
+**This note records a second implementation step. It changes none of the four decisions and
+closes nothing.** The evidence is in the Verification Register (A-018 and the F-26c row); this
+note states the shape and the limits.
+
+**Why it was needed.** The first note followed the Windows disposition by refusing every
+existing database, because stable `std::fs::Metadata` exposes neither the link count nor a
+stable file identifier (`windows_by_handle` #63010). That was fail-closed but unusable, and it
+left the pathname-to-connection race untouched: the two observations are observations of a
+path, while `sqlite3_open_v2` also takes a path.
+
+**What was built.**
+
+* `FileId` is now an enum. `FileId::Unix { dev, ino }` keeps the POSIX pair;
+  `FileId::Windows { volume_serial, file_id: [u8; 16] }` keeps the **full 128-bit**
+  `FILE_ID_INFO.FileId.Identifier`. Nothing is truncated to 64 bits and nothing is hashed, so
+  "same file" remains an exact comparison. The variants are not convertible.
+* `orxnud-platform-fs` gained a Windows-only module. It opens the path with `CreateFileW`
+  (`FILE_READ_ATTRIBUTES`, share read/write/delete, `OPEN_EXISTING`,
+  `FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS`), queries that one handle for
+  `FileIdInfo` and `FileStandardInfo`, and closes it through an RAII wrapper. `NotFound` is
+  `Absent`; every other failure is `Unknown`. No safe-looking default is substituted.
+* The portable contract gained `FilesystemIdentity::observe_sqlite_main`, with
+  `SqliteMainFacts::{NotApplicable, Known { name_count, identity }, Unknown { platform }}`.
+  `SqliteMainDatabase<'_>` is a borrowed type-erased wrapper, so `orxnud-domain` gains no
+  `rusqlite` dependency and no platform name.
+* On Windows, the adapter downcasts the wrapper to `rusqlite::Connection`, calls
+  `Connection::handle()`, then
+  `sqlite3_file_control(db, "main", SQLITE_FCNTL_WIN32_GET_HANDLE, &mut handle)`. It requires
+  `SQLITE_OK` and a usable handle, queries that **borrowed** handle for the same two facts, and
+  never closes it — SQLite owns it.
+* `orxnud-store` calls the handle observation immediately after `Connection::open`, before any
+  `PRAGMA` or WAL work. The handle's identity must equal the pre-open identity when there was
+  one and the post-open identity always; its link count must be exactly one. Failure is a typed
+  `AliasRefusal` (`MainDatabaseUnknown`, `MainDatabaseIdentityChanged`,
+  `MainDatabaseMultipleNames`) and no connection is returned.
+
+**The unsafe boundary.** `orxnud-platform-fs` uses `#![deny(unsafe_code)]` with one local
+`#[allow(unsafe_code)]` module and `SAFETY` comments, the same arrangement as
+`orxnud-platform-ipc`'s `SO_PEERCRED` call. Gate G4 already permits `unsafe` in
+`orxnud-platform-*`. No other crate gained `unsafe`; `orxnud-store` gained **no production
+dependency** on a platform crate (its `orxnud-platform-fs` edge is a development dependency for
+tests); `orxnud-domain` gained no SQLite dependency. The new dependencies (`rusqlite` and
+`windows-sys 0.61.2`) are target-specific to `orxnud-platform-fs`, and `windows-sys` is the
+version already in the lock.
+
+**What is verified.** On Linux only: 16 platform-fs tests, 401 store tests (0 failed, 1
+ignored), the four new main-handle cases in `s31_alias_safety`, clean clippy with
+`-D warnings`, clean rustdoc with `-D warnings`, and gates G2d/G3/G4/G17 at exit 0. The native
+Windows tests exist but **were not compiled or run on the authoring host**. Compiling
+`orxnud-platform-fs` for Windows there is blocked by the missing C toolchain (`lib.exe` for
+MSVC, `x86_64-w64-mingw32-gcc` for GNU); `cargo check --target x86_64-pc-windows-msvc -p
+orxnud-domain` does pass. The CI `windows-portability` lane now runs the focused store suites
+`s31_alias_safety` and `s31_windows_identity` (not `s31_sidecar_alias`) and the platform-fs unit
+tests, but its result is pending, and the job's 20-minute timeout has not been validated with the
+bundled-SQLite build.
+
+**Residual windows.** The Unix main database is still observed by path, because there is no
+equivalent opcode in use; `NotApplicable` names that rather than pretending the handle was
+verified. Every sidecar (`-wal`, `-shm`, `-journal`) remains a path observation on every
+platform. A hard link created **after** the handle observation is not detected. `CreateFileW` is
+called without the extended `\\?\` prefix, so long-path behavior is unvalidated; a path that
+cannot be opened or queried is refused as `Unknown`. And the Windows runtime evidence is pending.
+F-26c therefore remains OPEN, as Decision 3 requires while an unaccepted residual window
+remains; S-31 is still not complete; S-30 and S-11 are untouched.
+
+**No general Windows filesystem claim.** `FileIdInfo` is not universal. A filesystem or network
+redirector that cannot supply a 128-bit file id, or that reports no usable link count, answers
+`Unknown` and the open is refused. That is the intended direction. The tests require a
+filesystem that supports hard links; if the scratch filesystem does not, the hard-link test
+fails with that reason rather than passing without measuring it.

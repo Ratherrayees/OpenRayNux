@@ -1196,6 +1196,11 @@ dependencies = [
  "orxnud-platform-secrets",
  "orxnud-protocol",
  "proptest",
+ "rcgen",
+ "rusqlite",
+ "rustix",
+ "rustls",
+ "rustls-pki-types",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1251,6 +1256,7 @@ dependencies = [
 name = "orxnud-daemon"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "orxnud-audit",
  "orxnud-capability",
  "orxnud-config",
@@ -1277,6 +1283,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
  "zeroize",
 ]
 
@@ -1308,8 +1315,10 @@ version = "0.1.0"
 dependencies = [
  "orxnud-domain",
  "proptest",
+ "rusqlite",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1381,6 +1390,7 @@ version = "0.1.0"
 dependencies = [
  "libsqlite3-sys",
  "orxnud-domain",
+ "orxnud-platform-fs",
  "proptest",
  "rusqlite",
  "serde",
@@ -1397,6 +1407,7 @@ dependencies = [
  "jiff",
  "orxnud-audit",
  "orxnud-domain",
+ "orxnud-platform-fs",
  "orxnud-policy",
  "orxnud-store",
  "proptest",
@@ -1735,9 +1746,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2304,6 +2315,7 @@ version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

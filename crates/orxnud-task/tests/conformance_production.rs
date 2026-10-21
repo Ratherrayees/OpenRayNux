@@ -169,7 +169,7 @@ pub fn open_migrated(path: &std::path::Path) -> rusqlite::Connection {
 #[test]
 #[ignore = "child-process entry point for TP-7, not a test"]
 fn victim_entry_point() {
-    orxnud_task::conformance::power_loss::victim_entry_point();
+    orxnud_task::conformance::power_loss::victim_entry_point(&orxnud_platform_fs::OsIdentity);
 }
 
 /// The Phase 1 fixture's binary must expose the same entry point.

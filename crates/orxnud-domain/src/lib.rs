@@ -53,7 +53,10 @@ pub use ids::{
 };
 pub use intent::{IntentKind, Proposal, ProposedStep};
 pub use invocation::{ActionRequest, CapabilityRequest, InvocationContext};
-pub use platform::{FsContract, NotificationRequest, NotifyContract, SecretRef, SecretsContract};
+pub use platform::{
+    FileFacts, FileId, FilesystemIdentity, FsContract, NotificationRequest, NotifyContract,
+    SecretRef, SecretsContract, SqliteMainDatabase, SqliteMainFacts,
+};
 pub use schema::{ParamField, ParamKind, ParamSchema, ParamSpec, TargetSemantics};
 pub use security_state::{
     ApprovalLedger, AuditJournal, InMemoryApprovals, JournalEntry, JournalError, LedgerError,

@@ -718,7 +718,8 @@ fn engine(path: &Path) -> DurableEngine {
     // `critical: true` is the point of the exercise: those are the pragmas under
     // measurement (`synchronous = FULL`, WAL), so a harness that quietly opened with
     // `false` would report `FULL` as costing nothing.
-    let store = orxnud_store::sqlite::Store::open(path, true).expect("open the store");
+    let store = orxnud_store::sqlite::Store::open(path, true, &orxnud_platform_fs::OsIdentity)
+        .expect("open the store");
     orxnud_store::migration::MigrationRunner::new(store.conn())
         .migrate(path)
         .expect("migrate");

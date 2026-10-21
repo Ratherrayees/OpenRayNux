@@ -6,6 +6,8 @@ use std::fmt;
 
 use rusqlite::Connection;
 
+use orxnud_domain::platform::FilesystemIdentity;
+
 use crate::pragma::{Pragma, PragmaError};
 
 /// The minimum acceptable bundled SQLite version.
@@ -267,6 +269,27 @@ pub(crate) fn ownership_error(e: crate::ownership::OwnershipError) -> StoreError
     }
 }
 
+impl From<crate::alias::OpenFailure> for StoreError {
+    /// An alias refusal is an **ownership** refusal.
+    ///
+    /// Ownership of a database is keyed by path, so a database that is reachable
+    /// through a second name is one whose ownership cannot be expressed: another
+    /// process may already be using it under a name this process never sees.
+    /// Reporting it through the ownership channel means every caller that
+    /// already handles "this database is not safely openable" handles this too.
+    fn from(e: crate::alias::OpenFailure) -> Self {
+        match e {
+            crate::alias::OpenFailure::Ownership(source) => StoreError::Ownership {
+                source: Box::new(source),
+            },
+            crate::alias::OpenFailure::Alias { path, reason } => StoreError::Ownership {
+                source: Box::new(crate::ownership::OwnershipError::AliasUnsafe { path, reason }),
+            },
+            crate::alias::OpenFailure::Sqlite { source, .. } => StoreError::Sqlite(source),
+        }
+    }
+}
+
 impl From<crate::migration::MigrationError> for StoreError {
     fn from(e: crate::migration::MigrationError) -> Self {
         Self::Migration(Box::new(e))
@@ -282,11 +305,26 @@ impl From<crate::repository::RepositoryError> for StoreError {
 impl Store {
     /// Opens a store at `path`, applying and then **verifying** its pragmas.
     ///
+    /// # The filesystem-identity capability is required
+    ///
+    /// `identity` is not optional and has no default. ADR-0058 Decision 2 requires
+    /// that every open of a database presents the capability that can say how many
+    /// names reach it, and that a platform which cannot answer is a **refusal**
+    /// rather than a pass. A convenience constructor that supplied a permissive
+    /// answer would be the bypass reached through a different door, so there is
+    /// none: the production implementation comes from `orxnud-platform-fs`, and
+    /// the tests supply one that answers for themselves.
+    ///
     /// # Errors
     ///
     /// Fails if the SQLite version is too old, if a pragma cannot be applied or
-    /// read back, or if the file cannot be opened.
-    pub fn open(path: &std::path::Path, critical: bool) -> Result<Self, StoreError> {
+    /// read back, if the file cannot be opened, or if the database cannot be shown
+    /// to be alias-safe.
+    pub fn open(
+        path: &std::path::Path,
+        critical: bool,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Self, StoreError> {
         let version = verify_sqlite_version().map_err(StoreError::SqliteTooOld)?;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -296,11 +334,16 @@ impl Store {
                 source,
             })?;
         }
-        // Ownership first. If it cannot be taken we must not open the database at
-        // all: a connection opened without a lease is one that participates in
-        // nothing and can be modified behind a restore's back.
-        let ownership = crate::ownership::acquire_shared(path).map_err(ownership_error)?;
-        let conn = Connection::open(path)?;
+        // Ownership and the open are one operation. A connection opened without
+        // a lease is one that participates in nothing and can be modified behind
+        // a restore's back, so the lease and the guarded open cannot be two
+        // steps a caller has to remember.
+        //
+        // The open is guarded: the database's link count and identity are checked
+        // before SQLite is asked to open anything, and again afterwards. A
+        // database reachable through a second name is refused here rather than
+        // opened and left to participate in nothing.
+        let (conn, ownership, sidecars) = crate::alias::open_shared(path, identity)?;
         let pragma = if critical {
             Pragma::critical()
         } else {
@@ -310,6 +353,15 @@ impl Store {
         // lease with it. No path returns a connection without its lease.
         pragma.apply(&conn)?;
         pragma.verify(&conn)?;
+        // The sidecars are verified **after** WAL mode has been applied, because
+        // that is when SQLite materialises them. Verifying only before the open
+        // would look at a directory that did not have them yet.
+        sidecars.verify_after_open(identity).map_err(|f| {
+            ownership_error(crate::ownership::OwnershipError::AliasUnsafe {
+                path: f.path,
+                reason: f.reason,
+            })
+        })?;
         Ok(Self {
             conn,
             version,
@@ -387,8 +439,16 @@ impl Store {
 }
 
 /// Opens a store. A convenience alias for [`Store::open`].
-pub fn open(path: &std::path::Path, critical: bool) -> Result<Store, StoreError> {
-    Store::open(path, critical)
+///
+/// # Errors
+///
+/// As [`Store::open`].
+pub fn open(
+    path: &std::path::Path,
+    critical: bool,
+    identity: &dyn FilesystemIdentity,
+) -> Result<Store, StoreError> {
+    Store::open(path, critical, identity)
 }
 
 #[cfg(test)]
@@ -547,7 +607,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("s.db");
         let _ = std::fs::remove_file(&path);
-        let store = Store::open(&path, true).expect("open");
+        let store = Store::open(&path, true, &orxnud_platform_fs::OsIdentity).expect("open");
         assert!(store.sqlite_version().satisfies_minimum());
         drop(store);
         // The file exists and WAL is on it.

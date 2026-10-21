@@ -1022,7 +1022,8 @@ mod rollforward {
         assert_eq!(restore_state(&db), RestoreState::Outstanding);
 
         // The next open. No explicit recovery call: this is what `acquire_shared` does.
-        let _store = crate::sqlite::Store::open(&db, true).expect("open recovers");
+        let _store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("open recovers");
 
         assert_eq!(
             notes(&db),
@@ -1057,7 +1058,8 @@ mod rollforward {
         // The staged image is lost -- the failure mode recovery exists for.
         std::fs::remove_file(staging_path_for(&db)).expect("lose the staged image");
 
-        let err = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let err = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         let text = format!("{err:?}");
         assert!(
             text.contains("outstanding restore"),
@@ -1328,7 +1330,8 @@ mod scenarios {
         );
 
         // Restart: everything is re-read from disk.
-        let store = crate::sqlite::Store::open(&db, true).expect("open");
+        let store =
+            crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity).expect("open");
         drop(store);
 
         assert_eq!(
@@ -1387,7 +1390,8 @@ mod scenarios {
         );
 
         // The live database is untouched, and the ordinary path still serves it.
-        let store = crate::sqlite::Store::open(&db, true).expect("open");
+        let store =
+            crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity).expect("open");
         drop(store);
         assert_eq!(notes(&db), "LIVE");
         assert_eq!(digest_of(&db), live_digest_before);
@@ -1433,7 +1437,8 @@ mod scenarios {
         assert_eq!(intent.staging, staging_path_for(&db));
 
         // Restart through the ordinary path. Nothing in memory carries across.
-        let store = crate::sqlite::Store::open(&db, true).expect("open rolls forward");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("open rolls forward");
         drop(store);
 
         assert_eq!(notes(&db), "STAGED", "the staged content must win");
@@ -1488,7 +1493,8 @@ mod scenarios {
         // The partial database must not be served: recovery is still outstanding, and
         // recovery cannot complete while the fault is still armed.
         seams::arm(seams::Fault::DuringCopy);
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         assert_fired(seams::Fault::DuringCopy);
         seams::reset();
         assert!(
@@ -1502,7 +1508,8 @@ mod scenarios {
         assert!(intent_path_for(&db).exists());
 
         // The retry converges.
-        let store = crate::sqlite::Store::open(&db, true).expect("the retry converges");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("the retry converges");
         drop(store);
         assert_eq!(notes(&db), "STAGED");
         assert_eq!(digest_of(&db), staged_digest);
@@ -1540,7 +1547,8 @@ mod scenarios {
         // main file for a completed restore. Arming the same fault proves it does:
         // if recovery skipped the install, the fault would never fire again.
         seams::arm(seams::Fault::BeforeFinalize);
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must not be a no-op");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must not be a no-op");
         assert_fired(seams::Fault::BeforeFinalize);
         seams::reset();
         assert!(
@@ -1549,7 +1557,8 @@ mod scenarios {
         );
 
         // With the fault gone, the recovery completes.
-        let store = crate::sqlite::Store::open(&db, true).expect("the retry converges");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("the retry converges");
         drop(store);
         assert_eq!(notes(&db), "STAGED");
         assert_eq!(digest_of(&db), staged_digest);
@@ -1596,7 +1605,8 @@ mod scenarios {
 
         // Recovery: the log must be folded in, the sidecars removed, and only then
         // may the intent be cleared.
-        let store = crate::sqlite::Store::open(&db, true).expect("open recovers");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("open recovers");
         drop(store);
 
         // The sidecar state is read **before** any verification connection is opened.
@@ -1656,7 +1666,8 @@ mod scenarios {
 
         stage_and_publish(&db, &staged);
 
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         let text = format!("{refused:?}");
         assert!(
             text.contains("outstanding restore"),
@@ -1675,7 +1686,8 @@ mod scenarios {
         // The contention ends, and the retry converges.
         reader.execute_batch("COMMIT;").expect("release");
         drop(reader);
-        let store = crate::sqlite::Store::open(&db, true).expect("the retry converges");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("the retry converges");
         drop(store);
         assert_eq!(notes(&db), "STAGED");
         assert_eq!(digest_of(&db), staged_digest);
@@ -1714,7 +1726,8 @@ mod scenarios {
 
         // The ordinary path refuses, because the recovery cannot complete.
         seams::arm(seams::Fault::DuringVerification);
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         assert_fired(seams::Fault::DuringVerification);
         seams::reset();
         assert!(
@@ -1723,7 +1736,8 @@ mod scenarios {
         );
 
         // With the conditions restored, the retry converges.
-        let store = crate::sqlite::Store::open(&db, true).expect("the retry converges");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("the retry converges");
         drop(store);
         assert_eq!(notes(&db), "STAGED");
         assert_eq!(digest_of(&db), staged_digest);
@@ -1748,7 +1762,8 @@ mod scenarios {
         stage_and_publish(&db, &staged);
 
         seams::arm(seams::Fault::BeforeClearIntent);
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         assert_fired(seams::Fault::BeforeClearIntent);
         seams::reset();
         assert!(
@@ -1777,7 +1792,8 @@ mod scenarios {
         // recovery again rather than serve the database as though nothing were
         // outstanding.
         seams::arm(seams::Fault::BeforeClearIntent);
-        let again = crate::sqlite::Store::open(&db, true).expect_err("must not be a no-op");
+        let again = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must not be a no-op");
         assert_fired(seams::Fault::BeforeClearIntent);
         seams::reset();
         assert!(
@@ -1786,7 +1802,8 @@ mod scenarios {
         );
 
         // And once the clearing works, the restore is genuinely finished.
-        let store = crate::sqlite::Store::open(&db, true).expect("the retry converges");
+        let store = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect("the retry converges");
         drop(store);
         assert_eq!(notes(&db), "STAGED");
         assert_eq!(restore_state(&db), RestoreState::Idle);
@@ -1850,7 +1867,8 @@ mod scenarios {
             read_intent(&db).is_err(),
             "a malformed intent is an error, never None"
         );
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         assert!(
             format!("{refused:?}").contains("outstanding restore"),
             "{refused:?}"
@@ -1862,7 +1880,8 @@ mod scenarios {
         stage_and_publish(&db, &_staged);
         std::fs::remove_file(staging_path_for(&db)).expect("lose the image");
         assert_eq!(restore_state(&db), RestoreState::Outstanding);
-        let refused = crate::sqlite::Store::open(&db, true).expect_err("must refuse");
+        let refused = crate::sqlite::Store::open(&db, true, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must refuse");
         assert!(
             format!("{refused:?}").contains("outstanding restore"),
             "{refused:?}"
@@ -2015,7 +2034,8 @@ mod ordering {
         };
 
         record::clear();
-        let guard = crate::backup::RestoreGuard::acquire(&db).expect("guard");
+        let guard = crate::backup::RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("guard");
         snapshot.restore(&guard).expect("restore");
         drop(guard);
 
@@ -2061,7 +2081,8 @@ mod ordering {
         };
 
         seams::arm(seams::Fault::DirectoryFlush);
-        let guard = crate::backup::RestoreGuard::acquire(&db).expect("guard");
+        let guard = crate::backup::RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("guard");
         let err = snapshot.restore(&guard).expect_err("the flush must fail");
         seams::reset();
         assert!(format!("{err:?}").contains("injected"), "{err:?}");

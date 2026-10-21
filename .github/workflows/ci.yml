@@ -298,14 +298,18 @@ jobs:
   #    result is evidence that belongs in the verification register (V-29), not
   #    something this lane may be the first to assert.
   # 3. `orxnud-store` and everything above it (`task`, `policy`, `audit`,
-  #    `capability`, `daemon`) builds a bundled SQLite through `cl.exe`. It compiles
-  #    on this runner; running it would need the native tests to be proven portable
-  #    first, and they are not (see group 1).
+  #    `capability`, `daemon`) builds a bundled SQLite through `cl.exe`. The
+  #    focused step below runs exactly `s31_alias_safety` and
+  #    `s31_windows_identity`; it does **not** select `s31_sidecar_alias`. The
+  #    rest of the store's native tests still await a portability audit, and this
+  #    lane does not claim them. The 20-minute timeout has not been validated with
+  #    the bundled-SQLite build.
   #
   # # What this lane does prove
   #
   # That the portable core, the configuration layer, the CLI, and the filesystem and
-  # notification adapters *behave* — not merely compile — on Windows. That is the claim
+  # notification adapters *behave* — not merely compile — on Windows, and that a
+  # real database open inspects the file SQLite actually opened. That is the claim
   # V-29 needs, and `cargo check` cannot make it.
   windows-portability:
     name: Windows portability tests
@@ -329,6 +333,21 @@ jobs:
           -p orxnuctl
           -p orxnud-platform-fs
           -p orxnud-platform-notify
+
+      # The Windows identity path and the file SQLite actually opened. These are
+      # the focused store tests that measure the production open path: a native
+      # `CreateFileW` observation, the full 128-bit `FILE_ID_INFO` identity, a
+      # real hard link, and the main-database handle obtained from the live
+      # `rusqlite::Connection`. This step selects `s31_alias_safety` and
+      # `s31_windows_identity` only; `s31_sidecar_alias` is not selected. The
+      # store's broader suite still awaits a portability audit and is deliberately
+      # not run here.
+      - name: Filesystem identity and guarded database opening
+        run: >-
+          cargo test
+          -p orxnud-store
+          --test s31_alias_safety
+          --test s31_windows_identity
 
       # The platform dispatch itself: that a host without a sandbox backend refuses a
       # Tier-1 execution, and that `SandboxSpec`'s default working directory is

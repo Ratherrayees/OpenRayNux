@@ -79,6 +79,31 @@ pub struct ModelProvenance {
     pub prompt_hash: String,
     /// Correlation id for the provider request.
     pub request_id: RequestId,
+    /// A fingerprint of the **destination** that produced this proposal: the configured
+    /// provider endpoint and the model, hashed together.
+    ///
+    /// # Why it exists
+    ///
+    /// The model name alone does not identify a recipient. Two configured endpoints can
+    /// serve the same model name, so a proposal that was produced against one endpoint
+    /// must not later be disclosed to another merely because the model name still
+    /// matches. This binds the proposal to the destination that actually generated it.
+    ///
+    /// # What it is not
+    ///
+    /// It is **not** a credential, and it is **not** an authentication token: the raw
+    /// endpoint -- which may carry user information, query parameters or a fragment --
+    /// is never stored, only a digest of it. It is a binding check against the
+    /// destination configured at proposal time, not proof of which downstream inference
+    /// service a remote endpoint actually used.
+    ///
+    /// # Absent means "not bound"
+    ///
+    /// `None` is the honest answer for a proposal that predates this field, and for a
+    /// provider that cannot name its destination. Such a proposal must not qualify for
+    /// content disclosure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_fingerprint: Option<String>,
 }
 
 impl ModelProvenance {
@@ -94,6 +119,9 @@ impl ModelProvenance {
             revision: None,
             prompt_hash: prompt_hash.into(),
             request_id,
+            // No destination is bound until the caller that knows the provider stamps
+            // one. Defaulting to "unbound" is the fail-closed answer.
+            destination_fingerprint: None,
         }
     }
 }

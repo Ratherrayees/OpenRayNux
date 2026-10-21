@@ -706,9 +706,55 @@ def report(name: str, violations: list[Violation], root: str) -> int:
     return 0
 
 
+def all_rust_sources(root: str) -> list[str]:
+    """Every Rust file under ``crates/``, tests included.
+
+    G4 is about the *keyword*, and the keyword is just as much a declaration in a
+    test file as anywhere else, so this gate does not narrow to production
+    sources the way the authority gates do.
+    """
+    out: list[str] = []
+    crates = os.path.join(root, "crates")
+    for dirpath, _dirnames, filenames in os.walk(crates):
+        for name in sorted(filenames):
+            if name.endswith(".rs"):
+                out.append(os.path.join(dirpath, name))
+    return out
+
+
+def unsafe_violations(root: str) -> list[Violation]:
+    """Every use of the ``unsafe`` keyword outside the platform crates.
+
+    Only **code** counts. A string literal or a comment that happens to contain
+    the word is prose, not a declaration -- and every other gate in this file
+    already works that way; G3 says so in its own documentation. This gate used a
+    shell ``grep`` over raw text, so it flagged ordinary sentences, including
+    the word inside a diagnostic message, and treated them as unsafe code.
+
+    The rule itself is unchanged: the keyword may appear only in the
+    ``orxnud-platform-*`` crates, where the platform work belongs.
+    """
+    out: list[Violation] = []
+    for path in all_rust_sources(root):
+        if crate_of(path, root).startswith("orxnud-platform-"):
+            continue
+        code = _code_of(path)
+        for m in re.finditer(r"\bunsafe\b", code):
+            out.append(
+                Violation(
+                    path,
+                    rustscan.line_of(code, m.start()),
+                    "uses the `unsafe` keyword",
+                )
+            )
+    return out
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("gate", choices=["g2d", "g3", "g3-platform-crates", "g16", "g17"])
+    ap.add_argument(
+        "gate", choices=["g2d", "g3", "g3-platform-crates", "g4", "g16", "g17"]
+    )
     ap.add_argument(
         "--root",
         default=None,
@@ -765,9 +811,20 @@ def main(argv: list[str]) -> int:
             + unguarded_recovery_write_violations(root, sources)
         )
         both.sort(key=lambda v: (v.path, v.line))
+        if _APPLIED_EXEMPTIONS:
+            print("   intentional omissions (opens of a file that is not the database):")
+            for note in sorted(_APPLIED_EXEMPTIONS):
+                print(f"     {note}")
         return report(
             "G17: production code bypasses the recovery-aware opening boundary",
             both,
+            root,
+        )
+
+    if args.gate == "g4":
+        return report(
+            "G4: unsafe appears outside orxnud-platform-*",
+            unsafe_violations(root),
             root,
         )
 
@@ -843,6 +900,23 @@ def strip_cfg_test_fns(src: str, count_src: str | None = None) -> str:
     at the same characters, and the code outside the blanked item is untouched
     byte-for-byte.
 
+    # Which item an attribute applies to
+
+    The item is found from the text that **immediately follows** the attribute, by
+    :func:`rustscan.attributed_item_span`. It is not found by searching forwards for
+    an item keyword.
+
+    That distinction is the whole point, and it was a real defect. The previous rule
+    searched for the next ``fn``/``mod``/``impl``/... and took the body after it, so
+    an attribute whose item was *not* one of those keywords -- a ``use`` item, a macro
+    invocation, a statement -- was silently attributed to a **later, unrelated** item,
+    whose body was then blanked. In ``crates/orxnud-store/src/backup.rs`` the line
+    ``#[cfg(test)] use std::cell::RefCell;`` sits immediately above ``impl Backup {
+    ... }``; the keyword search skipped the ``use`` item, found ``impl``, and blanked
+    the whole block -- 608 lines of production code, including every
+    ``Connection::open`` in it -- out of gate **G17**'s view. The gate was not
+    checking that file at all, and nothing said so.
+
     # Why the previous implementations were wrong
 
     * Counting braces over already-stripped text lost structural braces and
@@ -852,6 +926,9 @@ def strip_cfg_test_fns(src: str, count_src: str | None = None) -> str:
       `runtime.rs` were reported as production.
     * Matching by indentation blanked *production* code adjacent to a test item, which
       hid a synthetic `acquire_exclusive_unchecked` route in `backup.rs` from G17.
+    * Searching forwards for an item keyword attributed an attribute to the *wrong*
+      item whenever the item it applied to was not a keyword -- a `use`, a macro
+      invocation, or a statement -- and blanked that later item's body instead.
 
     The lexer that feeds this was itself wrong for a long time: `_RAW_PREFIX` omitted
     the standalone `r` prefix, and the raw-string terminator was built as a quote, the
@@ -863,13 +940,12 @@ def strip_cfg_test_fns(src: str, count_src: str | None = None) -> str:
     # Failure behaviour
 
     If an attribute is recognised but no item body can be located, only the attribute
-    and its item's first line are blanked. Blanking too little risks a false positive,
-    which is visible and cheap; blanking too much hides production code, which is the
-    dangerous direction.
+    itself is blanked. Blanking too little risks a false positive, which is visible
+    and cheap; blanking too much hides production code, which is the dangerous
+    direction.
     """
     _ = count_src
     code = rustscan.code_mask(src)
-    matches = rustscan.delimiter_matches(src, code)
     edits: list[tuple[int, int]] = []
 
     def blank(a: int, b: int) -> None:
@@ -881,34 +957,13 @@ def strip_cfg_test_fns(src: str, count_src: str | None = None) -> str:
     for m in _TEST_ATTR.finditer(src):
         if not all(code[m.start():m.end()]):
             continue
-        rest = src[m.end():]
-        kw = _ITEM_KW.search(rest)
-        if kw is None:
+        span = rustscan.attributed_item_span(src, code, m.end())
+        if span is None:
+            # No item could be located. Blank the attribute alone: a false positive
+            # is visible and cheap, a hidden production open is not.
+            blank(m.start(), m.end())
             continue
-        body = m.end() + kw.start()
-        # The body opens at the first code brace at or after the item keyword. A
-        # signature may wrap across lines, so this is not "the brace on this line".
-        j = body
-        semicolon = None
-        while j < len(src):
-            if code[j]:
-                if src[j] == "{":
-                    break
-                if src[j] == ";":
-                    semicolon = j
-                    break
-            j += 1
-        if semicolon is not None:
-            blank(m.start(), semicolon + 1)
-            continue
-        if j < len(src) and src[j] == "{" and j in matches:
-            blank(m.start(), matches[j] + 1)
-        else:
-            # No body could be located. Blanking just the attribute line is the
-            # fail-closed choice: a false positive is visible, a hidden production
-            # open is not.
-            end = src.find("\n", j)
-            blank(m.start(), (len(src) if end == -1 else end))
+        blank(m.start(), span[1])
     for a_, b_ in sorted(edits, reverse=True):
         src = rustscan.blank_range(src, a_, b_)
     return src
@@ -916,7 +971,6 @@ def strip_cfg_test_fns(src: str, count_src: str | None = None) -> str:
 
 #: A test-only attribute: `#[test]`, or `#[cfg(...)]` whose predicate mentions `test`.
 _TEST_ATTR = re.compile(r"#\[\s*(?:test|cfg\s*\([^\]]*\btest\b[^\]]*\))\s*\]")
-_ITEM_KW = re.compile(r"\b(?:fn|mod|impl|struct|enum|trait|const|static)\b")
 
 
 def production_view(text: str) -> str:
@@ -1048,6 +1102,84 @@ def unguarded_recovery_write_violations(
     return out
 
 
+#: Opens of a file that is **not** the database the ownership boundary protects.
+#:
+#: Keyed by ``(relative path, the path expression passed to ``open``)``. The
+#: expression is matched exactly, with whitespace collapsed, so a rename breaks the
+#: exemption loudly rather than silently widening it.
+#:
+#: # Why these exist at all
+#:
+#: G17's rule is "no production open of a file-backed database outside the
+#: ownership boundary", and its purpose is narrower: *the live database* must not be
+#: opened without the recovery-aware lease, because an open that skips ownership can
+#: serve a half-restored database.
+#:
+#: The sites below open **copies** of the database -- the pre-migration snapshot and
+#: the staging files the snapshot and the restore are written through. They are
+#: created by this crate, they are not under ownership, they have no restore intent,
+#: and their integrity is established by the snapshot verification and the
+#: staged-digest comparison rather than by the ownership lease. Taking the *live*
+#: database's lease over them would be wrong: the restore path already holds that
+#: lease exclusively, and ``flock`` conflicts between open file descriptions even
+#: within one process (S-31).
+#:
+#: # Why the exemption is per-site and not per-file
+#:
+#: A file-level exemption would switch off the rule for every open in that file,
+#: including a future open of the *live* database there -- which is exactly the kind
+#: of hole this gate exists to close. A per-site exemption keeps the file under
+#: the rule: the live database's path expression (``db_path``) is **not** among
+#: these, so an open of it in the same file is still refused.
+#:
+#: The scanner fix that made these visible is in ``rustscan.attributed_item_span``:
+#: before it, ``#[cfg(test)] use std::cell::RefCell;`` in ``backup.rs`` caused the
+#: whole ``impl Backup`` block to be blanked out of the gate's view, and G17 had
+#: never seen this file at all.
+_DERIVED_OPEN_EXEMPT: dict[tuple[str, str], str] = {
+    (
+        os.path.join("crates", "orxnud-store", "src", "backup.rs"),
+        "dst_path",
+    ): "the snapshot staging file this crate is writing, not the database",
+    (
+        os.path.join("crates", "orxnud-store", "src", "backup.rs"),
+        "path",
+    ): "the published pre-migration snapshot, verified before it is used",
+    (
+        os.path.join("crates", "orxnud-store", "src", "backup.rs"),
+        "&self.path",
+    ): "the published pre-migration snapshot, verified before it is used",
+    (
+        os.path.join("crates", "orxnud-store", "src", "backup.rs"),
+        "&staging",
+    ): "the restore staging file, digest-compared against the snapshot",
+}
+
+
+#: The exemptions the last G17 run actually applied, one line each.
+#:
+#: An exemption that is not visible is an exemption nobody can review. The gate
+#: prints these, so the omissions it makes are stated rather than implied.
+_APPLIED_EXEMPTIONS: list[str] = []
+
+
+def _open_path_expression(view: str, paren_idx: int) -> str | None:
+    """The text passed to ``Connection::open(...)``, with whitespace collapsed.
+
+    ``paren_idx`` is the index of the ``(`` that opens the argument list. ``None``
+    means the argument list could not be delimited, which the caller treats as "not
+    exempt": an exemption that cannot be matched exactly is not applied.
+    """
+    if paren_idx < 0 or paren_idx >= len(view) or view[paren_idx] != "(":
+        return None
+    code = rustscan.code_mask(view)
+    matches = rustscan.delimiter_matches(view, code)
+    close = matches.get(paren_idx)
+    if close is None:
+        return None
+    return " ".join(view[paren_idx + 1 : close].split())
+
+
 def unguarded_open_violations(root: str, sources: list[str]) -> list[Violation]:
     """Production opens of a file-backed database that bypass the ownership boundary.
 
@@ -1069,6 +1201,7 @@ def unguarded_open_violations(root: str, sources: list[str]) -> list[Violation]:
     recovery protocol; that is the protocol's own tests. This is defence in depth.
     """
     out: list[Violation] = []
+    _APPLIED_EXEMPTIONS.clear()
     for path in sources:
         rel = os.path.relpath(path, root)
         if rel in OPEN_EXEMPT:
@@ -1081,6 +1214,17 @@ def unguarded_open_violations(root: str, sources: list[str]) -> list[Violation]:
             # `:memory:` is not a file; it has no path, no sidecars and nothing to recover.
             if "memory" in snippet:
                 continue
+            # A documented exemption for an open of a file that is not the database
+            # the ownership boundary protects. Checked *before* the lease window, so
+            # the exemption does not depend on how the open is spelled.
+            expression = _open_path_expression(production, m.end() - 1)
+            if expression is not None:
+                reason = _DERIVED_OPEN_EXEMPT.get((rel, expression))
+                if reason is not None:
+                    _APPLIED_EXEMPTIONS.append(
+                        f"{rel}:{rustscan.line_of(text, m.start())}: {expression} -- {reason}"
+                    )
+                    continue
             # The legitimate pattern: take the lease, then open. `Store::open` already
             # does both; a direct open is fine when a lease was taken just above it.
             window = "\n".join(production.split("\n")[max(0, line - 1 - _ACQUIRE_WINDOW) : line])

@@ -867,6 +867,19 @@ G17_CASES: list[tuple[str, str, str, bool]] = [
     ("G17: a production open after a raw string is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
     ("G17: a production open after a nested comment is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
     ("G17: an unguarded call to the recovery installer is still caught", "G17", "crates/orxnud-store/src/task_repo.rs", True),
+    # Scanner regressions: an attribute whose item is not keyword-introduced -- a
+    # `use`, a macro invocation, a statement -- used to be attributed to a *later*
+    # item, whose body was then blanked. The production code after it vanished
+    # from the gate's view. These pin the corrected behaviour.
+    ("G17: a production open after a cfg(test) macro invocation is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a keyword-free cfg(test) macro invocation is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a cfg(test) use item is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    ("G17: a production open after a cfg(test) statement is still caught", "G17", "crates/orxnud-task/src/a.rs", True),
+    # The derived-open exemption, in both directions: an open of a file that is
+    # not the database is accepted, and an open of the database itself in the
+    # same file is still refused.
+    ("G17: an open of a derived file is exempt", "G17", "crates/orxnud-store/src/backup.rs", False),
+    ("G17: an open of the live database in the exempted file is still refused", "G17", "crates/orxnud-store/src/backup.rs", True),
     # ---- must pass ---------------------------------------------------------------
     ("G17: acquire then open is the guarded pattern", "G17", "crates/orxnud-task/src/a.rs", False),
     ("G17: an in-memory database is not a file", "G17", "crates/orxnud-task/src/a.rs", False),
@@ -875,6 +888,7 @@ G17_CASES: list[tuple[str, str, str, bool]] = [
     ("G17: a #[cfg(test)] mod's opens are not production", "G17", "crates/orxnud-task/src/a.rs", False),
     ("G17: the recovery module may use the unchecked lease", "G17", "crates/orxnud-store/src/recovery.rs", False),
     ("G17: a test-only power loss helper is not production", "G17", "crates/orxnud-task/src/a.rs", False),
+    ("G17: a cfg(test) macro invocation's opens are not production", "G17", "crates/orxnud-task/src/a.rs", False),
 ]
 
 G17_BAD_FORMS: dict[str, str] = {
@@ -1001,6 +1015,55 @@ pub fn production(path: &std::path::Path) {
 /* outer /* inner { */ still a comment */
 fn a_helper() {}
 """,
+    # -- scanner regressions: an attribute on an item that is not
+    #    keyword-introduced must not swallow the production code after it.
+    "G17: a production open after a cfg(test) macro invocation is still caught": """
+#[cfg(test)]
+std::thread_local! {
+    static SEAMS: RefCell<u8> = const { RefCell::new(0) };
+}
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    # The same, with a macro body that contains no item keyword. The keyword
+    # search used to land on a *later* item here, which is how the production
+    # code after the macro disappeared from the gate's view.
+    "G17: a production open after a keyword-free cfg(test) macro invocation is still caught": """
+#[cfg(test)]
+thread_local! {
+    SEAMS.with(|_| ());
+}
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a production open after a cfg(test) use item is still caught": """
+#[cfg(test)]
+use std::cell::RefCell;
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    "G17: a production open after a cfg(test) statement is still caught": """
+pub fn helper() {
+    #[cfg(test)]
+    seams::check(1);
+}
+
+pub fn production(path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(path);
+}
+""",
+    # -- the derived-open exemption, in both directions.
+    "G17: an open of the live database in the exempted file is still refused": """
+pub fn production(db_path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(db_path);
+}
+""",
 }
 
 G17_GOOD = """
@@ -1054,6 +1117,22 @@ mod power_loss {
     pub fn crash_point(path: &std::path::Path) {
         let _c = rusqlite::Connection::open(path);
     }
+}
+""",
+    # A macro invocation under `#[cfg(test)]`: the whole invocation is test-only,
+    # including the open inside it.
+    "G17: a cfg(test) macro invocation's opens are not production": """
+#[cfg(test)]
+std::thread_local! {
+    static SEAMS: RefCell<rusqlite::Connection> =
+        const { RefCell::new(rusqlite::Connection::open("/tmp/scratch.db").unwrap()) };
+}
+""",
+    # An open of a file that is *not* the database the ownership boundary
+    # protects: the pre-migration snapshot, here named `dst_path`.
+    "G17: an open of a derived file is exempt": """
+pub fn take_into(dst_path: &std::path::Path) {
+    let _c = rusqlite::Connection::open(dst_path);
 }
 """,
 }
@@ -1638,6 +1717,105 @@ def run_transform(
     )
 
 
+# ---------------------------------------------------------------------------
+# G4: the unsafe-code gate.
+#
+# The gate is about the *keyword*. A string literal or a comment that happens
+# to contain the word is prose, and the previous shell `grep` over raw text
+# flagged it as unsafe code. These cases pin both halves of the rule: prose is
+# not a violation, and a real declaration outside the platform crates is.
+# ---------------------------------------------------------------------------
+
+G4_CASES: list[tuple[str, str, str, bool]] = [
+    # ---- must fail ---------------------------------------------------------------
+    ("G4: an unsafe block outside the platform crates", "G4", "crates/orxnud-task/src/a.rs", True),
+    ("G4: an unsafe fn outside the platform crates", "G4", "crates/orxnud-task/src/a.rs", True),
+    ("G4: an unsafe impl outside the platform crates", "G4", "crates/orxnud-task/src/a.rs", True),
+    # ---- must pass ---------------------------------------------------------------
+    ("G4: a string literal containing the word unsafe is prose", "G4", "crates/orxnud-task/src/a.rs", False),
+    ("G4: a comment containing the word unsafe is prose", "G4", "crates/orxnud-task/src/a.rs", False),
+    ("G4: the unsafe_code attribute is not the keyword", "G4", "crates/orxnud-task/src/a.rs", False),
+    ("G4: an unsafe block inside a platform crate is allowed", "G4", "crates/orxnud-platform-foo/src/a.rs", False),
+]
+
+G4_SOURCES: dict[str, str] = {
+    "G4: an unsafe block outside the platform crates": """
+fn production() {
+    let _ = unsafe { std::ptr::null::<u8>() };
+}
+""",
+    "G4: an unsafe fn outside the platform crates": """
+unsafe fn danger() -> u8 {
+    0
+}
+""",
+    "G4: an unsafe impl outside the platform crates": """
+struct Thing;
+
+unsafe impl Thing {
+    fn danger(&self) -> u8 {
+        0
+    }
+}
+""",
+    "G4: a string literal containing the word unsafe is prose": """
+fn production() {
+    let message = "the configured destination cannot be displayed safely";
+    let reason = "destination withheld (unsafe to display)";
+    println!("{message} {reason}");
+}
+""",
+    "G4: a comment containing the word unsafe is prose": """
+// An unsafe destination is withheld whole, and an unsafe model label with it.
+fn production() {}
+""",
+    "G4: the unsafe_code attribute is not the keyword": """
+#![forbid(unsafe_code)]
+
+fn production() {}
+""",
+    "G4: an unsafe block inside a platform crate is allowed": """
+fn production() {
+    let _ = unsafe { std::ptr::null::<u8>() };
+}
+""",
+}
+
+
+def run_g4_case(tmp: str, name: str, gate: str, rel: str, expect_fail: bool) -> tuple[bool, str]:
+    """Run the G4 gate against a minimal tree holding one fixture file.
+
+    A minimal tree on purpose: G4 is about the keyword in one file, and the
+    authority fixtures the other gates need would only add text that is not
+    under test.
+    """
+    root = os.path.join(tmp, "g4case")
+    shutil.rmtree(root, ignore_errors=True)
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(G4_SOURCES[name])
+    env = dict(os.environ, ORXNUD_GATE_ROOT=root)
+    result = subprocess.run(
+        ["bash", GATE, gate],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO,
+        check=False,
+    )
+    rejected = result.returncode != 0
+    if rejected == expect_fail:
+        return True, ""
+    return (
+        False,
+        f"{name}\n     expected the gate to "
+        f"{'REJECT' if expect_fail else 'ACCEPT'}, and it "
+        f"{'rejected' if rejected else 'accepted'}\n"
+        f"     gate output:\n{result.stdout}\n{result.stderr}",
+    )
+
+
 def main() -> int:
     failures: list[str] = []
     total = 0
@@ -1659,6 +1837,18 @@ def main() -> int:
             total += 1
             runner = run_g16_case if gate == "G16" else run_g17_case
             ok, detail = runner(tmp, name, gate, rel, expect_fail)
+            if ok:
+                print(f"  ok    {name}")
+            else:
+                print(f"  FAIL  {name}")
+                failures.append(detail)
+
+        # G4: the unsafe-code gate must reject a real declaration outside the
+        # platform crates, accept prose that merely contains the word, and accept
+        # the keyword inside a platform crate.
+        for name, gate, rel, expect_fail in G4_CASES:
+            total += 1
+            ok, detail = run_g4_case(tmp, name, gate, rel, expect_fail)
             if ok:
                 print(f"  ok    {name}")
             else:

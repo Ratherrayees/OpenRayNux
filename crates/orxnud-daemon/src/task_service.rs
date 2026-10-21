@@ -31,6 +31,7 @@ use std::path::Path;
 
 use orxnud_domain::Actor;
 use orxnud_domain::ids::{CapabilityId, TaskId};
+use orxnud_domain::platform::FilesystemIdentity;
 use orxnud_domain::task_state::TaskState;
 use orxnud_store::StoreError;
 use orxnud_store::migration::{MigrationError, MigrationRunner};
@@ -138,13 +139,24 @@ pub struct TaskService {
 impl TaskService {
     /// Opens the task database, migrates it, and reclaims the previous run's work.
     ///
+    /// # The filesystem-identity capability is required
+    ///
+    /// `identity` is not optional and has no default. ADR-0058 Decision 2 requires
+    /// every open of a database to present the capability that can say how many
+    /// names reach it, and requires a platform that cannot answer to be a
+    /// **refusal** rather than a pass. The composition root supplies it.
+    ///
     /// # Errors
     ///
     /// Any [`StartupError`]. Every one of them is a refusal to start: there is no
     /// degraded mode, because a task engine that cannot trust its own schema or its
     /// own leases cannot tell the user which of their tasks actually ran.
-    pub fn open(path: &Path, limits: EngineLimits) -> Result<Self, StartupError> {
-        Self::open_with_time(path, limits, now_ms())
+    pub fn open(
+        path: &Path,
+        limits: EngineLimits,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Self, StartupError> {
+        Self::open_with_time(path, limits, now_ms(), identity)
     }
 
     /// [`Self::open`] with an explicit clock, for tests and for replay.
@@ -156,6 +168,7 @@ impl TaskService {
         path: &Path,
         limits: EngineLimits,
         now_ms: i64,
+        identity: &dyn FilesystemIdentity,
     ) -> Result<Self, StartupError> {
         // `critical = true`: the task database is the one region ADR-0006 marks
         // critical, so its pragmas are verified rather than merely applied.
@@ -174,7 +187,7 @@ impl TaskService {
         // lease while a shared one is outstanding, and `flock` reports that even
         // within one process because the lock belongs to the open file description.
         let (applied, conn, ownership) = {
-            let store = Store::open(path, true).map_err(StartupError::Store)?;
+            let store = Store::open(path, true, identity).map_err(StartupError::Store)?;
             let runner = MigrationRunner::new(store.conn());
             match runner.migrate(path) {
                 Ok(applied) => {
@@ -198,13 +211,12 @@ impl TaskService {
                         // constructors. Three copies of drop-the-lease-then-take-exclusive
                         // is three chances to get the order wrong, and getting it wrong is a
                         // deadlock rather than a test failure.
-                        orxnud_store::migration::recover_from_snapshot(path, &snapshot).map_err(
-                            |e| {
-                                StartupError::Migration(format!(
-                                    "the migration failed and its snapshot could not be restored: {e}"
-                                ))
-                            },
-                        )?;
+                        orxnud_store::migration::recover_from_snapshot(path, &snapshot, identity)
+                            .map_err(|e| {
+                            StartupError::Migration(format!(
+                                "the migration failed and its snapshot could not be restored: {e}"
+                            ))
+                        })?;
                     }
                     return Err(StartupError::Migration(source.to_string()));
                 }
@@ -464,8 +476,13 @@ mod tests {
 
     #[test]
     fn opening_a_fresh_database_applies_every_migration() {
-        let s = TaskService::open_with_time(&db("fresh"), EngineLimits::documented(), NOW)
-            .expect("open");
+        let s = TaskService::open_with_time(
+            &db("fresh"),
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("open");
         assert_eq!(
             s.opened().migrations_applied,
             orxnud_store::migration::CURRENT_VERSION as usize,
@@ -478,9 +495,20 @@ mod tests {
     #[test]
     fn reopening_applies_nothing_and_reclaims_nothing() {
         let p = db("reopen");
-        TaskService::open_with_time(&p, EngineLimits::documented(), NOW).expect("first open");
-        let s =
-            TaskService::open_with_time(&p, EngineLimits::documented(), NOW).expect("second open");
+        TaskService::open_with_time(
+            &p,
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("first open");
+        let s = TaskService::open_with_time(
+            &p,
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("second open");
         assert_eq!(s.opened().migrations_applied, 0, "already migrated");
         assert_eq!(s.opened().leases_recovered, 0, "nothing was claimed");
     }
@@ -488,8 +516,13 @@ mod tests {
     #[test]
     fn a_restart_reclaims_the_previous_processs_lease() {
         let p = db("restart");
-        let mut first =
-            TaskService::open_with_time(&p, EngineLimits::documented(), NOW).expect("first open");
+        let mut first = TaskService::open_with_time(
+            &p,
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("first open");
         let t = orxnud_domain::ids::TaskId::new("svc-restart");
         first
             .engine_mut()
@@ -507,8 +540,13 @@ mod tests {
         // The "crash": the first service is dropped without shutting down.
         drop(first);
 
-        let second =
-            TaskService::open_with_time(&p, EngineLimits::documented(), NOW).expect("restart");
+        let second = TaskService::open_with_time(
+            &p,
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("restart");
         assert_eq!(
             second.opened().leases_recovered,
             1,
@@ -525,7 +563,13 @@ mod tests {
     #[test]
     fn shutdown_stops_claiming_and_reclaims_in_flight_work() {
         let p = db("shutdown");
-        let mut s = TaskService::open_with_time(&p, EngineLimits::documented(), NOW).expect("open");
+        let mut s = TaskService::open_with_time(
+            &p,
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("open");
         s.engine_mut()
             .enqueue_new(
                 &orxnud_store::task_repo::NewTask::new(
@@ -563,8 +607,13 @@ mod tests {
 
     #[test]
     fn an_idle_service_ticks_without_creating_work() {
-        let mut s = TaskService::open_with_time(&db("idle"), EngineLimits::documented(), NOW)
-            .expect("open");
+        let mut s = TaskService::open_with_time(
+            &db("idle"),
+            EngineLimits::documented(),
+            NOW,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("open");
         let r = s.tick(NOW).expect("tick");
         assert_eq!(r.tasks_created, 0);
         assert_eq!(r.schedules_considered, 0);
@@ -1052,6 +1101,29 @@ impl TaskService {
         self.guard_running()?;
         self.engine
             .record_approval_replacing_expired(approval, now_ms)
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
+    }
+
+    /// Removes an approval for an attempt.
+    ///
+    /// Used to compensate for a proposal decision that failed after its approval
+    /// was written: the row is removed so the two do not disagree.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault`] if it cannot be removed.
+    pub fn delete_approval(
+        &mut self,
+        task_id: &orxnud_domain::ids::TaskId,
+        step_no: u32,
+        attempt_no: u32,
+    ) -> Result<bool, TaskFault> {
+        self.guard_running()?;
+        self.engine
+            .delete_approval(task_id, step_no, attempt_no)
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
                 detail: e.to_string(),

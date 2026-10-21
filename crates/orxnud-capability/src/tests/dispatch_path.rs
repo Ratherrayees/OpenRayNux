@@ -290,6 +290,7 @@ fn an_ai_actor_cannot_elevate_its_delegating_humans_authority() {
             revision: None,
             prompt_hash: "fixture-prompt".into(),
             request_id: orxnud_domain::RequestId::new("req-ai"),
+            destination_fingerprint: None,
         },
     };
     let mut req = request();

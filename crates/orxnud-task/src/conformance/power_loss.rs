@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use orxnud_domain::platform::FilesystemIdentity;
 use orxnud_domain::task_state::TaskState;
 use orxnud_domain::{TaskId, TaskKind};
 
@@ -89,8 +90,20 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
 ///
 /// Written to be killable at *any* point, which is the point: it does not
 /// checkpoint, and it never gets to clean up.
-pub fn victim_main(db_path: &Path, ready_path: &Path, iterations: u32) -> ! {
-    let store = orxnud_store::Store::open(db_path, true).expect("victim: open store");
+///
+/// # The filesystem-identity capability
+///
+/// `identity` is supplied by the caller rather than constructed here, because
+/// the store's open requires one (ADR-0058 Decision 2) and this crate must not
+/// name a platform implementation: the capability belongs to whoever composes
+/// the run, and the composition layer supplies the real one.
+pub fn victim_main(
+    db_path: &Path,
+    ready_path: &Path,
+    iterations: u32,
+    identity: &dyn FilesystemIdentity,
+) -> ! {
+    let store = orxnud_store::Store::open(db_path, true, identity).expect("victim: open store");
     let conn = store.into_connection();
     // Ephemeral, and here that is the honest answer rather than a shortcut.
     // This process is about to be killed at an arbitrary instruction, so a snapshot
@@ -162,7 +175,12 @@ fn spawn_victim(
 /// Re-executed as a child process by [`kill_at_points`]. It is `#[ignore]`d so
 /// it does not run as a normal test, and it no-ops unless [`ENV_CHILD`] is set,
 /// so invoking the binary directly is harmless.
-pub fn victim_entry_point() {
+///
+/// `identity` is the filesystem-identity capability the victim's store open
+/// requires (ADR-0058 Decision 2). The caller supplies it, because the child
+/// process is the *test binary* re-executed, and the test binary is where the
+/// composition happens.
+pub fn victim_entry_point(identity: &dyn FilesystemIdentity) {
     if std::env::var_os(ENV_CHILD).is_none() {
         return;
     }
@@ -176,7 +194,7 @@ pub fn victim_entry_point() {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(64);
-    victim_main(Path::new(&db), Path::new(&ready), iterations);
+    victim_main(Path::new(&db), Path::new(&ready), iterations, identity);
 }
 
 /// Kills a child at a seeded point and returns how long it waited.

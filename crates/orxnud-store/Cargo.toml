@@ -58,3 +58,12 @@ proptest = { workspace = true }
 # Already a dependency of this crate; listed here because integration tests do not
 # inherit regular dependencies.
 rusqlite = { workspace = true }
+# Dev-only, and for the alias-safety tests (ADR-0058): the store's open requires a
+# filesystem-identity capability, and the strongest evidence is the **real** platform
+# implementation answering about a **real** hard link. A fake would prove the store's
+# logic and nothing about the implementation that ships.
+#
+# G2 reads `[dependencies]` only, so this cannot widen the shipped layer graph: the
+# store still depends on `orxnud-domain` alone, and the platform implementation is
+# injected by the composition layer.
+orxnud-platform-fs = { workspace = true }

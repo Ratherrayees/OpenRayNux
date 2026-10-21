@@ -56,10 +56,367 @@ pub const DEFAULT_MAX_CONTENT_BYTES: usize = 32 * 1024;
 ///
 /// Both parts matter. Comparing the model string alone would let a re-pointed endpoint
 /// inherit an approval given to the old one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderIdentity {
     endpoint: String,
     model: String,
+}
+
+/// A deterministic, versioned fingerprint of a provider **destination**.
+///
+/// # What it covers
+///
+/// Both the canonical endpoint and the model. A change to either changes the
+/// fingerprint, which is the point: a proposal produced against one destination must not
+/// be disclosable to another.
+///
+/// # How the input is encoded
+///
+/// Domain separated by a versioned prefix, and each field **length-prefixed**, so no two
+/// distinct `(endpoint, model)` pairs can encode to the same bytes. A naive
+/// concatenation would let `("ab", "c")` and `("a", "bc")` collide.
+///
+/// # What is not stored
+///
+/// Only the hex digest. The endpoint itself may carry user information, query
+/// parameters, a fragment or a credential, and none of that is durable state.
+///
+/// # What it proves
+///
+/// That the destination **configured when the proposal was produced** is the destination
+/// being asked now. It is not an authentication token, and not evidence of which
+/// downstream inference service a remote endpoint actually used.
+#[must_use]
+pub(crate) fn destination_fingerprint(identity: &ProviderIdentity) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"orxnud-destination-fingerprint-v1\0");
+    let endpoint = identity.endpoint().as_bytes();
+    hasher.update(&(endpoint.len() as u64).to_be_bytes());
+    hasher.update(endpoint);
+    let model = identity.model().as_bytes();
+    hasher.update(&(model.len() as u64).to_be_bytes());
+    hasher.update(model);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// A safe, displayable description of a configured provider destination.
+///
+/// # Why this is a separate type
+///
+/// [`ProviderIdentity::endpoint`] is a **comparison** form: it canonicalises an
+/// endpoint so that two spellings of one destination compare equal, and it preserves
+/// everything else verbatim -- including user information, query parameters and a
+/// fragment. It is therefore exactly the wrong thing to print. This type is the
+/// display projection, and it is built by a **deliberately strict grammar**: an
+/// endpoint it does not fully understand is refused, not sanitised.
+///
+/// # What it never contains
+///
+/// No user information, no query string, no fragment, no credential, and no control
+/// character. A refused endpoint yields `None`, never a partial or guessed URL.
+///
+/// # What it does not claim
+///
+/// It identifies the **configured** destination. It is not evidence of which downstream
+/// inference service processes the content, and a local endpoint may forward data
+/// according to its own implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationDisplay {
+    /// The scheme as configured.
+    pub scheme: String,
+    /// The host, lowercased.
+    pub host: String,
+    /// The port, when one is configured and is not the scheme's default.
+    pub port: Option<u16>,
+    /// The path prefix, when the endpoint configures one.
+    pub path_prefix: Option<String>,
+    /// The requested model.
+    pub model: String,
+    /// Whether this is the local scripted test provider rather than a model endpoint.
+    pub local_scripted: bool,
+}
+
+impl DestinationDisplay {
+    /// The one-line form an operator or a CLI shows.
+    ///
+    /// A local scripted provider is named as such, so it is never mistaken for a
+    /// remote model endpoint.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let mut authority = self.host.clone();
+        if let Some(port) = self.port {
+            authority.push(':');
+            authority.push_str(&port.to_string());
+        }
+        let mut out = format!("{}://{authority}", self.scheme);
+        if let Some(prefix) = &self.path_prefix {
+            out.push_str(prefix);
+        }
+        if self.local_scripted {
+            out.push_str(" (local scripted test provider, not a model endpoint)");
+        } else {
+            out.push_str(&format!(" (model: {})", self.model));
+        }
+        out
+    }
+}
+
+/// The longest model label shown. A model name is an identifier, not a document.
+const MAX_MODEL_LABEL: usize = 200;
+
+/// Builds the safe display projection of a destination, or `None` when the configured
+/// endpoint cannot be represented safely.
+///
+/// # The accepted grammar
+///
+/// * `scripted://local` -- the local scripted test provider, exactly;
+/// * otherwise `http` or `https`, case-insensitive, followed by `://`, an authority of
+///   a host and an optional numeric port, and an optional path starting with `/`.
+///
+/// # What is refused
+///
+/// User information (`@` in the authority), query parameters (`?`), fragments (`#`),
+/// control characters, backslashes, a missing or empty host, a port that is not a
+/// number in range, an empty or control-character model label, and a model label longer
+/// than 200 characters.
+///
+/// # Why refuse rather than sanitise
+///
+/// A sanitised URL is a guess about what the operator configured. Refusing is honest:
+/// the destination cannot be shown, so it is not shown.
+pub fn destination_display(identity: &ProviderIdentity) -> Option<DestinationDisplay> {
+    let endpoint = identity.endpoint();
+    let model = identity.model();
+
+    if model.is_empty() || model.trim().is_empty() || model.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if model.chars().count() > MAX_MODEL_LABEL {
+        return None;
+    }
+
+    // The scripted test provider, named exactly.
+    if endpoint == "scripted://local" {
+        return Some(DestinationDisplay {
+            scheme: "scripted".to_owned(),
+            host: "local".to_owned(),
+            port: None,
+            path_prefix: None,
+            model: model.to_owned(),
+            local_scripted: true,
+        });
+    }
+
+    let safe = safe_endpoint(endpoint)?;
+
+    Some(DestinationDisplay {
+        scheme: safe.scheme,
+        host: safe.host,
+        port: safe.port,
+        path_prefix: safe.path_prefix,
+        model: model.to_owned(),
+        local_scripted: false,
+    })
+}
+
+/// The safe parts of an endpoint, or `None` when the endpoint cannot be shown.
+///
+/// The endpoint grammar of the display projection, without the model rules: the
+/// model is checked by [`destination_display`], which owns the whole projection.
+/// Split out so that the diagnostic redaction and the projection cannot drift
+/// apart -- a second grammar would eventually accept something the first
+/// refuses.
+struct SafeEndpoint {
+    /// The scheme, lowercased.
+    scheme: String,
+    /// The host, lowercased.
+    host: String,
+    /// The port, when one is configured.
+    port: Option<u16>,
+    /// The path prefix, when the endpoint configures one.
+    path_prefix: Option<String>,
+}
+
+/// The endpoint grammar, on its own.
+///
+/// Refuses, without exception: user information (`@` in the authority), query
+/// parameters (`?`), fragments (`#`), control characters, backslashes, a scheme
+/// that is not `http` or `https`, an empty authority, a host that is neither a
+/// DNS name nor an IPv6 literal in brackets, and a port that is not a number.
+fn safe_endpoint(endpoint: &str) -> Option<SafeEndpoint> {
+    // Characters that have no place in a URL we are willing to show.
+    if endpoint
+        .chars()
+        .any(|c| c.is_control() || c == '\\' || c == '?' || c == '#')
+    {
+        return None;
+    }
+
+    let (scheme, rest) = endpoint.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // User information is refused outright: it may carry a password.
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            if h.is_empty() || p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let port: u16 = p.parse().ok()?;
+            (h.to_owned(), Some(port))
+        }
+        None => (authority.to_owned(), None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // A DNS name or an IPv6 literal in brackets. Nothing else is understood.
+    let host_ok = if let Some(inner) = host.strip_prefix('[') {
+        inner.ends_with(']')
+            && inner.len() > 2
+            && inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+    } else {
+        host.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            && !host.starts_with('.')
+            && !host.ends_with('.')
+            && host.contains('.')
+    };
+    if !host_ok {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+
+    // The path is shown as a prefix; it is already known to carry no query or
+    // fragment, because those were refused above.
+    let path_prefix = if path.is_empty() {
+        None
+    } else {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    };
+
+    // A default port adds nothing and is omitted, so the label matches the identity.
+    let default_port = matches!(
+        (scheme.as_str(), port),
+        ("https", Some(443)) | ("http", Some(80))
+    );
+    let port = if default_port { None } else { port };
+
+    Some(SafeEndpoint {
+        scheme,
+        host,
+        port,
+        path_prefix,
+    })
+}
+
+/// The text used in place of a destination that cannot be shown safely.
+pub const DESTINATION_WITHHELD: &str = "destination withheld (unsafe to display)";
+
+/// A description of a configured destination that is safe to print anywhere.
+///
+/// The safe projection's label when the destination can be represented, and a
+/// fixed placeholder when it cannot.
+///
+/// The raw endpoint is never returned. It may carry user information, a query
+/// string, a fragment or a credential, and a diagnostic line is not a place for
+/// any of those. A withheld destination is a *complete* answer: it says the
+/// destination exists and is not shown, rather than showing part of it.
+#[must_use]
+pub fn redacted_destination(endpoint: &str, model: &str) -> String {
+    match destination_display(&ProviderIdentity::new(endpoint, model)) {
+        Some(display) => display.label(),
+        None => DESTINATION_WITHHELD.to_owned(),
+    }
+}
+
+/// A description of an endpoint that is safe to print anywhere.
+///
+/// The scheme, host, port and path when the endpoint can be represented safely,
+/// and a fixed placeholder when it cannot.
+#[must_use]
+pub fn redacted_endpoint(endpoint: &str) -> String {
+    if endpoint == "scripted://local" {
+        return "scripted://local".to_owned();
+    }
+    let Some(safe) = safe_endpoint(endpoint) else {
+        return DESTINATION_WITHHELD.to_owned();
+    };
+    let mut authority = safe.host;
+    if let Some(port) = safe.port {
+        authority.push(':');
+        authority.push_str(&port.to_string());
+    }
+    let mut out = format!("{}://{authority}", safe.scheme);
+    if let Some(prefix) = safe.path_prefix {
+        out.push_str(&prefix);
+    }
+    out
+}
+
+/// Whether a destination recorded with a proposal is still the destination being asked.
+///
+/// The rule, in one place so it can be tested without a provider:
+///
+/// * no recorded fingerprint -- a proposal that predates the field, or one from a
+///   provider that cannot name its destination -- **does not qualify**;
+/// * no current destination -- **does not qualify**;
+/// * a fingerprint computed over the current `(endpoint, model)` that differs from the
+///   recorded one -- **does not qualify**.
+///
+/// A qualified destination is the one whose content may be disclosed.
+#[must_use]
+pub(crate) fn destination_matches(
+    recorded: Option<&str>,
+    current: Option<&ProviderIdentity>,
+) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    let Some(current) = current else {
+        return false;
+    };
+    // A destination that cannot be displayed safely is not eligible for disclosure
+    // either. The fingerprint is a binding check; it is not a display check, and an
+    // endpoint we cannot safely represent must not become a disclosure recipient --
+    // including a historical proposal that still carries an older fingerprint.
+    if destination_display(current).is_none() {
+        return false;
+    }
+    destination_fingerprint(current) == recorded
+}
+
+impl std::fmt::Debug for ProviderIdentity {
+    /// Never prints the endpoint.
+    ///
+    /// The endpoint is the *comparison* form, and it preserves user information,
+    /// query strings and fragments verbatim. A derived `Debug` would therefore be
+    /// a way to put a credential into a log line, so the safe projection is
+    /// printed instead -- and a destination that cannot be shown is withheld.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderIdentity")
+            .field(
+                "destination",
+                &redacted_destination(&self.endpoint, &self.model),
+            )
+            .finish()
+    }
 }
 
 impl ProviderIdentity {
@@ -1478,5 +1835,106 @@ mod disclosure_tests {
         assert_ne!(a.disclosure_request(), b.disclosure_request());
         assert_eq!(a.task_id(), &TaskId::new("t-a"));
         assert_eq!(b.task_id(), &TaskId::new("t-b"));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{DESTINATION_WITHHELD, ProviderIdentity, redacted_destination, redacted_endpoint};
+
+    /// A destination that cannot be shown is withheld **whole**.
+    ///
+    /// A partial or sanitised URL would be a guess about what the operator
+    /// configured, and the guess would still carry the part that matters.
+    #[test]
+    fn an_unsafe_destination_is_withheld_whole() {
+        for endpoint in [
+            "https://user:password@example.test/v1",
+            "https://user@example.test/v1",
+            "https://example.test/v1?token=QUERY-CANARY",
+            "https://example.test/v1#FRAGMENT-CANARY",
+            "https://example.test/v1?token=QUERY-CANARY#FRAGMENT-CANARY",
+            "https://example.test/v1\u{7}CONTROL-CANARY",
+            "https://example.test/v1\\BACKSLASH-CANARY",
+        ] {
+            let redacted = redacted_destination(endpoint, "a-model");
+            assert_eq!(
+                redacted, DESTINATION_WITHHELD,
+                "an unsafe destination must be withheld: {endpoint}"
+            );
+            for canary in [
+                "password",
+                "QUERY-CANARY",
+                "FRAGMENT-CANARY",
+                "CONTROL-CANARY",
+                "BACKSLASH-CANARY",
+            ] {
+                assert!(
+                    !redacted.contains(canary),
+                    "{canary} survived the redaction of {endpoint}: {redacted}"
+                );
+            }
+        }
+    }
+
+    /// A destination that can be shown is shown, through the same projection the
+    /// operator is shown.
+    #[test]
+    fn a_safe_destination_is_shown_through_the_projection() {
+        assert_eq!(
+            redacted_destination("https://example.test/v1", "a-model"),
+            "https://example.test/v1 (model: a-model)"
+        );
+        assert_eq!(
+            redacted_endpoint("https://example.test:8443/v1"),
+            "https://example.test:8443/v1"
+        );
+        // The scripted provider is named as it is.
+        assert_eq!(redacted_endpoint("scripted://local"), "scripted://local");
+    }
+
+    /// A model that cannot be shown withholds the whole destination with it.
+    #[test]
+    fn a_model_that_cannot_be_shown_withholds_the_destination() {
+        assert_eq!(
+            redacted_destination("https://example.test/v1", "bad\u{7}model"),
+            DESTINATION_WITHHELD
+        );
+        assert_eq!(
+            redacted_destination("https://example.test/v1", &"x".repeat(201)),
+            DESTINATION_WITHHELD
+        );
+    }
+
+    /// The `Debug` representations do not carry the raw destination.
+    ///
+    /// A derived `Debug` is the quietest way for a URL to reach a log line, and
+    /// it is the one a future edit is most likely to reintroduce.
+    #[test]
+    fn the_debug_representations_do_not_carry_the_raw_destination() {
+        let endpoint = "https://user:password@example.test/v1?token=QUERY-CANARY#FRAGMENT-CANARY";
+        let canaries = ["password", "QUERY-CANARY", "FRAGMENT-CANARY"];
+
+        let identity = ProviderIdentity::new(endpoint, "a-model");
+        let shown = format!("{identity:?}");
+        for canary in canaries {
+            assert!(!shown.contains(canary), "{canary} leaked: {shown}");
+        }
+
+        let config = crate::http_provider::ProviderConfig::new(
+            endpoint,
+            "a-model",
+            orxnud_domain::platform::SecretRef::new("provider-api-key", "local"),
+        );
+        let shown = format!("{config:?}");
+        for canary in canaries {
+            assert!(!shown.contains(canary), "{canary} leaked: {shown}");
+        }
+
+        let target = crate::transport::Target::parse(endpoint, "a-model").expect("a target");
+        let shown = format!("{target:?}");
+        for canary in canaries {
+            assert!(!shown.contains(canary), "{canary} leaked: {shown}");
+        }
     }
 }

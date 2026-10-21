@@ -74,7 +74,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Deliberately holds only non-secret values plus a *reference*. A `String` API key here
 /// would be one `clone()` away from a log line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     /// Base URL, e.g. `http://127.0.0.1:8080/v1`.
     pub base_url: String,
@@ -84,6 +84,25 @@ pub struct ProviderConfig {
     pub api_key: SecretRef,
     /// Path appended to `base_url`.
     pub completions_path: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    /// Never prints the base URL.
+    ///
+    /// The configured base URL may carry user information, a query string or a
+    /// fragment, and a `Debug` that printed it would put any of those into a log
+    /// line. The safe projection is printed instead, and a destination that
+    /// cannot be shown is withheld whole.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field(
+                "destination",
+                &crate::observation::redacted_destination(&self.base_url, &self.model),
+            )
+            .field("api_key", &self.api_key)
+            .field("completions_path", &self.completions_path)
+            .finish()
+    }
 }
 
 impl ProviderConfig {
@@ -303,7 +322,7 @@ impl<S: SecretsContract + Send + Sync> OpenAiCompatibleProvider<S> {
             String::new()
         };
         let request = format!(
-            "POST {}{} HTTP/1.1\r\n\
+            "POST {} HTTP/1.1\r\n\
              Host: {}\r\n\
              {}\
              Content-Type: application/json\r\n\
@@ -312,8 +331,7 @@ impl<S: SecretsContract + Send + Sync> OpenAiCompatibleProvider<S> {
              Connection: close\r\n\
              \r\n\
              {body}",
-            target.prefix,
-            self.config.completions_path,
+            target.request_target(&self.config.completions_path),
             target.authority,
             header,
             body.len()
@@ -452,7 +470,13 @@ fn io_error(error: std::io::Error) -> ProviderError {
 impl<S: SecretsContract + Send + Sync> std::fmt::Debug for OpenAiCompatibleProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiCompatibleProvider")
-            .field("base_url", &self.config.base_url)
+            .field(
+                "destination",
+                &crate::observation::redacted_destination(
+                    &self.config.base_url,
+                    &self.config.model,
+                ),
+            )
             .field("model", &self.config.model)
             .field("api_key", &"<redacted: a reference, not a value>")
             .field("timeout", &self.timeout)

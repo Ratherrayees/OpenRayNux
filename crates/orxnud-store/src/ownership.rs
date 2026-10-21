@@ -41,6 +41,8 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use crate::alias::AliasRefusal;
+
 /// Why an ownership lease could not be established.
 ///
 /// Both variants are refusals. Neither is ever converted into a successful open or a
@@ -53,12 +55,39 @@ pub enum OwnershipError {
         /// The lock file whose lease could not be taken.
         path: PathBuf,
     },
-    /// The lock file could not be created or opened.
+    /// The ownership lock could not be established.
+    ///
+    /// Either the lock file could not be created or opened, or the **lease key
+    /// could not be derived** — the configured path could not be resolved to a
+    /// stable target. The latter is a refusal rather than a fallback: a lock
+    /// name derived from an unresolved path is not a stable identity, and two
+    /// processes would not meet on it.
     Unavailable {
-        /// The lock file.
+        /// The path the refusal concerns: the lock file, or the database whose
+        /// key could not be derived.
         path: PathBuf,
         /// The underlying reason.
         source: std::io::Error,
+    },
+    /// The database could not be shown to be alias-safe (ADR-0058, F-26c).
+    ///
+    /// # Why this is an ownership refusal and not a separate error
+    ///
+    /// Because it is the same fact. Ownership of a database is keyed by path, so a
+    /// database reachable through a second name is one whose ownership cannot be
+    /// expressed — a second process may already hold it under a name this process
+    /// never sees. Reporting it through the ownership channel means every caller
+    /// that already handles "this database is not safely openable" handles this
+    /// too, and no route has to learn a second vocabulary for it.
+    ///
+    /// It is deliberately **not** [`OwnershipError::Unavailable`]: that one means the
+    /// lock file could not be created, and an operator's response to it is different
+    /// from their response to "somebody has a second name for your database".
+    AliasUnsafe {
+        /// The database path.
+        path: PathBuf,
+        /// Why it could not be shown to be safe.
+        reason: AliasRefusal,
     },
 }
 
@@ -78,6 +107,9 @@ impl std::fmt::Display for OwnershipError {
                     path.display()
                 )
             }
+            Self::AliasUnsafe { path, reason } => {
+                write!(f, "refusing to open {}: {reason}", path.display())
+            }
         }
     }
 }
@@ -90,23 +122,50 @@ impl std::error::Error for OwnershipError {}
 ///
 /// * **Extension, not a sibling of a sibling.** `state.db` locks at `state.db.lock`,
 ///   so the identity is a pure function of the database file name.
-/// * **Normalised.** The caller-supplied path is canonicalised relative to the current
-///   directory first. A lock identity derived from an unnormalised string would give
-///   `state.db`, `./state.db` and `/abs/cwd/state.db` three different locks for one
-///   database.
-/// * **Symlinks are resolved where the target exists.** `canonicalize` fails on a
-///   nonexistent path, which is the normal state of a database about to be created; the
-///   canonicalised *parent* is joined with the file name in that case, so a not-yet-created
-///   database still gets a stable, absolute identity rather than silently falling back to
-///   the caller's relative string.
+/// * **Normalised.** The caller-supplied path is resolved to an absolute path
+///   before the lock name is derived, so `state.db`, `./state.db` and
+///   `/abs/cwd/state.db` cannot be three different locks for one database.
+/// * **The target is resolved, not just the name.** A configured path that is a
+///   **symlink** is followed to the file it names — *even when that file does
+///   not exist yet*. This is what makes the lock name stable across the
+///   database's creation, and it is not a refinement: see "The failure this
+///   fixes" below.
 /// * **The lock file is never deleted or renamed.** Identity must outlive the processes
 ///   that hold it. Replacing it would let a new inode be locked by one process while an
 ///   old inode stays locked by another — two "owners" of one database.
 ///
-/// # Known gap — HARD LINKS ARE NOT DETECTED
+/// # The failure this fixes
 ///
-/// Symlinks and relative paths are handled above. **Hard links are not**, and that is a
-/// real bypass, measured:
+/// The key used to be derived by canonicalising the configured path and, when
+/// that failed, falling back to the canonicalised **parent** plus the file name.
+/// A database that does not exist yet is the normal state of a database about to
+/// be created, and `canonicalize` fails on it — so the fallback decided the lock
+/// name from the *name* rather than from the *target*.
+///
+/// When the configured path is a symlink whose target does not exist yet, the two
+/// answers disagree, and the lease splits:
+///
+/// ```text
+/// state.db -> victim.db        (victim.db does not exist yet)
+///
+/// first process   canonicalize fails    ->  state.db.lock
+/// (the open creates victim.db)
+/// second process  canonicalize succeeds ->  victim.db.lock
+/// ```
+///
+/// Two lock files for one database, so the second process participates in
+/// nothing: the same class of bypass as the hard-link alias below, reached
+/// through a symlink instead of a link.
+///
+/// Resolving the **target** instead of the name gives one answer before and
+/// after the database is created, and the same answer as the target's own path.
+/// The resolver follows the final component's symlink chain, refuses a path it
+/// cannot settle, and never falls back to the caller's own string.
+///
+/// # Hard links — detected, not tolerated
+///
+/// Symlinks and relative paths are handled above. **Hard links are not**, and that
+/// was a real bypass, measured:
 ///
 /// ```text
 /// state.db and alias.db are one inode (20445) but resolve to
@@ -116,32 +175,143 @@ impl std::error::Error for OwnershipError {}
 ///
 /// Keying the lock by inode does not fix it: `link(2)` permits a hard link in a different
 /// directory on the same filesystem, so an inode-keyed name would still need a parent
-/// directory and the two parents can differ.
+/// directory, and the two parents can differ.
 ///
-/// The fix is to **refuse** a database with more than one name, which needs the file's link
-/// count. That is platform-specific (`std::os::unix::fs::MetadataExt`), gate G3 forbids it
-/// outside `orxnud-platform-*`, and gate G2's layering forbids `orxnud-store` from
-/// depending on a platform crate. `orxnud_platform_fs::hard_link_count` exists and is
-/// correctly placed, but is currently unreachable from the crate that takes the lease.
+/// So the database is **refused**: a database reachable through more than one name
+/// cannot be owned by a path-keyed rule, and the check that refuses it lives in
+/// [`crate::alias`], where the filesystem-identity capability ADR-0058 requires is
+/// applied on both sides of the open.
 ///
-/// **Until that is resolved, ownership is not alias-safe.** Any caller opening this
-/// database through a hard link participates in nothing. Recorded as an open limitation
-/// in A-008; not claimed as fixed.
-#[must_use]
-pub fn lock_path_for(db_path: &Path) -> PathBuf {
-    match db_path.canonicalize() {
-        Ok(canonical) => with_lock_suffix(&canonical),
-        Err(_) => match db_path.parent().and_then(|p| Path::canonicalize(p).ok()) {
-            // Resolve the directory, keep the file name: a database that does not exist
-            // yet still gets an absolute, stable identity.
-            Some(parent) => with_lock_suffix(&parent.join(db_path.file_name().unwrap_or_default())),
-            // Last resort: normalise the path lexically rather than falling back to
-            // whatever string the caller passed.
-            None => with_lock_suffix(
-                &std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf()),
-            ),
-        },
+/// What that check establishes is stated in [`crate::alias`], and it is deliberately
+/// narrower than "ownership is alias-safe": the observations are of a **path**, and
+/// SQLite resolves the path itself, so a path changed and changed back inside the
+/// window is not detected. ADR-0058 Decision 2 approved that limitation rather than
+/// claiming it away.
+///
+/// # Errors
+///
+/// [`OwnershipError::Unavailable`] when the lease key cannot be derived. The
+/// derivation is deliberately fallible: a key that cannot be established must
+/// not become permission to continue without the intended ownership protection.
+pub fn lock_path_for(db_path: &Path) -> Result<PathBuf, OwnershipError> {
+    let target = resolve_lease_target(db_path).map_err(|source| OwnershipError::Unavailable {
+        path: db_path.to_path_buf(),
+        source,
+    })?;
+    Ok(with_lock_suffix(&target))
+}
+
+/// How many symbolic links may be followed while resolving the lease target.
+///
+/// The same order of magnitude as the operating system's own limit
+/// (`SYMLOOP_MAX` is 40 on Linux), so a path the kernel would accept is not
+/// rejected here — and a loop is caught rather than spun on.
+const MAX_SYMLINK_DEPTH: usize = 40;
+
+/// The database a configured path is *intended* to name, resolved as far as the
+/// filesystem allows.
+///
+/// # Why this exists
+///
+/// [`lock_path_for`] used to canonicalise the configured path and, when that
+/// failed, fall back to the canonicalised **parent** plus the file name. That
+/// fallback is unstable in exactly the case it exists to cover. A database that
+/// does not exist yet is the normal state of a database about to be created, and
+/// `canonicalize` fails on it — so the fallback decided the lock name from the
+/// *name* rather than from the *target*.
+///
+/// When the configured path is a symlink whose target does not exist yet, the
+/// two answers disagree:
+///
+/// ```text
+/// state.db -> victim.db        (victim.db does not exist yet)
+///
+/// first process   canonicalize fails    ->  state.db.lock
+/// (the open creates victim.db)
+/// second process  canonicalize succeeds ->  victim.db.lock
+/// ```
+///
+/// Two lock files for one database, so the second process participates in
+/// nothing — the same class of bypass as the hard-link alias ADR-0058 refuses,
+/// reached through a symlink instead of a link.
+///
+/// This resolves the **target** instead: a symlink is followed even when its
+/// destination does not exist, so the name is derived from the file the path
+/// will name once the database is there. The answer is the same before and after
+/// the database is created.
+///
+/// # What it resolves
+///
+/// * The parent directory is canonicalised, so `.`, `..` and symlinked parent
+///   directories are settled once and for all.
+/// * The final component is followed if it is a symlink, repeatedly, so a chain
+///   of symlinks settles on the file at the end of it.
+/// * A final component that is not a symlink keeps its name, whether or not it
+///   exists.
+///
+/// # What it refuses
+///
+/// * A parent that cannot be resolved.
+/// * A symlink whose destination cannot be read, or whose destination's parent
+///   directory does not exist.
+/// * A symlink loop, or a chain longer than [`MAX_SYMLINK_DEPTH`].
+///
+/// Every refusal is an error. The caller must not fall back to the caller's own
+/// string: a lock name derived from an unresolved path is not a stable identity,
+/// and two processes would not meet on it.
+fn resolve_lease_target(db_path: &Path) -> Result<PathBuf, std::io::Error> {
+    if db_path.as_os_str().is_empty() {
+        return Err(std::io::Error::other("the database path is empty"));
     }
+    // Absolute first, so the parent can be resolved: a relative path with no
+    // directory component has no parent to canonicalise.
+    let absolute = std::path::absolute(db_path)?;
+    let mut parent = absolute
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the database path has no parent directory"))?
+        .canonicalize()?;
+    let mut name = absolute
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("the database path has no file name"))?
+        .to_os_string();
+
+    for _ in 0..MAX_SYMLINK_DEPTH {
+        let current = parent.join(&name);
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            // A database that does not exist yet: the name stands, and the answer
+            // is the one it will have once the file is there.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            // Anything else — a permission problem, an I/O error — is not
+            // "absent". Treating it as absent would let the caller proceed with a
+            // key derived from an unreadable path.
+            Err(e) => return Err(e),
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(current);
+        }
+        let target = std::fs::read_link(&current)?;
+        // A relative destination is relative to the symlink's own directory.
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            parent.join(target)
+        };
+        let target_parent = resolved.parent().ok_or_else(|| {
+            std::io::Error::other("the symlink destination has no parent directory")
+        })?;
+        let target_name = resolved
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("the symlink destination has no file name"))?;
+        // The destination's parent must exist. A symlink to a path whose
+        // directory is absent names a file that cannot be placed, and there is no
+        // stable identity to derive for it.
+        parent = target_parent.canonicalize()?;
+        name = target_name.to_os_string();
+    }
+    Err(std::io::Error::other(
+        "too many levels of symbolic links while resolving the database path",
+    ))
 }
 
 fn with_lock_suffix(path: &Path) -> PathBuf {
@@ -237,37 +407,15 @@ pub fn acquire_exclusive_for_tests(db_path: &Path) -> Result<ExclusiveOwnership,
     acquire_exclusive(db_path)
 }
 
-/// **Rejects a database reachable through more than one name.**
-///
-/// `lock_path_for` normalises relative paths and resolves symlinks, and a hard link
-/// defeats both: `state.db` and `alias.db` are the same inode but canonicalise to two
-/// different names, so they produce **two lock files** and a competitor opening via the
-/// alias participates in nothing. Measured during S-31's review:
-///
-/// ```text
-/// a -> /tmp/.../state.db.lock
-/// b -> /tmp/.../alias.db.lock
-/// SAME LOCK? false        (both inode 20445)
-/// ```
-///
-/// Keying the lock by inode was considered and rejected: `link(2)` permits a hard link in a
-/// different directory on the same filesystem, so an inode-keyed name would still have to be
-/// scoped by a parent directory, and the two parents can differ. There is no
-/// filesystem-independent way to give one inode one name.
-///
-/// So the database is **refused**. This is also what SQLite itself warns about: opening one
-/// database through multiple names can give the two names different WAL or journal files,
-/// which is undefined behaviour independent of any locking question.
-///
-/// The count itself comes from `orxnud_platform_fs::hard_link_count`, because gate G3
-/// forbids a platform `cfg` in this crate. Where the platform cannot report a count it
-/// returns `None` and this function **passes** — recorded as a limitation in A-008 rather
-/// than presented as a check that happened to succeed.
 /// Acquire a shared lease on behalf of an **integration test**.
 ///
 /// Symmetric with [`acquire_exclusive_for_tests`]: S-31's coverage tests need to stand
 /// where an ordinary daemon stands, to prove that a second ordinary process may also open.
 /// Like its counterpart it grants nothing a normal open does not already require.
+///
+/// It takes no filesystem-identity capability, because it does not open the database:
+/// it takes the lease only. The alias check belongs to the open itself, and a lease
+/// without a database behind it has nothing to be unsafe about.
 pub fn acquire_shared_for_tests(db_path: &Path) -> Result<SharedOwnership, OwnershipError> {
     acquire_shared(db_path)
 }
@@ -304,12 +452,13 @@ pub(crate) mod seams {
 /// Typed rather than a panic or a silent pass: a caller that cannot restore must be told it
 /// cannot open, and the message must name recovery so the refusal is not misread as a lock
 /// contention.
-fn ownership_error(e: crate::recovery::RecoveryError) -> OwnershipError {
+///
+/// `path` is the path the refusal is about. It used to be a lock name derived from an
+/// **empty** path, which named nothing the caller could act on; the caller now passes the
+/// path it was actually working on.
+fn ownership_error(path: &Path, e: crate::recovery::RecoveryError) -> OwnershipError {
     OwnershipError::Unavailable {
-        path: lock_path_for(std::path::Path::new(""))
-            .to_string_lossy()
-            .into_owned()
-            .into(),
+        path: path.to_path_buf(),
         source: std::io::Error::other(format!(
             "an outstanding restore could not be completed: {e}"
         )),
@@ -363,19 +512,23 @@ pub(crate) fn acquire_shared(db_path: &Path) -> Result<SharedOwnership, Ownershi
         // not parse. Release the shared lease so recovery can take the exclusive one,
         // and let the recovery decide -- including refusing, if the intent is malformed.
         drop(lease);
-        crate::recovery::complete_outstanding_restore(db_path).map_err(ownership_error)?;
+        crate::recovery::complete_outstanding_restore(db_path)
+            .map_err(|e| ownership_error(db_path, e))?;
     }
-    Err(ownership_error(crate::recovery::RecoveryError::Io {
-        what: "the database did not settle: a restore is still outstanding".into(),
-        source: std::io::Error::other("outstanding restore"),
-    }))
+    Err(ownership_error(
+        db_path,
+        crate::recovery::RecoveryError::Io {
+            what: "the database did not settle: a restore is still outstanding".into(),
+            source: std::io::Error::other("outstanding restore"),
+        },
+    ))
 }
 
 /// The shared lease **without** the recovery check.
 ///
 /// The lease only. It grants no authority a checked acquisition would refuse.
 pub(crate) fn acquire_shared_unchecked(db_path: &Path) -> Result<SharedOwnership, OwnershipError> {
-    let path = lock_path_for(db_path);
+    let path = lock_path_for(db_path)?;
     let file = open_lock_file(&path)?;
     file.try_lock_shared().map_err(|e| classify(&path, e))?;
     Ok(SharedOwnership { _file: file, path })
@@ -395,7 +548,8 @@ pub(crate) fn acquire_exclusive(db_path: &Path) -> Result<ExclusiveOwnership, Ow
     // Under the exclusive lease, no other process can publish, complete or remove an
     // intent, so this read is authoritative and the recovery that follows can install
     // without re-taking the lease.
-    crate::recovery::complete_outstanding_restore_under_lease(db_path).map_err(ownership_error)?;
+    crate::recovery::complete_outstanding_restore_under_lease(db_path)
+        .map_err(|e| ownership_error(db_path, e))?;
     Ok(lease)
 }
 
@@ -407,7 +561,7 @@ pub(crate) fn acquire_exclusive(db_path: &Path) -> Result<ExclusiveOwnership, Ow
 pub(crate) fn acquire_exclusive_unchecked(
     db_path: &Path,
 ) -> Result<ExclusiveOwnership, OwnershipError> {
-    let path = lock_path_for(db_path);
+    let path = lock_path_for(db_path)?;
     let file = open_lock_file(&path)?;
     // `File::try_lock` is the *exclusive* non-blocking lock; `lock_shared` is the
     // shared one. Naming it `try_lock_exclusive` here would not compile, which is
@@ -472,7 +626,7 @@ mod tests {
         let db = d.join("state.db");
         std::fs::write(&db, b"").expect("touch");
 
-        let canonical = lock_path_for(&db);
+        let canonical = lock_path_for(&db).expect("a resolvable path yields a lease key");
         assert!(
             canonical.is_absolute(),
             "a lock identity derived from the caller's string would be relative and \
@@ -481,7 +635,7 @@ mod tests {
 
         // A path that does not exist yet still gets an absolute, stable identity.
         let missing = d.join("not-created-yet.db");
-        let lock_missing = lock_path_for(&missing);
+        let lock_missing = lock_path_for(&missing).expect("a missing file still has a key");
         assert!(
             lock_missing.is_absolute(),
             "a database about to be created must still get a stable absolute identity"
@@ -545,7 +699,7 @@ mod tests {
         let d = dir("stable");
         let db = d.join("state.db");
         std::fs::write(&db, b"").expect("touch");
-        let path = lock_path_for(&db);
+        let path = lock_path_for(&db).expect("a resolvable path yields a lease key");
 
         let first = acquire_shared(&db).expect("first");
         let inode_before = std::fs::metadata(&path).expect("metadata").ino();

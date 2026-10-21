@@ -74,6 +74,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod alias;
 pub mod backup;
 pub mod faults;
 pub mod migration;
@@ -89,6 +90,7 @@ pub mod sqlite;
 pub mod task_repo;
 pub mod tx;
 
+pub use alias::{AliasRefusal, OpenFailure};
 pub use migration::{MigrationError, MigrationRunner};
 pub use pragma::{Pragma, PragmaError};
 pub use region::{RegionRegistry, StateRegion, task_layer_regions};

@@ -384,3 +384,104 @@ fn a_file_exactly_at_the_ceiling_is_read() {
     }
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+/// **A hard link into the workspace is refused, even though the path is inside it.**
+///
+/// This is the F-26c aliasing escape, reproduced through the **real** governed path --
+/// the real dispatcher, the real sandbox, the real helper binary, the real verifier.
+/// A path-validation unit test would not have caught it: the path genuinely is inside
+/// the workspace, and every lexical check passes.
+///
+/// The mechanism: a file that lives *outside* the workspace is given a second name
+/// *inside* it. The sandbox mounts the workspace, and a hard link inside the mounted
+/// directory is a second name for the same inode -- so the content is reachable through
+/// the mount even though the content itself lives outside it. The sandbox cannot see
+/// that, because from inside the mount there is only one directory entry.
+///
+/// The mitigation is in the helper, and it is decided on the **opened descriptor**: the
+/// link count of the inode that is actually read. A file with exactly one link cannot
+/// be an alias for something outside, because a second name is exactly what a second
+/// link is.
+#[test]
+fn a_hard_linked_file_from_outside_the_workspace_is_refused_by_the_helper() {
+    let ws = workspace("hardlink");
+    // A directory beside the workspace, on the same filesystem, holding the real file.
+    let outside =
+        std::env::temp_dir().join(format!("orxnud-rt-outside-{}-hardlink", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+    // A unique, synthetic, non-sensitive sentinel.
+    let sentinel = "HARDLINK-SENTINEL-7f3c1d9a-THIS-IS-NOT-A-REAL-FILE";
+    let real = outside.join("real.txt");
+    std::fs::write(&real, sentinel.as_bytes()).expect("seed outside");
+
+    // The alias: an ordinary-looking name inside the workspace.
+    let alias = ws.join("innocent.txt");
+    std::fs::hard_link(&real, &alias).expect(
+        "the hard link must be created: on the intended Linux environment this \
+         filesystem supports links, and a test that silently skipped would be no \
+         evidence of anything",
+    );
+    // Confirm the alias really is a second name for that file, or the test proves
+    // nothing. The link count is the question the helper asks, asked here of the
+    // *alias*; where the platform cannot answer it, that is stated rather than
+    // papered over -- see the `None` branch below.
+    let alias_meta = std::fs::metadata(&alias).expect("stat alias");
+    let real_meta = std::fs::metadata(&real).expect("stat real");
+    assert_eq!(
+        alias_meta.len(),
+        real_meta.len(),
+        "precondition: the alias must name a file of the same size"
+    );
+    let link_count = orxnud_platform_fs::hard_link_count(&alias_meta);
+
+    // The governed read, through the real path, with a correctly scoped approval.
+    let outcome = dispatch_read(&ws, "innocent.txt", Some(&approval("innocent.txt"))).expect(
+        "the dispatch itself must proceed: a path-validation refusal is not \
+                evidence that the helper refused the alias",
+    );
+
+    // Where the platform cannot establish a link count, the helper refuses because the
+    // count is unavailable, not because it is a hard link. The read is still refused --
+    // which is the property that matters -- but this test does **not** claim to have
+    // established the link-count behaviour, and it says so instead of pretending.
+    if let Some(count) = link_count {
+        assert_eq!(
+            count, 2,
+            "precondition: the inode must have two links, or the alias is not an alias"
+        );
+    } else {
+        eprintln!(
+            "note: this platform does not expose a link count, so the helper refuses \
+             for want of one; the link-count behaviour itself is not established here"
+        );
+    }
+
+    // The helper must have run and refused. The result is a failed execution with an
+    // undetermined verdict -- the same shape as any other helper failure.
+    assert!(
+        !outcome.is_verified(),
+        "a hard-linked file must not be reported as a verified read: {outcome:?}"
+    );
+    match &outcome.execution {
+        ExecutionOutcome::Succeeded { output } => panic!(
+            "the helper must refuse the aliased inode, but the read succeeded with \
+             {output:?}"
+        ),
+        other => {
+            let rendered = format!("{other:?}");
+            assert!(
+                rendered.contains("hard link"),
+                "the refusal must be the helper's hard-link refusal, not some other                  failure: {rendered}"
+            );
+            assert!(
+                !rendered.contains(sentinel),
+                "the sentinel must never appear in the outcome: {rendered}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&outside);
+    let _ = std::fs::remove_dir_all(&ws);
+}

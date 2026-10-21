@@ -38,9 +38,12 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
-/// Must match `read_text::MAX_READ_BYTES`. The verifier applies the same ceiling, so the two
-/// halves of one read agree on what "too big" means.
-const MAX_READ_BYTES: u64 = 64 * 1024;
+/// The read ceiling, taken from the capability's own definition rather than restated.
+///
+/// The helper and the verifier are two halves of one read, and a ceiling that is
+/// written down twice is a ceiling that can drift. The preview surface in the daemon
+/// reports this same number, so all three read it from one place.
+const MAX_READ_BYTES: u64 = orxnud_capability::read_text::MAX_READ_BYTES;
 
 fn main() {
     match run() {
@@ -75,11 +78,21 @@ fn run() -> Result<(), String> {
     }
 
     // Lexical normalisation, so `a/../b` is understood here rather than by the kernel.
-    // Not the security boundary -- the sandbox is -- but refusing a climbing path keeps the
-    // failure legible instead of incidental.
+    // Refusing a climbing path keeps the failure legible instead of incidental, but it is
+    // **not** the boundary that keeps a read inside the workspace: the sandbox mounts the
+    // workspace, and a *hard link* inside the mounted workspace is a second name for an
+    // inode that may live outside it. The sandbox cannot see that, so the boundary is
+    // established below, on the opened descriptor.
     let normalised = normalise(target)?;
 
-    let meta = std::fs::metadata(&normalised)
+    // **Open first, then decide from the descriptor.** A pathname-based `metadata` call
+    // followed by an `open` is two observations of a name, and the file they name can
+    // change between them. Everything below is therefore taken from the descriptor that
+    // is actually read: the object, the size, and the link count.
+    let file = std::fs::File::open(&normalised)
+        .map_err(|e| format!("could not open {}: {e}", normalised.display()))?;
+    let meta = file
+        .metadata()
         .map_err(|e| format!("could not stat {}: {e}", normalised.display()))?;
 
     // A directory is refused rather than read, and refused *specially*: reading one would
@@ -87,6 +100,32 @@ fn run() -> Result<(), String> {
     // read, and a capability named `read-text` must not have a mode that returns names.
     if !meta.is_file() {
         return Err(format!("{} is not a regular file", normalised.display()));
+    }
+
+    // **A hard-linked file is refused.** A file with more than one directory entry can be
+    // reached through a name that is inside the workspace while its content lives outside
+    // it, and the sandbox -- which mounts the workspace -- cannot tell the difference.
+    // The link count of the *opened* descriptor is what settles it, and the decision is
+    // made on the same inode that is then read, so there is no window between the check
+    // and the bytes it governs.
+    //
+    // The count is not available everywhere, and a count that cannot be established is
+    // not a count of one: it fails **closed**, because the alternative is to read a file
+    // whose containment was never checked.
+    let links = orxnud_platform_fs::hard_link_count(&meta).ok_or_else(|| {
+        format!(
+            "{}: the hard-link count cannot be established on this platform, so the read \
+             is refused rather than performed unchecked",
+            normalised.display()
+        )
+    })?;
+    if links != 1 {
+        return Err(format!(
+            "{} has {links} hard link(s); only a file with exactly one link can be read, \
+             because a second link is a second name for an inode that may live outside the \
+             workspace",
+            normalised.display()
+        ));
     }
 
     // Refused, not truncated. Checked before reading, so an oversized file is never loaded.
@@ -108,8 +147,6 @@ fn run() -> Result<(), String> {
     //
     // `take` is what makes the bound real -- it stops reading rather than reading and then
     // discarding, so peak memory is the limit and not the file's size.
-    let file = std::fs::File::open(&normalised)
-        .map_err(|e| format!("could not open {}: {e}", normalised.display()))?;
     let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
     file.take(MAX_READ_BYTES + 1)
         .read_to_end(&mut bytes)

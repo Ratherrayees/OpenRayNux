@@ -100,6 +100,9 @@ fn parse_args() -> Result<Action, String> {
     // `cargo check --release` warns about the unused `mut`, which is the proof.
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut permit_argv_payload_for_tests = false;
+    // Only ever set in a debug build, for the same reason as the flag above.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut provider_credential_file: Option<std::path::PathBuf> = None;
     let mut scripted = false;
     let mut doctor = false;
     let mut args = std::env::args().skip(1);
@@ -166,6 +169,35 @@ fn parse_args() -> Result<Action, String> {
             "--permit-argv-payload-exposure-for-tests" => {
                 permit_argv_payload_for_tests = true;
             }
+            // A test affordance, and deliberately not reachable in a shipped binary.
+            //
+            // The provider credential comes from the platform credential store, which
+            // on a developer's machine holds the developer's own secret. A suite that
+            // spawns this binary needs a *synthetic* credential instead, so this names
+            // a file to read one from.
+            //
+            // It does not disable the credential check. The daemon still resolves a
+            // credential through the ordinary contract, still refuses when there is
+            // none, and still sends it in the `Authorization` header. And it never
+            // falls back to the platform store: a file that cannot be read is a
+            // refusal to start, so a misconfigured test fails loudly instead of
+            // quietly using whatever secret the machine happens to hold.
+            //
+            // `cfg(debug_assertions)` means a shipped release binary rejects this as
+            // an unrecognised argument, exactly as it does the argv-payload flag.
+            #[cfg(debug_assertions)]
+            "--provider-credential-file" => {
+                provider_credential_file =
+                    Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                        "--provider-credential-file needs a path".to_owned()
+                    })?));
+            }
+            #[cfg(debug_assertions)]
+            other if other.starts_with("--provider-credential-file=") => {
+                provider_credential_file = Some(std::path::PathBuf::from(
+                    &other["--provider-credential-file=".len()..],
+                ));
+            }
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
@@ -181,6 +213,7 @@ fn parse_args() -> Result<Action, String> {
         root,
         provider: ProviderChoice::new(base_url, model, scripted),
         permit_argv_payload_for_tests,
+        provider_credential_file,
     })
 }
 
@@ -205,6 +238,9 @@ enum Action {
         /// Grant the argv-payload exception. See [`Action::Serve`]: only settable by a
         /// debug build, and only by a flag whose name says what it is.
         permit_argv_payload_for_tests: bool,
+        /// Read the provider credential from this file instead of the platform store.
+        /// Only settable by a debug build; `None` means the platform store.
+        provider_credential_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -285,13 +321,18 @@ fn main() -> ExitCode {
         }
         Action::Serve { .. } => {}
     };
-    let (provider, permit_argv_payload_for_tests) = match &action {
+    let (provider, permit_argv_payload_for_tests, provider_credential_file) = match &action {
         Action::Serve {
             provider,
             permit_argv_payload_for_tests,
+            provider_credential_file,
             ..
-        } => (provider.clone(), *permit_argv_payload_for_tests),
-        _ => (ProviderChoice::None, false),
+        } => (
+            provider.clone(),
+            *permit_argv_payload_for_tests,
+            provider_credential_file.clone(),
+        ),
+        _ => (ProviderChoice::None, false, None),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -306,7 +347,13 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
-        serve(Paths::under(&root), provider, permit_argv_payload_for_tests).await
+        serve(
+            Paths::under(&root),
+            provider,
+            permit_argv_payload_for_tests,
+            provider_credential_file,
+        )
+        .await
     })
 }
 
@@ -316,11 +363,132 @@ fn main() -> ExitCode {
 /// refusal at startup rather than a guess here, because a default model name silently
 /// substituted for a missing one is a daemon that reports proposals from a model nobody
 /// chose.
+/// The secret store this daemon reads its provider credential from.
+///
+/// One type, two sources: the platform store in every build, and -- in a debug
+/// build only -- a file, so a suite can run this binary with a synthetic
+/// credential and never read the developer's own.
+#[derive(Clone)]
+enum DaemonSecrets {
+    /// The platform credential store.
+    Platform(KeyringSecrets),
+    /// A file, for a test that must not touch the platform store.
+    #[cfg(debug_assertions)]
+    File(orxnud_daemon::test_support::FileSecrets),
+}
+
+impl DaemonSecrets {
+    /// The stale probe entry to warn about, if this store has one.
+    fn stale_probe_entry(&self) -> Option<&str> {
+        match self {
+            Self::Platform(store) => store.stale_probe_entry(),
+            #[cfg(debug_assertions)]
+            Self::File(_) => None,
+        }
+    }
+}
+
+/// A failure from either secret store.
+#[derive(Debug)]
+enum DaemonSecretError {
+    /// The platform store failed.
+    Platform(orxnud_platform_secrets::SecretError),
+    /// The file-backed test store failed.
+    #[cfg(debug_assertions)]
+    File(String),
+}
+
+impl std::fmt::Display for DaemonSecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Platform(e) => write!(f, "{e}"),
+            #[cfg(debug_assertions)]
+            Self::File(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonSecretError {}
+
+impl orxnud_domain::platform::SecretsContract for DaemonSecrets {
+    type Error = DaemonSecretError;
+
+    fn get(
+        &self,
+        reference: &orxnud_domain::platform::SecretRef,
+    ) -> Result<orxnud_domain::platform::SecretLookup, Self::Error> {
+        match self {
+            Self::Platform(store) => store.get(reference).map_err(DaemonSecretError::Platform),
+            #[cfg(debug_assertions)]
+            Self::File(store) => store
+                .get(reference)
+                .map_err(|e| DaemonSecretError::File(e.to_string())),
+        }
+    }
+
+    fn set(
+        &self,
+        reference: &orxnud_domain::platform::SecretRef,
+        value: &str,
+    ) -> Result<(), Self::Error> {
+        match self {
+            Self::Platform(store) => store
+                .set(reference, value)
+                .map_err(DaemonSecretError::Platform),
+            #[cfg(debug_assertions)]
+            Self::File(store) => store
+                .set(reference, value)
+                .map_err(|e| DaemonSecretError::File(e.to_string())),
+        }
+    }
+
+    fn delete(&self, reference: &orxnud_domain::platform::SecretRef) -> Result<(), Self::Error> {
+        match self {
+            Self::Platform(store) => store.delete(reference).map_err(DaemonSecretError::Platform),
+            #[cfg(debug_assertions)]
+            Self::File(store) => store
+                .delete(reference)
+                .map_err(|e| DaemonSecretError::File(e.to_string())),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        match self {
+            Self::Platform(store) => store.is_available(),
+            #[cfg(debug_assertions)]
+            Self::File(_) => true,
+        }
+    }
+}
+
 async fn serve(
     paths: Paths,
     choice: ProviderChoice,
     permit_argv_payload_for_tests: bool,
+    provider_credential_file: Option<std::path::PathBuf>,
 ) -> ExitCode {
+    // One store, chosen once, before anything else: the provider and the runtime
+    // must resolve the credential through the *same* store, or the availability
+    // one of them reports cannot describe the one the other uses.
+    //
+    // A credential file that cannot be read is a refusal to start. Falling back to
+    // the platform store here would mean a test that meant to be hermetic quietly
+    // used the machine's real secret -- and the failure would be invisible until
+    // something leaked.
+    let secrets: DaemonSecrets = match provider_credential_file {
+        #[cfg(debug_assertions)]
+        Some(path) => match orxnud_daemon::test_support::FileSecrets::from_file(&path) {
+            Ok(store) => DaemonSecrets::File(store),
+            Err(why) => {
+                eprintln!(
+                    "orxnud: refusing to start: the provider credential could not be \
+                          used: {why}"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => DaemonSecrets::Platform(KeyringSecrets::new()),
+    };
     let provider: Option<std::sync::Arc<dyn orxnud_daemon::proposer::ProposalProvider>> =
         match choice {
             ProviderChoice::None => {
@@ -354,13 +522,20 @@ async fn serve(
                 match orxnud_daemon::http_provider::provider_from_settings(
                     Some(&base_url),
                     Some(&model),
-                    KeyringSecrets::new(),
+                    secrets.clone(),
                 ) {
                     Ok(p) => {
+                        // The configured destination is shown through the safe
+                        // projection, never raw: a base URL may carry user
+                        // information, a query string, a fragment or a credential,
+                        // and a startup banner is read by whoever is watching the
+                        // machine, not only by the operator who typed the URL.
                         eprintln!(
-                            "orxnud: proposal provider configured ({} model {})",
-                            p.config().base_url,
-                            p.config().model
+                            "orxnud: proposal provider configured: {}",
+                            orxnud_daemon::observation::redacted_destination(
+                                &p.config().base_url,
+                                &p.config().model,
+                            )
                         );
                         Some(std::sync::Arc::new(p))
                     }
@@ -371,10 +546,6 @@ async fn serve(
                 }
             }
         };
-
-    // One store instance for both the startup report and the runtime, so the availability
-    // reported cannot come from a different probe than the one that is used.
-    let secrets = KeyringSecrets::new();
 
     // The ordering that matters is inside `Runtime::start`: durable security state is
     // attached before the endpoint exists. If it fails here, nothing was bound.

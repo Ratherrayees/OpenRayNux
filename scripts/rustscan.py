@@ -279,6 +279,13 @@ class CfgPredicate:
     line: int
     text: str
     is_cfg_attr: bool
+    #: Index just past the ``]`` that closes the attribute this predicate is in.
+    #:
+    #: The predicate alone does not say where the *item* it applies to begins: an
+    #: attribute is ``#[cfg(...)]``, and the item follows the closing bracket. This
+    #: is what lets the item's extent be found from the text that actually follows
+    #: the attribute, instead of by searching forwards for an item keyword.
+    attr_end: int = 0
 
 
 def _match_paren(code: str, open_idx: int) -> int:
@@ -318,11 +325,17 @@ def cfg_predicates(src: str, mask: list[bool]) -> list[CfgPredicate]:
             continue
         raw = code[open_idx + 1 : end - 1]
         is_cfg_attr = bool(m.group(1))
+        # The attribute's closing bracket: the first `]` at a code position after
+        # the predicate. A `]` inside a string is not a code position, so it cannot
+        # be mistaken for the end of the attribute.
+        close = code.find("]", end)
+        attr_end = len(src) if close == -1 else close + 1
         found.append(
             CfgPredicate(
                 line=line_of(src, m.start()),
                 text=raw,
                 is_cfg_attr=is_cfg_attr,
+                attr_end=attr_end,
             )
         )
     return found
@@ -500,6 +513,134 @@ class TestOnlyRegion:
     predicate: str
 
 
+def _matching_brace(src: str, mask: list[bool], open_idx: int) -> int:
+    """Index of the ``}`` closing the ``{`` at ``open_idx``, or ``-1``.
+
+    Counts only code positions, so a brace inside a string, a raw string or a
+    comment cannot shift the match.
+    """
+    depth = 0
+    for i in range(open_idx, len(src)):
+        if not mask[i]:
+            continue
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _skip_attributes_and_space(src: str, mask: list[bool], i: int) -> int:
+    """Index of the first code token at or after ``i``, skipping attributes.
+
+    Attributes and whitespace may sit between the attribute under examination
+    and the item it applies to (``#[cfg(test)] #[derive(Debug)] struct S``), and
+    comments sit there too. All three are skipped, because the item is what
+    follows them, not any of them.
+    """
+    n = len(src)
+    while i < n:
+        if src[i] == "#":
+            j = i + 1
+            while j < n and src[j] in " \t":
+                j += 1
+            if j < n and src[j] == "[":
+                depth = 0
+                while j < n:
+                    if src[j] == "[":
+                        depth += 1
+                    elif src[j] == "]":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            break
+                    j += 1
+                i = j
+                continue
+            break
+        if not mask[i] or src[i].isspace():
+            i += 1
+            continue
+        break
+    return i
+
+
+def attributed_item_span(src: str, mask: list[bool], after: int) -> tuple[int, int] | None:
+    """The character span of the item an attribute applies to.
+
+    ``after`` is the index just past the attribute's closing ``]``. The returned
+    span is ``(start, end)``: ``start`` is the item's first code token and
+    ``end`` is one past the item's last character.
+
+    # Why the item is found from the text that follows the attribute
+
+    The previous rule searched *forwards* for an item keyword (``fn``, ``mod``,
+    ``impl``, ...) and then took the body after it. That silently attributes an
+    attribute to a **later, unrelated** item whenever the item it really applies
+    to is not one of those keywords — a ``use`` item, a macro invocation, or a
+    statement. The consequence is not a cosmetic off-by-one: the *later* item's
+    body is blanked, so production code disappears from the scanner's input and
+    the gates stop seeing it.
+
+    That is not hypothetical. In ``crates/orxnud-store/src/backup.rs`` the line
+    ``#[cfg(test)] use std::cell::RefCell;`` sits immediately above
+    ``impl Backup { ... }``. The keyword search skipped the ``use`` item, found
+    ``impl``, and blanked the whole ``impl`` block — 608 lines of production
+    code, including every ``Connection::open`` in it — out of the view of gate
+    **G17**. The rule is therefore: find the item where the attribute says it
+    is, not where the next keyword happens to be.
+
+    # The extent of an item
+
+    * An item with a body — ``fn``, ``mod``, ``impl``, ``struct``, ``enum``, a
+      macro invocation — ends at the ``}`` matching the first ``{`` at depth 0.
+    * An item without one — ``use``, ``let``, a statement — ends at the first
+      ``;`` at depth 0.
+    * A ``use`` item's braces are a *use tree*, not a body, so a ``use`` ends at
+      its ``;`` even though it contains braces.
+
+    Depth is tracked over ``()``, ``[]`` and ``{}``, so a brace inside a call's
+    arguments is not mistaken for a body.
+
+    # Failure behaviour
+
+    ``None`` means no item could be located. The caller decides what to do with
+    that, and the callers all fail in the safe direction: blank too little and a
+    gate may report a false positive, which is visible and cheap; blank too much
+    and production code is hidden, which is not.
+    """
+    start = _skip_attributes_and_space(src, mask, after)
+    if start >= len(src):
+        return None
+
+    # A `use` item's braces are a use tree, not a body.
+    j = start
+    while j < len(src) and (src[j].isalnum() or src[j] == "_"):
+        j += 1
+    is_use = src[start:j] == "use"
+
+    depth = 0
+    i = start
+    while i < len(src):
+        if mask[i]:
+            c = src[i]
+            if c in "([{":
+                if c == "{" and depth == 0 and not is_use:
+                    close = _matching_brace(src, mask, i)
+                    if close == -1:
+                        return None
+                    return (start, close + 1)
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == ";" and depth == 0:
+                return (start, i + 1)
+        i += 1
+    return None
+
+
 def test_only_regions(src: str, mask: list[bool]) -> list[TestOnlyRegion]:
     """Spans of ``src`` that are test-only because a real ``cfg`` attribute says so.
 
@@ -508,52 +649,22 @@ def test_only_regions(src: str, mask: list[bool]) -> list[TestOnlyRegion]:
     ``#[cfg(test)] fn helper() { ... }`` likewise. An attribute with no brace at all
     -- ``#[cfg(test)] use foo;`` -- covers only its own line.
 
-    The end is found by brace counting, so nesting is handled rather than assumed:
-    the old rule ("the first line starting with ``}`` at column 0") happened to work
-    for rustfmt output and silently truncated anything else, which is a gate that
-    passes for the wrong reason.
+    The end is found from the item the attribute applies to, using
+    :func:`attributed_item_span`, so nesting is handled rather than assumed and
+    an attribute is never allowed to swallow a *later* item's body.
     """
     regions: list[TestOnlyRegion] = []
     for pred in cfg_predicates(src, mask):
         if pred.is_cfg_attr or not is_test_only_predicate(pred.text):
             continue
         start = pred.line - 1
-        # Find the item's opening brace after the attribute.
-        brace = _first_brace_after(src, mask, pred.line)
-        if brace == -1:
+        span = attributed_item_span(src, mask, pred.attr_end)
+        if span is None:
             regions.append(TestOnlyRegion(start + 1, start + 1, pred.text))
             continue
-        end = _matching_brace_line(src, mask, brace)
+        end = line_of(src, span[1] - 1)
         regions.append(TestOnlyRegion(start + 1, end, pred.text))
     return regions
-
-
-def _first_brace_after(src: str, mask: list[bool], after_line: int) -> int:
-    """Index of the first ``{`` at a code position on a line after ``after_line``."""
-    code = code_only(src, mask)
-    line_start = 0
-    for _ in range(after_line):
-        nxt = code.find("\n", line_start)
-        if nxt == -1:
-            return -1
-        line_start = nxt + 1
-    brace = code.find("{", line_start)
-    return -1 if brace == -1 else brace
-
-
-def _matching_brace_line(src: str, mask: list[bool], brace_idx: int) -> int:
-    """1-based line of the ``}`` closing the ``{`` at ``brace_idx``."""
-    depth = 0
-    for i in range(brace_idx, len(src)):
-        if not mask[i]:
-            continue
-        if src[i] == "{":
-            depth += 1
-        elif src[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return line_of(src, i)
-    return len(src.split("\n"))
 
 
 def test_only_line_mask(src: str) -> list[bool]:
@@ -847,6 +958,112 @@ def _selftest() -> int:
     check("delimiter count", len(m), 2)
     check("blank_range preserves length", len(blank_range(src, 3, 7)), len(src))
     check("blank_range preserves surrounding code", blank_range(src, 3, 7)[8:], src[8:])
+
+    # -- 5. which item an attribute applies to ------------------------------
+    #
+    # The defect these guard: the item was found by searching *forwards* for an
+    # item keyword, so an attribute whose item was not keyword-introduced -- a
+    # `use`, a macro invocation, a statement -- was attributed to a **later**,
+    # unrelated item, whose body was then blanked. In
+    # `crates/orxnud-store/src/backup.rs` the line `#[cfg(test)] use
+    # std::cell::RefCell;` sits immediately above `impl Backup { ... }`, and the
+    # whole `impl` block -- 608 lines of production code, including every
+    # `Connection::open` in it -- was blanked out of gate G17's view.
+
+    def span_text(src: str) -> str:
+        """The text of the item the first `#[cfg(test)]` attribute applies to."""
+        mask = code_mask(src)
+        close = src.index("]")
+        span = attributed_item_span(src, mask, close + 1)
+        return "" if span is None else src[span[0] : span[1]]
+
+    check(
+        "a use item's span is the statement",
+        span_text("#[cfg(test)]\nuse std::cell::RefCell;\n\nimpl Backup { fn p() {} }\n").strip(),
+        "use std::cell::RefCell;",
+    )
+    check(
+        "a macro invocation's span is the whole invocation",
+        span_text(
+            "#[cfg(test)]\nstd::thread_local! {\n    static S: u8 = const { 0 };\n}\n"
+            "\nfn p() {}\n"
+        ),
+        "std::thread_local! {\n    static S: u8 = const { 0 };\n}",
+    )
+    check(
+        "a statement's span ends at its semicolon",
+        span_text("#[cfg(test)]\nseams::check(Fault::X);\n\nfn p() {}\n").strip(),
+        "seams::check(Fault::X);",
+    )
+
+    # A production function after a test-only macro invocation must survive.
+    src = """
+#[cfg(test)]
+std::thread_local! {
+    static SEAMS: RefCell<u8> = const { RefCell::new(0) };
+}
+
+pub fn production() {
+    let _ = 1;
+}
+"""
+    view = strip_test_only(src)
+    check("a production fn after a cfg(test) macro survives", "pub fn production" in view, True)
+    check("the cfg(test) macro is excluded", "SEAMS" in view, False)
+
+    # The `use` item that hid 608 lines of production code.
+    src = """
+#[cfg(test)]
+use std::cell::RefCell;
+
+impl Backup {
+    pub fn production(&self) -> u8 { 1 }
+}
+"""
+    view = strip_test_only(src)
+    check("an impl after a cfg(test) use survives", "impl Backup" in view, True)
+    check("the cfg(test) use is excluded", "use std::cell::RefCell" in view, False)
+
+    # Nested braces inside a test-only item must not swallow what follows.
+    src = """
+#[cfg(test)]
+fn a_test() {
+    let x = Foo { a: { b: 1 } };
+}
+
+pub fn production() {}
+"""
+    view = strip_test_only(src)
+    check("nested braces do not swallow the next item", "pub fn production" in view, True)
+    check("the test fn's body is excluded", "Foo {" in view, False)
+
+    # Braces and test-looking text inside strings and comments must not move a
+    # boundary.
+    src = """
+#[cfg(test)]
+fn a_test() {
+    let s = "} { #[cfg(test)] fn fake() {";
+    /* a comment with { and } */
+}
+
+pub fn production() {}
+"""
+    view = strip_test_only(src)
+    check("a brace in a string does not corrupt the boundary", "pub fn production" in view, True)
+    check("a cfg inside a string is not a region", "fn fake()" in view, False)
+
+    # A test-only function is excluded, and the production code after it is not.
+    src = """
+#[cfg(test)]
+fn a_test() {
+    let _c = rusqlite::Connection::open("/tmp/scratch.db");
+}
+
+pub fn production() {}
+"""
+    view = strip_test_only(src)
+    check("a cfg(test) fn's body is excluded", "scratch.db" in view, False)
+    check("the production fn after it survives", "pub fn production" in view, True)
 
     if failures:
         for f in failures:

@@ -637,21 +637,24 @@ fn a_dispatch_is_audited_with_a_real_wall_clock_instant() {
 
 /// The `at-ms` instant of every audited dispatch record, in chain order.
 fn audited_at_ms(d: &Path) -> Vec<i64> {
-    orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-        .expect("open the journal the runtime wrote")
-        .entries()
-        .expect("entries")
-        .iter()
-        .filter_map(|e| {
-            let v: Value = serde_json::from_slice(&e.payload).ok()?;
-            let outcome = v.get("outcome")?;
-            outcome
-                .get("detail")
-                .and_then(|d| d.get("at-ms"))
-                .or_else(|| outcome.get("at-ms"))
-                .and_then(Value::as_i64)
-        })
-        .collect()
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &d.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the journal the runtime wrote")
+    .entries()
+    .expect("entries")
+    .iter()
+    .filter_map(|e| {
+        let v: Value = serde_json::from_slice(&e.payload).ok()?;
+        let outcome = v.get("outcome")?;
+        outcome
+            .get("detail")
+            .and_then(|d| d.get("at-ms"))
+            .or_else(|| outcome.get("at-ms"))
+            .and_then(Value::as_i64)
+    })
+    .collect()
 }
 
 /// How many records the durable journal holds.
@@ -661,23 +664,29 @@ fn audit_rows(d: &Path) -> u64 {
 
 /// The persisted record count, via the store's own migration-verified database.
 fn audit_count_from_disk(d: &Path) -> u64 {
-    orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-        .expect("open the journal the runtime wrote")
-        .entries()
-        .expect("entries")
-        .len() as u64
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &d.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the journal the runtime wrote")
+    .entries()
+    .expect("entries")
+    .len() as u64
 }
 
 /// The highest persisted sequence number.
 fn max_seq(d: &Path) -> u64 {
-    orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-        .expect("open")
-        .entries()
-        .expect("entries")
-        .iter()
-        .map(|e| e.seq)
-        .max()
-        .unwrap_or(0)
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &d.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open")
+    .entries()
+    .expect("entries")
+    .iter()
+    .map(|e| e.seq)
+    .max()
+    .unwrap_or(0)
 }
 
 #[cfg_attr(

@@ -83,6 +83,14 @@ pub enum Method {
     /// actor may do -- it can only produce the artefact the dispatcher's anti-Loopjacking
     /// check compares against.
     CapabilityApprove,
+    /// A read-only preview of a pending proposal, for a human to inspect before
+    /// deciding whether to approve it.
+    ///
+    /// **Not an authorisation and not a dispatch.** It creates no approval, executes no
+    /// capability, reads no file and changes no task state. It exists so that what an
+    /// operator is about to authorise can be *shown* to them, rather than summarised by
+    /// the client that is asking for the approval.
+    CapabilityPreview,
 
     /// Ask for a governed action to be proposed by a running task.
     ///
@@ -147,7 +155,7 @@ impl Method {
     ///
     /// The single place the set is written down. `all_method_names` reads it, so a
     /// new variant cannot be added without appearing there too.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::DaemonStatus,
         Self::DaemonVersion,
         Self::CapabilityList,
@@ -159,6 +167,7 @@ impl Method {
         Self::TaskComplete,
         Self::TaskCancel,
         Self::CapabilityApprove,
+        Self::CapabilityPreview,
         Self::TaskPropose,
         Self::TaskExecute,
         Self::TaskAiPropose,
@@ -182,6 +191,7 @@ impl Method {
             Self::TaskComplete => "task/complete",
             Self::TaskCancel => "task/cancel",
             Self::CapabilityApprove => "capability/approve",
+            Self::CapabilityPreview => "capability/preview",
             Self::TaskPropose => "task/propose",
             Self::TaskExecute => "task/execute",
             Self::TaskAiPropose => "task/ai-propose",
@@ -212,6 +222,7 @@ impl Method {
             "task/complete" => Some(Self::TaskComplete),
             "task/cancel" => Some(Self::TaskCancel),
             "capability/approve" => Some(Self::CapabilityApprove),
+            "capability/preview" => Some(Self::CapabilityPreview),
             "task/propose" => Some(Self::TaskPropose),
             "task/execute" => Some(Self::TaskExecute),
             "task/ai-propose" => Some(Self::TaskAiPropose),

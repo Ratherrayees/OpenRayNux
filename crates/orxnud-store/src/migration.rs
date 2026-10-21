@@ -36,6 +36,8 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use orxnud_domain::platform::FilesystemIdentity;
+
 use crate::backup::{Backup, BackupError};
 use crate::sqlite::StoreError;
 
@@ -552,15 +554,24 @@ fn now_ms() -> i64 {
 
 /// Convenience: open a store and migrate it in one step.
 ///
+/// # The filesystem-identity capability is required
+///
+/// As [`crate::sqlite::Store::open`]: ADR-0058 Decision 2 requires every open of a
+/// database to present the capability that can say how many names reach it, and
+/// requires a platform that cannot answer to be a refusal.
+///
 /// # Errors
 ///
 /// Any [`StoreError`].
-pub fn open_and_migrate(path: &std::path::Path) -> Result<crate::sqlite::Store, StoreError> {
+pub fn open_and_migrate(
+    path: &std::path::Path,
+    identity: &dyn FilesystemIdentity,
+) -> Result<crate::sqlite::Store, StoreError> {
     // Whether the file already exists is read *before* opening it, because a failed
     // first migration must not leave a half-built file behind for the next start to
     // inherit. See `discard_failed_initialisation`.
     let pre_existing = path.exists();
-    let store = crate::sqlite::Store::open(path, true)?;
+    let store = crate::sqlite::Store::open(path, true, identity)?;
     match MigrationRunner::new(store.conn()).migrate(path) {
         Ok(_) => Ok(store),
         Err(MigrationError::RecoveryRequired { source, snapshot }) => {
@@ -568,7 +579,7 @@ pub fn open_and_migrate(path: &std::path::Path) -> Result<crate::sqlite::Store, 
             // on this path could not take exclusive ownership. Drop it first, which
             // closes the connection and releases the lease, then recover.
             drop(store);
-            recover_from_snapshot(path, &snapshot)?;
+            recover_from_snapshot(path, &snapshot, identity)?;
             Err(StoreError::Migration(source))
         }
         Err(e) => {
@@ -588,15 +599,26 @@ pub fn open_and_migrate(path: &std::path::Path) -> Result<crate::sqlite::Store, 
 /// 2. exclusive ownership is taken (S-31), failing fast if another process holds it;
 /// 3. the snapshot is restored, which verifies the restored *logical* content (S-30).
 ///
+/// # The filesystem-identity capability is required
+///
+/// As [`crate::sqlite::Store::open`]: the restore writes **through** the existing
+/// database file, so a database reachable through a second name is one whose two
+/// names would end up holding different content. ADR-0058 Decision 2 requires the
+/// capability on every open and requires "the platform cannot say" to be a refusal.
+///
 /// # Errors
 ///
 /// [`MigrationError::RestoreFailed`] if the restore does not produce a database whose
 /// logical content matches the snapshot. The original migration error is the caller's to
 /// keep: this reports that recovery itself failed, which is a different and more urgent
 /// fact.
-pub fn recover_from_snapshot(db_path: &Path, snapshot: &Path) -> Result<(), StoreError> {
+pub fn recover_from_snapshot(
+    db_path: &Path,
+    snapshot: &Path,
+    identity: &dyn FilesystemIdentity,
+) -> Result<(), StoreError> {
     crate::backup::Backup::existing(snapshot.to_path_buf())
-        .restore_coordinated(db_path)
+        .restore_coordinated(db_path, identity)
         .map_err(|source| {
             StoreError::Migration(Box::new(MigrationError::RestoreFailed(Box::new(
                 RestoreFailure {
@@ -1448,7 +1470,7 @@ mod tests {
             "precondition: the database file must not exist before the call"
         );
 
-        let Err(err) = open_and_migrate(&path) else {
+        let Err(err) = open_and_migrate(&path, &orxnud_platform_fs::OsIdentity) else {
             panic!("the snapshot path is a directory, so the migration cannot proceed");
         };
         // The failure is reported, not swallowed by the cleanup: a silent success here
@@ -1680,7 +1702,7 @@ mod tests {
         assert!(path.exists(), "precondition: the file is already there");
 
         assert!(
-            open_and_migrate(&path).is_err(),
+            open_and_migrate(&path, &orxnud_platform_fs::OsIdentity).is_err(),
             "the snapshot cannot be taken, so the migration cannot proceed"
         );
 
@@ -1781,7 +1803,7 @@ mod tests {
         let path = dir.join("m.db");
         let _ = std::fs::remove_file(&path);
 
-        let store = open_and_migrate(&path).expect("open+migrate");
+        let store = open_and_migrate(&path, &orxnud_platform_fs::OsIdentity).expect("open+migrate");
         assert_eq!(
             MigrationRunner::new(store.conn())
                 .applied_version()
@@ -1790,7 +1812,7 @@ mod tests {
         );
         drop(store);
         // Reopen: the version is durable.
-        let store2 = open_and_migrate(&path).expect("reopen");
+        let store2 = open_and_migrate(&path, &orxnud_platform_fs::OsIdentity).expect("reopen");
         assert_eq!(
             MigrationRunner::new(store2.conn())
                 .migrate(&path)
@@ -1822,7 +1844,8 @@ mod tests {
         let path = tmp_db("fresh");
         assert!(!path.exists(), "precondition: no database yet");
 
-        let store = crate::sqlite::Store::open(&path, true).expect("open");
+        let store =
+            crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity).expect("open");
         let applied = MigrationRunner::new(store.conn())
             .migrate(&path)
             .expect("a fresh database must migrate");
@@ -1851,7 +1874,8 @@ mod tests {
         // (a) no schema_meta at all.
         let path = tmp_db("strict-nometa");
         {
-            let store = crate::sqlite::Store::open(&path, true).expect("open");
+            let store = crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity)
+                .expect("open");
             MigrationRunner::new(store.conn())
                 .migrate(&path)
                 .expect("run");
@@ -1866,7 +1890,8 @@ mod tests {
         // (b) schema_meta present but empty.
         let path = tmp_db("strict-norows");
         {
-            let store = crate::sqlite::Store::open(&path, true).expect("open");
+            let store = crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity)
+                .expect("open");
             MigrationRunner::new(store.conn())
                 .migrate(&path)
                 .expect("run");
@@ -1883,7 +1908,8 @@ mod tests {
     #[test]
     fn an_empty_snapshot_is_accepted_only_when_the_source_is_also_empty() {
         let path = tmp_db("fresh-verify");
-        let store = crate::sqlite::Store::open(&path, true).expect("open");
+        let store =
+            crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity).expect("open");
         let backup =
             Backup::take(store.conn(), &path).expect("a fresh database can be snapshotted");
 

@@ -143,6 +143,208 @@ pub trait FsContract {
     fn ensure_dir(&self, path: &std::path::Path) -> Result<(), Self::Error>;
 }
 
+/// A stable identity for a file, where the platform can establish one.
+///
+/// # What it is for
+///
+/// ADR-0058: a database's ownership is keyed by *path*, so a second name for the
+/// same file defeats it. Detecting that second name needs the file's link count,
+/// and checking that the file did not change underneath an open needs an identity
+/// to compare. Both are facts about the file rather than about the name, which is
+/// why they live here rather than in the store that consumes them.
+///
+/// # Why it is an enum, and why each variant keeps its native representation
+///
+/// The two supported platforms answer with different facts. POSIX supplies a
+/// device and inode number; Windows supplies a volume serial number and a
+/// **128-bit** file identifier. They are not convertible: truncating the Windows
+/// identifier to the low 64 bits of a POSIX `ino` would conflate distinct files,
+/// and hashing it would turn an exact comparison into a probabilistic one. Keeping
+/// each representation intact means an identity observed on one platform cannot be
+/// mistaken for an identity observed on another.
+///
+/// Neither representation is a promise that two observations of the same file
+/// always match: a file that is replaced and then replaced back with the same
+/// inode is the same file by this measure, and a file whose inode is reused after
+/// deletion is a different file by every measure this offers. The guarantee they
+/// support is narrow — "this path resolved to this file, and it still does" — and
+/// that is the guarantee ADR-0058 Decision 3 asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileId {
+    /// The POSIX device and inode number.
+    Unix {
+        /// The device the file lives on.
+        dev: u64,
+        /// The file's number within that device.
+        ino: u64,
+    },
+    /// The Windows volume serial number and full 128-bit file identifier.
+    Windows {
+        /// The serial number of the volume the file lives on.
+        volume_serial: u64,
+        /// The file's identifier within that volume, exactly as
+        /// `FILE_ID_INFO.FileId.Identifier` reports it.
+        file_id: [u8; 16],
+    },
+}
+
+/// What the platform established about a path.
+///
+/// # The three states, and why there are three
+///
+/// * [`FileFacts::Absent`] — the path does not exist. This is the normal state of
+///   a database about to be created, and it is **not** a failure. It is also not
+///   the same as "unknown": a caller that cannot tell them apart would either
+///   refuse every fresh install or treat every unanswerable question as a
+///   freshly-created file.
+/// * [`FileFacts::Known`] — the platform established the facts. This is the only
+///   state in which anything may be concluded.
+/// * [`FileFacts::Unknown`] — the platform could not establish them. The reason
+///   is carried so a refusal can name it, because "we could not tell" and "we
+///   checked and it is fine" demand opposite responses and must never collapse
+///   into the same answer.
+///
+/// ADR-0058 Decision 2 is the rule this type exists to support: **unknown is a
+/// refusal**. A permissive default that read `Unknown` as "one name, safe" would
+/// be exactly the bypass the finding describes, reached through a different door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFacts {
+    /// The path does not exist.
+    Absent,
+    /// The platform established the facts about the file.
+    Known {
+        /// How many directory entries name this file's inode.
+        ///
+        /// One means no second name can reach it. More than one means a second
+        /// name exists, and any ownership rule keyed by path is bypassed by it.
+        name_count: u64,
+        /// The file's stable identity, where the platform can supply one.
+        ///
+        /// `None` inside a `Known` means the platform answered the link-count
+        /// question but not the identity question. A caller that needs identity
+        /// continuity must treat that as unknown rather than as "unchanged".
+        identity: Option<FileId>,
+    },
+    /// The platform could not establish the facts.
+    Unknown {
+        /// The platform that could not answer, named so a refusal can say why.
+        platform: &'static str,
+    },
+}
+
+/// What the platform established about the file behind SQLite's main-database
+/// handle.
+///
+/// # Why this is not a [`FileFacts`]
+///
+/// An open connection cannot have an absent main database, and a handle that was
+/// inspected always has an identity — the two optional states in `FileFacts` do
+/// not exist here. Keeping the types separate makes "we inspected the handle but
+/// it had no identity" unrepresentable rather than a case every caller must
+/// remember to refuse.
+///
+/// # Why `NotApplicable` is not a pass
+///
+/// It is returned only by a platform that genuinely has no API for the question.
+/// It means the caller's only identity evidence is the path observation, whose
+/// limits are documented at the call site. A platform that has the API but could
+/// not use it must answer [`SqliteMainFacts::Unknown`], because on Windows every
+/// failure to inspect the handle is a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteMainFacts {
+    /// This platform does not expose the connection's native main-database handle.
+    NotApplicable,
+    /// The platform inspected the file SQLite actually opened.
+    Known {
+        /// How many directory entries name the opened file.
+        name_count: u64,
+        /// The opened file's stable identity.
+        identity: FileId,
+    },
+    /// The platform supports the check but could not establish the facts.
+    Unknown {
+        /// The platform that could not answer, named so a refusal can say why.
+        platform: &'static str,
+    },
+}
+
+/// A borrowed SQLite connection, erased so the portable core does not depend on
+/// `rusqlite`.
+///
+/// # Why this exists
+///
+/// The only way to learn which file SQLite *actually* opened is to ask the
+/// connection for its native main-database handle. That operation is
+/// platform-specific and lives in `orxnud-platform-fs`; naming
+/// `rusqlite::Connection` here would make `orxnud-domain` depend on SQLite and on
+/// a C build, which the layering forbids. This wrapper carries the borrow without
+/// naming the type.
+///
+/// # What the platform may assume
+///
+/// The connection is alive for the duration of the call. The platform must not
+/// retain the borrow, close any handle, or take ownership. A platform that does
+/// not recognise the erased type must answer [`SqliteMainFacts::Unknown`], never
+/// [`SqliteMainFacts::NotApplicable`] — the latter is reserved for platforms that
+/// have no such API at all.
+#[derive(Clone, Copy)]
+pub struct SqliteMainDatabase<'a> {
+    connection: &'a dyn std::any::Any,
+}
+
+impl<'a> SqliteMainDatabase<'a> {
+    /// Wraps a live connection for the duration of one observation.
+    #[must_use]
+    pub fn new<T: std::any::Any>(connection: &'a T) -> Self {
+        Self { connection }
+    }
+
+    /// The erased connection, for a platform implementation that knows the
+    /// concrete type.
+    #[must_use]
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.connection.downcast_ref::<T>()
+    }
+}
+
+/// The filesystem-identity capability ADR-0058 requires.
+///
+/// # The direction
+///
+/// The core defines the trait; `orxnud-platform-fs` implements it. That is the
+/// arrangement every other contract in this module follows, and it is what lets
+/// `orxnud-store` — which may depend on `orxnud-domain` and on no platform crate
+/// — require the capability without naming an operating system.
+///
+/// # Why the observation is one call
+///
+/// The two facts that matter — how many names the file has, and which file it is
+/// — are asked together on purpose. Two separate calls would be two separate
+/// resolutions of the same path, and the file could change between them; the
+/// pair would then describe two different files while looking like one
+/// observation. One call is one resolution, so what it reports is internally
+/// consistent.
+pub trait FilesystemIdentity {
+    /// What the platform can establish about `path`.
+    ///
+    /// Implementations must not invent a safe-looking answer. A metadata error,
+    /// an unsupported platform, and a path that does not exist are three
+    /// different facts and map to three different states.
+    #[must_use]
+    fn observe(&self, path: &std::path::Path) -> FileFacts;
+
+    /// What the platform can establish about the file behind the main-database
+    /// handle of `connection`.
+    ///
+    /// This is a second, independent observation. The path observation above can
+    /// be invalidated by a rename between the check and SQLite's own open; the
+    /// handle is the file SQLite is actually using. A platform that cannot
+    /// inspect the handle must say so, and on Windows every failure to do so is
+    /// a refusal rather than a fallback to the path check.
+    #[must_use]
+    fn observe_sqlite_main(&self, connection: SqliteMainDatabase<'_>) -> SqliteMainFacts;
+}
+
 /// Outcome of a secret lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretLookup {

@@ -668,6 +668,27 @@ impl DurableEngine {
             .map_err(EngineError::from)
     }
 
+    /// Removes an approval for an attempt.
+    ///
+    /// A thin pass-through to the repository, which owns the transaction. It exists
+    /// for the one case where an approval was written and the proposal it belongs
+    /// to could not be decided: the row is removed so that "an approval exists" and
+    /// "the proposal was decided" stay the same statement.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] of kind `Storage`.
+    pub fn delete_approval(
+        &mut self,
+        task_id: &orxnud_domain::ids::TaskId,
+        step_no: u32,
+        attempt_no: u32,
+    ) -> Result<bool, EngineError> {
+        self.repo()
+            .delete_approval(task_id, step_no, attempt_no)
+            .map_err(EngineError::from)
+    }
+
     /// Records a governed action this task asks to perform, and parks it for a human.
     ///
     /// A thin pass-through to the repository, which owns the transaction. Deliberately

@@ -60,12 +60,21 @@
 pub mod http_provider;
 pub mod observation;
 pub mod proposer;
+mod read_approval_challenge;
+mod read_dispatch_authorization;
 pub mod runtime;
 /// The serving loop and the bounds that govern it. See the module documentation for
 /// what changed and, more usefully, what deliberately did not.
 pub mod serve;
 pub mod task_service;
 pub mod transport;
+
+/// Test support: a file-backed secret store, for suites that must not read a
+/// developer's own credential.
+///
+/// Compiled out of release builds, so a shipped binary has no route to it.
+#[cfg(debug_assertions)]
+pub mod test_support;
 
 use std::sync::Arc;
 
@@ -641,6 +650,37 @@ pub struct Components {
     pub config_version: ConfigSchemaVersion,
     /// The instance lock plan.
     pub instance: InstanceLock,
+    /// The filesystem-identity capability every database open must present.
+    ///
+    /// # Why the composition root holds it
+    ///
+    /// ADR-0058 Decision 1: the capability is a trait in `orxnud-domain`,
+    /// implemented by the platform layer, and **injected** into the store. The
+    /// store cannot depend on `orxnud-platform-fs` — gate G2's layering forbids
+    /// it — so the platform implementation has to arrive from here, where the
+    /// platform is known.
+    ///
+    /// Decision 2: the capability is **required**. There is no default, no
+    /// fallback, and no way to open a database without one. A default that
+    /// reported "unknown" as "one name" would be the alias bypass reached
+    /// through a different door, so the only implementations that exist are the
+    /// real platform one and the ones a test writes for itself.
+    ///
+    /// # The Windows consequence
+    ///
+    /// `orxnud_platform_fs::OsIdentity` now has a native Windows path: it opens
+    /// the path with `CreateFileW`, queries `FileIdInfo` and `FileStandardInfo`,
+    /// and inspects the live SQLite main-database handle with
+    /// `SQLITE_FCNTL_WIN32_GET_HANDLE`. It no longer answers `Unknown` merely
+    /// because the platform is Windows. The earlier disposition — refuse every
+    /// open on Windows because stable Rust could not report the required facts —
+    /// is historical.
+    ///
+    /// Native Windows runtime behavior is **unverified**. The platform crate has
+    /// not built for a Windows target on the authoring host because the C
+    /// toolchain is missing, and no Windows test has run. Filesystems that cannot
+    /// supply the required identity facts still answer `Unknown` and are refused.
+    pub identity: orxnud_platform_fs::OsIdentity,
 }
 
 impl Components {
@@ -704,6 +744,27 @@ pub struct Daemon {
     /// inspectable rather than merely present.
     policy: PolicyEngine,
     started_with: Option<RequestId>,
+    /// The preview-challenge state.
+    ///
+    /// Held on the daemon, which lives inside the single governed mutex, so it is
+    /// **shared across client connections** — the client asks for a preview on one
+    /// connection and would approve on another — and it disappears when the daemon
+    /// runtime is recreated, which invalidates every outstanding challenge.
+    challenges: crate::read_approval_challenge::ChallengeState,
+    /// The read-dispatch authorizations.
+    ///
+    /// A digest-valid approval proves the *operation* was approved; it does not prove
+    /// the daemon issued that approval through a path a human reviewed. This registry
+    /// holds the digests the daemon itself created through a permitted
+    /// proposal-approval path, and a read dispatch requires one.
+    ///
+    /// Held on the daemon, so it is shared across client connections and disappears
+    /// when the runtime is recreated. A read approval persisted before a restart
+    /// therefore cannot dispatch afterwards: that is the fail-closed direction.
+    read_authorizations: crate::read_dispatch_authorization::ReadDispatchAuthorizations,
+    /// The clock the read authorizations are timed against. Monotonic and
+    /// runtime-relative, so a wall-clock step cannot extend an authorization.
+    read_clock: crate::read_approval_challenge::MonotonicClock,
 }
 
 impl Daemon {
@@ -783,12 +844,18 @@ impl Daemon {
             tracing: TracingPlan::new(),
             config_version: ConfigSchemaVersion::INITIAL,
             instance,
+            // The real platform implementation, supplied by the composition root
+            // because the store may not name a platform crate (ADR-0058).
+            identity: orxnud_platform_fs::OsIdentity,
         };
         Self {
             components,
             state: LifecycleState::Created,
             policy: PolicyEngine::new(shipped_policy_set("daemon/1"), shipped_budget(), "daemon/1"),
             started_with: None,
+            challenges: Default::default(),
+            read_authorizations: Default::default(),
+            read_clock: Default::default(),
         }
     }
 
@@ -914,12 +981,12 @@ impl Daemon {
     ) -> Result<(), LifecycleError> {
         let unavailable =
             |what: &'static str, e: String| LifecycleError::SecurityState { what, reason: e };
-        let journal = SqliteAuditJournal::open(path)
+        let journal = SqliteAuditJournal::open(path, &self.components.identity)
             .map_err(|e| unavailable("audit journal", e.to_string()))?;
         self.policy
             .restore(&journal)
             .map_err(|e| unavailable("audit journal verification", e.to_string()))?;
-        let ledger = SqliteApprovalLedger::open(path)
+        let ledger = SqliteApprovalLedger::open(path, &self.components.identity)
             .map_err(|e| unavailable("approval ledger", e.to_string()))?;
         self.policy = std::mem::replace(
             &mut self.policy,
@@ -1082,8 +1149,12 @@ impl Daemon {
     /// [`LifecycleError::Store`] if not. Present so `doctor` can report a real
     /// diagnosis; Phase 1 does not call it during `compose`.
     pub fn probe_store(&self) -> Result<Store, LifecycleError> {
-        Store::open(&self.components.paths.database, true)
-            .map_err(|e| LifecycleError::Store(e.to_string()))
+        Store::open(
+            &self.components.paths.database,
+            true,
+            &self.components.identity,
+        )
+        .map_err(|e| LifecycleError::Store(e.to_string()))
     }
 
     fn state_name(&self) -> &'static str {
@@ -1607,6 +1678,38 @@ mod argv_payload_tests {
             window.contains("#[cfg(debug_assertions)]"),
             "the test flag must be gated on debug_assertions, or a release binary gains \
              a route to permit an argv payload; the 12 lines before it are:\n{window}"
+        );
+    }
+
+    /// The credential-file flag is compiled out of release builds, too.
+    ///
+    /// `--provider-credential-file` names a file the daemon reads the provider
+    /// credential from. It exists so a suite can run the real binary with a
+    /// synthetic credential instead of the developer's own, and it is gated on
+    /// `cfg(debug_assertions)` for the same reason the argv-payload flag is: a
+    /// shipped binary must have no route to a credential that is not the one in
+    /// the platform store.
+    #[test]
+    fn the_credential_file_flag_is_compiled_out_of_release_builds() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("main.rs is readable");
+        let arm = src
+            .lines()
+            .position(|l| l.contains("\"--provider-credential-file\""))
+            .expect("the credential file flag exists");
+        let window: String = src
+            .lines()
+            .skip(arm.saturating_sub(12))
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            window.contains("#[cfg(debug_assertions)]"),
+            "the credential file flag must be gated on debug_assertions, or a release \
+             binary gains a route to a credential outside the platform store; the 12 \
+             lines before it are:\n{window}"
         );
     }
 }

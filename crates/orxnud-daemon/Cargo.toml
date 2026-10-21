@@ -22,6 +22,8 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls-native-certs = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
 orxnud-domain = { workspace = true }
 orxnud-protocol = { workspace = true }
 orxnud-store = { workspace = true }

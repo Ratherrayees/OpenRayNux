@@ -1188,11 +1188,15 @@ fn restoring_a_journal_reports_what_the_previous_process_left_unsettled() {
 
     {
         let mut engine = policy();
-        let journal = orxnud_store::SqliteAuditJournal::open(&db).expect("open journal");
+        let journal = orxnud_store::SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("open journal");
         engine.restore(&journal).expect("load");
         let mut engine = engine.with_security_state(
             Box::new(journal),
-            Box::new(orxnud_store::SqliteApprovalLedger::open(&db).expect("ledger")),
+            Box::new(
+                orxnud_store::SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity)
+                    .expect("ledger"),
+            ),
         );
 
         // A healthy dispatch first, so the journal is not *entirely* unhealthy. A
@@ -1239,7 +1243,8 @@ fn restoring_a_journal_reports_what_the_previous_process_left_unsettled() {
     // A fresh process. This is the production boundary: `restore` runs while the journal
     // loads and before anything is served.
     let mut restored = policy();
-    let journal = orxnud_store::SqliteAuditJournal::open(&db).expect("open journal again");
+    let journal = orxnud_store::SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+        .expect("open journal again");
     restored
         .restore(&journal)
         .expect("the journal must load and verify");
@@ -1312,16 +1317,21 @@ fn a_clean_journal_reports_settled_on_restore() {
                 .expect("dispatch");
             }
         }
-        let journal = orxnud_store::SqliteAuditJournal::open(&db).expect("open journal");
+        let journal = orxnud_store::SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("open journal");
         engine.restore(&journal).expect("load");
         let _ = engine.with_security_state(
             Box::new(journal),
-            Box::new(orxnud_store::SqliteApprovalLedger::open(&db).expect("ledger")),
+            Box::new(
+                orxnud_store::SqliteApprovalLedger::open(&db, &orxnud_platform_fs::OsIdentity)
+                    .expect("ledger"),
+            ),
         );
     }
 
     let mut restored = policy();
-    let journal = orxnud_store::SqliteAuditJournal::open(&db).expect("open again");
+    let journal = orxnud_store::SqliteAuditJournal::open(&db, &orxnud_platform_fs::OsIdentity)
+        .expect("open again");
     restored.restore(&journal).expect("load");
     let report = restored
         .restored_settlement()

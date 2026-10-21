@@ -3929,6 +3929,42 @@ impl<'a> TaskRepository<'a> {
         Ok(true)
     }
 
+    /// Removes an approval that was written for a proposal that could not be decided.
+    ///
+    /// # Why this exists
+    ///
+    /// The approval row and the proposal's decision are **two transactions, not one**:
+    /// the approval is written first, because a proposal that says `approved` with no
+    /// approval behind it is a dead end, and the decision is made afterwards. If the
+    /// decision fails, the approval row would otherwise remain -- live, unconsumed,
+    /// and belonging to a proposal that is still pending.
+    ///
+    /// Such a row cannot be dispatched: a dispatch needs the proposal to be decided
+    /// *and* a registry entry that was activated after the decision. But it would
+    /// refuse a later, legitimate approval with "an approval for this attempt is
+    /// valid until ...", leaving the task unable to proceed until the row expired on
+    /// its own.
+    ///
+    /// Removing it restores the invariant that matters: **an approval exists if and
+    /// only if its proposal was decided.**
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error.
+    pub fn delete_approval(
+        &mut self,
+        task_id: &TaskId,
+        step_no: u32,
+        attempt_no: u32,
+    ) -> Result<bool, TaskRepoError> {
+        let changed = write(self.conn.execute(
+            "DELETE FROM task_approvals
+              WHERE task_id = ?1 AND step_no = ?2 AND attempt_no = ?3;",
+            rusqlite::params![task_id.as_str(), step_no, attempt_no],
+        ))?;
+        Ok(changed > 0)
+    }
+
     // ----------------------------------------------------------------- events
 
     /// Appends to the transition log.

@@ -182,6 +182,7 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
                     out.push_str(&format!("  {key}: {v}\n"));
                 }
             }
+            render_recipient(&reply, &mut out);
             Ok(out)
         }
         TaskCommand::Continue { task, worker } => {
@@ -210,6 +211,7 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
                 return Ok(out);
             }
             let mut out = render_proposal(&reply);
+            render_recipient(&reply, &mut out);
             if let Some(step) = reply.get("step").and_then(Value::as_u64) {
                 out.push_str(&format!("  step: {step}\n"));
             }
@@ -246,6 +248,403 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             Ok(render_cancel(&reply))
         }
     }
+}
+
+/// Renders the safe recipient status of an AI-generated proposal.
+///
+/// The daemon sends a `recipient` label only when the configured destination could be
+/// represented safely, and a `recipient_status` of `identified` or `unavailable`. There
+/// is no fallback to a raw endpoint: the client is never given one to print.
+///
+/// This is **not** an informed-approval notice. It tells the operator who the proposal
+/// is bound to before they run the separate approval command; the approval flow itself
+/// still issues an approval without a preview or an explicit confirmation, and that
+/// remains outstanding work.
+fn render_recipient(reply: &Value, out: &mut String) {
+    match reply.get("recipient").and_then(Value::as_str) {
+        Some(label) => {
+            out.push_str(&format!("  recipient: {label}\n"));
+        }
+        None => {
+            let status = reply
+                .get("recipient_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            if status == "identified" {
+                out.push_str("  recipient: (the daemon reported no recipient label)\n");
+            } else {
+                out.push_str(
+                    "  recipient: cannot be safely identified, so file-content \
+                     disclosure is unavailable\n",
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The disclosure preview and the confirmation that follows it.
+//
+// A model-initiated file read discloses the file's contents to the model provider
+// that asked for it. The operator must therefore see what they are authorising -- the
+// path, the recipient, and the limits -- and must say yes, before an approval is
+// created. The daemon enforces the challenge; the client is what turns a request
+// into an informed decision.
+//
+// These are separated from the request sequence so that the parts that can be wrong
+// quietly -- the classification, the rendering, the parsing -- can be tested without a
+// terminal, a socket, or a provider.
+// ---------------------------------------------------------------------------
+
+/// What the daemon says a proposal is, and therefore what the client must do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProposalKind {
+    /// A model-initiated file read: approving it discloses the contents to the
+    /// provider that originated the proposal, so it needs a reviewed confirmation.
+    ModelInitiatedFileRead,
+    /// A model-initiated proposal of some other capability.
+    ModelInitiated,
+    /// A direct, human-delegated proposal.
+    DirectProposal,
+}
+
+/// Reads the server's classification of a proposal.
+///
+/// # Failing closed
+///
+/// Anything missing, unknown, or internally inconsistent is an error. A client that
+/// cannot tell what it is approving must not approve it, and in particular must not
+/// conclude that a proposal is human-originated merely because a recipient label or a
+/// fingerprint is missing.
+pub(crate) fn classify_proposal(preview: &Value) -> Result<ProposalKind, String> {
+    let p = preview
+        .get("preview")
+        .ok_or("the preview reply carried no `preview`")?;
+    let kind = p
+        .get("proposal_kind")
+        .and_then(Value::as_str)
+        .ok_or("the preview carried no `proposal_kind`")?;
+    let requires = p
+        .get("requires_confirmation")
+        .and_then(Value::as_bool)
+        .ok_or("the preview carried no `requires_confirmation`")?;
+    let operation = p
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or("the preview carried no `operation`")?;
+    let kind = match kind {
+        "model-initiated-file-read" => {
+            if !requires {
+                return Err(
+                    "a model-initiated file read must require a disclosure confirmation".to_owned(),
+                );
+            }
+            if operation != "file-read" {
+                return Err(format!(
+                    "a model-initiated file read must be a file read, not {operation:?}"
+                ));
+            }
+            ProposalKind::ModelInitiatedFileRead
+        }
+        "model-initiated" => {
+            if requires {
+                return Err(
+                    "only a model-initiated file read may require a disclosure confirmation"
+                        .to_owned(),
+                );
+            }
+            ProposalKind::ModelInitiated
+        }
+        "direct-proposal" => {
+            if requires {
+                return Err("a direct proposal cannot require a disclosure confirmation".to_owned());
+            }
+            ProposalKind::DirectProposal
+        }
+        other => return Err(format!("unknown proposal kind {other:?}")),
+    };
+    Ok(kind)
+}
+
+/// Makes a stored value safe to print.
+///
+/// A path or a label comes from durable state, and a value carrying an escape
+/// sequence could otherwise move the operator's cursor, rewrite the line, or hide
+/// what it says. Control characters are shown as their code point instead.
+pub(crate) fn safe_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The recipient label, if it is safe to print.
+///
+/// The daemon supplies a *safe* label, built by its own projection. If it ever
+/// supplied something that looks like a raw URL carrying user information, a query
+/// or a fragment, it is **not** printed: a credential must not reach the terminal
+/// because a projection changed.
+fn safe_recipient(label: &str) -> Option<String> {
+    if label.contains('@') || label.contains('?') || label.contains('#') {
+        return None;
+    }
+    Some(safe_text(label))
+}
+
+/// Renders the disclosure preview the operator is asked to confirm.
+///
+/// Every fact shown comes from the server's response, and the recipient is the
+/// **safe label** the daemon produced. A raw endpoint, a credential, or an
+/// unfiltered URL is never printed, and stored text is escaped.
+pub(crate) fn render_read_preview(
+    preview: &Value,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let p = &preview["preview"];
+    let text = |k: &str| {
+        p.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("(not reported)")
+            .to_owned()
+    };
+    let num = |k: &str| p.get(k).and_then(Value::as_u64);
+    let disclosure = &p["disclosure"];
+    let dtext = |k: &str| {
+        disclosure
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+
+    writeln!(out, "This action is waiting for your approval.\n")?;
+    writeln!(out, "  proposal:   {}", safe_text(&text("proposal_id")))?;
+    writeln!(out, "  capability: {}", safe_text(&text("capability")))?;
+    writeln!(out, "  path:       {}", safe_text(&text("path")))?;
+    writeln!(
+        out,
+        "  operation:  {} -- this READS a file; it does not write one.",
+        safe_text(&text("operation"))
+    )?;
+
+    // Only a proposal that actually discloses to a model provider may say so. A
+    // direct, human-delegated proposal must not be told that its content is going
+    // to a model provider, because it is not.
+    if p.get("requires_confirmation")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        writeln!(
+            out,
+            "\n  The file's contents MAY BE DISCLOSED to the model provider that originated"
+        )?;
+        writeln!(
+            out,
+            "  this proposal, for the AI request immediately following it. Disclosure is"
+        )?;
+        writeln!(
+            out,
+            "  not guaranteed: the content may be skipped or not retained at all."
+        )?;
+    }
+
+    match p
+        .get("recipient")
+        .and_then(Value::as_str)
+        .and_then(safe_recipient)
+    {
+        Some(label) => writeln!(out, "\n  recipient:  {label}")?,
+        None => writeln!(out, "\n  recipient:  (not identified)")?,
+    }
+    if let Some(why) = p.get("blocked_reason").and_then(Value::as_str) {
+        writeln!(out, "  blocked:    {}", safe_text(why))?;
+    }
+
+    writeln!(out, "\n  limits:")?;
+    if let Some(b) = num("read_ceiling_bytes") {
+        writeln!(out, "    at most {b} bytes are read by one operation")?;
+    }
+    if let Some(b) = num("observation_ceiling_bytes") {
+        writeln!(
+            out,
+            "    at most {b} bytes are disclosed per provider request, in total"
+        )?;
+    }
+    if let Some(n) = num("max_entries") {
+        writeln!(
+            out,
+            "    at most {n} observations are released per provider request"
+        )?;
+    }
+    if let Some(b) = num("effective_bytes") {
+        writeln!(out, "    the effective per-request capacity is {b} bytes")?;
+    }
+    let limits = dtext("limits");
+    if !limits.is_empty() {
+        writeln!(out, "    {limits}")?;
+    }
+    let timing = dtext("timing");
+    if !timing.is_empty() {
+        writeln!(out, "    {timing}")?;
+    }
+    writeln!(
+        out,
+        "    observations are never truncated to fit: one too large for the budget is skipped whole"
+    )?;
+    writeln!(
+        out,
+        "    eligible content is available only to the immediately following logical step"
+    )?;
+    Ok(())
+}
+
+/// Whether a line is an explicit affirmative.
+///
+/// The default is **no**. Only `y` or `yes`, trimmed and compared case-insensitively,
+/// are accepted. An empty line, `n`, `no`, anything unrecognised, EOF and a read
+/// error all decline.
+pub(crate) fn parse_confirmation(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Reads one line and decides whether the operator accepted.
+///
+/// `Ok(false)` means declined -- which includes EOF. `Err` is a read failure, and
+/// it also declines: no approval may be submitted on either.
+pub(crate) fn read_confirmation(input: &mut dyn std::io::BufRead) -> Result<bool, String> {
+    let mut line = String::new();
+    match input.read_line(&mut line) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(parse_confirmation(&line)),
+        Err(e) => Err(format!("could not read the confirmation: {e}")),
+    }
+}
+
+/// The requests the approval orchestration makes.
+///
+/// The real client and the test fake both satisfy it, so the sequence the tests
+/// record is the sequence production runs -- not a second implementation of it.
+pub(crate) trait PreviewRequests {
+    /// Performs one request and returns its `result` value.
+    fn call(&self, method: &str, params: Value) -> Result<Value, ClientError>;
+}
+
+impl PreviewRequests for Client {
+    fn call(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+        Client::call(self, method, params)
+    }
+}
+
+/// The approval orchestration for a proposal, as one testable function.
+///
+/// # The sequence
+///
+/// inspection (no challenge) -> terminal check -> fresh preview (with a challenge) ->
+/// render -> confirm -> approve with that challenge and `confirmed: true`.
+///
+/// The terminal check sits **before** the challenge-bearing preview, so a
+/// non-interactive caller never leaves a challenge behind in the bounded store.
+///
+/// # Why the inspection comes first
+///
+/// The inspection carries no challenge and only classifies the proposal, so the
+/// client knows whether a reviewed confirmation is needed at all before it takes one.
+/// The fresh preview is what is displayed and what the challenge comes from: a
+/// preview shown to the operator and a challenge submitted must describe the same
+/// thing.
+pub(crate) fn approve_proposal_with(
+    requests: &impl PreviewRequests,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+    proposal_id: &str,
+    payload: &mut Value,
+) -> Result<Option<Value>, ClientError> {
+    // Inspection first. It carries no challenge, so a client that turns out not to
+    // need a confirmation has not left one behind in the bounded store.
+    let inspected = requests.call(
+        "capability/preview",
+        json!({ "proposal": proposal_id, "inspect_only": true }),
+    )?;
+    let kind =
+        classify_proposal(&inspected).map_err(|why| ClientError::InvalidParams { detail: why })?;
+    if kind == ProposalKind::ModelInitiatedFileRead {
+        // The terminal check comes **before** a challenge-bearing preview, so a
+        // non-interactive caller never mints a challenge it cannot use.
+        if !interactive {
+            return Err(ClientError::InvalidParams {
+                detail: "approving a model-generated file read needs an interactive \
+                          confirmation: the read's contents may be disclosed to the \
+                          model provider, and that has to be accepted at a terminal."
+                    .to_owned(),
+            });
+        }
+        // The fresh preview is authoritative for what is displayed and for the
+        // challenge that is submitted; the inspection above is only a
+        // classification.
+        let fresh = requests.call("capability/preview", json!({ "proposal": proposal_id }))?;
+        let fresh_kind =
+            classify_proposal(&fresh).map_err(|why| ClientError::InvalidParams { detail: why })?;
+        if fresh_kind != ProposalKind::ModelInitiatedFileRead {
+            return Err(ClientError::InvalidParams {
+                detail: "the proposal changed between the inspection and the review; \
+                          nothing was approved."
+                    .to_owned(),
+            });
+        }
+        if fresh["preview"]
+            .get("approval_allowed")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(ClientError::InvalidParams {
+                detail: fresh["preview"]
+                    .get("blocked_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("this read cannot currently be approved")
+                    .to_owned(),
+            });
+        }
+        let challenge = fresh["preview"]
+            .get("challenge")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ClientError::Malformed(
+                    "the preview carried no challenge, so the read cannot be reviewed".to_owned(),
+                )
+            })?
+            .to_owned();
+
+        render_read_preview(&fresh, out)
+            .map_err(|e| ClientError::Malformed(format!("could not render the preview: {e}")))?;
+        write!(
+            out,
+            "\n  Authorise this read, and the disclosure of its contents to the \
+             recipient above? [y/N] "
+        )
+        .map_err(|e| ClientError::Malformed(format!("could not write the prompt: {e}")))?;
+        std::io::Write::flush(out)
+            .map_err(|e| ClientError::Malformed(format!("could not write the prompt: {e}")))?;
+        let accepted = read_confirmation(input).unwrap_or(false);
+        if !accepted {
+            // Nothing is sent. The challenge that was taken expires on its own.
+            return Ok(None);
+        }
+        payload["challenge"] = json!(challenge);
+        payload["confirmed"] = json!(true);
+    }
+
+    // The approval is submitted **here**, so that the whole journey -- inspection,
+    // the review, and the approval -- is one observable orchestration. A caller that
+    // only classified the proposal and then returned would leave the direct and
+    // non-read routes with no approval at all.
+    let reply = requests.call("capability/approve", payload.clone())?;
+    Ok(Some(reply))
 }
 
 /// Renders a proposal from a `task/propose` or `task/execute` reply.
@@ -540,7 +939,22 @@ pub fn approve_capability(
     if let Some(ttl) = ttl_ms {
         payload["ttl_ms"] = json!(ttl);
     }
-    let reply = client.call("capability/approve", payload)?;
+    let reply = if let Some(proposal_id) = proposal {
+        match approve_proposal_with(
+            client,
+            std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            proposal_id,
+            &mut payload,
+        )? {
+            Some(reply) => reply,
+            None => return Ok("Declined: nothing was approved.".to_owned()),
+        }
+    } else {
+        // A standalone approval names its own action and has no proposal to review.
+        client.call("capability/approve", payload)?
+    };
 
     let approval = reply.get("approval").ok_or_else(|| {
         ClientError::Malformed("the daemon's approval reply carried no `approval` field".to_owned())
@@ -622,4 +1036,602 @@ pub fn describe_refusal(error: &ClientError) -> String {
 /// Always `Err`, carrying [`ClientError::Refused`].
 pub fn refuse(error: &orxnud_protocol::RpcError) -> Result<Value, ClientError> {
     Err(refusal(error))
+}
+
+#[cfg(test)]
+mod recipient_rendering_tests {
+    use super::render_recipient;
+    use serde_json::json;
+
+    /// An identified recipient is shown, and the raw endpoint is never a fallback.
+    #[test]
+    fn an_identified_recipient_is_rendered_and_no_raw_endpoint_appears() {
+        let reply = json!({
+            "recipient": "https://api.example.invalid:8443/v1 (model: some-model)",
+            "recipient_status": "identified",
+        });
+        let mut out = String::new();
+        render_recipient(&reply, &mut out);
+        assert!(out.contains("recipient:"), "{out}");
+        assert!(out.contains("api.example.invalid"), "{out}");
+        assert!(!out.contains("secret"), "{out}");
+    }
+
+    /// An unavailable recipient is stated plainly: the content cannot be disclosed.
+    #[test]
+    fn an_unavailable_recipient_says_disclosure_is_unavailable() {
+        let reply = json!({ "recipient": null, "recipient_status": "unavailable" });
+        let mut out = String::new();
+        render_recipient(&reply, &mut out);
+        assert!(out.contains("cannot be safely identified"), "{out}");
+        assert!(out.contains("disclosure is unavailable"), "{out}");
+    }
+
+    /// The canaries of a rejected endpoint never reach the output, because the client
+    /// is never given a raw endpoint to print.
+    #[test]
+    fn a_rejected_destination_never_reaches_the_output() {
+        let canary_userinfo = "user:CANARY-USERINFO-4b1e";
+        let canary_query = "CANARY-QUERY-TOKEN-9d2c";
+        let canary_fragment = "CANARY-FRAGMENT-77aa";
+        let reply = json!({ "recipient": null, "recipient_status": "unavailable" });
+        let mut out = String::new();
+        render_recipient(&reply, &mut out);
+        for canary in [canary_userinfo, canary_query, canary_fragment] {
+            assert!(!out.contains(canary), "a canary reached the output: {out}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod disclosure_preview_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A complete, eligible model-initiated file-read preview.
+    fn read_preview() -> Value {
+        json!({
+            "preview": {
+                "proposal_id": "p-1",
+                "task_id": "t-1",
+                "capability": "filesystem/read-text",
+                "path": "src/main.rs",
+                "operation": "file-read",
+                "proposal_kind": "model-initiated-file-read",
+                "requires_confirmation": true,
+                "approval_allowed": true,
+                "recipient": "https://api.example.invalid/v1 (model: some-model)",
+                "recipient_status": "identified",
+                "read_ceiling_bytes": 65536,
+                "observation_ceiling_bytes": 32768,
+                "max_entries": 8,
+                "effective_bytes": 32768,
+                "disclosure": {
+                    "read_ceiling_bytes": 65536,
+                    "observation_ceiling_bytes": 32768,
+                    "max_entries": 8,
+                    "effective_bytes": 32768,
+                    "limits": "an observation that does not fit the applicable budget is skipped entirely, not truncated",
+                    "timing": "eligibility is limited to the immediately following logical step",
+                },
+            }
+        })
+    }
+
+    #[test]
+    fn only_an_explicit_yes_accepts() {
+        assert!(parse_confirmation("y"));
+        assert!(parse_confirmation("yes"));
+        assert!(parse_confirmation("Y"));
+        assert!(parse_confirmation("YES"));
+        assert!(parse_confirmation("  Yes  "));
+    }
+
+    #[test]
+    fn everything_else_declines() {
+        for line in [
+            "", "   ", "n", "no", "N", "NO", "yep", "y yes", "approve", "1", "true",
+        ] {
+            assert!(!parse_confirmation(line), "{line:?} must decline");
+        }
+    }
+
+    #[test]
+    fn eof_and_a_read_error_decline() {
+        let mut empty = std::io::Cursor::new(b"".as_slice());
+        assert!(
+            !read_confirmation(&mut empty).expect("EOF is not an error"),
+            "EOF must decline"
+        );
+
+        let mut text = std::io::Cursor::new(
+            b"yes
+"
+            .as_slice(),
+        );
+        assert!(
+            read_confirmation(&mut text).expect("a read"),
+            "a read must accept"
+        );
+
+        let mut text = std::io::Cursor::new(
+            b"nope
+"
+            .as_slice(),
+        );
+        assert!(
+            !read_confirmation(&mut text).expect("a read"),
+            "unrecognised input must decline"
+        );
+    }
+
+    #[test]
+    fn the_classification_is_read_from_the_server() {
+        assert_eq!(
+            classify_proposal(&read_preview()).expect("classified"),
+            ProposalKind::ModelInitiatedFileRead
+        );
+
+        let mut direct = read_preview();
+        direct["preview"]["proposal_kind"] = json!("direct-proposal");
+        direct["preview"]["requires_confirmation"] = json!(false);
+        assert_eq!(
+            classify_proposal(&direct).expect("classified"),
+            ProposalKind::DirectProposal
+        );
+
+        let mut other = read_preview();
+        other["preview"]["proposal_kind"] = json!("model-initiated");
+        other["preview"]["requires_confirmation"] = json!(false);
+        assert_eq!(
+            classify_proposal(&other).expect("classified"),
+            ProposalKind::ModelInitiated
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_inconsistent_classification_fails_closed() {
+        let mut unknown = read_preview();
+        unknown["preview"]["proposal_kind"] = json!("something-else");
+        assert!(
+            classify_proposal(&unknown).is_err(),
+            "an unknown kind must fail closed"
+        );
+
+        let mut inconsistent = read_preview();
+        inconsistent["preview"]["requires_confirmation"] = json!(false);
+        assert!(
+            classify_proposal(&inconsistent).is_err(),
+            "a model-initiated read that does not require confirmation must fail closed"
+        );
+
+        let mut wrong_operation = read_preview();
+        wrong_operation["preview"]["operation"] = json!("file-write");
+        assert!(
+            classify_proposal(&wrong_operation).is_err(),
+            "a model-initiated file read must not claim to be a write"
+        );
+
+        let mut missing = read_preview();
+        missing["preview"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("proposal_kind");
+        assert!(
+            classify_proposal(&missing).is_err(),
+            "a missing kind must fail closed"
+        );
+
+        assert!(
+            classify_proposal(&json!({})).is_err(),
+            "a reply with no preview must fail closed"
+        );
+    }
+
+    #[test]
+    fn the_rendered_preview_carries_everything_the_operator_needs() {
+        let mut out: Vec<u8> = Vec::new();
+        render_read_preview(&read_preview(), &mut out).expect("rendered");
+        let text = String::from_utf8(out).expect("utf-8");
+        for expected in [
+            "p-1",
+            "filesystem/read-text",
+            "src/main.rs",
+            "READS a file",
+            "MAY BE DISCLOSED",
+            "https://api.example.invalid/v1 (model: some-model)",
+            "65536",
+            "32768",
+            "not truncated",
+            "immediately following logical step",
+        ] {
+            assert!(
+                text.contains(expected),
+                "the preview must contain {expected:?}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_proposal_is_not_described_as_a_model_disclosure() {
+        let mut preview = read_preview();
+        preview["preview"]["proposal_kind"] = json!("direct-proposal");
+        preview["preview"]["requires_confirmation"] = json!(false);
+        let mut out: Vec<u8> = Vec::new();
+        render_read_preview(&preview, &mut out).expect("rendered");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            !text.contains("MAY BE DISCLOSED"),
+            "a direct proposal must not be described as a model disclosure: {text}"
+        );
+    }
+
+    #[test]
+    fn canaries_never_reach_the_output_and_control_characters_are_escaped() {
+        let mut preview = read_preview();
+        preview["preview"]["path"] = json!("a\u{1b}[31mplain-path.txt");
+        preview["preview"]["recipient"] = json!(
+            "https://user:CANARY-USERINFO-4b1e@host/v1?token=CANARY-QUERY-9d2c#CANARY-FRAG-77aa"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        render_read_preview(&preview, &mut out).expect("rendered");
+        let text = String::from_utf8(out).expect("utf-8");
+        for canary in [
+            "CANARY-USERINFO-4b1e",
+            "CANARY-QUERY-9d2c",
+            "CANARY-FRAG-77aa",
+        ] {
+            assert!(
+                !text.contains(canary),
+                "a canary reached the output: {text}"
+            );
+        }
+        // The escape sequence must not survive as control characters.
+        assert!(
+            !text.contains('\u{1b}'),
+            "an escape sequence reached the output"
+        );
+        assert!(
+            text.contains("\\u{1b}"),
+            "the control character must be shown as a code point: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod approval_sequence_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// A recording request caller, standing in for the client.
+    struct Recorder {
+        calls: Mutex<Vec<(String, Value)>>,
+        replies: Mutex<Vec<Result<Value, ClientError>>>,
+    }
+
+    impl Recorder {
+        fn new(replies: Vec<Result<Value, ClientError>>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                replies: Mutex::new(replies),
+            }
+        }
+        fn calls(&self) -> Vec<(String, Value)> {
+            self.calls.lock().expect("recorder lock").clone()
+        }
+        fn methods(&self) -> Vec<String> {
+            self.calls().into_iter().map(|(m, _)| m).collect()
+        }
+    }
+
+    impl PreviewRequests for Recorder {
+        fn call(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+            self.calls
+                .lock()
+                .expect("recorder lock")
+                .push((method.to_owned(), params));
+            let mut replies = self.replies.lock().expect("recorder lock");
+            if replies.is_empty() {
+                return Err(ClientError::Malformed("no reply was configured".to_owned()));
+            }
+            replies.remove(0)
+        }
+    }
+
+    /// An inspection reply: the classification, and no challenge.
+    fn inspection(kind: &str, requires: bool, operation: &str) -> Value {
+        json!({
+            "preview": {
+                "proposal_id": "p-1",
+                "capability": "filesystem/read-text",
+                "path": "src/main.rs",
+                "operation": operation,
+                "proposal_kind": kind,
+                "requires_confirmation": requires,
+                "approval_allowed": true,
+                "recipient": "https://api.example.invalid/v1 (model: some-model)",
+                "recipient_status": "identified",
+                "read_ceiling_bytes": 65536,
+                "observation_ceiling_bytes": 32768,
+                "max_entries": 8,
+                "effective_bytes": 32768,
+                "disclosure": {
+                    "limits": "an observation that does not fit is skipped entirely, not truncated",
+                    "timing": "eligibility is limited to the immediately following logical step",
+                },
+            }
+        })
+    }
+
+    /// A challenge-bearing reply.
+    fn fresh_preview(challenge: &str) -> Value {
+        let mut v = inspection("model-initiated-file-read", true, "file-read");
+        v["preview"]["challenge"] = json!(challenge);
+        v
+    }
+
+    fn ok_approval() -> Result<Value, ClientError> {
+        Ok(json!({ "approval": { "digest": "abc" } }))
+    }
+
+    /// The whole sequence, and the challenge that is actually submitted.
+    #[test]
+    fn the_model_read_sequence_is_inspection_then_preview_then_confirmation_then_approval() {
+        let recorder = Recorder::new(vec![
+            Ok(inspection("model-initiated-file-read", true, "file-read")),
+            Ok(fresh_preview("challenge-fresh")),
+            ok_approval(),
+        ]);
+        let mut input = std::io::Cursor::new(
+            b"y
+"
+            .as_slice(),
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let mut payload = json!({ "proposal": "p-1", "ttl_ms": 60_000 });
+
+        let approved =
+            approve_proposal_with(&recorder, true, &mut input, &mut out, "p-1", &mut payload)
+                .expect("approved");
+        assert!(approved.is_some(), "the approval must have been submitted");
+
+        // The exact order.
+        assert_eq!(
+            recorder.methods(),
+            vec![
+                "capability/preview".to_owned(),
+                "capability/preview".to_owned(),
+                "capability/approve".to_owned(),
+            ],
+            "the sequence must be inspection, then the fresh preview, then the approval"
+        );
+        let calls = recorder.calls();
+        assert_eq!(
+            calls[0].1["inspect_only"],
+            json!(true),
+            "the first preview must be an inspection"
+        );
+        assert!(
+            calls[0].1.get("challenge").is_none(),
+            "the inspection must not ask for a challenge"
+        );
+        assert!(
+            calls[1].1.get("inspect_only").is_none(),
+            "the second preview must be the challenge-bearing one"
+        );
+
+        // The approval carries the fresh challenge and the confirmation.
+        assert_eq!(payload["proposal"], json!("p-1"));
+        assert_eq!(payload["ttl_ms"], json!(60_000));
+        assert_eq!(payload["challenge"], json!("challenge-fresh"));
+        assert_eq!(payload["confirmed"], json!(true));
+        // And nothing the caller could have used to override daemon state.
+        for forbidden in ["recipient", "fingerprint", "path", "capability", "endpoint"] {
+            assert!(
+                payload.get(forbidden).is_none(),
+                "the approval must not carry {forbidden:?}: {payload}"
+            );
+        }
+
+        // The preview was rendered before the confirmation was consumed.
+        let rendered = String::from_utf8(out).expect("utf-8");
+        assert!(rendered.contains("src/main.rs"), "{rendered}");
+        assert!(rendered.contains("READS a file"), "{rendered}");
+    }
+
+    /// A decline, and every other way of not saying yes, submits nothing.
+    #[test]
+    fn a_decline_submits_no_approval() {
+        for answer in ["\n", "n\n", "no\n", "maybe\n", ""] {
+            let recorder = Recorder::new(vec![
+                Ok(inspection("model-initiated-file-read", true, "file-read")),
+                Ok(fresh_preview("challenge-fresh")),
+            ]);
+            let mut input = std::io::Cursor::new(answer.as_bytes());
+            let mut out: Vec<u8> = Vec::new();
+            let mut payload = json!({ "proposal": "p-1" });
+            let approved =
+                approve_proposal_with(&recorder, true, &mut input, &mut out, "p-1", &mut payload)
+                    .expect("no error");
+            assert!(approved.is_none(), "{answer:?} must decline");
+            assert!(
+                payload.get("challenge").is_none(),
+                "a decline must not submit an approval: {payload}"
+            );
+            assert_eq!(
+                recorder.methods(),
+                vec![
+                    "capability/preview".to_owned(),
+                    "capability/preview".to_owned()
+                ],
+                "{answer:?}: no approval request may be sent"
+            );
+        }
+    }
+
+    /// A non-interactive caller must not take a challenge at all.
+    #[test]
+    fn a_non_interactive_caller_takes_no_challenge_and_submits_nothing() {
+        let recorder = Recorder::new(vec![Ok(inspection(
+            "model-initiated-file-read",
+            true,
+            "file-read",
+        ))]);
+        let mut input = std::io::Cursor::new(
+            b"y
+"
+            .as_slice(),
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let mut payload = json!({ "proposal": "p-1" });
+        let err =
+            approve_proposal_with(&recorder, false, &mut input, &mut out, "p-1", &mut payload)
+                .expect_err("a non-interactive caller must fail closed");
+        assert!(format!("{err:?}").contains("interactive"), "{err:?}");
+        assert_eq!(
+            recorder.methods(),
+            vec!["capability/preview".to_owned()],
+            "only the inspection may have happened"
+        );
+        assert!(payload.get("challenge").is_none(), "{payload}");
+    }
+
+    /// A direct proposal keeps its established route: one inspection, then the ordinary
+    /// approval, exactly once, with no challenge and no confirmation.
+    ///
+    /// This is the regression the previous revision of this test could not see: it
+    /// exercised only the classification helper, so the approval submission -- which the
+    /// caller performed -- was invisible, and a broken route would have looked correct.
+    #[test]
+    fn a_direct_proposal_keeps_its_established_approval_route() {
+        let recorder = Recorder::new(vec![
+            Ok(inspection("direct-proposal", false, "file-read")),
+            ok_approval(),
+        ]);
+        let mut input = std::io::Cursor::new(b"y\n".as_slice());
+        let mut out: Vec<u8> = Vec::new();
+        let mut payload = json!({ "proposal": "p-1", "ttl_ms": 60_000 });
+        let reply =
+            approve_proposal_with(&recorder, true, &mut input, &mut out, "p-1", &mut payload)
+                .expect("no error")
+                .expect("the direct proposal must be approved");
+        assert!(reply.get("approval").is_some(), "{reply}");
+        assert_eq!(
+            recorder.methods(),
+            vec![
+                "capability/preview".to_owned(),
+                "capability/approve".to_owned()
+            ],
+            "a direct proposal must keep its established approval route"
+        );
+        let calls = recorder.calls();
+        assert_eq!(
+            calls[0].1["inspect_only"],
+            json!(true),
+            "the first preview must be an inspection"
+        );
+        let approve = &calls[1].1;
+        assert_eq!(approve["proposal"], json!("p-1"));
+        assert_eq!(approve["ttl_ms"], json!(60_000));
+        assert!(approve.get("challenge").is_none(), "{approve}");
+        assert!(approve.get("confirmed").is_none(), "{approve}");
+    }
+
+    /// A model-initiated capability that is not a file read keeps its route too.
+    #[test]
+    fn an_unrelated_model_capability_keeps_its_established_approval_route() {
+        let recorder = Recorder::new(vec![
+            Ok(inspection("model-initiated", false, "other")),
+            ok_approval(),
+        ]);
+        let mut input = std::io::Cursor::new(b"y\n".as_slice());
+        let mut out: Vec<u8> = Vec::new();
+        let mut payload = json!({ "proposal": "p-1", "ttl_ms": 60_000 });
+        approve_proposal_with(&recorder, true, &mut input, &mut out, "p-1", &mut payload)
+            .expect("no error")
+            .expect("the proposal must be approved");
+        assert_eq!(
+            recorder.methods(),
+            vec![
+                "capability/preview".to_owned(),
+                "capability/approve".to_owned()
+            ],
+            "an unrelated model capability must keep its established approval route"
+        );
+        let calls = recorder.calls();
+        assert!(calls[1].1.get("challenge").is_none(), "{:?}", calls[1].1);
+        assert!(calls[1].1.get("confirmed").is_none(), "{:?}", calls[1].1);
+    }
+
+    /// A blocked inspection, a request failure and a malformed reply each submit no
+    /// approval at all.
+    #[test]
+    fn a_failed_inspection_submits_no_approval() {
+        let mut blocked = inspection("model-initiated-file-read", true, "file-read");
+        blocked["preview"]["approval_allowed"] = json!(false);
+        blocked["preview"]["blocked_reason"] = json!("the recipient cannot be identified");
+        for reply in [
+            Ok(blocked),
+            Err(ClientError::Malformed("the daemon fell over".to_owned())),
+            Ok(json!({ "nonsense": true })),
+        ] {
+            let recorder = Recorder::new(vec![reply]);
+            let mut input = std::io::Cursor::new(b"y\n".as_slice());
+            let mut out: Vec<u8> = Vec::new();
+            let mut payload = json!({ "proposal": "p-1" });
+            assert!(
+                approve_proposal_with(&recorder, true, &mut input, &mut out, "p-1", &mut payload)
+                    .is_err(),
+                "a failed inspection must fail closed"
+            );
+            assert!(
+                !recorder
+                    .calls()
+                    .iter()
+                    .any(|(m, _)| m == "capability/approve"),
+                "no approval may be sent"
+            );
+        }
+    }
+
+    /// A blocked or inconsistent fresh preview submits nothing.
+    #[test]
+    fn a_blocked_or_inconsistent_preview_submits_no_approval() {
+        let mut blocked = fresh_preview("challenge-fresh");
+        blocked["preview"]["approval_allowed"] = json!(false);
+        blocked["preview"]["blocked_reason"] = json!("the recipient cannot be identified");
+
+        let mut no_challenge = inspection("model-initiated-file-read", true, "file-read");
+        no_challenge["preview"]["approval_allowed"] = json!(true);
+
+        let mut wrong_kind = fresh_preview("challenge-fresh");
+        wrong_kind["preview"]["proposal_kind"] = json!("model-initiated");
+
+        for preview in [blocked, no_challenge, wrong_kind] {
+            let recorder = Recorder::new(vec![
+                Ok(inspection("model-initiated-file-read", true, "file-read")),
+                Ok(preview),
+            ]);
+            let mut input = std::io::Cursor::new(
+                b"y
+"
+                .as_slice(),
+            );
+            let mut out: Vec<u8> = Vec::new();
+            let mut payload = json!({ "proposal": "p-1" });
+            let result =
+                approve_proposal_with(&recorder, true, &mut input, &mut out, "p-1", &mut payload);
+            assert!(result.is_err(), "a blocked preview must fail closed");
+            assert!(payload.get("challenge").is_none(), "{payload}");
+            assert_eq!(
+                recorder.methods(),
+                vec![
+                    "capability/preview".to_owned(),
+                    "capability/preview".to_owned()
+                ],
+                "no approval may be sent"
+            );
+        }
+    }
 }

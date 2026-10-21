@@ -278,12 +278,7 @@ fn propose_the_read(s: &Serving) -> String {
 /// observation — that is a property of the design, not a workaround. The caller decides what
 /// to assert about the refusal.
 fn approve_and_run(s: &Serving, pid: &str) -> Value {
-    send(
-        &s.endpoint,
-        "a",
-        "capability/approve",
-        json!({ "proposal": pid, "ttl_ms": 60_000 }),
-    );
+    approve_read(&s.endpoint, pid, true);
     let out = send(
         &s.endpoint,
         "x",
@@ -369,11 +364,10 @@ fn an_approved_verified_read_reaches_the_next_proposal_and_nothing_else() {
         assert_eq!(provider.total_disclosed_bytes(), SENTINEL.len());
 
         // Consumed: a further proposal carries nothing.
-        send(
+        approve_read(
             &s.endpoint,
-            "a",
-            "capability/approve",
-            json!({ "proposal": next["result"]["proposal"]["proposal_id"].as_str().unwrap(), "ttl_ms": 60_000 }),
+            next["result"]["proposal"]["proposal_id"].as_str().unwrap(),
+            false,
         );
         send(
             &s.endpoint,
@@ -453,13 +447,16 @@ fn the_disclosed_content_appears_in_no_durable_row() {
 
 /// Every audit record the journal holds, parsed.
 fn audit_records(d: &Path) -> Vec<Value> {
-    orxnud_store::security_state::SqliteAuditJournal::open(&d.join("state.db"))
-        .expect("open the journal the daemon wrote")
-        .entries()
-        .expect("entries")
-        .iter()
-        .filter_map(|e| serde_json::from_slice::<Value>(&e.payload).ok())
-        .collect()
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &d.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the journal the daemon wrote")
+    .entries()
+    .expect("entries")
+    .iter()
+    .filter_map(|e| serde_json::from_slice::<Value>(&e.payload).ok())
+    .collect()
 }
 
 /// A disclosure is recorded, on its own correlation, naming the approved read it came from.
@@ -727,12 +724,7 @@ fn the_content_informs_exactly_one_proposal() {
             .as_str()
             .unwrap()
             .to_owned();
-        send(
-            &s.endpoint,
-            "a",
-            "capability/approve",
-            json!({ "proposal": step2, "ttl_ms": 60_000 }),
-        );
+        approve_read(&s.endpoint, &step2, false);
         let done = send(
             &s.endpoint,
             "x",
@@ -922,12 +914,7 @@ fn an_observation_never_crosses_a_task_boundary() {
             .as_str()
             .unwrap()
             .to_owned();
-        send(
-            &s.endpoint,
-            "a2",
-            "capability/approve",
-            json!({ "proposal": t2_pid, "ttl_ms": 60_000 }),
-        );
+        approve_read(&s.endpoint, &t2_pid, false);
         send(
             &s.endpoint,
             "x2",
@@ -1102,3 +1089,575 @@ fn only_one_continuation_can_disclose_a_claim_of_the_boundary() {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// The reviewed approval path for a read.
+///
+/// A fresh preview, which issues a challenge, and then an approval bound to that
+/// challenge and explicitly acknowledging the disclosure. The daemon refuses an AI read
+/// approval without both, so this is the only way the successful pipeline is reachable.
+fn approve_read(endpoint: &Path, pid: &str, expect_challenge: bool) {
+    let preview = send(
+        endpoint,
+        "p",
+        "capability/preview",
+        json!({ "proposal": pid }),
+    );
+    // A challenge is issued only for an **AI-generated file read** -- the one case the
+    // reviewed path governs. A human-proposed read and a write are not covered by the
+    // preview, and are approved on the ordinary route.
+    // The preview answers for an AI-generated file read. A human proposal and a
+    // write are not covered by it, and the daemon refuses the preview for them.
+    let covered = preview
+        .get("result")
+        .and_then(|r| r.get("preview"))
+        .is_some();
+    let challenge = preview["result"]["preview"]["challenge"]
+        .as_str()
+        .map(str::to_owned);
+    // A challenge is issued only for a **model-initiated** read, which is exactly the
+    // proposal the preview reports as requiring a disclosure confirmation. A
+    // human-delegated read carries no provider disclosure, so it is not part of the
+    // reviewed path and is approved on the ordinary route.
+    let approvable = preview["result"]["preview"]["requires_confirmation"] == true;
+    if expect_challenge && covered && approvable {
+        assert!(
+            challenge.is_some(),
+            "an eligible AI read preview must issue a challenge, so the read can be \
+             approved through the reviewed path: {preview}"
+        );
+    }
+    match challenge {
+        Some(challenge) => {
+            send(
+                endpoint,
+                "a",
+                "capability/approve",
+                json!({
+                    "proposal": pid,
+                    "ttl_ms": 60_000,
+                    "challenge": challenge,
+                    "confirmed": true,
+                }),
+            );
+        }
+        None => {
+            send(
+                endpoint,
+                "a",
+                "capability/approve",
+                json!({ "proposal": pid, "ttl_ms": 60_000 }),
+            );
+        }
+    }
+}
+
+/// The challenge-enforced approval path, checked against **persisted** state.
+///
+/// The disclosure suite above proves the *successful* route. These prove the *refused*
+/// ones: that a rejected or replayed attempt creates no approval row and does not
+/// decide the proposal. A returned error alone would not be evidence of that.
+mod challenge_enforcement {
+    use super::*;
+
+    /// The daemon's state database, wherever it lives under the state root.
+    fn state_db(root: &Path) -> PathBuf {
+        let mut found: Vec<PathBuf> = Vec::new();
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "db") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(root, &mut found);
+        found
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == "state.db"))
+            .expect("the daemon must have a state database")
+    }
+
+    /// The persisted proposal: its task and its status.
+    fn proposal_state(root: &Path, pid: &str) -> (String, String) {
+        let db = state_db(root);
+        let conn = rusqlite::Connection::open(&db).expect("open the state database");
+        conn.query_row(
+            "SELECT task_id, status FROM task_proposals WHERE proposal_id = ?1",
+            [pid],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .unwrap_or_else(|e| panic!("the proposal {pid:?} must be persisted: {e}"))
+    }
+
+    /// How many approvals are persisted for a task.
+    fn approvals_for_task(root: &Path, task_id: &str) -> i64 {
+        let db = state_db(root);
+        let conn = rusqlite::Connection::open(&db).expect("open the state database");
+        conn.query_row(
+            "SELECT COUNT(*) FROM task_approvals WHERE task_id = ?1",
+            [task_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// A fresh challenge for the proposal, or `None` when the preview is blocked.
+    fn challenge_for(endpoint: &Path, pid: &str) -> Option<String> {
+        let preview = send(
+            endpoint,
+            "p",
+            "capability/preview",
+            json!({ "proposal": pid }),
+        );
+        preview["result"]["preview"]["challenge"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// The daemon serving a synthetic provider, with a read proposal already made.
+    async fn serving_with_read(tag: &str) -> (Serving, PathBuf, String) {
+        let d = dir(tag);
+        seed(&d);
+        let provider = Arc::new(Recorder::new(
+            "scripted/reader",
+            "https://provider.test/v1",
+            &[READ_PROPOSAL],
+        ));
+        let s = Serving::start_with(d.clone(), provider.clone()).await;
+        let pid = propose_the_read(&s);
+        (s, d, pid)
+    }
+
+    /// A model-initiated read cannot be approved without a challenge.
+    #[test]
+    fn an_ai_read_without_a_challenge_is_refused_and_leaves_the_proposal_pending() {
+        rt().block_on(async {
+            let (s, root, pid) = serving_with_read("nochallenge").await;
+            let reply = send(
+                &s.endpoint,
+                "a",
+                "capability/approve",
+                json!({ "proposal": pid, "ttl_ms": 60_000 }),
+            );
+            assert!(
+                reply.get("error").is_some(),
+                "an AI read approval without a challenge must be refused: {reply}"
+            );
+            let (task_id, status) = proposal_state(&root, &pid);
+            assert_eq!(status, "pending", "the proposal must not be decided");
+            assert_eq!(
+                approvals_for_task(&root, &task_id),
+                0,
+                "no approval may be created"
+            );
+        });
+    }
+
+    /// A challenge with the confirmation missing or false is refused, and the attempt
+    /// consumes the challenge: a later attempt with the same challenge cannot succeed.
+    #[test]
+    fn a_challenge_without_an_affirmative_confirmation_is_refused_and_is_consumed() {
+        rt().block_on(async {
+            for (label, extra) in [("missing", serde_json::json!({})), ("false", json!({"confirmed": false}))] {
+                let (s, root, pid) = serving_with_read(&format!("noconfirm-{label}")).await;
+                let challenge = challenge_for(&s.endpoint, &pid).expect("an eligible preview issues a challenge");
+                let mut params = json!({ "proposal": pid, "ttl_ms": 60_000, "challenge": challenge });
+                for (k, v) in extra.as_object().expect("an object") {
+                    params[k] = v.clone();
+                }
+                let reply = send(&s.endpoint, "a", "capability/approve", params);
+                assert!(reply.get("error").is_some(), "the {label} confirmation must be refused: {reply}");
+                let (task_id, status) = proposal_state(&root, &pid);
+                assert_eq!(status, "pending", "the proposal must not be decided");
+                assert_eq!(approvals_for_task(&root, &task_id), 0, "no approval may be created");
+
+                // The failed attempt consumed the challenge, so the same challenge
+                // cannot now be redeemed.
+                let again = send(
+                    &s.endpoint,
+                    "a",
+                    "capability/approve",
+                    json!({ "proposal": pid, "ttl_ms": 60_000, "challenge": challenge, "confirmed": true }),
+                );
+                assert!(again.get("error").is_some(), "a consumed challenge must not be reusable: {again}");
+                let (_, status) = proposal_state(&root, &pid);
+                assert_eq!(status, "pending", "the proposal must still be pending");
+                assert_eq!(approvals_for_task(&root, &task_id), 0, "still no approval");
+            }
+        });
+    }
+
+    /// A valid challenge with an affirmative confirmation creates exactly one approval,
+    /// and replaying it creates no second one.
+    #[test]
+    fn a_confirmed_challenge_creates_one_approval_and_cannot_be_replayed() {
+        rt().block_on(async {
+            let (s, root, pid) = serving_with_read("confirmed").await;
+            let challenge = challenge_for(&s.endpoint, &pid).expect("an eligible preview issues a challenge");
+            let reply = send(
+                &s.endpoint,
+                "a",
+                "capability/approve",
+                json!({ "proposal": pid, "ttl_ms": 60_000, "challenge": challenge, "confirmed": true }),
+            );
+            assert!(reply.get("result").is_some(), "the confirmed approval must succeed: {reply}");
+            let (task_id, status) = proposal_state(&root, &pid);
+            assert_ne!(status, "pending", "the proposal must be decided");
+            assert_eq!(approvals_for_task(&root, &task_id), 1, "exactly one approval");
+
+            // The replay must not create a second approval.
+            let replay = send(
+                &s.endpoint,
+                "a",
+                "capability/approve",
+                json!({ "proposal": pid, "ttl_ms": 60_000, "challenge": challenge, "confirmed": true }),
+            );
+            assert!(replay.get("error").is_some(), "a replay must be refused: {replay}");
+            let (_, status_after) = proposal_state(&root, &pid);
+            assert_eq!(status_after, status, "the replay must not change the proposal");
+            assert_eq!(approvals_for_task(&root, &task_id), 1, "still exactly one approval");
+        });
+    }
+
+    /// A challenge issued for one proposal cannot approve another: the binding is
+    /// checked, and the attempt leaves the other proposal untouched.
+    #[test]
+    fn a_challenge_for_another_proposal_fails_closed() {
+        rt().block_on(async {
+            let (s, _root_a, first) = serving_with_read("bindmis-a").await;
+            let challenge = challenge_for(&s.endpoint, &first).expect("an eligible preview issues a challenge");
+
+            // A second, independent proposal on the same daemon.
+            let d2 = dir("bindmis-b");
+            seed(&d2);
+            let provider = Arc::new(Recorder::new(
+                "scripted/reader",
+                "https://provider.test/v1",
+                &[READ_PROPOSAL],
+            ));
+            let s2 = Serving::start_with(d2.clone(), provider).await;
+            let other = propose_the_read(&s2);
+
+            let reply = send(
+                &s2.endpoint,
+                "a",
+                "capability/approve",
+                json!({ "proposal": other, "ttl_ms": 60_000, "challenge": challenge, "confirmed": true }),
+            );
+            assert!(reply.get("error").is_some(), "a foreign challenge must be refused: {reply}");
+            let (task_id, status) = proposal_state(&d2, &other);
+            assert_eq!(status, "pending", "the other proposal must not be decided");
+            assert_eq!(approvals_for_task(&d2, &task_id), 0, "no approval may be created");
+        });
+    }
+
+    /// A change of provider endpoint or model invalidates a challenge: the destination
+    /// fingerprint is part of the binding.
+    #[test]
+    fn a_changed_provider_destination_invalidates_the_challenge() {
+        rt().block_on(async {
+            let (s, _root, pid) = serving_with_read("drift").await;
+            let challenge = challenge_for(&s.endpoint, &pid).expect("an eligible preview issues a challenge");
+
+            // A daemon whose provider has a different endpoint and model.
+            let d2 = dir("drift-2");
+            seed(&d2);
+            let provider = Arc::new(Recorder::new(
+                "scripted/other",
+                "https://other.test/v1",
+                &[READ_PROPOSAL],
+            ));
+            let s2 = Serving::start_with(d2.clone(), provider).await;
+
+            // The same proposal id, presented to a daemon with a different destination.
+            let reply = send(
+                &s2.endpoint,
+                "a",
+                "capability/approve",
+                json!({ "proposal": pid, "ttl_ms": 60_000, "challenge": challenge, "confirmed": true }),
+            );
+            assert!(reply.get("error").is_some(), "a drifted destination must be refused: {reply}");
+        });
+    }
+}
+
+/// An inspection request classifies the proposal without minting a challenge.
+///
+/// A client that only wants to look -- to decide whether it needs an interactive
+/// confirmation -- must not take a challenge it might abandon. The inspection
+/// response carries the same authoritative classification and the same safe
+/// information; only the challenge is absent.
+#[test]
+fn an_inspection_request_classifies_the_proposal_without_taking_a_challenge() {
+    rt().block_on(async {
+        let d = dir("inspect");
+        seed(&d);
+        let provider = Arc::new(Recorder::new(
+            "scripted/reader",
+            "https://provider.test/v1",
+            &[READ_PROPOSAL],
+        ));
+        let s = Serving::start_with(d.clone(), provider).await;
+        let pid = propose_the_read(&s);
+
+        let inspected = send(
+            &s.endpoint,
+            "p",
+            "capability/preview",
+            json!({ "proposal": pid, "inspect_only": true }),
+        );
+        let preview = &inspected["result"]["preview"];
+        assert_eq!(preview["proposal_kind"], "model-initiated-file-read");
+        assert_eq!(preview["requires_confirmation"], true);
+        assert_eq!(preview["approval_allowed"], true);
+        assert!(
+            preview["challenge"].is_null(),
+            "an inspection must not take a challenge: {inspected}"
+        );
+
+        // The ordinary preview still does, so inspection is a mode and not a
+        // different contract.
+        let ordinary = send(
+            &s.endpoint,
+            "p",
+            "capability/preview",
+            json!({ "proposal": pid }),
+        );
+        assert!(
+            ordinary["result"]["preview"]["challenge"].is_string(),
+            "an ordinary preview must still take a challenge: {ordinary}"
+        );
+    });
+}
+
+/// The dispatch boundary: a read needs **both** a policy-valid approval **and** a
+/// daemon-side authorisation.
+#[cfg(test)]
+mod read_dispatch_authorization {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A provider that answers with the read proposal.
+    fn reader(tag: &str) -> (PathBuf, Arc<Recorder>) {
+        let d = dir(tag);
+        seed(&d);
+        let provider = Arc::new(Recorder::new(
+            "scripted/reader",
+            "https://provider.test/v1",
+            &[READ_PROPOSAL],
+        ));
+        (d, provider)
+    }
+
+    /// Approves a read through the reviewed path, and returns the daemon's approval
+    /// record and the proposal id.
+    async fn approve_a_read(s: &Serving) -> (String, Value) {
+        let pid = propose_the_read(s);
+        let preview = send(
+            &s.endpoint,
+            "p",
+            "capability/preview",
+            json!({ "proposal": pid }),
+        );
+        let challenge = preview["result"]["preview"]["challenge"]
+            .as_str()
+            .expect("an eligible read must be given a challenge")
+            .to_owned();
+        let approved = send(
+            &s.endpoint,
+            "a",
+            "capability/approve",
+            json!({
+                "proposal": pid,
+                "ttl_ms": 60_000,
+                "challenge": challenge,
+                "confirmed": true,
+            }),
+        );
+        assert!(
+            approved["result"]["approval"].is_object(),
+            "the approval must have been issued: {approved}"
+        );
+        (pid, approved["result"]["approval"].clone())
+    }
+
+    /// A dispatch request built entirely from the daemon's own approval record, so
+    /// every field the digest covers is the daemon's.
+    fn dispatch_request(approval: &Value) -> Value {
+        // The approval's `params` is the *canonical string*; the digest covers the
+        // parsed parameters, so the request has to carry the object back, not the
+        // string. Passing the string through would produce an action whose parameters
+        // are not the ones that were approved.
+        let params: Value = serde_json::from_str(
+            approval["params"]
+                .as_str()
+                .expect("the approval carries its params"),
+        )
+        .expect("the approval's params must be canonical JSON");
+        json!({
+            "capability": approval["capability"],
+            "params": params,
+            "target": approval["target"],
+            // The step the approval was issued for: the digest was computed over it.
+            "step": approval["step_no"],
+            "approval": approval,
+        })
+    }
+
+    /// A digest-valid approval that this daemon never authorised must not dispatch a
+    /// read.
+    ///
+    /// The tuple is entirely genuine: the daemon issued it, for the right approver, the
+    /// right action and the right step, and the policy's digest recomputation accepts
+    /// it. What it lacks is the *daemon-side* authorisation -- the registry entry that
+    /// `approve_proposal` creates for a read. It is presented to a **different daemon**,
+    /// whose registry has never seen it, which is exactly the shape of a tuple obtained
+    /// by a route that is no longer permitted.
+    #[test]
+    fn a_digest_valid_but_unregistered_approval_does_not_dispatch_a_read() {
+        rt().block_on(async {
+            let (d1, provider1) = reader("dispatch-a");
+            let s1 = Serving::start_with(d1, provider1).await;
+            let (_pid, approval) = approve_a_read(&s1).await;
+
+            // A second daemon, with its own registry, which never authorised this.
+            let (d2, provider2) = reader("dispatch-b");
+            let s2 = Serving::start_with(d2, provider2).await;
+
+            let reply = send(
+                &s2.endpoint,
+                "x",
+                "capability/dispatch",
+                dispatch_request(&approval),
+            );
+            assert!(
+                reply.get("error").is_some(),
+                "an unregistered read approval must be refused: {reply}"
+            );
+            let detail = reply["error"]["data"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            assert!(
+                detail.contains("read-not-authorized") || detail.contains("read"),
+                "the refusal must name the read authorisation: {reply}"
+            );
+        });
+    }
+
+    /// A genuine approval from a **previous runtime** cannot execute after a restart.
+    ///
+    /// The registry is deliberately ephemeral: a restart empties it, so an approval that
+    /// was registered before the restart cannot authorise a read afterwards. The tuple
+    /// itself is genuine -- issued by a daemon, for the right approver, action and step
+    /// -- and the policy's own digest and expiry checks are untouched; what refuses it is
+    /// the absent authorisation.
+    #[test]
+    fn an_approval_from_before_a_restart_cannot_execute_after_it() {
+        rt().block_on(async {
+            let (d1, provider1) = reader("restart-a");
+            let s1 = Serving::start_with(d1, provider1).await;
+            let (_pid, approval) = approve_a_read(&s1).await;
+
+            // A fresh runtime: a new daemon, with a new -- therefore empty -- registry.
+            let (d2, provider2) = reader("restart-b");
+            let s2 = Serving::start_with(d2, provider2).await;
+
+            let reply = send(
+                &s2.endpoint,
+                "x",
+                "capability/dispatch",
+                dispatch_request(&approval),
+            );
+            assert!(
+                reply.get("error").is_some(),
+                "an approval from before a restart must not execute: {reply}"
+            );
+            let reason = reply["error"]["data"]["reason"]
+                .as_str()
+                .unwrap_or_default();
+            assert_eq!(
+                reason, "read-not-authorized",
+                "the refusal must be the missing authorisation: {reply}"
+            );
+            // No contents, and no observation, could have been produced.
+            assert!(
+                !reply.to_string().contains("contents"),
+                "no file contents may be returned: {reply}"
+            );
+        });
+    }
+
+    /// One registered authorisation is claimed by exactly one dispatch.
+    ///
+    /// The route that actually executes a read is `task/execute`, which recomposes the
+    /// approval from the durable row rather than trusting a client-supplied tuple. Two
+    /// concurrent executions of the same proposal therefore race for the same
+    /// authorisation, and exactly one may win.
+    ///
+    /// The daemon serialises requests under the governed mutex, so the two requests are
+    /// serialised in practice; a `Barrier` is used so they start together. What this
+    /// proves is the end-to-end single-use invariant, not a lock-free claim.
+    #[test]
+    fn one_registered_read_authorisation_is_claimed_by_exactly_one_dispatch() {
+        rt().block_on(async {
+            let (d, provider) = reader("dispatch-once");
+            let s = Serving::start_with(d, provider).await;
+            let (pid, _approval) = approve_a_read(&s).await;
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|i| {
+                    let endpoint = s.endpoint.clone();
+                    let pid = pid.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        send(
+                            &endpoint,
+                            &format!("x{i}"),
+                            "task/execute",
+                            json!({ "proposal": pid, "worker": "w1" }),
+                        )
+                    })
+                })
+                .collect();
+            let replies: Vec<Value> = handles
+                .into_iter()
+                .map(|h| h.join().expect("the request thread must not panic"))
+                .collect();
+
+            let succeeded = replies
+                .iter()
+                .filter(|r| r.get("result").is_some() && r["result"]["verified"] == true)
+                .count();
+            let refused = replies.iter().filter(|r| r.get("error").is_some()).count();
+            assert_eq!(
+                succeeded, 1,
+                "exactly one dispatch may execute the read: {replies:?}"
+            );
+            assert_eq!(
+                refused, 1,
+                "the other dispatch must be refused: {replies:?}"
+            );
+
+            // The same proposal cannot be executed again: the authorisation and the
+            // approval are both spent.
+            let again = send(
+                &s.endpoint,
+                "x",
+                "task/execute",
+                json!({ "proposal": pid, "worker": "w1" }),
+            );
+            assert!(
+                again.get("error").is_some(),
+                "a spent read authorisation must not execute again: {again}"
+            );
+        });
+    }
+}
