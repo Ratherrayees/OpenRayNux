@@ -37,8 +37,17 @@
 
 use std::path::{Path, PathBuf};
 
+// These three are used only by the Unix cases below: `StoreError` and
+// `OwnershipError` are matched on inside the refusal assertions, and the
+// exclusive lease and the `Store` are only reached through a symlink or a hard
+// link. The Windows lane compiles every test target (`cargo check --workspace
+// --all-targets`) but runs the portable alias suite instead, so the imports
+// are gated with the tests that use them rather than silenced.
+#[cfg(unix)]
 use orxnud_store::StoreError;
+#[cfg(unix)]
 use orxnud_store::ownership::{OwnershipError, acquire_exclusive_for_tests};
+#[cfg(unix)]
 use orxnud_store::sqlite::Store;
 
 /// A scratch directory, unique per test name.
@@ -79,9 +88,10 @@ fn plant_database(dir: &Path, path: &Path) {
 
 /// Create a symlink at `link` pointing at `target`.
 ///
-/// Unix-only: the repository's Windows lane does not run `orxnud-store`'s tests
-/// (see `.github/workflows/ci.yml`, the `windows-portability` job), and the
-/// store's own inode test is already `#[cfg(unix)]`.
+/// Unix-only: `std::os::unix::fs::symlink` has no Windows equivalent here, and
+/// the store's own inode test is already `#[cfg(unix)]`. The Windows lane
+/// compiles every test target but does not run this file, so the imports only
+/// these Unix cases use are gated to Unix as well.
 #[cfg(unix)]
 fn symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).expect("create the symlink");

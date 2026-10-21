@@ -38,7 +38,6 @@ use orxnud_domain::platform::{
 use orxnud_platform_fs::OsIdentity;
 use orxnud_store::StoreError;
 use orxnud_store::alias::AliasRefusal;
-use orxnud_store::backup::Backup;
 use orxnud_store::ownership::OwnershipError;
 use orxnud_store::sqlite::Store;
 
@@ -83,6 +82,12 @@ fn notes(conn: &rusqlite::Connection) -> String {
 /// Open `db` through the production path and give it known content.
 ///
 /// The connection stays open, so the WAL sidecars are materialised and alive.
+///
+/// Unix-only: every caller of this helper is a hard-link case, and a hard link
+/// is a Unix-only way to reach one file through two names. The Windows lane
+/// compiles this file (`cargo check --workspace --all-targets`) but runs the
+/// portable alias suite instead, so the helper is gated rather than silenced.
+#[cfg(unix)]
 fn open_with_content(db: &Path) -> Store {
     let store = Store::open(db, true, &OsIdentity).expect("open the database");
     store
@@ -402,6 +407,8 @@ fn an_aliased_wal_sidecar_is_refused_by_the_store() {
 #[cfg(unix)]
 #[test]
 fn the_restore_path_refuses_an_aliased_sidecar() {
+    use orxnud_store::backup::Backup;
+
     let d = dir("restore");
     let db = d.join("state.db");
     let evil = d.join("evil.db");

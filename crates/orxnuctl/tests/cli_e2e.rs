@@ -23,6 +23,33 @@
 //! which cargo places in `target/<profile>/deps/` — the same directory whose siblings
 //! are the built binaries.
 
+// Unix-only, whole-file.
+//
+// The subject of this suite is the CLI reaching a real `orxnud` daemon over a
+// real Unix-domain socket, and the interactive-approval cases additionally drive
+// a real pseudo-terminal, so the CLI's own `stdin.is_terminal()` check runs
+// unchanged. The daemon's local IPC transport refuses on Windows rather than
+// binding a named pipe, so this evidence cannot exist there.
+//
+// Most of the tests were already `#[cfg_attr(not(target_os = "linux"), ignore)]`
+// for exactly that reason. The rest reach `rustix::pty`,
+// `std::os::unix::fs::PermissionsExt` or `std::os::unix::net`, which on Windows
+// are not merely unavailable at runtime: `rustix::pty` is compiled out
+// (`#[cfg(not(windows))]`) and `std::os::unix` does not exist. The Windows
+// `cargo check --workspace --all-targets` job therefore failed to compile this
+// file, with E0432 and E0433, before a single test could run.
+//
+// The file-level gate states what is already true, and it leaves no hollow
+// Windows test binary behind: a suite that compiled on Windows while silently
+// losing its one observable is exactly the "a partial lane that looks like
+// evidence" failure this repository's CI exclusions are written to avoid. Every
+// Linux test below is unchanged.
+//
+// Recorded, not forgotten: Windows has no evidence for the CLI/daemon path. That
+// gap belongs to a Windows verification slice with a Windows transport, and it is
+// not evidence this file can produce.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
