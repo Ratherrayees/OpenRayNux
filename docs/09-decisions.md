@@ -6123,8 +6123,8 @@ are fixed here rather than left for the next concurrent start to find:
 * **F-26 stays open** and **F-26b stays open**: at the time of this pass a hard-linked alias
   produced a second lock file and bypassed ownership entirely. ADR-0058 (approved 2026-10-14 and
   implemented) now rejects that pre-existing alias in the tested paths, but the Unix
-  pathname-to-connection window, the sidecars and Windows runtime evidence remain open, so
-  ownership is not established against every alias.
+  pathname-to-connection window, the sidecars and the Windows evidence for the sidecar alias
+  family remain open, so ownership is not established against every alias.
 * **S-11 is not closed.** What is gone is the trust-me API and the two production callers that
   used it. S-11's wider specification in the remediation plan is not fully discharged by this.
 * The ordering in `Backup::take` — reading the source's emptiness before the copy — **was**
@@ -6410,9 +6410,9 @@ discussion anticipated, and it reached further into the migration flow than "add
 **F-26c REMAINS OPEN**: at the time of this record a hard-linked alias produced a second lock
 file and bypassed ownership entirely, which was measured and, at that time, unfixed. That
 pre-existing-alias case is now rejected in the tested paths by the implemented ADR-0058 check,
-but the Unix pathname-to-connection window, the sidecars and Windows runtime evidence remain
-open. **F-26b stays open** on its narrower remaining point, and **F-26 stays open**; S-11
-remains blocked.
+but the Unix pathname-to-connection window, the sidecars and the Windows evidence for the
+sidecar alias family remain open. **F-26b stays open** on its narrower remaining point, and
+**F-26 stays open**; S-11 remains blocked.
 
 **Feasibility observation, 2026-10-17 — the private-layout dependency is avoidable.**
 This is **feasibility research, not an implementation and not a closure.** The proof above reached
@@ -6446,9 +6446,9 @@ than a settled detail. None of the following was attempted or measured in this p
 * unsafe FFI implementation, and its audit;
 * correct file-descriptor binding and hard-link refusal **across SQLite's actual open path**;
 * WAL and rollback-journal behaviour, **including links created after a connection opens**;
-* a Windows implementation (written 2026-10-21; see the Windows implementation note below) and
-  any Windows runtime evidence (none on the authoring host; the CI lane is the first intended
-  producer);
+* a Windows implementation (written 2026-10-21; see the Windows implementation note below, and
+  the run it has since been measured in) and the Windows runtime evidence a *descriptor-backed*
+  VFS would still need;
 * upstream SQLite regression tests, and a comparison against the unmodified baseline;
 * maintenance cost for the pinned SQLite version and for upgrades;
 * the availability and denial-of-service consequence of **refusing** a hard-linked database, which
@@ -6458,21 +6458,25 @@ than a settled detail. None of the following was attempted or measured in this p
 
 **The remaining design decision this note identifies** is whether to author a public-API VFS gate
 at all, accepting that POSIX lands first. Windows no longer has to be refused for want of an
-identity implementation: a native Windows path was written on 2026-10-21. That implementation is
-not runtime-verified, is not a descriptor-backed VFS gate, and does not close F-26c.
+identity implementation: a native Windows path was written on 2026-10-21, and it has since been
+compiled and exercised on a hosted Windows runner. That implementation is not a descriptor-backed
+VFS gate, it does not cover the sidecar alias family or long paths, and it does not close F-26c.
 **F-26c remains OPEN.**
 
 **What this record does not establish.** That any of the three options is correct on this
 codebase — two are argued from shape and one is explicitly unmeasured. That F-26 or F-26b is
 fixed. That S-30 is closed. That S-11 is implemented. That S-29 may begin.
 
-## ADR-0058 — APPROVED 2026-10-14; IMPLEMENTED (WINDOWS RUNTIME UNVERIFIED) — a filesystem-identity capability `orxnud-store` can require, so a hard-link alias cannot bypass ownership
+## ADR-0058 — APPROVED 2026-10-14; IMPLEMENTED (WINDOWS FOCUSED RUNTIME EVIDENCE 2026-10-21; F-26c STILL OPEN) — a filesystem-identity capability `orxnud-store` can require, so a hard-link alias cannot bypass ownership
 
 **Status.** **The three open decisions are APPROVED (2026-10-14). The capability, the two-sided
 check and a native Windows path are now implemented; the implementation notes at the end record
 what exists and what remains unverified.** The boundary, the enforcement points and the test
 plan below are settled. F-26c, F-26b and F-26 all remain open, and S-31 is **implemented but not
-complete**.
+complete**. The native Windows path has since been compiled and exercised on a hosted Windows
+runner (CI run **39611931128**, 2026-10-21, commit `6034d89`): the focused identity suites are
+green there. That is the third implementation note's subject, it is **scoped to what those suites
+exercise**, and it closes no finding.
 
 | Decision | Disposition |
 |---|---|
@@ -7033,12 +7037,15 @@ implementation followed on 2026-10-21).** At that time stable Windows could not 
 fail-closed rule meant the platform implementation **refused every open on Windows** until a
 native `GetFileInformationByHandle` implementation existed. That was the disposition then.
 A native `CreateFileW`/`GetFileInformationByHandleEx` path now exists in source, and the
-`SQLITE_FCNTL_WIN32_GET_HANDLE` check is implemented. The Windows platform build has not
-succeeded on this host: it is blocked before the Windows Rust code compiles by the missing
-`lib.exe` (MSVC) and `x86_64-w64-mingw32-gcc` (GNU) toolchains. Windows runtime behavior is
-unverified; unsupported filesystems remain fail-closed through `Unknown`; long-path behavior is
-unvalidated because `CreateFileW` is called without the extended `\\?\` prefix; and F-26c
-remains OPEN.
+`SQLITE_FCNTL_WIN32_GET_HANDLE` check is implemented. That path has since been compiled and
+executed on a hosted Windows runner (CI run **39611931128**, 2026-10-21; see the third
+implementation note below), so Windows runtime behavior is now **evidenced for the focused
+scope** and no longer entirely unverified. It is not evidenced for every filesystem: unsupported
+filesystems remain fail-closed through `Unknown`; long-path behavior is unvalidated because
+`CreateFileW` is called without the extended `\\?\` prefix; the sidecar alias family is still
+unexecuted on Windows; and F-26c remains OPEN. The build still cannot be reproduced on this
+authoring host: it is blocked before the Windows Rust code compiles by the missing
+`lib.exe` (MSVC) and `x86_64-w64-mingw32-gcc` (GNU) toolchains.
 
 **Decision 3 — S-31 remains implemented but NOT complete.** While a known bypass or an
 unaccepted residual window remains, S-31 does not close, and S-30 is not declared fully closed.
@@ -7161,22 +7168,89 @@ ignored), the four new main-handle cases in `s31_alias_safety`, clean clippy wit
 Windows tests exist but **were not compiled or run on the authoring host**. Compiling
 `orxnud-platform-fs` for Windows there is blocked by the missing C toolchain (`lib.exe` for
 MSVC, `x86_64-w64-mingw32-gcc` for GNU); `cargo check --target x86_64-pc-windows-msvc -p
-orxnud-domain` does pass. The CI `windows-portability` lane now runs the focused store suites
+orxnud-domain` does pass. The CI `windows-portability` lane runs the focused store suites
 `s31_alias_safety` and `s31_windows_identity` (not `s31_sidecar_alias`) and the platform-fs unit
-tests, but its result is pending, and the job's 20-minute timeout has not been validated with the
-bundled-SQLite build.
+tests. **Its result was pending when this note was written; the third note below records the run
+that produced it**, including what the lane's 20-minute timeout does and does not establish.
 
 **Residual windows.** The Unix main database is still observed by path, because there is no
 equivalent opcode in use; `NotApplicable` names that rather than pretending the handle was
 verified. Every sidecar (`-wal`, `-shm`, `-journal`) remains a path observation on every
 platform. A hard link created **after** the handle observation is not detected. `CreateFileW` is
 called without the extended `\\?\` prefix, so long-path behavior is unvalidated; a path that
-cannot be opened or queried is refused as `Unknown`. And the Windows runtime evidence is pending.
-F-26c therefore remains OPEN, as Decision 3 requires while an unaccepted residual window
-remains; S-31 is still not complete; S-30 and S-11 are untouched.
+cannot be opened or queried is refused as `Unknown`. The Windows runtime evidence was pending
+when this note was written; the third note below records what has since been measured, and how
+far that measurement reaches. F-26c therefore remains OPEN, as Decision 3 requires while an
+unaccepted residual window remains; S-31 is still not complete; S-30 and S-11 are untouched.
 
 **No general Windows filesystem claim.** `FileIdInfo` is not universal. A filesystem or network
 redirector that cannot supply a 128-bit file id, or that reports no usable link count, answers
 `Unknown` and the open is refused. That is the intended direction. The tests require a
 filesystem that supports hard links; if the scratch filesystem does not, the hard-link test
 fails with that reason rather than passing without measuring it.
+
+---
+
+## ADR-0058 — IMPLEMENTATION NOTE (2026-10-21) — the Windows path has been run on a Windows runner
+
+**This note records a measurement. It changes none of the four decisions and closes nothing.** The
+evidence is in the Verification Register (**A-019**, and the F-26c row); this note states what
+was measured and how far it reaches. The two notes above are retained as the historical record
+of what was true when they were written.
+
+**The run.** GitHub Actions run **39611931128**, on the temporary validation branch
+`validation/windows-identity-2026-10-21`, at commit
+`6034d89d16e38e53ec76d4fed14295f75510560c`, on the `windows-2025` runner image. Two Windows jobs:
+
+* **`windows-check` — green.** `cargo check --workspace --all-targets` for the MSVC host target
+  completed with exit 0, so every crate and every test target in the workspace compiles for MSVC
+  on a real Windows toolchain.
+* **`windows-portability` — green**, all three steps. The focused step
+  (`cargo test -p orxnud-store --test s31_alias_safety --test s31_windows_identity`) **executed;
+  it was not skipped**: `s31_alias_safety` **14 passed**, `s31_windows_identity` **5 passed**,
+  and `orxnud-platform-fs`'s own unit tests **18 passed**.
+
+**What that makes true.** The native Windows identity path — `CreateFileW`, `FileIdInfo`,
+`FileStandardInfo` — and the main-database handle check — `SQLITE_FCNTL_WIN32_GET_HANDLE` — have
+**runtime** evidence on Windows, for the scenarios the focused suites exercise. They are not
+"not yet verified at runtime" any more, and the note above's wording is superseded on that point
+alone.
+
+**What it does not make true, and this is the part that matters.**
+
+* **It is one environment.** The run exercised the runner's own local scratch filesystem, which
+  supports hard links. A filesystem or redirector that cannot supply a 128-bit file id, or that
+  reports no usable link count, still answers `Unknown` and the open is refused. No network share
+  was tested.
+* **Long paths are still unvalidated.** `CreateFileW` is called without the extended `\\?\`
+  prefix, and nothing in this run changes that.
+* **The sidecar alias family is still unevidenced on Windows.** The lane runs `s31_alias_safety`
+  and `s31_windows_identity`; it does **not** select `s31_sidecar_alias` or `s31_lease_key`. Every
+  sidecar remains a path observation on every platform, and a hard link created after the handle
+  observation is still not detected.
+* **The Unix main database is still observed by path**, and that half of the pathname-to-connection
+  gap is untouched by any of this.
+* **Windows isolation is still NOT PROVEN**, and this run says nothing about it: there is no Job
+  Object or AppContainer backend, and a Tier-1 execution is refused there rather than degraded.
+
+**The timeout claim, in full.** The `windows-portability` job ran from 13:53:20Z to 13:56:38Z —
+**3 minutes 18 seconds** — against its 20-minute timeout. That is the whole claim: the job fits
+inside the limit with the bundled-SQLite build. It is **not** evidence that 20 minutes suffices
+under heavy runner load, and the lane has not been load-tested.
+
+**The overall workflow run is a `failure`, and it is not the Windows jobs.** The `Linux gates
+(G1-G11)` job failed at G9 on a test that needs a Tier-1 sandbox the hosted Linux runner reports
+it cannot provide (`host cannot isolate`; the daemon refuses with `-32043 sandbox-unavailable`).
+That failure is independent of Windows and is not addressed by this note.
+
+**The two commits that made the lane compile were test-only.** The Unix-only `cli_e2e` suite is
+now `#![cfg(unix)]`; the Unix-only imports in the store's lease-key and sidecar suites are gated
+to the cases that use them; and a link-count assertion that was self-contradictory off Unix is
+now Unix-only. **No production behaviour, dependency, manifest, gate rule or CI selection
+changed.** The two-process ownership evidence, the six ADR test-plan cases and every Linux
+assertion are exactly as they were.
+
+**F-26c remains OPEN.** Three of its four residual items are live — the Unix path observation,
+the sidecars, and a hard link created after the handle observation — and S-31 still awaits an
+explicit acceptance of the narrowed threat model. This is not a claim of Windows support and not
+a release-readiness claim.

@@ -676,10 +676,13 @@ pub struct Components {
     /// open on Windows because stable Rust could not report the required facts —
     /// is historical.
     ///
-    /// Native Windows runtime behavior is **unverified**. The platform crate has
-    /// not built for a Windows target on the authoring host because the C
-    /// toolchain is missing, and no Windows test has run. Filesystems that cannot
-    /// supply the required identity facts still answer `Unknown` and are refused.
+    /// Native Windows runtime behavior is now **measured for a focused scope**: the
+    /// `windows-portability` lane compiled the workspace for MSVC and ran the
+    /// focused identity suites on a hosted Windows runner (CI run 39611931128,
+    /// 2026-10-21). The authoring host still cannot build for a Windows target,
+    /// because the C toolchain is missing. Filesystems that cannot supply the
+    /// required identity facts still answer `Unknown` and are refused, and the
+    /// sidecar alias family is still unexecuted on Windows.
     pub identity: orxnud_platform_fs::OsIdentity,
 }
 

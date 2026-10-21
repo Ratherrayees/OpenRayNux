@@ -107,7 +107,7 @@ Legend — **Cadence**: `event` (re-checked on a named trigger) · `quarterly` �
 phase gate).
 
 | ID | Claim | Verification source | Cadence / trigger | Last verified | Consequence of silent drift |
-| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — approved 2026-10-14 and implemented in source; Windows runtime unverified), and S-11's wider specification. **AMENDED 2026-10-17 (A-011): the public-schema-SQL route described by that residual gap is now closed and G16 also refuses production schema DDL — but F-26 remains OPEN**, because `orxnud-store` still publishes live `Connection` values and G16 is lexical enforcement, not a type-system guarantee. The original 2026-10-14 text follows, retained because it records what was measured.**
+| **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — approved 2026-10-14 and implemented in source; the focused Windows identity suites have since run on a hosted Windows runner — A-019 — and the finding remains open on its residual window), and S-11's wider specification. **AMENDED 2026-10-17 (A-011): the public-schema-SQL route described by that residual gap is now closed and G16 also refuses production schema DDL — but F-26 remains OPEN**, because `orxnud-store` still publishes live `Connection` values and G16 is lexical enforcement, not a type-system guarantee. The original 2026-10-14 text follows, retained because it records what was measured.**
 
 The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
 §7-S30) owns the restore defect; S-11 (§7-S11) owns the six entry points. **S-11 is blocked on
@@ -185,7 +185,7 @@ reporting success, but that is not a clean rollback and this row does not claim 
 
 | **V-27** | **`cargo-deny` 0.20 removed `[licenses] deny`** — the copyleft prohibition is now expressed by the *absence* of copyleft from `[licenses] allow` | `cargo deny check licenses` on this tree; the tool's own error output (`error[deprecated]`) | **release:** re-read the tool's config schema | 2026-09-30 | **Medium.** ADR-0006/ADR-0019 forbid GPL/AGPL/NC. If a future `deny.toml` reintroduces a `deny` key, cargo-deny will *error* rather than silently ignore it — the failure is loud, but only if someone reads it. `scripts/ci-gates.sh` G8 fails on any cargo-deny error. |
 | **V-28** | **The twelve Phase 1 gates actually pass on this tree** | `scripts/ci-gates.sh` (exit 0), run locally against Rust 1.98.1 | **milestone:** every commit in CI; **event:** a toolchain or dependency bump | 2026-09-30 | **High.** The gates are the Phase 1 deliverable (docs-13 §5). A gate that silently stops running is worse than a gate that fails, so G12 skips loudly when no release tag exists rather than passing vacuously. |
-| **V-29** | ****Windows: all 16 crates compile for MSVC and the platform-neutral suites pass on a hosted Windows runner; the sandbox still has no Windows backend and a Tier-1 execution is refused there rather than degraded**** | `cargo check -p <crate> --all-targets --target x86_64-pc-windows-msvc`: clean for `orxnud-domain`, `orxnud-protocol`, `orxnud-config`, `orxnud-obs`, `orxnuctl`, `orxnud-platform-fs`, `orxnud-platform-sandbox`, `orxnud-platform-secrets`, `orxnud-platform-notify`; the `orxnud-platform-sandbox` `windows-portability` CI lane; mutation check: a type error planted in the `not(target_os = "linux")` arm fails the MSVC build and not the Linux build, so the Windows path is compiled, not dead | **release:** the Windows lanes report the result -- green on run 37343986458 (2026-10-05); **milestone:** any change to `platform::host_backend`, `SandboxRunner`, `spec_for`, or a platform crate's MSVC reachability| 2026-10-05 | **Scope, and what is deliberately still NOT proven.** The original V-29 was a single fact: the MSVC check was blocked *on this development host* by a missing C toolchain (`cc-rs: failed to find tool "lib.exe"`), not by a code defect. That remains true for the six crates behind bundled SQLite (`store`, `task`, `policy`, `audit`, `capability`, `daemon`) and no Rust-level error was observed in any of them. What has changed is that the Windows claim is no longer a single undifferentiated open item Reconciled 2026-10-05, and the entry was materially wrong before. It accounted for **15 of 16** crates -- `orxnud-platform-ipc` appeared nowhere in this file at all -- and it asserted that no Rust-level error had been observed. Both were false, and a hosted runner is what showed it. Five Rust-level MSVC defects were found and fixed across `9609892`, `3928e75`, `92808e4` and `1721761`: `Inner` declared only under `#[cfg(unix)]` in `platform-ipc`; `PermissionsExt` used unguarded in `orxnud-daemon`; three daemon *test* binaries naming `std::os::unix::net::UnixStream`; Linux-kernel tests in the sandbox lib; and two errno helpers left dead by that gating. The middle one is the instructive one -- gate **G3** greps for `cfg`, not for a platform API, so unguarded `std::os::unix` passed G3 and broke MSVC, which is this entry's own recorded "consequence of drift" arriving on schedule. **Corrected count: 16 of 16 crates**, 11 verifiable on a C-toolchain-free host and the remaining 5 (`store`, `task`, `policy`, `capability`, `daemon`) verifiable only on a runner with a real MSVC toolchain. **Still NOT PROVEN, and unchanged in substance:** Windows *isolation*. No Job Object or AppContainer backend exists, `host_backend()` binds the refusing `UnsupportedRunner` there, and a Tier-1 execution is refused rather than degraded. The portable core is now genuinely portable -- the mutation check proving the Windows arm is compiled rather than dead still holds -- but portability is not isolation. |
+| **V-29** | ****Windows: all 16 crates compile for MSVC and the platform-neutral suites pass on a hosted Windows runner; the sandbox still has no Windows backend and a Tier-1 execution is refused there rather than degraded**** | `cargo check -p <crate> --all-targets --target x86_64-pc-windows-msvc`: clean for `orxnud-domain`, `orxnud-protocol`, `orxnud-config`, `orxnud-obs`, `orxnuctl`, `orxnud-platform-fs`, `orxnud-platform-sandbox`, `orxnud-platform-secrets`, `orxnud-platform-notify`; the `orxnud-platform-sandbox` `windows-portability` CI lane; mutation check: a type error planted in the `not(target_os = "linux")` arm fails the MSVC build and not the Linux build, so the Windows path is compiled, not dead | **release:** the Windows lanes report the result -- green on run 37343986458 (2026-10-05), and again on run 39611931128 (2026-10-21, commit 6034d89, runner `windows-2025`), where the MSVC workspace check and the focused native-identity suites also ran and passed (A-019); **milestone:** any change to `platform::host_backend`, `SandboxRunner`, `spec_for`, or a platform crate's MSVC reachability| 2026-10-05 | **Scope, and what is deliberately still NOT proven.** The original V-29 was a single fact: the MSVC check was blocked *on this development host* by a missing C toolchain (`cc-rs: failed to find tool "lib.exe"`), not by a code defect. That remains true for the six crates behind bundled SQLite (`store`, `task`, `policy`, `audit`, `capability`, `daemon`) and no Rust-level error was observed in any of them. What has changed is that the Windows claim is no longer a single undifferentiated open item Reconciled 2026-10-05, and the entry was materially wrong before. It accounted for **15 of 16** crates -- `orxnud-platform-ipc` appeared nowhere in this file at all -- and it asserted that no Rust-level error had been observed. Both were false, and a hosted runner is what showed it. Five Rust-level MSVC defects were found and fixed across `9609892`, `3928e75`, `92808e4` and `1721761`: `Inner` declared only under `#[cfg(unix)]` in `platform-ipc`; `PermissionsExt` used unguarded in `orxnud-daemon`; three daemon *test* binaries naming `std::os::unix::net::UnixStream`; Linux-kernel tests in the sandbox lib; and two errno helpers left dead by that gating. The middle one is the instructive one -- gate **G3** greps for `cfg`, not for a platform API, so unguarded `std::os::unix` passed G3 and broke MSVC, which is this entry's own recorded "consequence of drift" arriving on schedule. **Corrected count: 16 of 16 crates**, 11 verifiable on a C-toolchain-free host and the remaining 5 (`store`, `task`, `policy`, `capability`, `daemon`) verifiable only on a runner with a real MSVC toolchain. **Still NOT PROVEN, and unchanged in substance:** Windows *isolation*. No Job Object or AppContainer backend exists, `host_backend()` binds the refusing `UnsupportedRunner` there, and a Tier-1 execution is refused rather than degraded. The portable core is now genuinely portable -- the mutation check proving the Windows arm is compiled rather than dead still holds -- but portability is not isolation. |
 
 **PROVEN (compile-time, cross-checked):** the sandbox crate's platform dispatch is a real abstraction rather than a Linux import behind a portable name. Before this work `orxnud-capability` imported `linux::BwrapRunner` directly, so a Windows build would have bound a Linux backend and adding one would have required a `cfg` in a crate gate G3 forbids. `spec_for` also tested `program.starts_with('/')` for absoluteness, which is correct on Unix and refuses *every* Windows program (`C:\\...` is absolute and does not begin with `/`); it now uses `Path::is_absolute`, which was **measured** to be the identical predicate on Unix (19 inputs, 0 divergences) and correct on Windows.
 
@@ -709,9 +709,9 @@ further portability fact was established by measurement.**
   `MetadataExt::number_of_links`, `file_index` and `volume_serial_number` are **nightly-only
   experimental** (`windows_by_handle #63010`). `identity` needs the latter two, so on stable
   Windows the capability was then unavailable *in full*, and the fail-closed rule required either
-  native Win32 or **refusing every open on Windows**. A native Win32 path now exists (A-018), but
-  no Windows platform build or runtime test has verified it; the fail-closed requirement itself
-  is unchanged.
+  native Win32 or **refusing every open on Windows**. A native Win32 path now exists (A-018), and
+  **A-019 records the Windows runner that has since compiled and executed the focused suites**;
+  the fail-closed requirement itself is unchanged.
 * **Decision 2 approved — the residual window is not to be called closed.** Stronger enforcement
   (a custom VFS or equivalent) is to be *investigated*, with feasibility **and WAL interaction**
   evidenced, before any descriptor-backed opening is committed to. Nothing is proposed.
@@ -857,10 +857,11 @@ closed, defer native.** At that time stable Windows supplied neither `name_count
 so Decision 1 meant **every open was refused on Windows** until a native
 `GetFileInformationByHandle` path existed. That was recorded as a support decision, not an
 omission. A native `CreateFileW`/`GetFileInformationByHandleEx` path and the
-`SQLITE_FCNTL_WIN32_GET_HANDLE` main-handle check now exist. No Windows platform build has
-succeeded and no Windows runtime test has run, so the integration is unverified; unsupported
-filesystems still refuse through `Unknown`; `CreateFileW` long-path behavior is unvalidated
-because no `\\?\` prefix is used; and F-26c remains OPEN.
+`SQLITE_FCNTL_WIN32_GET_HANDLE` main-handle check now exist, and **A-019 records the Windows
+runner that has since compiled and executed the focused suites**. The integration is verified for
+the scope those suites exercise and no further: unsupported filesystems still refuse through
+`Unknown`; `CreateFileW` long-path behavior is unvalidated because no `\\?\` prefix is used; the
+sidecar alias family is still unexecuted on Windows; and F-26c remains OPEN.
 
 **Limitations, stated rather than smoothed over.**
 * **Advisory locks coordinate only participants that follow the protocol.** A process opening
@@ -1241,22 +1242,28 @@ refused, and a file replaced during the open is detected unless it is replaced a
 inside the window* on Unix, or unless it is created after the Windows handle check. A path
 identity check is **not** verified connection identity on Unix, and this row does not claim it.
 
-**Platforms actually verified.** Linux (this host) only. The store's alias-safety suite
+**Platforms actually verified.** Linux (this host), and — since **A-019** — a hosted Windows
+runner, for the focused scope only. The store's alias-safety suite
 (`crates/orxnud-store/tests/s31_alias_safety.rs`) creates a **real** hard link and asserts that
 the **real** platform implementation refuses it; the platform adapter's own suite
-(`orxnud-platform-fs`) asserts the link count and identity it reports. **No Windows behaviour has
-been verified on this host.** The native Windows implementation exists (A-018) and the CI lane
-now runs the focused Windows suites, but those results are **pending** until the lane runs.
+(`orxnud-platform-fs`) asserts the link count and identity it reports. On the Windows runner
+(`windows-2025`, run 39611931128) `s31_alias_safety` passed **14/14** and the Windows-only
+`s31_windows_identity` passed **5/5**, and `orxnud-platform-fs`'s own unit tests passed **18/18**.
+**What that covers is the runner's own local filesystem and the scenarios those suites
+exercise**; it is not evidence for every Windows filesystem, for a network share, or for long
+paths, and the sidecar-alias and lease-key suites (`s31_sidecar_alias`, `s31_lease_key`) compile
+on Windows but are **not** selected for execution there.
 
 **Windows — current status.** The 2026-10-14 disposition answered `Unknown` for every existing
 file, because stable `MetadataExt::number_of_links`, `file_index` and `volume_serial_number` are
 nightly-only (`windows_by_handle` #63010). **A-018 supersedes that consequence**: the platform
 now opens the path with `CreateFileW`, queries `FILE_ID_INFO` and `FILE_STANDARD_INFO` through
 `GetFileInformationByHandleEx`, and inspects the file behind SQLite's actual main-database handle
-with `SQLITE_FCNTL_WIN32_GET_HANDLE`. The old `Unknown`-for-everything behaviour is gone, but
-the new path is **not yet verified at runtime** and no general Windows filesystem claim is made.
-`FileIdInfo` is not universal; a filesystem or redirector that cannot supply it is `Unknown`,
-and the store refuses, which is the intended fail-closed direction.
+with `SQLITE_FCNTL_WIN32_GET_HANDLE`. The old `Unknown`-for-everything behaviour is gone, and
+**A-019** records the run in which that path was compiled and executed on a real Windows runner.
+No general Windows filesystem claim is made. `FileIdInfo` is not universal; a filesystem or
+redirector that cannot supply it is `Unknown`, and the store refuses, which is the intended
+fail-closed direction.
 
 **Relation to the neighbouring findings — none of them closes.**
 
@@ -1282,11 +1289,11 @@ therefore avoid the undocumented-layout dependency.
 **That is feasibility, not safety.** No VFS has been integrated. Unsafe FFI and its audit;
 file-descriptor binding across SQLite's actual open path; WAL and rollback-journal behaviour
 including links created after a connection opens; a Windows implementation (now written outside
-the VFS, see **A-018**) and Windows runtime evidence (still absent); upstream SQLite regression
-tests against an unmodified baseline; maintenance cost for the pinned SQLite version and
-upgrades; the availability/denial-of-service consequence of refusing a hard-linked database; and
-cross-process and filesystem limitations. The VFS-specific items are still **unattempted and
-unmeasured**.
+the VFS, see **A-018**, and exercised on a Windows runner by **A-019**) and the Windows runtime
+evidence a *descriptor-backed* VFS would still need; upstream SQLite regression tests against an
+unmodified baseline; maintenance cost for the pinned SQLite version and upgrades; the
+availability/denial-of-service consequence of refusing a hard-linked database; and cross-process
+and filesystem limitations. The VFS-specific items are still **unattempted and unmeasured**.
 
 **F-26c remains OPEN.**
 
@@ -1422,8 +1429,11 @@ version.
 
 * **Not a Windows claim.** No Windows behaviour was tested, and none is claimed. At the time of
   A-013 the platform answered `Unknown` and every open of an existing database was refused — a
-  support decision (ADR-0058, 2026-10-14), not an accident. **A-018 supersedes that platform
-  behaviour on Windows; the runtime evidence it still lacks is the reason this remains unclaimed.**
+  support decision (ADR-0058, 2026-10-14), not an accident. **A-018 superseded that platform
+  behaviour on Windows, and A-019 records the Windows runner that has since exercised the
+  focused suites.** What this bullet established, and still establishes, is that A-013 itself
+  measured nothing on Windows; the Windows evidence is A-019's, and it is scoped to what those
+  suites exercise.
 * **Not a claim that the connection is bound to the checked inode.** The observations are of a
   path. See the F-26c row.
 * **Not a claim that S-31, S-30, S-11, F-26 or F-26b is closed.**
@@ -1554,7 +1564,7 @@ conclusion is *correct*, but it was an inference, and it is replaced here by a d
   no-op, and it is why "the package was already at HEAD" was never an answer on its own.
 
 **Status of the findings after this amendment.** Unchanged: **F-26c remains OPEN** (the residual
-TOCTOU window and the Windows limitation), **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**,
+TOCTOU window and the remaining Windows limitations), **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**,
 **S-31 remains implemented but not complete**, and **F-26 remains OPEN**. Nothing here is a
 release-readiness claim.
 
@@ -1562,7 +1572,7 @@ release-readiness claim.
 
 **This closes the `rustls-webpki` advisory and nothing else.** No F-26c behaviour changed, no
 finding closed, no threat model narrowed: **F-26c remains OPEN** (residual TOCTOU window and the
-Windows limitation), **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**, **S-31 remains implemented
+remaining Windows limitations), **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**, **S-31 remains implemented
 but not complete**, and **F-26 remains OPEN**. The scanner correction and its regression tests are
 untouched by this work.
 
@@ -1943,8 +1953,9 @@ has happened.
 **This removes the "Windows cannot answer" consequence and closes one half of the
 pathname-to-connection gap. F-26c remains OPEN**, because the Unix main database is still
 observed only by path, every sidecar is still observed only by path, a hard link created
-after the handle observation is not detected, and Windows runtime evidence is pending.
-F-26b/S-30, S-11, S-31 and F-26 are untouched.
+after the handle observation is not detected, and the Windows runtime evidence was pending when
+this amendment was written (**A-019** records the run that has since produced it, for the focused
+scope only). F-26b/S-30, S-11, S-31 and F-26 are untouched.
 
 **What was wrong.** The 2026-10-14 Windows disposition made Windows fail closed by answering
 `Unknown` for every existing file: stable `std::fs::Metadata` exposes neither the link count
@@ -2035,13 +2046,16 @@ toolchain**: `x86_64-pc-windows-msvc` fails in `cc-rs` with `failed to find tool
 and `x86_64-pc-windows-gnu` fails with `failed to find tool
 "x86_64-w64-mingw32-gcc"`. Both failures occur in `cc-rs` before the Windows Rust implementation
 is compiled. They are caused by the missing host C toolchain, and the attempt neither proves nor
-disproves that the Windows Rust code compiles; source compilation remains unverified. The CI lane
-`windows-portability` now runs `cargo test -p orxnud-store --test s31_alias_safety --test
-s31_windows_identity` on `windows-2025`; it does **not** select `s31_sidecar_alias`. Its existing
-`-p orxnud-platform-fs` step runs the three native unit tests (`s31`-style integration tests
-are under `tests/s31_windows_identity.rs`, which is `#![cfg(windows)]`). Those results are
-**pending** until the lane runs at least once, and the job's 20-minute timeout has not been
-validated with the new bundled-SQLite build.
+disproves that the Windows Rust code compiles; source compilation remains unverified **on this
+host**. The CI lane `windows-portability` runs `cargo test -p orxnud-store --test s31_alias_safety
+--test s31_windows_identity` on `windows-2025`; it does **not** select `s31_sidecar_alias`. Its
+existing `-p orxnud-platform-fs` step runs the native unit tests (`s31`-style integration tests
+are under `tests/s31_windows_identity.rs`, which is `#![cfg(windows)]`). **Those results are no
+longer pending: A-019 records the run that produced them** — the lane is green, the focused
+suites pass, and the job completed in 3 minutes 18 seconds against its 20-minute timeout. That
+last fact is the whole of the timeout claim: it shows the job fits inside the limit with the
+bundled-SQLite build, and it is **not** evidence that 20 minutes suffices under heavy runner
+load.
 
 **Filesystems.** No general Windows filesystem claim is made. The tests require NTFS (or
 another filesystem that supports hard links); if the scratch filesystem cannot create one,
@@ -2063,14 +2077,106 @@ refuses. This row does not claim that every Windows filesystem supports the chec
 * **Long paths.** `CreateFileW` is called without the extended `\\?\` prefix, so behavior beyond
   `MAX_PATH` has not been validated. A path that cannot be opened or queried is `Unknown`, and
   the store refuses.
-* **Windows runtime evidence.** None yet on the authoring host; the CI step is the first
-  intended producer.
+* **Windows runtime evidence.** None on the authoring host; the CI lane has now produced it for
+  the focused scope (**A-019**), and it is scoped to the runner's own filesystem and the
+  scenarios those suites exercise.
 
 **Why F-26c remains OPEN.** Windows is no longer refused by construction, and the main
-database's connection identity is now checked on Windows, but three of the four residual
-items above are live, the Windows evidence is pending, and S-31 still awaits an explicit
-acceptance of the narrowed threat model. The bypass this finding named remains closed; the
+database's connection identity is now checked on Windows — and, since **A-019**, exercised on a
+Windows runner — but three of the four residual items above are live, and S-31 still awaits an
+explicit acceptance of the narrowed threat model. The bypass this finding named remains closed; the
 guarantee is still narrower than "detection".
+
+### A-019 — the Windows lanes have run: the MSVC compile and the focused native-identity suites are green on a hosted Windows runner
+
+**This is a verification amendment. It changes no behaviour, closes no finding, and narrows no
+threat model. F-26c, F-26b/S-30, S-11, S-31 and F-26 are all exactly as they were, and all
+remain OPEN.**
+
+**The run.** GitHub Actions run **39611931128**, event `workflow_dispatch`, branch
+`validation/windows-identity-2026-10-21`, commit
+`6034d89d16e38e53ec76d4fed14295f75510560c`, runner image `windows-2025`. Everything below is taken
+from that run's own job and step output.
+
+**What the Windows jobs did.**
+
+* **`windows-check` — success.** `cargo check --workspace --all-targets` for the MSVC host target
+  completed with exit 0. Every workspace crate, and every test target in it, compiles for MSVC on
+  a real Windows toolchain.
+* **`windows-portability` — success**, with all three of its steps green:
+  * *Portable-core and adapter tests* — the portable crates' unit and integration targets passed
+    (`orxnuctl` 52, `cli_boundary` 6, `orxnud-config` 18, `orxnud-domain` 82, `orxnud-obs` 12,
+    `orxnud-platform-fs` **18**, `orxnud-platform-notify` 9, `orxnud-protocol` 30, `compile_fail`
+    1). `cli_e2e` reports **0 tests**: that suite is now `#![cfg(unix)]` (commit `811907a`),
+    because it needs a real daemon over a Unix-domain socket and a pseudo-terminal.
+  * *Filesystem identity and guarded database opening* — **this step executed; it was not
+    skipped.** `cargo test -p orxnud-store --test s31_alias_safety --test s31_windows_identity`
+    reported **`s31_alias_safety` 14 passed, 0 failed, 0 ignored** and **`s31_windows_identity` 5
+    passed, 0 failed, 0 ignored**. The five are the native ones: a real store open validates the
+    handle SQLite actually opened, a hard-linked database is refused, a main handle with two names
+    is refused, a mismatched main-handle identity is refused, and an unverifiable main handle is
+    refused.
+  * *Sandbox platform-dispatch tests* — `cargo test -p orxnud-platform-sandbox --lib` reported
+    **40 passed, 0 failed**.
+
+**What this establishes, and only this.** The native Windows identity path in
+`orxnud-platform-fs` (`CreateFileW`, `FileIdInfo`, `FileStandardInfo`) and the main-database handle
+check (`SQLITE_FCNTL_WIN32_GET_HANDLE`) now have **runtime** evidence, on a real Windows runner,
+for the scenarios the focused suites exercise. That is the first time the Windows platform code has
+been both compiled and executed by a Windows toolchain, and it retires the "Windows runtime
+unverified" wording A-013 and A-018 carried.
+
+**What it does not establish.**
+
+* **Not every Windows filesystem, and no network share.** The run exercised the runner's own local
+  scratch filesystem, which supports hard links. `FileIdInfo` is not universal: a filesystem or
+  redirector that cannot supply a 128-bit file id, or that reports no usable link count, answers
+  `Unknown` and the open is refused. That fail-closed direction is unchanged and untested here.
+* **Long paths remain unvalidated.** `CreateFileW` is called without the extended `\\?\` prefix.
+* **`s31_sidecar_alias` and `s31_lease_key` compile on Windows but were not selected for
+  execution.** The lane runs only `s31_alias_safety` and `s31_windows_identity`; the sidecar-alias
+  and lease-key suites are Unix-only in substance (hard links, symlinks), so the **sidecar alias
+  family is still unevidenced on Windows**.
+* **`orxnud-store`'s lib tests still do not run on Windows**, so `Backup::publish`'s
+  replace-existing claim and F-26b's durability behaviour are still argued from the platform's
+  documented API shape rather than measured.
+* **Windows isolation is still NOT PROVEN.** There is no Job Object or AppContainer backend, and
+  a Tier-1 execution is refused there rather than degraded. V-29 is unchanged by this run.
+* **The Unix pathname-to-SQLite-connection race, the sidecar pathname-to-open races and the
+  derived staging-sidecar concern remain open**, exactly as the F-26c row states.
+
+**The timeout claim, stated narrowly.** The `windows-portability` job ran from 13:53:20Z to
+13:56:38Z — **3 minutes 18 seconds** — against its 20-minute timeout. That is the whole of the
+claim: the job completed comfortably inside the limit with the bundled-SQLite build. It is **not**
+evidence that 20 minutes is sufficient under heavy runner load, and the lane has not been
+load-tested.
+
+**The overall workflow run is `failure`, and that is recorded here rather than smoothed over.**
+The `Linux gates (G1-G11)` job failed at G9 on
+`orxnuctl::cli_e2e a_model_initiated_read_is_approved_through_an_interactive_confirmation`: the
+hosted Linux runner reports `host cannot isolate`, and the daemon refuses the approved read with
+`-32043 sandbox-unavailable`. The failure is **independent of Windows**, is identical in runs
+39602421731, 39610413735 and 39611931128, and is not addressed by this amendment.
+
+**What made the lane compile (test-only).** Two commits on the validation branch, neither of which
+touched production behaviour:
+
+* `811907a` — `crates/orxnuctl/tests/cli_e2e.rs` is now `#![cfg(unix)]`, and the Unix-only imports
+  in `crates/orxnud-store/tests/s31_lease_key.rs` and
+  `crates/orxnud-store/tests/s31_sidecar_alias.rs` are gated to the Unix cases that use them.
+  Without this the Windows lane could not compile the `orxnuctl` test target at all (`E0432` for
+  `rustix::pty`, `E0433` for `std::os::unix::*`).
+* `6034d89` — the `orxnud-platform-fs` unit test
+  `the_link_count_of_a_file_is_one_until_it_is_hard_linked` asserted `Some(1)` unconditionally
+  while its own `#[cfg(not(unix))]` block asserted `None`; the two cannot both hold off Unix, so
+  the test could never pass on Windows. The `Some(1)` assertion is now `#[cfg(unix)]`.
+  `hard_link_count` answering `None` off Unix is the documented contract, not a defect.
+
+**Not claimed.** No finding is upgraded because selected Windows tests passed. F-26c remains OPEN
+because three of its four residual items are live — the Unix path observation, the sidecars, and a
+hard link created after the handle observation — and S-31 still awaits an explicit acceptance of
+the narrowed threat model. This is not a release-readiness claim, and it is not a claim of Windows
+support.
 
 ### A-012 — F-26b: durable roll-forward recovery, recovery-aware opening, and a durability refusal
 
@@ -2397,10 +2503,10 @@ It now makes the target read-only, which is a real failure.
 **Update 2026-10-14, after S-31: the cross-process gap recorded here is enforced by a stable
 per-database lock file held across the whole restore lifecycle, with two-process evidence —
 but F-26c REMAINS OPEN**, because at that time a hard-linked alias still bypassed ownership
-(A-008 follow-up). Later evidence rejects the pre-existing alias in the tested paths (A-013,
-A-018); the Unix pathname-to-connection race, the sidecar pathname-to-open race and Windows
-runtime verification remain open. **F-26b remains open** on the narrower point below; **F-26
-remains open** and belongs to S-11.
+(A-008 follow-up). Later evidence rejects the pre-existing alias in the tested paths (A-013, A-018, and A-019's Windows
+run for the focused scope); the Unix pathname-to-connection race and the sidecar pathname-to-open
+race remain open, and the Windows sidecar alias family is still unexecuted on Windows. **F-26b
+remains open** on the narrower point below; **F-26 remains open** and belongs to S-11.
 
 **F-26b stays open on a *different* ground, now F-26c.** The
 in-process evidence above is sound and is not discounted: it establishes that a stale log no
