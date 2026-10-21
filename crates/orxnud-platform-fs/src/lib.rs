@@ -506,11 +506,21 @@ mod tests {
         std::fs::write(&file, b"one").expect("write");
 
         let meta = std::fs::metadata(&file).expect("stat");
-        assert_eq!(
-            hard_link_count(&meta),
-            Some(1),
-            "a file with a single name must report one link"
-        );
+        // On Unix the count is `st_nlink`, and a file with a single name reports
+        // one. Off Unix this helper answers `None` -- "not established", never
+        // "one" -- because stable `std::fs::Metadata` does not expose the count
+        // there, and the non-Unix expectation is pinned by the block below
+        // instead. Asserting `Some(1)` unconditionally would demand a number the
+        // platform cannot give, and would contradict that block: the two
+        // assertions cannot both hold anywhere off Unix.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                hard_link_count(&meta),
+                Some(1),
+                "a file with a single name must report one link"
+            );
+        }
 
         // Where the platform does not expose the count, `None` is the answer and the
         // test says so rather than asserting a number the platform cannot give.
