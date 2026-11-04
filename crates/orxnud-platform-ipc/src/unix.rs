@@ -22,7 +22,7 @@
 //! `struct ucred` in this crate, which would be strictly more unsafe code written by
 //! us instead of more safe code taken from `libc`.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{IpcError, Listener, LocalStream, TransportPrincipal};
@@ -147,10 +147,42 @@ impl UnixSocketListener {
             Probe::Stale => {
                 // Ours, from a crashed predecessor. Removing it is the documented
                 // case, and it is the *only* case in which anything is unlinked.
-                std::fs::remove_file(path).map_err(|e| IpcError::Bind {
-                    path: path.display().to_string(),
-                    reason: format!("a stale endpoint could not be removed: {e}"),
-                })?;
+                //
+                // `probe` only proves that a connect attempt failed; it does not prove
+                // that the path is a socket. A regular file, a directory, a FIFO or a
+                // symlink can all fail the same way (or, for a symlink, be followed by
+                // `exists`). Check the path itself, without following the final
+                // component, before unlinking. A non-socket is somebody else's path and
+                // is refused, not deleted.
+                match std::fs::symlink_metadata(path) {
+                    Ok(meta) if meta.file_type().is_socket() => {
+                        match std::fs::remove_file(path) {
+                            Ok(()) => {}
+                            // A concurrent owner removed the stale path first. The
+                            // endpoint is free now, so binding is the correct next
+                            // step rather than reporting a race as a bind failure.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                return Err(IpcError::Bind {
+                                    path: path.display().to_string(),
+                                    reason: format!("a stale endpoint could not be removed: {e}"),
+                                });
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        return Err(IpcError::EndpointExists(path.display().to_string()));
+                    }
+                    // The path disappeared between `probe` and this check. Binding it
+                    // is now the ordinary free-path case.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(IpcError::Bind {
+                            path: path.display().to_string(),
+                            reason: format!("a stale endpoint could not be inspected: {e}"),
+                        });
+                    }
+                }
             }
             Probe::Free => {}
         }
@@ -177,8 +209,16 @@ impl UnixSocketListener {
         // umask's mode. Narrowing that window needs `umask(2)`, which is process-wide
         // and would mean `unsafe` plus a race against every other thread creating a
         // file — a worse trade than a sub-millisecond window on a path whose parent
-        // directory is `0700`. The directory is the real boundary; the `chmod` makes
-        // the socket independently correct.
+        // directory is `0700`.
+        //
+        // The directory **is** the real boundary, and it is now established rather
+        // than assumed: the daemon restricts the state root to `0700` before it
+        // binds the endpoint (`orxnud_daemon::Paths::ensure_state_root`), so the
+        // socket's parent is owner-only by the time this runs. This crate cannot
+        // establish that itself — it is handed a path, and the path's parent may be
+        // any directory the caller chose — so tightening it here would change the
+        // mode of a directory this program does not own. The `chmod` below makes
+        // the socket independently correct regardless.
         let inner = tokio::net::UnixListener::bind(path).map_err(bind_err)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
             IpcError::Bind {
@@ -297,6 +337,49 @@ mod tests {
         let accepted = first.accept().await;
         assert!(accepted.is_ok() || matches!(accepted, Err(IpcError::Disconnected)));
         first.close();
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[tokio::test]
+    async fn a_regular_file_at_the_endpoint_path_is_refused_and_left_alone() {
+        let path = tmp("regular-at-endpoint");
+        std::fs::write(&path, b"a user document").expect("write");
+
+        let err = UnixSocketListener::bind_owned(&path)
+            .await
+            .expect_err("a regular file is not a stale endpoint and must not be removed");
+        assert!(matches!(err, IpcError::EndpointExists(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"a user document",
+            "the refusal must not truncate or replace the regular file"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[tokio::test]
+    async fn a_symlink_at_the_endpoint_path_is_not_followed_or_unlinked() {
+        let path = tmp("symlink-at-endpoint");
+        let target = path.parent().expect("parent").join("target");
+        std::fs::write(&target, b"target contents").expect("write target");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        let err = UnixSocketListener::bind_owned(&path)
+            .await
+            .expect_err("a symlink is not a stale socket and must not be followed or removed");
+        assert!(matches!(err, IpcError::EndpointExists(_)), "{err:?}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must survive the refusal"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"target contents",
+            "the symlink target must be untouched"
+        );
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 

@@ -80,7 +80,7 @@ pub enum IpcError {
         reason: String,
     },
 
-    /// A previously bound endpoint exists and is not ours to remove.
+    /// A previous endpoint, or any other path, exists and is not ours to remove.
     ///
     /// Never resolved by deleting the path. See [`bind`].
     #[error("local endpoint `{0}` already exists; refusing to remove a path we did not create")]
@@ -552,7 +552,9 @@ impl Listener {
 ///
 /// * the endpoint does not exist → bind;
 /// * it exists and something is listening → [`IpcError::EndpointExists`];
-/// * it exists and nothing answers → remove the stale file and bind.
+/// * it exists as a socket and nothing answers → remove the stale socket and bind;
+/// * it exists as anything else — a regular file, directory, FIFO or symlink — →
+///   [`IpcError::EndpointExists`], and the path is left untouched.
 ///
 /// # Errors
 ///
