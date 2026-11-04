@@ -327,3 +327,119 @@ fn concurrent_helper_processes_do_not_cross_payloads() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_existing_regular_file_is_truncated_before_the_new_body() {
+    // The open is deliberately not `O_TRUNC` (the alias checks must happen first), so
+    // this pins the explicit truncation that took its place. Without it a shorter
+    // replacement would leave the old tail behind.
+    let helper = orxnud_capability::write_text::resolve_helper().expect("helper built");
+    let dir = scratch("overwrite");
+    let target = dir.join("out.txt");
+    std::fs::write(&target, b"a long old body that must not survive").expect("seed");
+
+    let (ok, stderr) = run(
+        &helper,
+        &[
+            orxnud_capability::stdin_frame::VERSION_ARG,
+            "--path",
+            target.to_str().expect("utf-8 path"),
+        ],
+        Some(&orxnud_capability::stdin_frame::encode(b"new").expect("frames")),
+    );
+
+    assert!(
+        ok,
+        "overwriting a regular file must succeed; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("readable"),
+        b"new",
+        "the old tail must be gone, not merely overwritten in front"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_target_is_refused_and_its_target_is_untouched() {
+    let helper = orxnud_capability::write_text::resolve_helper().expect("helper built");
+    let dir = scratch("symlink");
+    let real = dir.join("real.txt");
+    std::fs::write(&real, b"original").expect("seed target");
+    let link = dir.join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let (ok, stderr) = run(
+        &helper,
+        &[
+            orxnud_capability::stdin_frame::VERSION_ARG,
+            "--path",
+            link.to_str().expect("utf-8 path"),
+        ],
+        Some(&orxnud_capability::stdin_frame::encode(b"replaced").expect("frames")),
+    );
+
+    assert!(
+        !ok,
+        "a final-component symlink must be refused; stderr: {stderr}"
+    );
+    assert!(
+        stderr.to_ascii_lowercase().contains("symbolic link"),
+        "the refusal must say it refused a symbolic link; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&real).expect("readable"),
+        b"original",
+        "the symlink's target must not be truncated or rewritten"
+    );
+    let meta = std::fs::symlink_metadata(&link).expect("lstat");
+    assert!(meta.file_type().is_symlink(), "the link itself must remain");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_linked_target_is_refused_before_truncation() {
+    let helper = orxnud_capability::write_text::resolve_helper().expect("helper built");
+    let dir = scratch("hardlink");
+    let real = dir.join("real.txt");
+    std::fs::write(&real, b"keep me").expect("seed target");
+    let alias = dir.join("alias.txt");
+    std::fs::hard_link(&real, &alias).expect("hard link");
+    assert_eq!(
+        std::fs::read(&real).expect("readable"),
+        b"keep me",
+        "precondition: both names reach the same contents"
+    );
+
+    let (ok, stderr) = run(
+        &helper,
+        &[
+            orxnud_capability::stdin_frame::VERSION_ARG,
+            "--path",
+            alias.to_str().expect("utf-8 path"),
+        ],
+        Some(&orxnud_capability::stdin_frame::encode(b"replaced").expect("frames")),
+    );
+
+    assert!(
+        !ok,
+        "a hard-linked target must be refused; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("hard link"),
+        "the refusal must name the link count; stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&real).expect("readable"),
+        b"keep me",
+        "the other name's contents must be untouched"
+    );
+    assert_eq!(
+        std::fs::read(&alias).expect("readable"),
+        b"keep me",
+        "the refused target must not be truncated either"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

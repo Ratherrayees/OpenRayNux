@@ -124,8 +124,36 @@ fn run() -> Result<(), String> {
     // Everything above this line can refuse with nothing written. The write itself is
     // last, so there is no path that creates a file and then decides it had the wrong
     // input.
-    let mut file = std::fs::File::create(&normalised)
-        .map_err(|e| format!("could not create {}: {e}", normalised.display()))?;
+    //
+    // Open without following a final-component symlink, and without `O_TRUNC`: both
+    // checks below have to run before the old contents are destroyed. A hard-linked
+    // target is refused for the same reason the read helper refuses one -- a second
+    // name can reach an inode outside the workspace the sandbox mounted.
+    let mut file = orxnud_platform_fs::open_for_write_no_follow(&normalised)
+        .map_err(|e| format!("could not open {}: {e}", normalised.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("could not stat {}: {e}", normalised.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", normalised.display()));
+    }
+    let links = orxnud_platform_fs::hard_link_count(&meta).ok_or_else(|| {
+        format!(
+            "{}: the hard-link count cannot be established on this platform, so the \
+             write is refused rather than performed unchecked",
+            normalised.display()
+        )
+    })?;
+    if links != 1 {
+        return Err(format!(
+            "{} has {links} hard link(s); only a file with exactly one link can be \
+             written, because a second link is a second name for an inode that may live \
+             outside the workspace",
+            normalised.display()
+        ));
+    }
+    file.set_len(0)
+        .map_err(|e| format!("could not truncate {}: {e}", normalised.display()))?;
     file.write_all(&contents)
         .map_err(|e| format!("could not write {}: {e}", normalised.display()))?;
     file.flush()
