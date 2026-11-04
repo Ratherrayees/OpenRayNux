@@ -804,17 +804,16 @@ fn a_blocked_provider_does_not_stop_unrelated_requests() {
             .get("result")
             .is_some()
         );
-        assert!(
-            call(
-                &endpoint,
-                &frame("task/claim", json!({"id": task_id, "worker": "w"})),
-                PROBE_BUDGET
-            )
-            .expect("task/claim")
-            .0
-            .get("result")
-            .is_some()
-        );
+        let (claimed, _) = call(
+            &endpoint,
+            &frame("task/claim", json!({"id": task_id, "worker": "w"})),
+            PROBE_BUDGET,
+        )
+        .expect("task/claim");
+        assert!(claimed.get("result").is_some());
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         // Start the model call. It runs on its own connection task and blocks in the
         // provider.
@@ -822,7 +821,10 @@ fn a_blocked_provider_does_not_stop_unrelated_requests() {
         let asking = tokio::spawn(async move {
             call(
                 &asking_endpoint,
-                &frame("task/ai-propose", json!({"task": task_id, "worker": "w"})),
+                &frame(
+                    "task/ai-propose",
+                    json!({"task": task_id, "worker": "w", "claim_generation": claim_generation}),
+                ),
                 Duration::from_secs(60),
             )
         });

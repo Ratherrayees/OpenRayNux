@@ -86,7 +86,9 @@ fn db(tag: &str) -> (PathBuf, Connection) {
     let p = d.join("state.db");
     let c = Connection::open(&p).expect("open");
     Pragma::critical().apply(&c).expect("pragmas");
-    MigrationRunner::new(&c).migrate(&p).expect("migrate");
+    MigrationRunner::new(&c)
+        .migrate(&p, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     (p, c)
 }
 
@@ -124,6 +126,7 @@ fn approval(task: &str, digest: &str) -> ApprovalRow {
 /// `execute_proposal` does before it reserves the effect.
 struct InFlight {
     proposal_id: String,
+    claim_generation: i64,
 }
 
 fn in_flight(repo: &mut TaskRepository<'_>, task: &str) -> InFlight {
@@ -140,6 +143,7 @@ fn in_flight(repo: &mut TaskRepository<'_>, task: &str) -> InFlight {
             "p1",
             &tid(task),
             "w1",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             "{}",
@@ -152,10 +156,12 @@ fn in_flight(repo: &mut TaskRepository<'_>, task: &str) -> InFlight {
     repo.record_approval(&approval(task, "00")).expect("record");
     repo.decide_proposal("p1", "approved", NOW + 3)
         .expect("decide");
-    repo.begin_execution_spending_approval("p1", "w1", NOW + 4, LEASE)
+    let begun = repo
+        .begin_execution_spending_approval("p1", "w1", NOW + 4, LEASE)
         .expect("begin execution");
     InFlight {
         proposal_id: p.proposal_id,
+        claim_generation: begun.claim_generation,
     }
 }
 
@@ -200,7 +206,7 @@ fn unresolved(conn: &Connection, task: &str) -> Vec<(String, Option<i64>, i64, i
 fn a_re_proposal_cannot_release_the_lease_under_an_unresolved_effect() {
     let (p, mut c) = db("repropose");
     let mut repo = TaskRepository::new(&mut c);
-    in_flight(&mut repo, "t");
+    let f = in_flight(&mut repo, "t");
 
     // `execute_proposal` reserved the effect and dispatch failed before resolving it.
     let key = "t|filesystem/write-text|1/1";
@@ -208,6 +214,8 @@ fn a_re_proposal_cannot_release_the_lease_under_an_unresolved_effect() {
         repo.reserve_effect(
             key,
             &tid("t"),
+            "w1",
+            f.claim_generation,
             1,
             1,
             "filesystem/write-text",
@@ -224,6 +232,7 @@ fn a_re_proposal_cannot_release_the_lease_under_an_unresolved_effect() {
         "p2",
         &tid("t"),
         "w1",
+        2,
         "filesystem/write-text",
         Some("out.txt"),
         "{}",
@@ -283,10 +292,12 @@ fn no_state_in_the_table_hides_an_unresolved_effect_from_recovery() {
     let key = "t|filesystem/write-text|1/1";
     {
         let mut repo = TaskRepository::new(&mut c);
-        in_flight(&mut repo, "t");
+        let f = in_flight(&mut repo, "t");
         repo.reserve_effect(
             key,
             &tid("t"),
+            "w1",
+            f.claim_generation,
             1,
             1,
             "filesystem/write-text",
@@ -308,6 +319,7 @@ fn no_state_in_the_table_hides_an_unresolved_effect_from_recovery() {
                 "p2",
                 &tid("t"),
                 "w1",
+                2,
                 "filesystem/write-text",
                 Some("out.txt"),
                 "{}",
@@ -354,10 +366,12 @@ fn no_state_in_the_table_hides_an_unresolved_effect_from_recovery() {
 fn recovery_settles_an_interrupted_execution_the_worker_could_not_re_propose() {
     let (p, mut c) = db("recover");
     let mut repo = TaskRepository::new(&mut c);
-    in_flight(&mut repo, "t");
+    let f = in_flight(&mut repo, "t");
     repo.reserve_effect(
         "t|filesystem/write-text|1/1",
         &tid("t"),
+        "w1",
+        f.claim_generation,
         1,
         1,
         "filesystem/write-text",
@@ -370,6 +384,7 @@ fn recovery_settles_an_interrupted_execution_the_worker_could_not_re_propose() {
             "p2",
             &tid("t"),
             "w1",
+            2,
             "filesystem/write-text",
             Some("out.txt"),
             "{}",
@@ -424,11 +439,13 @@ fn recovery_settles_an_interrupted_execution_the_worker_could_not_re_propose() {
 fn a_resolved_effect_is_no_longer_what_refuses_the_next_proposal() {
     let (p, mut c) = db("resolved");
     let mut repo = TaskRepository::new(&mut c);
-    in_flight(&mut repo, "t");
+    let f = in_flight(&mut repo, "t");
     let key = "t|filesystem/write-text|1/1";
     repo.reserve_effect(
         key,
         &tid("t"),
+        "w1",
+        f.claim_generation,
         1,
         1,
         "filesystem/write-text",
@@ -450,6 +467,7 @@ fn a_resolved_effect_is_no_longer_what_refuses_the_next_proposal() {
         "p2",
         &tid("t"),
         "w1",
+        2,
         "filesystem/write-text",
         Some("out.txt"),
         "{}",
@@ -495,8 +513,18 @@ fn a_stale_row_from_an_earlier_attempt_does_not_block_the_retry() {
         let mut repo = TaskRepository::new(&mut c);
         in_flight(&mut repo, "t");
         // An idempotent capability, interrupted mid-dispatch.
-        repo.reserve_effect("t|cap/idem|1/1", &tid("t"), 1, 1, "cap/idem", true, NOW + 5)
-            .expect("reserve");
+        repo.reserve_effect(
+            "t|cap/idem|1/1",
+            &tid("t"),
+            "w1",
+            2,
+            1,
+            1,
+            "cap/idem",
+            true,
+            NOW + 5,
+        )
+        .expect("reserve");
     }
     // Recovery: idempotent, so the task is returned to `pending` and is retryable.
     assert_eq!(
@@ -527,6 +555,7 @@ fn a_stale_row_from_an_earlier_attempt_does_not_block_the_retry() {
         "p2",
         &tid("t"),
         "w2",
+        3,
         "cap/idem",
         None,
         "{}",
@@ -558,6 +587,8 @@ fn a_successful_execution_resolves_its_effect_and_completes_the_step() {
     repo.reserve_effect(
         key,
         &tid("t"),
+        "w1",
+        f.claim_generation,
         1,
         1,
         "filesystem/write-text",
@@ -573,6 +604,7 @@ fn a_successful_execution_resolves_its_effect_and_completes_the_step() {
         .complete_verified_step(&orxnud_store::task_repo::VerifiedStep {
             task_id: tid("t"),
             worker: "w1",
+            claim_generation: f.claim_generation,
             step_no: 1,
             proposal_id: &f.proposal_id,
             status: orxnud_store::task_repo::StepStatus::Verified,

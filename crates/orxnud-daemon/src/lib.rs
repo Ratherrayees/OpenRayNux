@@ -139,6 +139,50 @@ impl Paths {
         self.root.join("workspace")
     }
 
+    /// Creates the state root if it is absent, and restricts it to its owner.
+    ///
+    /// # Why the root is the boundary
+    ///
+    /// The state root holds the database, the audit journal, the approval
+    /// ledger and the capability workspace. The platform creates those files
+    /// with the process's umask applied — `0644` under the common `022` — so
+    /// without a restriction on the *directory* every other account on the
+    /// machine can read them, whatever mode the files themselves carry.
+    ///
+    /// The directory is therefore restricted to `0700` before anything is
+    /// created inside it, and the mode is set **exactly** rather than inherited
+    /// from the umask: `mkdir` masks the requested mode, so a `0700` request
+    /// can arrive as `0000` under a permissive umask, and only a second,
+    /// explicit change makes it `0700` rather than "whatever the umask
+    /// allowed".
+    ///
+    /// # What it does not touch
+    ///
+    /// Missing *parents* of the root are created with the platform's default
+    /// mode and an existing parent's mode is never changed. The root is the one
+    /// directory this product owns; the directories above it belong to the
+    /// user's account layout.
+    ///
+    /// # When it runs
+    ///
+    /// Before the database is opened, so the file SQLite creates is never
+    /// reachable by another account even for the moment between its creation
+    /// and its own restriction.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be created or its mode cannot be set. A failure
+    /// is fatal to the start: a daemon that cannot make its own state private
+    /// should not serve requests against it.
+    /// # What the answer means
+    ///
+    /// `Restricted` when the state root is owner-only, and `NotApplicable` when the
+    /// platform has no owner-only mechanism — which is **not** a pass, and which the
+    /// daemon reports rather than records as a protection it did not apply.
+    pub fn ensure_state_root(&self) -> std::io::Result<orxnud_domain::platform::PrivacyOutcome> {
+        orxnud_platform_fs::create_private_dir(&self.root)
+    }
+
     /// Creates the workspace directory if it is absent.
     ///
     /// Called during composition rather than lazily at first dispatch, so a capability
@@ -150,12 +194,15 @@ impl Paths {
     /// # Errors
     ///
     /// If the directory cannot be created.
-    pub fn ensure_workspace(&self) -> std::io::Result<()> {
+    pub fn ensure_workspace(&self) -> std::io::Result<orxnud_domain::platform::PrivacyOutcome> {
         let ws = self.workspace();
         if ws.is_dir() {
-            return Ok(());
+            // An existing workspace is left exactly as it is -- a side-effecting
+            // capability may have put files in it. The mode it happens to have is
+            // therefore not this function's to restate, and the answer is
+            // `NotApplicable`: nothing was restricted here.
+            return Ok(orxnud_domain::platform::PrivacyOutcome::NotApplicable);
         }
-        std::fs::create_dir_all(&ws)?;
         // Owner-only, like the database and the socket: this tree holds the output of a
         // High-risk capability, so it must not be group- or world-readable.
         //
@@ -163,7 +210,12 @@ impl Paths {
         // unconditional `std::os::unix::fs::PermissionsExt` in this file, which gate G3
         // could not see -- it greps for `cfg`, not for a platform API -- and which broke
         // the MSVC build outright.
-        orxnud_platform_fs::restrict_to_owner(&ws)
+        //
+        // The platform crate creates it *and* sets the mode exactly, rather than
+        // creating it at the umask's mode and restricting it afterwards: the
+        // window between the two is then a window in which the directory is
+        // too strict rather than too open.
+        orxnud_platform_fs::create_private_dir(&ws)
     }
 
     /// Every path this configuration would use, for `doctor` output.
@@ -582,7 +634,7 @@ const ARGV_PAYLOAD_EXPOSED_CAPABILITY_ID: &str = "filesystem/write-text";
 ///
 /// The plan's R-1 names two postures: refuse, or continue the exposure under an owner
 /// decision **with a stated bounded period, a named host model, and a review date**
-/// (`docs/18` section 12). A configuration value is not that decision. It carries no
+/// (`docs/12-verification-register.md` V-67, R-1). A configuration value is not that decision. It carries no
 /// approver, no expiry and no review date, and it is settable by *anything* running as
 /// the user -- a shell profile, a CI job, a compromised dependency -- none of which is
 /// an owner accepting a risk on the record. Shipping one would have meant describing an
@@ -1633,8 +1685,8 @@ mod argv_payload_tests {
                     assert!(
                         !text.contains(needle),
                         "{} reintroduces `{needle}`. The argv-payload exception is not \
-                         reachable from configuration by decision (docs/18 section 12, \
-                         R-1); see the note above.",
+                         reachable from configuration by decision (docs/12 V-67, R-1); \
+                         see the note above.",
                         p.display()
                     );
                 }

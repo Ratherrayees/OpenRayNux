@@ -51,7 +51,9 @@ fn db(tag: &str) -> (PathBuf, Connection) {
     let p = d.join("state.db");
     let c = Connection::open(&p).expect("open");
     Pragma::critical().apply(&c).expect("pragmas");
-    MigrationRunner::new(&c).migrate(&p).expect("migrate");
+    MigrationRunner::new(&c)
+        .migrate(&p, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     (p, c)
 }
 
@@ -136,6 +138,7 @@ fn a_second_proposal_for_the_same_execution_identity_is_refused_by_the_database(
         "p1",
         &tid("t"),
         "w1",
+        1,
         "filesystem/write-text",
         Some("out.txt"),
         "{}",
@@ -218,6 +221,7 @@ fn the_two_unique_keys_produce_two_different_refusals() {
             "p1",
             &tid("t"),
             "w1",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             "{}",
@@ -257,6 +261,7 @@ fn the_two_unique_keys_produce_two_different_refusals() {
             "p2",
             &tid("t"),
             "w1",
+            2,
             "filesystem/write-text",
             Some("out.txt"),
             "{}",
@@ -311,6 +316,7 @@ fn the_two_unique_keys_produce_two_different_refusals() {
             "q1", // deliberately the id now in use, on the other task
             &tid("other"),
             "w2",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             "{}",
@@ -383,6 +389,7 @@ fn concurrent_proposals_for_one_identity_produce_exactly_one_winner() {
                     &id,
                     &tid("t"),
                     "w1",
+                    1,
                     "filesystem/write-text",
                     Some("out.txt"),
                     "{}",
@@ -473,6 +480,7 @@ fn one_identity_cannot_hold_two_proposals_for_an_approval_to_choose_between() {
             "p1",
             &tid("t"),
             "w1",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             "{}",

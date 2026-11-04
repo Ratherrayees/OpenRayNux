@@ -328,6 +328,44 @@ impl Pragma {
                 actual: actual_fk.to_string(),
             });
         }
+
+        // `busy_timeout` is not a durability knob, but it is the pragma whose
+        // silent failure is a *startup* error: `journal_mode = wal` needs an
+        // exclusive lock, and a handler that did not take effect turns ordinary
+        // contention into a refusal. Reading it back is the only way to know the
+        // handler exists rather than trusting the SET.
+        let actual_busy: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+            .map_err(|source| PragmaError::Read {
+                name: "busy_timeout",
+                source,
+            })?;
+        let expected_busy = i64::from(self.busy_timeout_ms);
+        if actual_busy != expected_busy {
+            return Err(PragmaError::Mismatch {
+                name: "busy_timeout",
+                expected: expected_busy.to_string(),
+                actual: actual_busy.to_string(),
+            });
+        }
+
+        // `cache_size` is negative for KiB (SQLite's default unit is pages), so
+        // the sign is part of the value. A positive read-back would mean the unit
+        // silently changed, which is exactly the kind of drift this module exists
+        // to catch.
+        let actual_cache: i64 = conn
+            .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+            .map_err(|source| PragmaError::Read {
+                name: "cache_size",
+                source,
+            })?;
+        if actual_cache != self.cache_size_kib {
+            return Err(PragmaError::Mismatch {
+                name: "cache_size",
+                expected: self.cache_size_kib.to_string(),
+                actual: actual_cache.to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -432,6 +470,43 @@ mod tests {
     }
 
     #[test]
+    fn verify_reads_back_busy_timeout_and_cache_size_too() {
+        let conn = Connection::open_in_memory().expect("open");
+        let p = Pragma::in_memory();
+        p.apply(&conn).expect("apply");
+        p.verify(&conn).expect("the full set must verify");
+
+        conn.execute_batch("PRAGMA busy_timeout = 1;")
+            .expect("weaken busy_timeout");
+        assert!(
+            matches!(
+                p.verify(&conn),
+                Err(PragmaError::Mismatch {
+                    name: "busy_timeout",
+                    ..
+                })
+            ),
+            "a weakened busy handler must be caught, not trusted"
+        );
+
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout = {}; PRAGMA cache_size = -1;",
+            p.busy_timeout_ms
+        ))
+        .expect("restore busy_timeout and weaken cache_size");
+        assert!(
+            matches!(
+                p.verify(&conn),
+                Err(PragmaError::Mismatch {
+                    name: "cache_size",
+                    ..
+                })
+            ),
+            "a changed cache size unit or value must be caught"
+        );
+    }
+
+    #[test]
     fn busy_timeout_is_applied_before_the_lock_taking_pragma() {
         // The ordering that makes concurrent opens reliable. `journal_mode = wal`
         // needs an exclusive lock to perform the transition; a busy handler set
@@ -516,8 +591,14 @@ mod tests {
             failures.first()
         );
 
-        // And the database ended up in the state every caller asked for.
+        // And the database ended up in the state every caller asked for. The
+        // reopened connection must apply the set before verifying it: the journal
+        // mode is persistent, but `busy_timeout` and `cache_size` are
+        // connection-local and a fresh connection has the compile-time defaults.
         let conn = rusqlite::Connection::open(&path).expect("reopen");
+        Pragma::critical()
+            .apply(&conn)
+            .expect("apply on a fresh connection");
         Pragma::critical()
             .verify(&conn)
             .expect("the pragma set took effect");

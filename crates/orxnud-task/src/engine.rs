@@ -41,7 +41,7 @@ use orxnud_domain::ids::{CapabilityId, TaskId};
 use orxnud_domain::task_state::{TaskKind, TaskState};
 use orxnud_store::schedule_repo::ScheduleRepository;
 use orxnud_store::task_repo::{
-    ApprovalRow, ClaimOutcome, ClaimRefusal, ClaimedTask, EffectStatus, NewTask,
+    ApprovalRow, ClaimOutcome, ClaimRefusal, ClaimedTask, EffectStatus, ExecutionClaim, NewTask,
     TargetedClaimOutcome, TaskRepoError, TaskRepository, TaskRow,
 };
 
@@ -179,7 +179,7 @@ impl DurableEngine {
         &mut self,
         worker: &str,
         now_ms: i64,
-    ) -> Result<Option<TaskRow>, EngineError> {
+    ) -> Result<Option<ClaimedTask>, EngineError> {
         self.claim_task_at(worker, now_ms)
     }
 
@@ -195,7 +195,7 @@ impl DurableEngine {
         &mut self,
         worker: &str,
         now_ms: i64,
-    ) -> Result<Option<TaskRow>, EngineError> {
+    ) -> Result<Option<ClaimedTask>, EngineError> {
         let live = self
             .repo_ref()
             .live_leases(now_ms)
@@ -206,7 +206,7 @@ impl DurableEngine {
         }
         let outcome = self.repo().claim(worker, now_ms, limits.lease_duration_ms);
         match outcome.map_err(EngineError::from)? {
-            ClaimOutcome::Claimed(c) => Ok(Some(c.row)),
+            ClaimOutcome::Claimed(c) => Ok(Some(*c)),
             // A task past its budget was dead-lettered rather than skipped. The
             // caller is told nothing: there is nothing to do about it, and the
             // dead-letter row plus the event log are the durable record. Surfacing
@@ -285,16 +285,27 @@ impl DurableEngine {
     ///
     /// [`EngineError`] of kind `Invariant` if the requested transition is illegal,
     /// or `Storage` if the write fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_task(
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         to: TaskState,
         effect_observed: bool,
         error: Option<&str>,
     ) -> Result<bool, EngineError> {
-        self.complete_task_with(id, worker, now_ms, to, effect_observed, error, None)
+        self.complete_task_with(
+            id,
+            worker,
+            claim_generation,
+            now_ms,
+            to,
+            effect_observed,
+            error,
+            None,
+        )
     }
 
     /// [`Self::complete_task`], with an explicit retry delay for a `Failed` outcome.
@@ -312,15 +323,62 @@ impl DurableEngine {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         to: TaskState,
         effect_observed: bool,
         error: Option<&str>,
         retry_delay_ms: Option<i64>,
     ) -> Result<bool, EngineError> {
+        self.complete_task_with_at_write(
+            id,
+            worker,
+            claim_generation,
+            to,
+            effect_observed,
+            error,
+            retry_delay_ms,
+            move || now_ms,
+        )
+    }
+
+    /// [`Self::complete_task_with`], with the lease clock sampled inside the
+    /// repository's `IMMEDIATE` transaction.
+    ///
+    /// Use this when the caller may have waited between deciding to complete and
+    /// reaching the write. [`Self::complete_task_with`] remains for deterministic
+    /// callers that supply a fixed timestamp.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::complete_task_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_task_with_at_write<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        to: TaskState,
+        effect_observed: bool,
+        error: Option<&str>,
+        retry_delay_ms: Option<i64>,
+        now: F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnOnce() -> i64,
+    {
         let delay = retry_delay_ms.unwrap_or(self.limits.retry_backoff_ms);
         self.repo()
-            .complete_with(id, worker, now_ms, to, effect_observed, error, delay)
+            .complete_with_at_write(
+                id,
+                worker,
+                claim_generation,
+                to,
+                effect_observed,
+                error,
+                delay,
+                now,
+            )
             .map_err(EngineError::from)
     }
 
@@ -403,11 +461,34 @@ impl DurableEngine {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
     ) -> Result<bool, EngineError> {
+        self.heartbeat_at_write(id, worker, claim_generation, move || now_ms)
+    }
+
+    /// [`Self::heartbeat`], with the lease clock sampled inside the repository's
+    /// `IMMEDIATE` transaction.
+    ///
+    /// A renewal that waited for the write lock must be judged against the time it
+    /// actually wrote, not the time it was requested.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::heartbeat`].
+    pub fn heartbeat_at_write<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        now: F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnOnce() -> i64,
+    {
         let lease_ms = self.limits.lease_duration_ms;
         self.repo()
-            .heartbeat(id, worker, now_ms, lease_ms)
+            .heartbeat_at_write(id, worker, claim_generation, lease_ms, now)
             .map_err(EngineError::from)
     }
 
@@ -489,6 +570,8 @@ impl DurableEngine {
         &mut self,
         key: &str,
         id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
         step_no: u32,
         attempt_no: u32,
         step_key: &str,
@@ -496,7 +579,17 @@ impl DurableEngine {
         now_ms: i64,
     ) -> Result<bool, EngineError> {
         self.repo()
-            .reserve_effect(key, id, step_no, attempt_no, step_key, idempotent, now_ms)
+            .reserve_effect(
+                key,
+                id,
+                worker,
+                claim_generation,
+                step_no,
+                attempt_no,
+                step_key,
+                idempotent,
+                now_ms,
+            )
             .map(|o| o.is_some())
             .map_err(EngineError::from)
     }
@@ -704,12 +797,52 @@ impl DurableEngine {
         proposal_id: &str,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         capability: &CapabilityId,
         target: Option<&str>,
         canonical_params: &str,
         proposer: &Actor,
         now_ms: i64,
     ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
+        self.propose_action_at_write(
+            proposal_id,
+            id,
+            worker,
+            claim_generation,
+            capability,
+            target,
+            canonical_params,
+            proposer,
+            move || now_ms,
+        )
+    }
+
+    /// [`Self::propose_action`], with the lease clock sampled inside the
+    /// repository's `IMMEDIATE` transaction.
+    ///
+    /// Use this when the caller may have waited between gathering the proposal and
+    /// reaching the write. [`Self::propose_action`] remains for deterministic
+    /// callers that supply a fixed timestamp.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::propose_action`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_action_at_write<F>(
+        &mut self,
+        proposal_id: &str,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        capability: &CapabilityId,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer: &Actor,
+        now: F,
+    ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError>
+    where
+        F: FnOnce() -> i64,
+    {
         let authority = proposer.authority_root().map(|u| u.as_str().to_owned());
         let proposer_json = serde_json::to_string(proposer)
             .map_err(|e| EngineError::storage(format!("proposer could not be encoded: {e}")))?;
@@ -723,17 +856,18 @@ impl DurableEngine {
         // is still step 1.
         let step_no = self.repo().next_step_no(id)?;
         self.repo()
-            .propose_action(
+            .propose_action_at_write(
                 proposal_id,
                 id,
                 worker,
+                claim_generation,
                 capability.as_str(),
                 target,
                 canonical_params,
                 &proposer_json,
                 authority.as_deref(),
                 step_no,
-                now_ms,
+                now,
             )
             .map_err(EngineError::from)
     }
@@ -784,7 +918,7 @@ impl DurableEngine {
         proposal_id: &str,
         worker: &str,
         now_ms: i64,
-    ) -> Result<orxnud_store::task_repo::ProposalRow, EngineError> {
+    ) -> Result<ExecutionClaim, EngineError> {
         let lease_ms = self.limits.lease_duration_ms;
         self.repo()
             .begin_execution_spending_approval(proposal_id, worker, now_ms, lease_ms)
@@ -881,7 +1015,9 @@ impl TaskEngine for DurableEngine {
             .map_err(EngineError::from)
             .map_err(|e| e.to_contract_string())?
         {
-            ClaimOutcome::Claimed(c) => Ok(Claim::Claimed(record_of(&c.row))),
+            ClaimOutcome::Claimed(c) => {
+                Ok(Claim::Claimed(record_of_claim(&c.row, c.claim_generation)))
+            }
             ClaimOutcome::Empty | ClaimOutcome::DeadLettered { .. } => Ok(Claim::Empty),
         }
     }
@@ -890,6 +1026,7 @@ impl TaskEngine for DurableEngine {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         state: TaskState,
         effect_observed: bool,
@@ -903,6 +1040,7 @@ impl TaskEngine for DurableEngine {
             .complete_task_with(
                 id,
                 worker,
+                claim_generation,
                 now_ms,
                 state,
                 effect_observed,
@@ -966,10 +1104,22 @@ fn record_of(row: &TaskRow) -> TaskRecord {
         attempts: row.attempts,
         lease_expires_at_ms: row.lease_expires_at_ms,
         lease_holder: row.lease_holder.clone(),
+        claim_generation: row.claim_generation,
         idempotent: row.idempotent,
         effect_observed: row.effect_observed,
         last_error: row.last_error.clone(),
     }
+}
+
+/// Projects a row returned by a successful claim.
+///
+/// Kept separate from [`record_of`] so the claim's generation comes from the same
+/// `UPDATE ... RETURNING` that minted it, rather than a later read that could observe a
+/// different claimant.
+fn record_of_claim(row: &TaskRow, claim_generation: i64) -> TaskRecord {
+    let mut record = record_of(row);
+    record.claim_generation = claim_generation;
+    record
 }
 
 /// Converts a repository error into the engine's taxonomy, for callers that only
@@ -1056,11 +1206,19 @@ mod tests {
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Query, NOW), NOW)
             .expect("enqueue");
         let claimed = e.claim_task("w", NOW).expect("claim").expect("some work");
-        assert_eq!(claimed.id, tid("t"));
-        assert_eq!(claimed.state, TaskState::Running);
+        assert_eq!(claimed.row.id, tid("t"));
+        assert_eq!(claimed.row.state, TaskState::Running);
         assert!(
-            e.complete_task(&tid("t"), "w", NOW, TaskState::Completed, true, None)
-                .expect("complete")
+            e.complete_task(
+                &tid("t"),
+                "w",
+                claimed.claim_generation,
+                NOW,
+                TaskState::Completed,
+                true,
+                None
+            )
+            .expect("complete")
         );
         let row = e.task(&tid("t")).expect("read").expect("present");
         assert_eq!(row.state, TaskState::Completed);
@@ -1121,8 +1279,7 @@ mod tests {
             .claim_task("w", NOW)
             .expect("claim")
             .expect("claimed")
-            .lease_expires_at_ms
-            .expect("expiry");
+            .lease_expires_at_ms;
         e.enqueue_new(&NewTask::new(tid("t2"), TaskKind::Query, NOW), NOW)
             .expect("enqueue");
         assert!(e.claim_task("w", NOW).is_err(), "the budget is exhausted");
@@ -1145,12 +1302,13 @@ mod tests {
             .claim_task("zombie", NOW)
             .expect("claim")
             .expect("claimed");
-        let expiry = claimed.lease_expires_at_ms.expect("expiry");
+        let expiry = claimed.lease_expires_at_ms;
 
         assert!(
             !e.complete_task(
                 &tid("t"),
                 "zombie",
+                claimed.claim_generation,
                 expiry,
                 TaskState::Completed,
                 true,
@@ -1170,13 +1328,15 @@ mod tests {
         let mut e = mem();
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let expiry = e
+        let claimed = e
             .claim_task("zombie", NOW)
             .expect("claim")
-            .expect("claimed")
-            .lease_expires_at_ms
-            .expect("expiry");
-        assert!(!e.heartbeat(&tid("t"), "zombie", expiry).expect("hb"));
+            .expect("claimed");
+        let expiry = claimed.lease_expires_at_ms;
+        assert!(
+            !e.heartbeat(&tid("t"), "zombie", claimed.claim_generation, expiry)
+                .expect("hb")
+        );
         assert_eq!(
             e.task(&tid("t"))
                 .expect("read")
@@ -1225,15 +1385,35 @@ mod tests {
         let mut e = mem();
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         let key = DurableEngine::idempotency_key(&tid("t"), "send", "initial");
         assert!(
-            e.reserve_effect(&key, &tid("t"), 1, 1, "send", false, NOW)
-                .expect("reserve")
+            e.reserve_effect(
+                &key,
+                &tid("t"),
+                "w",
+                claimed.claim_generation,
+                1,
+                1,
+                "send",
+                false,
+                NOW
+            )
+            .expect("reserve")
         );
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 1, 2, "send", false, NOW)
-                .expect("reserve"),
+            !e.reserve_effect(
+                &key,
+                &tid("t"),
+                "w",
+                claimed.claim_generation,
+                1,
+                2,
+                "send",
+                false,
+                NOW
+            )
+            .expect("reserve"),
             "a retry must not be able to dispatch the same effect again"
         );
     }
@@ -1244,10 +1424,20 @@ mod tests {
         let mut e = mem();
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         let key = DurableEngine::idempotency_key(&tid("t"), "s", "initial");
         let _ = e
-            .reserve_effect(&key, &tid("t"), 1, 1, "s", false, NOW)
+            .reserve_effect(
+                &key,
+                &tid("t"),
+                "w",
+                claimed.claim_generation,
+                1,
+                1,
+                "s",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(!e.all_effects_resolved(&tid("t")).expect("unresolved"));
         assert!(
@@ -1279,7 +1469,7 @@ mod tests {
         let mut e = mem();
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         e.record_approval(&approval("t", 1, NOW + 60_000))
             .expect("record");
         assert!(e.may_use_approval(&tid("t"), 1, 1, NOW).expect("check"));
@@ -1288,6 +1478,7 @@ mod tests {
             .complete_task_with(
                 &tid("t"),
                 "w",
+                claimed.claim_generation,
                 NOW,
                 TaskState::Failed,
                 false,
@@ -1296,7 +1487,7 @@ mod tests {
             )
             .expect("fail");
         let retry = e.claim_task("w", NOW + 1).expect("claim").expect("claimed");
-        assert_eq!(retry.attempts, 2);
+        assert_eq!(retry.row.attempts, 2);
 
         assert!(
             !e.may_use_approval(&tid("t"), 1, 2, NOW + 1).expect("check"),
@@ -1309,7 +1500,7 @@ mod tests {
         let mut e = mem();
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         e.record_approval(&approval("t", 1, NOW + 60_000))
             .expect("record");
         e.consume_approval(&tid("t"), 1, 1, NOW).expect("consume");

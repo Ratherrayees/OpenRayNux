@@ -154,7 +154,8 @@ fn d_restore_refuses_without_exclusive_ownership_and_recovers_when_free() {
     let expected: i64 = conn
         .query_row("SELECT MAX(version) FROM schema_meta", [], |r| r.get(0))
         .expect("read the current version");
-    let snapshot = orxnud_store::backup::Backup::take(&conn, &db).expect("take a snapshot");
+    let snapshot = orxnud_store::backup::Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity)
+        .expect("take a snapshot");
     // Damage by **deleting** a row rather than inserting one: `schema_meta` has a
     // NOT NULL column set, and an insert that half-fills it is a fixture error rather
     // than the damage this test means to cause.

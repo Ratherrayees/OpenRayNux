@@ -56,9 +56,22 @@ pub struct SqliteAuditJournal {
     conn: Connection,
     /// Shared ownership, held for the journal's lifetime (S-31).
     _ownership: crate::ownership::SharedOwnership,
+    /// Whether the database file was made owner-only, or the platform has no
+    /// owner-only mechanism to apply. Carried rather than assumed.
+    privacy: orxnud_domain::platform::PrivacyOutcome,
 }
 
 impl SqliteAuditJournal {
+    /// Whether the database this journal reads is private to its owner.
+    ///
+    /// [`orxnud_domain::platform::PrivacyOutcome::NotApplicable`] means the platform
+    /// has **no** owner-only mechanism — not that the file is private, and not that
+    /// the check was skipped. The same distinction the store draws, on the same file.
+    #[must_use]
+    pub fn privacy_outcome(&self) -> orxnud_domain::platform::PrivacyOutcome {
+        self.privacy
+    }
+
     /// # Concurrency
     ///
     /// Two *adapters over one file* is the supported arrangement, and concurrent
@@ -103,7 +116,7 @@ impl SqliteAuditJournal {
         //
         // The open is guarded: the database's link count and identity are checked
         // before SQLite is asked to open anything, and again afterwards.
-        let (conn, ownership, sidecars) =
+        let (conn, ownership, sidecars, privacy) =
             crate::alias::open_shared(path, identity).map_err(|e| unavailable(e.to_string()))?;
         // `critical`, not `derived`: a lost audit record is a lost record, and
         // this table is the `critical` region ADR-0028 names for exactly this.
@@ -123,6 +136,14 @@ impl SqliteAuditJournal {
                 f.reason
             ))
         })?;
+        // And then restricted to their owner, for the same reason the database
+        // itself was: SQLite creates them with the process's umask applied, and
+        // a `-wal` file holding the audit record is as sensitive as the database
+        // beside it. After the verification, so a sidecar this module has just
+        // refused to touch is never modified.
+        sidecars
+            .restrict_to_owner(identity)
+            .map_err(|e| unavailable(e.to_string()))?;
         // The whole database's schema is migrated here, not just the journal's: every
         // migration in `MIGRATIONS` creates tables in this one file, and this function
         // runs **before** `TaskService::open` does. So this is the site's first shot at
@@ -134,10 +155,11 @@ impl SqliteAuditJournal {
         // the awkward part — the restore needs *exclusive* ownership and this function
         // holds a *shared* lease plus an open connection, and `flock` conflicts between
         // them even in one process — so both are dropped before recovery.
-        match MigrationRunner::new(&conn).migrate(path) {
+        match MigrationRunner::new(&conn).migrate(path, identity) {
             Ok(_) => Ok(Self {
                 conn,
                 _ownership: ownership,
+                privacy,
             }),
             Err(crate::migration::MigrationError::RecoveryRequired { source, snapshot }) => {
                 // Drop the connection and the shared lease before anything asks for
@@ -186,6 +208,8 @@ impl SqliteAuditJournal {
             conn,
             // No file, so nothing to coordinate across processes.
             _ownership: crate::ownership::SharedOwnership::in_memory(),
+            // And no file to make private, so owner-only access does not apply.
+            privacy: orxnud_domain::platform::PrivacyOutcome::NotApplicable,
         }
     }
 
@@ -305,6 +329,21 @@ pub struct SqliteApprovalLedger {
     /// process could write it would be restoring a record of decisions that had
     /// already moved on, so it participates like every other open.
     _ownership: crate::ownership::SharedOwnership,
+    /// Whether the database file was made owner-only, or the platform has no
+    /// owner-only mechanism to apply. Carried rather than assumed.
+    privacy: orxnud_domain::platform::PrivacyOutcome,
+}
+
+impl SqliteApprovalLedger {
+    /// Whether the database this ledger reads is private to its owner.
+    ///
+    /// [`orxnud_domain::platform::PrivacyOutcome::NotApplicable`] means the platform
+    /// has **no** owner-only mechanism — not that the file is private, and not that
+    /// the check was skipped.
+    #[must_use]
+    pub fn privacy_outcome(&self) -> orxnud_domain::platform::PrivacyOutcome {
+        self.privacy
+    }
 }
 
 impl std::fmt::Debug for SqliteApprovalLedger {
@@ -348,7 +387,7 @@ impl SqliteApprovalLedger {
         }
         // As with the audit journal: the lease and the guarded open are one
         // operation.
-        let (conn, ownership, sidecars) =
+        let (conn, ownership, sidecars, privacy) =
             crate::alias::open_shared(path, identity).map_err(|e| unavailable(e.to_string()))?;
         let pragma = Pragma::critical();
         pragma
@@ -366,14 +405,21 @@ impl SqliteApprovalLedger {
                 f.reason
             ))
         })?;
+        // As with the audit journal: the sidecars are restricted to their owner
+        // once they have been verified, so a sidecar this module has just
+        // refused to touch is never modified.
+        sidecars
+            .restrict_to_owner(identity)
+            .map_err(|e| unavailable(e.to_string()))?;
         // As with `SqliteAuditJournal::open`: this migrates the whole database, and this
         // is the site's first attempt at it. The approval ledger is the replay gate that
         // stops one approval being presented twice across restarts, so a half-applied
         // migration here is the failure mode K.1 is about.
-        match MigrationRunner::new(&conn).migrate(path) {
+        match MigrationRunner::new(&conn).migrate(path, identity) {
             Ok(_) => Ok(Self {
                 conn,
                 _ownership: ownership,
+                privacy,
             }),
             Err(crate::migration::MigrationError::RecoveryRequired { source, snapshot }) => {
                 drop(conn);

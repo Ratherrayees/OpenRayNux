@@ -163,16 +163,87 @@ fn state_of(endpoint: &Path, id: &str) -> String {
         .to_owned()
 }
 
+/// Wall-clock milliseconds, the unit the task store stamps leases in.
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("milliseconds fit in i64")
+}
+
+/// Polls `probe` until it yields a value or `deadline` elapses.
+///
+/// Used only to bound "a renewal should have happened by now"; the property itself is
+/// asserted on the value, not on the fact that a timeout did not fire.
+fn wait_for<T>(deadline: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Opens the daemon's own SQLite file for observation.
+fn open_state_db(root: &Path) -> orxnud_store::security_state::SqliteAuditJournal {
+    orxnud_store::security_state::SqliteAuditJournal::open(
+        &root.join("state.db"),
+        &orxnud_platform_fs::OsIdentity,
+    )
+    .expect("open the daemon's state database")
+}
+
+/// `(state, lease holder, lease expiry)` for one task, read from the store.
+fn task_lease(
+    db: &orxnud_store::security_state::SqliteAuditJournal,
+    id: &str,
+) -> (String, Option<String>, Option<i64>) {
+    db.conn()
+        .query_row(
+            "SELECT state, lease_holder, lease_expires_at_ms FROM tasks WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("the task row")
+}
+
+/// The `created_at_ms` of every proposal persisted for `(task, step)`.
+fn step_proposals(
+    db: &orxnud_store::security_state::SqliteAuditJournal,
+    id: &str,
+    step: u32,
+) -> Vec<i64> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT created_at_ms FROM task_proposals
+              WHERE task_id = ?1 AND step_no = ?2
+              ORDER BY created_at_ms ASC",
+        )
+        .expect("prepare the proposal query");
+    stmt.query_map(rusqlite::params![id, i64::from(step)], |r| r.get(0))
+        .expect("query proposals")
+        .collect::<Result<Vec<i64>, _>>()
+        .expect("proposal rows")
+}
+
 /// Runs one step to completion: propose, approve, execute.
 ///
 /// The ordinary route, written once so every test in this file provably used it rather
 /// than a shortcut that happens to produce the same state.
-fn run_one_step(endpoint: &Path, worker: &str) -> Value {
+fn run_one_step(endpoint: &Path, worker: &str, claim_generation: i64) -> Value {
     let p = send(
         endpoint,
         "p",
         "task/ai-propose",
-        json!({ "task": "t1", "worker": worker }),
+        json!({ "task": "t1", "worker": worker, "claim_generation": claim_generation }),
     );
     assert!(p.get("result").is_some(), "the step must propose: {p}");
     let pid = p["result"]["proposal"]["proposal_id"]
@@ -204,13 +275,14 @@ fn run_one_step(endpoint: &Path, worker: &str) -> Value {
 /// than being chosen here. Used by the two tests that need a verified step *without* a
 /// working provider, so that the provider failure under test is unambiguously the
 /// continuation's rather than the first step's.
-fn propose_first_step(endpoint: &Path, target: &str) -> String {
+fn propose_first_step(endpoint: &Path, target: &str, claim_generation: i64) -> String {
     let p = send(
         endpoint,
         "q",
         "task/propose",
         json!({
             "task": "t1", "worker": "w1", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": target,
             "params": {"path": target, "contents": "first"},
         }),
@@ -274,13 +346,16 @@ fn a_multi_step_task_advances_across_a_verified_step_boundary() {
             json!({"id": "t1", "max_steps": 2, "content": "write final.txt"}),
         );
 
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
-        run_one_step(&s.endpoint, "w1");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        run_one_step(&s.endpoint, "w1", claim_generation);
 
         // The verified step parked the task at a boundary rather than finishing it, because
         // `max_steps` says a second step is allowed.
@@ -381,13 +456,16 @@ fn a_single_step_task_completes_and_cannot_be_continued() {
             "task/create",
             json!({"id": "t1", "content": "write final.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
-        run_one_step(&s.endpoint, "w1");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        run_one_step(&s.endpoint, "w1", claim_generation);
 
         assert_eq!(
             state_of(&s.endpoint, "t1"),
@@ -482,13 +560,16 @@ fn a_boundary_is_claimed_by_exactly_one_worker() {
             "task/create",
             json!({"id": "t1", "max_steps": 2, "content": "write final.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
-        run_one_step(&s.endpoint, "w1");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        run_one_step(&s.endpoint, "w1", claim_generation);
         assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
 
         // Both continuations issued from separate connections at the same time.
@@ -596,13 +677,16 @@ fn a_provider_failure_returns_the_task_to_its_boundary_and_is_retryable() {
 
         // Claimed directly and driven to a boundary without the provider, so the failure
         // below is unambiguously the continuation's.
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
-        let pid = propose_first_step(&s.endpoint, "first.txt");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        let pid = propose_first_step(&s.endpoint, "first.txt", claim_generation);
         approve_and_run(&s.endpoint, &pid);
         assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
 
@@ -676,13 +760,16 @@ fn a_model_can_say_no_further_work_is_needed() {
             "task/create",
             json!({"id": "t1", "max_steps": 3, "content": "write final.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
-        run_one_step(&s.endpoint, "w1");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        run_one_step(&s.endpoint, "w1", claim_generation);
         assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
         s.stop().await;
 
@@ -887,13 +974,16 @@ fn continuation_without_a_provider_is_refused_before_the_boundary_is_crossed() {
             "task/create",
             json!({"id": "t1", "max_steps": 2, "content": "write final.txt"}),
         );
-        send(
+        let claimed = send(
             &endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
-        let pid = propose_first_step(&endpoint, "final.txt");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        let pid = propose_first_step(&endpoint, "final.txt", claim_generation);
         approve_and_run(&endpoint, &pid);
         assert_eq!(state_of(&endpoint, "t1"), "awaiting-next-step");
 
@@ -917,5 +1007,644 @@ fn continuation_without_a_provider_is_refused_before_the_boundary_is_crossed() {
         let _ = tx.send(());
         let _ = task.await;
         let _ = std::fs::remove_dir_all(&d);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// CONC-006: the governed lock is not held across the model's network wait
+// ---------------------------------------------------------------------------
+
+/// A provider that blocks until the test releases it, and records that it was entered.
+///
+/// The same latch-based seam `serve_lifecycle.rs` uses for the `task/ai-propose` route,
+/// reproduced here because each integration test file is its own binary and cannot
+/// share code with the other. A latch rather than a sleep: the test needs to assert
+/// something about a state where the provider is *definitely* mid-call, and a sleep
+/// races that — on a loaded machine the call may not have started, and the test
+/// would pass for the wrong reason.
+struct BlockingProvider {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl BlockingProvider {
+    fn new() -> (
+        Arc<Self>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let p = Arc::new(Self {
+            entered: entered_tx,
+            release: Arc::new(std::sync::Mutex::new(release_rx)),
+        });
+        (p, entered_rx, release_tx)
+    }
+}
+
+impl orxnud_daemon::proposer::ProposalProvider for BlockingProvider {
+    fn model_id(&self) -> &str {
+        "test/blocking"
+    }
+
+    fn complete(
+        &self,
+        _ctx: &orxnud_daemon::proposer::ProposalContext,
+    ) -> Result<String, orxnud_daemon::proposer::ProviderError> {
+        // Announce first, then block. The order matters: a provider that blocked
+        // before announcing would leave the test unable to tell "not started" from
+        // "started and stuck".
+        let _ = self.entered.send(());
+        if let Ok(release) = self.release.lock() {
+            // A closed channel is how the harness tears the provider down at the end
+            // of a failing run, so it must not hang here.
+            let _ = release.recv();
+        }
+        // A valid answer, so a released provider still produces an ordinary outcome
+        // rather than a refusal this test would have to interpret.
+        //
+        // `text/word-count` because it is in-process and carries no argv payload, so
+        // it is offered by every runtime -- including one built without the
+        // argv-payload exception -- and the proposal this continuation persists is
+        // therefore an ordinary one on both.
+        Ok(r#"{"capability":"text/word-count","params":{"text":"one two three"}}"#.to_owned())
+    }
+}
+
+/// **A blocked `task/continue` does not hold the daemon's governed lock.**
+///
+/// The continuation used to hold the single-writer mutex — the one every durable-state
+/// route needs — across the model's network round trip, so a slow model stalled every
+/// other request for the length of the call. `task/ai-propose` was split long ago for
+/// exactly this reason (`serve_lifecycle.rs`'s `a_blocked_provider_does_not_stop_unrelated_
+/// requests`); the continuation was not, and the asymmetry was the finding.
+///
+/// The probe is `task/list`, not `daemon/status`: `daemon/status` answers from
+/// composition state and takes no lock at all, so it would pass whether or not the
+/// defect is present. `task/list` reads durable state, so it needs the governed lock,
+/// and it is the probe that can detect this.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_blocked_continuation_does_not_hold_the_governed_lock() {
+    rt().block_on(async {
+        let (provider, entered, release) = BlockingProvider::new();
+        let d = dir("blocked-continuation");
+        let s = Serving::start_with(d.clone(), provider).await;
+
+        // A task at a boundary, reached through the human route so the provider is
+        // not involved in the setup.
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "t1", "max_steps": 2, "content": "write final.txt"}),
+        );
+        let claimed = send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "t1", "worker": "w1"}),
+        );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        let pid = propose_first_step(&s.endpoint, "first.txt", claim_generation);
+        approve_and_run(&s.endpoint, &pid);
+        assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
+
+        // The model call, on its own connection, blocked inside the provider.
+        let asking_endpoint = s.endpoint.clone();
+        let asking = std::thread::spawn(move || {
+            send(
+                &asking_endpoint,
+                "k",
+                "task/continue",
+                json!({"task": "t1", "worker": "w1"}),
+            )
+        });
+
+        // Wait for the provider to be *definitely* inside the call, not merely scheduled.
+        let entered = std::thread::spawn(move || entered.recv());
+        let ok = entered.join().expect("waiter").is_ok();
+        assert!(ok, "the provider was never entered");
+
+        // The probe that needs the governed lock. It must answer while the model is
+        // mid-call: a continuation that holds the lock across the network wait is what
+        // makes this fail.
+        let listed = send(&s.endpoint, "l", "task/list", json!({}));
+        assert!(
+            listed.get("result").is_some(),
+            "task/list must be answered while a continuation waits on the model: {listed}"
+        );
+
+        // The lock-free route, for contrast: it must answer too, and by a different
+        // mechanism (it takes no lock at all).
+        let status = send(&s.endpoint, "h", "daemon/status", json!({}));
+        assert!(
+            status.get("result").is_some(),
+            "daemon/status must be answered while a continuation waits on the model: {status}"
+        );
+
+        // Let the model answer, and the continuation must finish and persist.
+        drop(release);
+        let continued = asking.join().expect("continuation thread");
+        assert!(
+            continued.get("result").is_some(),
+            "the continuation must finish once the model answers: {continued}"
+        );
+        assert_eq!(
+            continued["result"]["continued"], true,
+            "the boundary must have been crossed: {continued}"
+        );
+        assert_eq!(
+            continued["result"]["waiting_for"], "human-approval",
+            "a continued step is governed exactly like the first: {continued}"
+        );
+        assert_eq!(
+            state_of(&s.endpoint, "t1"),
+            "waiting-for-user",
+            "the continuation's proposal must have been persisted: the task waits for a human,              and it is not the boundary it was continued from"
+        );
+
+        s.stop().await;
+    });
+}
+
+/// **A task cancelled while the model is being asked cannot receive a stale proposal.**
+///
+/// The continuation's claim is fenced by the store, not by the mutex: `propose_action`
+/// re-reads the task and its live lease holder inside its own transaction and refuses
+/// unless the task is still `Running` under *this worker's* live lease. A cancel
+/// clears the lease, so a continuation that was waiting on the model when the cancel
+/// landed must be refused at the write — and its cleanup must not resurrect the task.
+///
+/// The cancel also has to *proceed* while the model is blocked, which it could not do
+/// while the continuation held the governed lock. That is the same property the probe
+/// above asserts, seen from the other side.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_cancelled_task_cannot_receive_a_stale_proposal_from_a_blocked_continuation() {
+    rt().block_on(async {
+        let (provider, entered, release) = BlockingProvider::new();
+        let d = dir("cancelled-continuation");
+        let s = Serving::start_with(d.clone(), provider).await;
+
+        send(
+            &s.endpoint,
+            "c",
+            "task/create",
+            json!({"id": "t1", "max_steps": 2, "content": "write final.txt"}),
+        );
+        let claimed = send(
+            &s.endpoint,
+            "c",
+            "task/claim",
+            json!({"id": "t1", "worker": "w1"}),
+        );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
+        let pid = propose_first_step(&s.endpoint, "first.txt", claim_generation);
+        approve_and_run(&s.endpoint, &pid);
+        assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
+
+        let asking_endpoint = s.endpoint.clone();
+        let asking = std::thread::spawn(move || {
+            send(
+                &asking_endpoint,
+                "k",
+                "task/continue",
+                json!({"task": "t1", "worker": "w1"}),
+            )
+        });
+
+        let entered = std::thread::spawn(move || entered.recv());
+        let ok = entered.join().expect("waiter").is_ok();
+        assert!(ok, "the provider was never entered");
+
+        // The cancel, while the model is blocked. It needs the governed lock, so it
+        // could not have landed while the continuation held it across the wait.
+        let cancelled = send(&s.endpoint, "x", "task/cancel", json!({"id": "t1"}));
+        assert!(
+            cancelled.get("result").is_some(),
+            "the cancel must be served while a continuation waits on the model: {cancelled}"
+        );
+
+        // Let the model answer. The continuation must now be refused: the task is no
+        // longer `Running` under this worker's live lease.
+        drop(release);
+        let continued = asking.join().expect("continuation thread");
+        assert!(
+            continued.get("error").is_some(),
+            "a continuation whose task was cancelled must be refused, not persisted: {continued}"
+        );
+        assert_eq!(
+            state_of(&s.endpoint, "t1"),
+            "cancelled",
+            "the cancelled task must stay cancelled: the stale continuation's cleanup must \
+             not resurrect it"
+        );
+
+        s.stop().await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The claim's lease, and the model's wait
+// ---------------------------------------------------------------------------
+
+/// The lease the tests below use: short enough that a model call can outlast it
+/// in a test, and long enough that the renewal has three chances to fire.
+///
+/// The renewal cadence is a third of the lease, so a 900 ms lease renews every
+/// 300 ms — the same ratio the engine's own documented limits describe.
+const SHORT_LEASE_MS: i64 = 900;
+
+/// The limits a short-lease runtime is built with.
+///
+/// Everything else is the documented default: only the lease duration changes,
+/// because the lease duration is what the test is about.
+fn short_lease_limits() -> orxnud_task::EngineLimits {
+    orxnud_task::EngineLimits {
+        lease_duration_ms: SHORT_LEASE_MS,
+        ..orxnud_task::EngineLimits::default()
+    }
+}
+
+/// A runtime with a short lease and a provider that blocks.
+///
+/// The argv-payload exception is *not* granted: the first step here uses
+/// `text/word-count`, which is in-process and needs no exception, so the test
+/// exercises the ordinary shipped posture.
+async fn serving_with_a_short_lease(
+    root: PathBuf,
+    provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
+) -> Serving {
+    let runtime = Runtime::start_with_engine_limits(
+        Paths::under(&root),
+        NoSecrets,
+        provider,
+        short_lease_limits(),
+    )
+    .await
+    .expect("the runtime must start");
+    let endpoint = runtime.endpoint().to_path_buf();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = runtime
+            .serve(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    await_ready(&endpoint);
+    Serving {
+        endpoint,
+        shutdown: Some(tx),
+        task,
+    }
+}
+
+/// Puts a task at a boundary, through the human route so the provider is not
+/// involved in the setup.
+fn task_at_a_boundary(endpoint: &Path) {
+    send(
+        endpoint,
+        "c",
+        "task/create",
+        json!({"id": "t1", "max_steps": 2, "content": "count some words"}),
+    );
+    let claimed = send(
+        endpoint,
+        "c",
+        "task/claim",
+        json!({"id": "t1", "worker": "w1"}),
+    );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
+    let proposed = send(
+        endpoint,
+        "q",
+        "task/propose",
+        json!({"task": "t1", "worker": "w1", "capability": "text/word-count",
+               "claim_generation": claim_generation,
+               "params": {"text": "one two three"}}),
+    );
+    assert!(
+        proposed.get("result").is_some(),
+        "the manual proposal must be written: {proposed}"
+    );
+    let pid = proposed["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned();
+    let approved = send(
+        endpoint,
+        "a",
+        "capability/approve",
+        json!({"proposal": pid, "ttl_ms": 60_000}),
+    );
+    assert!(
+        approved.get("result").is_some(),
+        "the proposal must be approved: {approved}"
+    );
+    let done = send(
+        endpoint,
+        "x",
+        "task/execute",
+        json!({"proposal": pid, "worker": "w1"}),
+    );
+    assert_eq!(
+        done["result"]["verified"], true,
+        "the first step must verify: {done}"
+    );
+    assert_eq!(state_of(endpoint, "t1"), "awaiting-next-step");
+}
+
+/// **A model call that outlasts the lease still lands, and only because the claim is
+/// renewed.**
+///
+/// The claim is a lease, and a lease expires. The provider's own timeout is 60 s and
+/// the lease is 30 s, so without a renewal a call that runs to its timeout is refused
+/// at the write. The continuation renews the claim while the model is being asked, so
+/// the answer still has somewhere to go.
+///
+/// This test is the proof that the renewal is *necessary*, not merely present. The
+/// final proposal write samples its clock **inside** the store's `IMMEDIATE`
+/// transaction (`propose_action_at_write`), after the provider wait. So with the
+/// heartbeat disabled the lease is genuinely expired when the write is attempted and
+/// the proposal is refused; with the heartbeat enabled the lease is still live and the
+/// proposal lands. The assertions below read the lease and the persisted proposal from
+/// the daemon's own database, so they observe the durable state rather than the
+/// request's reply.
+///
+/// The lease here is short on purpose: the test holds the provider for three lease
+/// durations, which is long enough for several renewals and short enough to run in a
+/// few seconds. The wait is driven by explicit channels, and the only timeouts are
+/// bounds on "something failed to make progress".
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_continuation_survives_a_model_call_longer_than_the_lease() {
+    rt().block_on(async {
+        let (provider, entered, release) = BlockingProvider::new();
+        let d = dir("lease-renewed");
+        let s = serving_with_a_short_lease(d.clone(), provider).await;
+        task_at_a_boundary(&s.endpoint);
+
+        let db = open_state_db(&d);
+        let (state, holder, expiry_at_boundary) = task_lease(&db, "t1");
+        assert_eq!(state, "awaiting-next-step");
+        assert_eq!(holder, None, "a boundary must not hold a lease");
+        assert_eq!(expiry_at_boundary, None, "a boundary must not hold a lease");
+
+        let asking_endpoint = s.endpoint.clone();
+        let asking = std::thread::spawn(move || {
+            send(
+                &asking_endpoint,
+                "k",
+                "task/continue",
+                json!({"task": "t1", "worker": "w1"}),
+            )
+        });
+
+        // The provider is *definitely* inside the call.
+        let entered = std::thread::spawn(move || entered.recv());
+        assert!(
+            entered.join().expect("waiter").is_ok(),
+            "the provider was never entered"
+        );
+
+        // The claim is durable by the time the provider is called. Record the expiry it
+        // wrote, before any renewal can extend it.
+        let (state, holder, initial_expiry) = task_lease(&db, "t1");
+        assert_eq!(state, "running");
+        assert_eq!(holder.as_deref(), Some("w1"));
+        let initial_expiry = initial_expiry.expect("the claim must set an expiry");
+
+        // Hold the model for three lease durations. Without renewal the claim has
+        // certainly lapsed by the time the provider is released.
+        std::thread::sleep(Duration::from_millis(SHORT_LEASE_MS as u64 * 3));
+
+        // The lease is *live*, not merely held. `running` alone would not prove that:
+        // a task can be `running` under an expired lease. Poll with a bounded deadline
+        // so the assertion is not at the mercy of where the polling instant falls
+        // between two renewal ticks.
+        let live_expiry = wait_for(Duration::from_millis(SHORT_LEASE_MS as u64), || {
+            let (state, holder, expiry) = task_lease(&db, "t1");
+            (state == "running"
+                && holder.as_deref() == Some("w1")
+                && expiry.is_some_and(|e| e > now_ms()))
+            .then_some(expiry.expect("checked above"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the claim's lease must still be live while the model is blocked; \
+                 observed {:?}",
+                task_lease(&db, "t1")
+            )
+        });
+        assert!(
+            live_expiry > initial_expiry,
+            "the lease must have been extended by a renewal: initial={initial_expiry}, \
+             live={live_expiry}"
+        );
+
+        // Stamp the instant the provider is released. The proposal's `created_at_ms` is
+        // written by the store's post-wait clock, so it must not precede this instant.
+        let before_release = now_ms();
+        drop(release);
+        let continued = asking.join().expect("continuation thread");
+        assert!(
+            continued.get("result").is_some(),
+            "the continuation must persist its proposal once the model answers: {continued}"
+        );
+        assert_eq!(
+            continued["result"]["continued"], true,
+            "the boundary must have been crossed: {continued}"
+        );
+        assert_eq!(
+            state_of(&s.endpoint, "t1"),
+            "waiting-for-user",
+            "the proposal must be persisted and the task must wait for a human"
+        );
+
+        let proposals = step_proposals(&db, "t1", 2);
+        assert_eq!(
+            proposals.len(),
+            1,
+            "exactly one proposal must exist for the claimed step: {proposals:?}"
+        );
+        assert!(
+            proposals[0] >= before_release,
+            "the proposal must be stamped at persistence time, not with the pre-wait claim \
+             time: created_at_ms={}, released_at={before_release}",
+            proposals[0],
+        );
+
+        s.stop().await;
+    });
+}
+
+/// **The governed lock is still released between renewals.**
+///
+/// The renewal takes the lock for the write and gives it straight back, so the
+/// daemon's other routes are not held up while the model is being asked. The
+/// probes here are the ones the blocked-continuation regression already uses:
+/// `task/list` needs the governed lock, and `task/create` needs it too.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn the_governed_lock_is_released_between_renewals() {
+    rt().block_on(async {
+        let (provider, entered, release) = BlockingProvider::new();
+        let d = dir("renewal-releases");
+        let s = serving_with_a_short_lease(d.clone(), provider).await;
+        task_at_a_boundary(&s.endpoint);
+
+        let asking_endpoint = s.endpoint.clone();
+        let asking = std::thread::spawn(move || {
+            send(
+                &asking_endpoint,
+                "k",
+                "task/continue",
+                json!({"task": "t1", "worker": "w1"}),
+            )
+        });
+
+        let entered = std::thread::spawn(move || entered.recv());
+        assert!(
+            entered.join().expect("waiter").is_ok(),
+            "the provider was never entered"
+        );
+
+        // Long enough for several renewals to have happened, so the probes below
+        // are taken while the renewal loop is running.
+        std::thread::sleep(Duration::from_millis(SHORT_LEASE_MS as u64 * 2));
+
+        let listed = send(&s.endpoint, "l", "task/list", json!({}));
+        assert!(
+            listed.get("result").is_some(),
+            "task/list must be answered while the model is being asked: {listed}"
+        );
+        let created = send(
+            &s.endpoint,
+            "n",
+            "task/create",
+            json!({"id": "t2", "content": "another task"}),
+        );
+        assert!(
+            created.get("result").is_some(),
+            "task/create must be answered while the model is being asked: {created}"
+        );
+
+        drop(release);
+        let continued = asking.join().expect("continuation thread");
+        assert!(
+            continued.get("result").is_some(),
+            "the continuation must finish once the model answers: {continued}"
+        );
+
+        s.stop().await;
+    });
+}
+
+/// **A cancelled task is not revived by a renewal, and its late answer is refused.**
+///
+/// The renewal is the store's fenced heartbeat: `WHERE id = ? AND lease_holder = ?
+/// AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?`. A cancel clears
+/// the lease, so a renewal cannot extend it — and a renewal that finds the claim gone
+/// is a loss, not a success, so the continuation stops rather than waiting out a model
+/// whose answer has nowhere to go.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket evidence: this test reaches the daemon through a real \
+             Unix domain socket, and the local IPC transport refuses on Windows \
+             rather than binding a named pipe (crates/orxnud-platform-ipc)"
+)]
+#[test]
+fn a_cancelled_task_is_not_revived_by_a_renewal() {
+    rt().block_on(async {
+        let (provider, entered, release) = BlockingProvider::new();
+        let d = dir("cancel-not-revived");
+        let s = serving_with_a_short_lease(d.clone(), provider).await;
+        task_at_a_boundary(&s.endpoint);
+
+        let asking_endpoint = s.endpoint.clone();
+        let asking = std::thread::spawn(move || {
+            send(
+                &asking_endpoint,
+                "k",
+                "task/continue",
+                json!({"task": "t1", "worker": "w1"}),
+            )
+        });
+
+        let entered = std::thread::spawn(move || entered.recv());
+        assert!(
+            entered.join().expect("waiter").is_ok(),
+            "the provider was never entered"
+        );
+
+        let cancelled = send(&s.endpoint, "x", "task/cancel", json!({"id": "t1"}));
+        assert!(
+            cancelled.get("result").is_some(),
+            "the cancel must be served while the model is being asked: {cancelled}"
+        );
+
+        // Let the renewal tick at least once after the cancel.
+        std::thread::sleep(Duration::from_millis(SHORT_LEASE_MS as u64 * 2));
+
+        assert_eq!(
+            state_of(&s.endpoint, "t1"),
+            "cancelled",
+            "a renewal must not revive a cancelled task"
+        );
+
+        drop(release);
+        let continued = asking.join().expect("continuation thread");
+        assert!(
+            continued.get("error").is_some(),
+            "the late answer must be refused, not persisted: {continued}"
+        );
+        // The *word* matters, not just the error. Losing the claim is discovered by the
+        // renewal before the model has anything to answer: the reply says the claim was
+        // lost, and it does not wait for the model only for the store's write fences to
+        // refuse the result after the fact. A swallowed renewal loss (a renewal that
+        // shrugs at `Ok(false)` and waits the model out anyway) would answer with a
+        // different refusal here, written after the model finished — so this pins the
+        // behaviour that mutation would otherwise leave standing.
+        assert_eq!(
+            continued["error"]["data"]["reason"], "claim-lost",
+            "the loss of the claim must be stated by the response itself: {continued}"
+        );
+        assert_eq!(
+            state_of(&s.endpoint, "t1"),
+            "cancelled",
+            "the cancelled task must stay cancelled: the stale continuation's cleanup must \
+             not resurrect it"
+        );
+
+        s.stop().await;
     });
 }

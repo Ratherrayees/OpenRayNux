@@ -165,18 +165,22 @@ fn pending_proposal(s: &Serving, id: &str) -> String {
         "task/create",
         json!({"id": id, "content": "governed"}),
     );
-    send(
+    let claimed = send(
         &s.endpoint,
         "cl",
         "task/claim",
         json!({"id": id, "worker": "w1"}),
     );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let p = send(
         &s.endpoint,
         "p",
         "task/propose",
         json!({
             "task": id, "worker": "w1", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}}),
     );
     p["result"]["proposal"]["proposal_id"]

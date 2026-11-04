@@ -1058,17 +1058,20 @@ fn the_context_a_provider_receives_carries_the_declared_target_semantics() {
                 "task/create",
                 serde_json::json!({"id": "m", "content": "do the thing"}),
             );
-            send(
+            let claimed = send(
                 &endpoint,
                 "c",
                 "task/claim",
                 serde_json::json!({"id": "m", "worker": "ai"}),
             );
+            let claim_generation = claimed["result"]["claim_generation"]
+                .as_i64()
+                .expect("claim generation");
             let _ = send(
                 &endpoint,
                 "p",
                 "task/ai-propose",
-                serde_json::json!({"task": "m", "worker": "ai"}),
+                serde_json::json!({"task": "m", "worker": "ai", "claim_generation": claim_generation}),
             );
             let _ = tx.send(());
             let _ = task.await;
@@ -1175,12 +1178,20 @@ fn the_durable_proposal_names_the_model_that_actually_answered() {
             "task/create",
             serde_json::json!({"id": "pv", "content": "write final.txt containing ok"}),
         );
-        send(&endpoint, "c", "task/claim", serde_json::json!({"id": "pv", "worker": "ai"}));
+        let claimed = send(
+            &endpoint,
+            "c",
+            "task/claim",
+            serde_json::json!({"id": "pv", "worker": "ai"}),
+        );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let reply = send(
             &endpoint,
             "p",
             "task/ai-propose",
-            serde_json::json!({"task": "pv", "worker": "ai"}),
+            serde_json::json!({"task": "pv", "worker": "ai", "claim_generation": claim_generation}),
         );
         assert_eq!(reply["result"]["proposed_by"], "ai", "{reply}");
         // Joined only now: the fake server was waiting for the request above.
@@ -1262,12 +1273,20 @@ fn two_daemons_record_their_own_providers_model() {
                 "task/create",
                 serde_json::json!({"id": "pv", "content": "write final.txt containing ok"}),
             );
-            send(&endpoint, "c", "task/claim", serde_json::json!({"id": "pv", "worker": "ai"}));
+            let claimed = send(
+                &endpoint,
+                "c",
+                "task/claim",
+                serde_json::json!({"id": "pv", "worker": "ai"}),
+            );
+            let claim_generation = claimed["result"]["claim_generation"]
+                .as_i64()
+                .expect("claim generation");
             let _ = send(
                 &endpoint,
                 "p",
                 "task/ai-propose",
-                serde_json::json!({"task": "pv", "worker": "ai"}),
+                serde_json::json!({"task": "pv", "worker": "ai", "claim_generation": claim_generation}),
             );
             let _ = server.await;
             let _ = tx.send(());
@@ -1354,12 +1373,20 @@ fn a_real_provider_proposes_through_a_real_daemon() {
             "task/create",
             serde_json::json!({"id": "p1", "content": "Write final.txt containing from a real provider"}),
         );
-        send(&endpoint, "c", "task/claim", serde_json::json!({"id": "p1", "worker": "ai"}));
+        let claimed = send(
+            &endpoint,
+            "c",
+            "task/claim",
+            serde_json::json!({"id": "p1", "worker": "ai"}),
+        );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let reply = send(
             &endpoint,
             "p",
             "task/ai-propose",
-            serde_json::json!({"task": "p1", "worker": "ai"}),
+            serde_json::json!({"task": "p1", "worker": "ai", "claim_generation": claim_generation}),
         );
 
         let _ = server.await;
@@ -1429,12 +1456,20 @@ fn an_unconfigured_daemon_refuses_rather_than_using_the_scripted_provider() {
             "task/create",
             serde_json::json!({"id": "n1", "content": "write a file"}),
         );
-        send(&endpoint, "c", "task/claim", serde_json::json!({"id": "n1", "worker": "ai"}));
+        let claimed = send(
+            &endpoint,
+            "c",
+            "task/claim",
+            serde_json::json!({"id": "n1", "worker": "ai"}),
+        );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let reply = send(
             &endpoint,
             "p",
             "task/ai-propose",
-            serde_json::json!({"task": "n1", "worker": "ai"}),
+            serde_json::json!({"task": "n1", "worker": "ai", "claim_generation": claim_generation}),
         );
 
         assert_eq!(
@@ -1499,17 +1534,20 @@ fn a_provider_failure_leaves_the_task_executable_by_nobody() {
             "task/create",
             serde_json::json!({"id": "f1", "content": "write a file"}),
         );
-        send(
+        let claimed = send(
             &endpoint,
             "c",
             "task/claim",
             serde_json::json!({"id": "f1", "worker": "ai"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let reply = send(
             &endpoint,
             "p",
             "task/ai-propose",
-            serde_json::json!({"task": "f1", "worker": "ai"}),
+            serde_json::json!({"task": "f1", "worker": "ai", "claim_generation": claim_generation}),
         );
 
         let _ = server.await;

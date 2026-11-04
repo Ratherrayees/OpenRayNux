@@ -131,6 +131,7 @@ impl TaskEngine for TrivialEngine {
         &mut self,
         id: &TaskId,
         worker: &str,
+        _claim_generation: i64,
         now_ms: i64,
         state: TaskState,
         effect_observed: bool,
@@ -257,6 +258,7 @@ mod tests {
             e.complete(
                 &TaskId::new("a"),
                 "w",
+                0,
                 clock.now_ms(),
                 TaskState::Completed,
                 true,
@@ -283,6 +285,7 @@ mod tests {
         let res = e.complete(
             &TaskId::new("a"),
             "zombie",
+            0,
             clock.now_ms(),
             TaskState::Completed,
             true,
@@ -307,6 +310,7 @@ mod tests {
         let res = e.complete(
             &TaskId::new("a"),
             "impostor",
+            0,
             clock.now_ms(),
             TaskState::Completed,
             true,
@@ -344,6 +348,7 @@ mod tests {
         e.complete(
             &TaskId::new("a"),
             "w",
+            0,
             clock.now_ms(),
             TaskState::Completed,
             true,
@@ -378,6 +383,7 @@ mod tests {
         e.complete(
             &TaskId::new("a"),
             "w",
+            0,
             clock.now_ms(),
             TaskState::Completed,
             true,
@@ -391,6 +397,7 @@ mod tests {
             e.complete(
                 &TaskId::new("a"),
                 "w2",
+                0,
                 clock.now_ms(),
                 TaskState::Running,
                 false,

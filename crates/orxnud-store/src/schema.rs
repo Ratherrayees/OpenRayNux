@@ -15,6 +15,7 @@
 //! | `task_events` | ADR-0028 invariant 6 ("every state transition is observable — via the audit journal or the event log, never by inspecting a table after the fact") |
 //! | `schedules` | ADR-0021 ("schedules are persisted, and every schedule carries a timezone and a misfire policy as data") |
 //! | `schedule_fires` | ADR-0029 TP-8 (`UNIQUE(schedule_id, fire_time)`), ADR-0021 decision 3 |
+//! | `database_identity` | The pre-migration snapshot provenance check: a snapshot has to be shown to belong to *this* database before it is adopted as its recovery point (verification register V-100) |
 //!
 //! # What is deliberately NOT here
 //!
@@ -90,6 +91,48 @@ pub const MISFIRE_POLICIES: &[&str] = &[
     "skip-if-older",
     "pause",
 ];
+
+/// The provenance table: the identity of *this* database.
+///
+/// # Why it exists
+///
+/// A pre-migration snapshot is **adopted** from the canonical path
+/// (`<db>.pre-migration.bak`) rather than taken afresh, because it may be the
+/// only good copy of a database whose last migration failed. What the adoption
+/// has to establish is that the file is a snapshot *of this database* — and a
+/// file that is merely a **valid database** does not say that. A complete,
+/// healthy SQLite database belonging to something else passes every structural
+/// check the store makes, and adopting it means the recovery obligation points at
+/// another installation's data, and the restore that follows installs that data
+/// over this database.
+///
+/// So the database says what it is: one row, one value, minted when the database
+/// first comes under the store's care and carried by every copy the store takes
+/// of it.
+///
+/// # Why it is not a migration
+///
+/// It is not part of the versioned schema and deliberately does not appear in
+/// `schema_meta`. A migration changes the *shape* of the database, is applied in
+/// order, and is recorded; this is a property of the *instance*, it is created
+/// before the first snapshot is taken, and a database that has never been
+/// migrated still needs one. Putting it in the migration sequence would make the
+/// identity of a database depend on which migrations had run — and the snapshot
+/// that has to carry the identity is taken *before* any of them run.
+///
+/// # The singleton key
+///
+/// `singleton` is the primary key and is constrained to `1`, so the table holds
+/// exactly one row. That is not decoration: the row is inserted with
+/// `ON CONFLICT DO NOTHING`, and a table that could hold two rows would let a
+/// concurrent creator insert a second identity beside the first.
+pub(crate) const DATABASE_IDENTITY_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS database_identity (
+    singleton     INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+    id            TEXT    NOT NULL CHECK (length(id) > 0),
+    created_at_ms INTEGER NOT NULL
+);
+"#;
 
 /// `tasks` plus `task_attempts`. One migration, one transaction.
 ///
@@ -914,6 +957,16 @@ DROP INDEX IF EXISTS idx_task_proposals_step_attempt;
 
 CREATE UNIQUE INDEX idx_task_proposals_step_attempt
     ON task_proposals (task_id, step_no, attempt_no);
+"#;
+
+/// Adds the durable per-claim generation used to fence stale same-worker writes.
+///
+/// `attempts` cannot serve this purpose: it is deliberately reset at a verified step
+/// boundary, so the first claim of two different logical steps would otherwise share a
+/// value. Existing rows begin at zero and the first successful claim increments the value
+/// atomically with the lease grant.
+pub(crate) const MIGRATION_CLAIM_GENERATION: &str = r#"
+ALTER TABLE tasks ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0;
 "#;
 
 #[cfg(test)]

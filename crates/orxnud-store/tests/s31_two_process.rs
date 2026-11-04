@@ -318,7 +318,9 @@ fn s31_role_body() {
             let conn = rusqlite::Connection::open(&db).expect("restorer seed");
             conn.pragma_update(None, "journal_mode", "WAL")
                 .expect("wal");
-            let snapshot = orxnud_store::backup::Backup::take(&conn, &db).expect("take");
+            let snapshot =
+                orxnud_store::backup::Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity)
+                    .expect("take");
             conn.execute_batch("INSERT INTO notes VALUES (2,'POST');")
                 .expect("post-snapshot write");
             drop(conn);

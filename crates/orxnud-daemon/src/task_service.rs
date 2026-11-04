@@ -189,7 +189,7 @@ impl TaskService {
         let (applied, conn, ownership) = {
             let store = Store::open(path, true, identity).map_err(StartupError::Store)?;
             let runner = MigrationRunner::new(store.conn());
-            match runner.migrate(path) {
+            match runner.migrate(path, identity) {
                 Ok(applied) => {
                     // Carry the connection *and* its lease onward. `into_connection`
                     // would drop both, unprotecting a connection that is still in use.
@@ -402,7 +402,7 @@ impl TaskService {
         &mut self,
         worker: &str,
         now_ms: i64,
-    ) -> Result<Option<orxnud_store::task_repo::TaskRow>, TaskServiceError> {
+    ) -> Result<Option<orxnud_store::task_repo::ClaimedTask>, TaskServiceError> {
         if self.stopped {
             return Err(TaskServiceError::Stopped);
         }
@@ -864,23 +864,63 @@ impl TaskService {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         to: TaskState,
         effect_observed: bool,
         error: Option<&str>,
         retry_delay_ms: Option<i64>,
     ) -> Result<TaskRow, TaskFault> {
+        self.complete_task_with_at_write(
+            id,
+            worker,
+            claim_generation,
+            to,
+            effect_observed,
+            error,
+            retry_delay_ms,
+            move || now_ms,
+        )
+    }
+
+    /// [`Self::complete_task_with`], with the lease clock sampled inside the store's
+    /// `IMMEDIATE` transaction.
+    ///
+    /// Use this when the caller may have waited between deciding to complete and
+    /// reaching the write; the fence then measures the lease at the moment the row is
+    /// actually changed. [`Self::complete_task_with`] remains for deterministic
+    /// callers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::complete_task_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_task_with_at_write<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        to: TaskState,
+        effect_observed: bool,
+        error: Option<&str>,
+        retry_delay_ms: Option<i64>,
+        now: F,
+    ) -> Result<TaskRow, TaskFault>
+    where
+        F: FnOnce() -> i64,
+    {
         self.guard_running()?;
         let ok = self
             .engine
-            .complete_task_with(
+            .complete_task_with_at_write(
                 id,
                 worker,
-                now_ms,
+                claim_generation,
                 to,
                 effect_observed,
                 error,
                 retry_delay_ms,
+                now,
             )
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
@@ -900,6 +940,68 @@ impl TaskService {
             .ok_or(TaskFault::Fenced)
     }
 
+    /// Extends the lease `worker` holds on a task, if it still holds it.
+    ///
+    /// Goes through the engine's fenced heartbeat, whose predicate names the
+    /// holder **and** requires the lease to be unexpired:
+    ///
+    /// ```sql
+    /// WHERE id = ? AND lease_holder = ?
+    ///   AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?
+    /// ```
+    ///
+    /// So it extends only a lease this worker still holds and that has not yet
+    /// lapsed. A cancelled task (a cancel clears the lease), a task another
+    /// worker has taken, and a task whose lease has already expired are all left
+    /// alone — a renewal cannot resurrect work that is no longer this worker's.
+    ///
+    /// `Ok(false)` is a refusal, not a failure: the write was refused because the
+    /// fence says so, and the caller has to treat it as the loss of the claim
+    /// rather than as a successful renewal.
+    ///
+    /// # Errors
+    ///
+    /// [`TaskFault::NotFound`] if there is no such task, or [`TaskFault::Engine`]
+    /// if the write fails.
+    pub fn heartbeat(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        now_ms: i64,
+    ) -> Result<bool, TaskFault> {
+        self.heartbeat_at_write(id, worker, claim_generation, move || now_ms)
+    }
+
+    /// [`Self::heartbeat`], with the lease clock sampled inside the store's
+    /// `IMMEDIATE` transaction.
+    ///
+    /// A renewal that waited for the write lock is judged against the instant it
+    /// actually wrote, so it cannot revive a lease that lapsed while the renewal was
+    /// queued.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::heartbeat`].
+    pub fn heartbeat_at_write<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        now: F,
+    ) -> Result<bool, TaskFault>
+    where
+        F: FnOnce() -> i64,
+    {
+        self.guard_running()?;
+        self.engine
+            .heartbeat_at_write(id, worker, claim_generation, now)
+            .map_err(|e| TaskFault::Engine {
+                cause: e.cause,
+                detail: e.to_string(),
+            })
+    }
+
     /// Completes a task through the engine, fenced by the caller's live lease.
     ///
     /// # Errors
@@ -910,6 +1012,7 @@ impl TaskService {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         to: TaskState,
     ) -> Result<TaskRow, TaskFault> {
@@ -928,7 +1031,7 @@ impl TaskService {
             .is_some();
         let committed = self
             .engine
-            .complete_task(id, worker, now_ms, to, true, None)
+            .complete_task(id, worker, claim_generation, now_ms, to, true, None)
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
                 detail: e.to_string(),
@@ -964,23 +1067,64 @@ impl TaskService {
         proposal_id: &str,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         capability: &CapabilityId,
         target: Option<&str>,
         canonical_params: &str,
         proposer: &Actor,
         now_ms: i64,
     ) -> Result<ProposalRow, TaskFault> {
+        self.propose_action_at_write(
+            proposal_id,
+            id,
+            worker,
+            claim_generation,
+            capability,
+            target,
+            canonical_params,
+            proposer,
+            move || now_ms,
+        )
+    }
+
+    /// [`Self::propose_action`], with the lease clock sampled inside the store's
+    /// `IMMEDIATE` transaction.
+    ///
+    /// Use this when the caller may have waited between gathering the proposal and
+    /// reaching the write; the fence then measures the lease at the moment the row is
+    /// actually changed. [`Self::propose_action`] remains for deterministic callers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::propose_action`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_action_at_write<F>(
+        &mut self,
+        proposal_id: &str,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        capability: &CapabilityId,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer: &Actor,
+        now: F,
+    ) -> Result<ProposalRow, TaskFault>
+    where
+        F: FnOnce() -> i64,
+    {
         self.guard_running()?;
         self.engine
-            .propose_action(
+            .propose_action_at_write(
                 proposal_id,
                 id,
                 worker,
+                claim_generation,
                 capability,
                 target,
                 canonical_params,
                 proposer,
-                now_ms,
+                now,
             )
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
@@ -1054,6 +1198,8 @@ impl TaskService {
         &mut self,
         key: &str,
         id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
         step_no: u32,
         attempt_no: u32,
         step_key: &str,
@@ -1061,7 +1207,17 @@ impl TaskService {
         now_ms: i64,
     ) -> Result<bool, TaskFault> {
         self.engine
-            .reserve_effect(key, id, step_no, attempt_no, step_key, idempotent, now_ms)
+            .reserve_effect(
+                key,
+                id,
+                worker,
+                claim_generation,
+                step_no,
+                attempt_no,
+                step_key,
+                idempotent,
+                now_ms,
+            )
             .map_err(|e| TaskFault::Engine {
                 cause: e.cause,
                 detail: e.to_string(),
@@ -1180,7 +1336,7 @@ impl TaskService {
         proposal_id: &str,
         worker: &str,
         now_ms: i64,
-    ) -> Result<ProposalRow, TaskFault> {
+    ) -> Result<orxnud_store::task_repo::ExecutionClaim, TaskFault> {
         self.guard_running()?;
         self.engine
             .begin_execution_spending_approval(proposal_id, worker, now_ms)

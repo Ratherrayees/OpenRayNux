@@ -73,14 +73,18 @@ fn open_engine(path: &Path) -> DurableEngine {
     let conn = Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
 fn open_raw(path: &Path) -> Connection {
     let conn = Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     conn
 }
 
@@ -115,10 +119,24 @@ fn reserve(
 ) {
     let key =
         DurableEngine::idempotency_key(&tid(id), capability, &format!("{step_no}/{attempt_no}"));
+    let claim_generation = e
+        .task(&tid(id))
+        .expect("read")
+        .expect("present")
+        .claim_generation;
+    let worker = e
+        .task(&tid(id))
+        .expect("read")
+        .expect("present")
+        .lease_holder
+        .clone()
+        .unwrap_or_default();
     assert!(
         e.reserve_effect(
             &key,
             &tid(id),
+            &worker,
+            claim_generation,
             step_no,
             attempt_no,
             capability,
@@ -152,6 +170,7 @@ fn resolve(
 /// result, which resets the attempt counter.
 fn complete_step(e: &mut DurableEngine, id: &str, step_no: u32, max_steps: u32) {
     let proposal = format!("proposal-{step_no}");
+    let claim_generation;
     {
         let mut repo = TaskRepository::new(e.conn_mut());
         repo.propose_action(
@@ -160,6 +179,7 @@ fn complete_step(e: &mut DurableEngine, id: &str, step_no: u32, max_steps: u32) 
             // The lease holder. `propose_action` refuses anyone else, which is the
             // fence that stops a task being steered while another worker owns it.
             WORKER,
+            1,
             NON_IDEMPOTENT,
             Some("in.txt"),
             r#"{"path":"in.txt"}"#,
@@ -186,14 +206,17 @@ fn complete_step(e: &mut DurableEngine, id: &str, step_no: u32, max_steps: u32) 
         .expect("record approval");
         // Spend the approval and take the lease in one operation, which is what
         // production does before it dispatches.
-        repo.begin_execution_spending_approval(&proposal, WORKER, NOW, LEASE_MS)
+        let claim = repo
+            .begin_execution_spending_approval(&proposal, WORKER, NOW, LEASE_MS)
             .expect("begin execution");
+        claim_generation = claim.claim_generation;
     }
     // A verified outcome for the step: this is the only thing that advances the counter,
     // and it resets `attempts` to 0 on the boundary.
     let done = orxnud_store::task_repo::VerifiedStep {
         task_id: tid(id),
         worker: WORKER,
+        claim_generation,
         step_no,
         proposal_id: &format!("proposal-{step_no}"),
         status: orxnud_store::task_repo::StepStatus::Verified,
@@ -302,7 +325,7 @@ fn a_verified_effect_from_a_completed_earlier_step_does_not_wedge_the_task() {
 
         // Step 1: non-idempotent capability, effect reserved and verified.
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.row.attempts, 1);
         reserve(&mut e, "t", 1, 1, NON_IDEMPOTENT, false, NOW);
         resolve(
             &mut e,
@@ -384,7 +407,15 @@ fn an_unresolved_current_non_idempotent_effect_is_never_retried() {
         enqueue(&mut e, "t", 1);
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
         // Reserved and dispatched; nothing resolved it.
-        reserve(&mut e, "t", 1, claimed.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            claimed.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
     }
 
     let mut e = open_engine(&db);
@@ -445,7 +476,7 @@ fn an_unresolved_current_idempotent_effect_stays_retryable() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, claimed.attempts, IDEMPOTENT, true, NOW);
+        reserve(&mut e, "t", 1, claimed.row.attempts, IDEMPOTENT, true, NOW);
     }
 
     let mut e = open_engine(&db);
@@ -485,7 +516,15 @@ fn recovery_reasons_from_the_current_attempt_not_a_stale_one() {
         enqueue(&mut e, "t", 1);
         let first = e.claim_task("w1", NOW).expect("claim").expect("claimable");
         // Attempt 1: unresolved, non-idempotent. Never resolved, so it stays pending.
-        reserve(&mut e, "t", 1, first.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            first.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
         // The lease expires and recovery puts it back on the queue.
         e.conn()
             .execute(
@@ -498,9 +537,20 @@ fn recovery_reasons_from_the_current_attempt_not_a_stale_one() {
             .claim_task("w2", NOW + 10)
             .expect("claim")
             .expect("claimable");
-        assert_eq!(second.attempts, 2, "a second claim advances the counter");
+        assert_eq!(
+            second.row.attempts, 2,
+            "a second claim advances the counter"
+        );
         // Attempt 2: unresolved, but idempotent.
-        reserve(&mut e, "t", 1, second.attempts, IDEMPOTENT, true, NOW + 11);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            second.row.attempts,
+            IDEMPOTENT,
+            true,
+            NOW + 11,
+        );
     }
 
     let mut e = open_engine(&db);
@@ -520,12 +570,20 @@ fn recovery_reasons_from_the_current_attempt_not_a_stale_one() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let first = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, first.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            first.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
         resolve(
             &mut e,
             "t",
             1,
-            first.attempts,
+            first.row.attempts,
             NON_IDEMPOTENT,
             EffectStatus::NotPerformed,
             NOW + 1,
@@ -541,12 +599,12 @@ fn recovery_reasons_from_the_current_attempt_not_a_stale_one() {
             .claim_task("w2", NOW + 10)
             .expect("claim")
             .expect("claimable");
-        assert_eq!(second.attempts, 2);
+        assert_eq!(second.row.attempts, 2);
         reserve(
             &mut e,
             "t",
             1,
-            second.attempts,
+            second.row.attempts,
             NON_IDEMPOTENT,
             false,
             NOW + 11,
@@ -593,8 +651,16 @@ fn an_unresolved_attempt_is_adjudicated_before_a_later_attempt_can_exist() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let first = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        assert_eq!(first.attempts, 1);
-        reserve(&mut e, "t", 1, first.attempts, NON_IDEMPOTENT, false, NOW);
+        assert_eq!(first.row.attempts, 1);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            first.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
     }
 
     // The lease is lost. Recovery is the only route back to the queue, and it must
@@ -640,12 +706,20 @@ fn a_disproved_earlier_attempt_does_not_decide_a_later_one() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let first = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, first.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            first.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
         resolve(
             &mut e,
             "t",
             1,
-            first.attempts,
+            first.row.attempts,
             NON_IDEMPOTENT,
             EffectStatus::NotPerformed,
             NOW + 1,
@@ -659,8 +733,16 @@ fn a_disproved_earlier_attempt_does_not_decide_a_later_one() {
             .claim_task("w2", LATER + 1)
             .expect("claim")
             .expect("claimable");
-        assert_eq!(second.attempts, 2);
-        reserve(&mut e, "t", 1, second.attempts, IDEMPOTENT, true, LATER + 2);
+        assert_eq!(second.row.attempts, 2);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            second.row.attempts,
+            IDEMPOTENT,
+            true,
+            LATER + 2,
+        );
     }
 
     let mut e = open_engine(&db);
@@ -692,7 +774,15 @@ fn an_unresolved_earlier_step_effect_does_not_contaminate_the_current_step() {
         // because production cannot cross it while an effect is unresolved -- so this
         // state is one only a stale ledger can produce, which is exactly why the
         // tolerance has to be tested.
-        reserve(&mut e, "t", 1, claimed.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            claimed.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
         e.conn()
             .execute(
                 "UPDATE tasks SET state = 'awaiting-next-step', steps_completed = 1, \
@@ -733,12 +823,20 @@ fn a_disproved_current_effect_leaves_the_task_retryable() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, claimed.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            claimed.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
         resolve(
             &mut e,
             "t",
             1,
-            claimed.attempts,
+            claimed.row.attempts,
             NON_IDEMPOTENT,
             EffectStatus::NotPerformed,
             NOW + 1,
@@ -769,7 +867,15 @@ fn uncertainty_is_terminal_unclaimable_and_has_no_automatic_exit() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, claimed.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            claimed.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
     }
     {
         let mut e = open_engine(&db);
@@ -829,7 +935,15 @@ fn two_workers_recovering_one_orphan_produce_one_settling_transition() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 1);
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, claimed.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            claimed.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
     }
 
     let results: Vec<_> = (0..4)
@@ -987,6 +1101,9 @@ fn a_schema_10_database_with_historical_effects_upgrades_without_fabrication() {
         let conn = Connection::open(&db).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
         migrate_to(&conn, 10);
+        orxnud_store::MigrationRunner::new(&conn)
+            .migrate(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("migrate to current");
 
         let mut e = DurableEngine::new(conn, EngineLimits::documented()).expect("engine");
         // Two tasks, so the fixture proves the migration does not disturb unrelated work.
@@ -1019,7 +1136,7 @@ fn a_schema_10_database_with_historical_effects_upgrades_without_fabrication() {
         e.conn()
             .execute(
                 "UPDATE tasks SET state = 'running', attempts = ?1 WHERE id = 'historic';",
-                rusqlite::params![claimed.attempts],
+                rusqlite::params![claimed.row.attempts],
             )
             .expect("leave it mid-flight");
     }
@@ -1117,6 +1234,9 @@ fn a_schema_10_disproved_effect_stays_retryable_across_the_upgrade() {
         let conn = Connection::open(&db).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
         migrate_to(&conn, 10);
+        orxnud_store::MigrationRunner::new(&conn)
+            .migrate(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("migrate to current");
         let mut e = DurableEngine::new(conn, EngineLimits::documented()).expect("engine");
         e.enqueue_new(
             &orxnud_store::task_repo::NewTask::new(tid("t"), TaskKind::Workflow, NOW),
@@ -1137,7 +1257,7 @@ fn a_schema_10_disproved_effect_stays_retryable_across_the_upgrade() {
         e.conn()
             .execute(
                 "UPDATE tasks SET state = 'running', attempts = ?1 WHERE id = 't';",
-                rusqlite::params![claimed.attempts],
+                rusqlite::params![claimed.row.attempts],
             )
             .expect("leave it mid-flight");
     }
@@ -1164,7 +1284,15 @@ fn a_row_written_after_the_upgrade_carries_and_is_matched_on_its_step() {
         let mut e = open_engine(&db);
         enqueue(&mut e, "t", 2);
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimable");
-        reserve(&mut e, "t", 1, claimed.attempts, NON_IDEMPOTENT, false, NOW);
+        reserve(
+            &mut e,
+            "t",
+            1,
+            claimed.row.attempts,
+            NON_IDEMPOTENT,
+            false,
+            NOW,
+        );
     }
     {
         let mut e = open_engine(&db);

@@ -189,7 +189,9 @@ impl From<&TaskRepoError> for TaskCause {
             TaskRepoError::AlreadyExists(_) => Self::AlreadyExists,
             // "Not in the state you need": already decided, already terminal, or the caller
             // does not hold the lease. All three are conflicts, not bad input.
-            TaskRepoError::ProposalNotInState { .. } => Self::Conflict,
+            TaskRepoError::ProposalNotInState { .. } | TaskRepoError::ClaimFenced { .. } => {
+                Self::Conflict
+            }
             // The same shape of refusal for a different reason: the request is
             // well-formed and the *task* is not in a state that accepts it, because the
             // previous execution's side effect has no established outcome. The client's
@@ -364,7 +366,7 @@ impl From<TaskRepoError> for EngineError {
             // Kept as its own arm rather than folded into the group above: appending a
             // `|` variant to an existing arm's pattern changes every variant already in
             // it, which is how four unrelated refusals once became conflicts at once.
-            | TaskRepoError::EffectOutcomeUnresolved { .. } => {
+            | TaskRepoError::EffectOutcomeUnresolved { .. } | TaskRepoError::ClaimFenced { .. } => {
                 EngineErrorKind::ConcurrencyConflict
             }
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => {
@@ -407,13 +409,41 @@ impl From<orxnud_store::migration::MigrationError> for EngineError {
         use orxnud_store::migration::MigrationError as M;
         let kind = match &e {
             // A failed migration is not retryable: the schema is in an unknown
-            // state and retrying could compound the damage.
-            M::Failed { .. } | M::RestoreFailed(_) | M::Snapshot(_) => EngineErrorKind::Invariant,
+            // state and retrying could compound the damage. A gapped history and a
+            // database newer than this binary are the same kind of fact: the same
+            // binary cannot make either safe by trying again.
+            M::Failed { .. }
+            | M::RestoreFailed(_)
+            | M::Snapshot(_)
+            | M::IncompleteHistory { .. }
+            | M::UnsupportedVersion { .. } => EngineErrorKind::Invariant,
             // S-31: a pending recovery is the same shape -- the schema is in an
             // unknown state until the snapshot is restored, so it is equally not
             // retryable. Routing it anywhere else would let a caller treat an
             // unrecovered schema as recoverable.
             M::RecoveryRequired { .. } => EngineErrorKind::Invariant,
+            // An existing snapshot that could not be made private, or could not
+            // be shown to be safe, is a different shape from all of the above:
+            // the migration **did not proceed**, so the schema is untouched and
+            // the snapshot is still where it was. Nothing is invariant-violated
+            // and nothing is permanently broken -- the platform could not do
+            // one thing, and the operator can fix it and try again. `Unavailable`
+            // is the honest classification, and it is retryable because a retry
+            // of a migration that never ran changes nothing.
+            M::SnapshotPrivacy { .. } | M::SnapshotAliasUnsafe { .. } | M::SnapshotLock { .. } => {
+                EngineErrorKind::Unavailable
+            }
+            // The same shape, for the same reason: a snapshot that cannot be
+            // shown to belong to *this* database is refused rather than adopted,
+            // and a database that cannot be given an identity cannot be migrated
+            // at all. In both cases the migration did not proceed and the file at
+            // the canonical path was left exactly where it was. The operator's
+            // remedy is the same in each case -- move the file aside, or make the
+            // database writable, and start again -- so the classification is the
+            // same too.
+            M::SnapshotProvenanceMissing { .. }
+            | M::SnapshotProvenanceMismatch { .. }
+            | M::ProvenanceUnavailable { .. } => EngineErrorKind::Unavailable,
         };
         Self::new(kind, e.to_string())
     }
@@ -600,6 +630,49 @@ mod tests {
         );
     }
 
+    /// **A refusal that stopped the migration before it started is
+    /// `Unavailable`, and it is retryable.**
+    ///
+    /// The same shape as SEC-003's privacy and alias refusals: the migration
+    /// **did not proceed**, so the schema is untouched, nothing is
+    /// invariant-violated, and the operator can act — move the file at the
+    /// canonical path aside, or make the database writable — and start again. A
+    /// retry of a migration that never ran changes nothing.
+    ///
+    /// The provenance refusals are here for the same reason: a snapshot that
+    /// cannot be shown to belong to this database is left exactly where it was,
+    /// and the migration refuses rather than adopt a file it cannot vouch for.
+    #[test]
+    fn a_provenance_refusal_is_unavailable_and_retryable() {
+        let cases = [
+            orxnud_store::migration::MigrationError::SnapshotProvenanceMissing {
+                path: std::path::PathBuf::from("/tmp/state.db.pre-migration.bak"),
+            },
+            orxnud_store::migration::MigrationError::SnapshotProvenanceMismatch {
+                path: std::path::PathBuf::from("/tmp/state.db.pre-migration.bak"),
+                expected: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                found: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            },
+            orxnud_store::migration::MigrationError::ProvenanceUnavailable {
+                source: rusqlite::Error::QueryReturnedNoRows,
+            },
+        ];
+        for e in cases {
+            let mapped = EngineError::from(e);
+            assert_eq!(
+                mapped.kind,
+                EngineErrorKind::Unavailable,
+                "a refusal that stopped the migration before it started is not an \
+                 invariant violation: {mapped}"
+            );
+            assert!(
+                mapped.kind.is_retryable(),
+                "the operator can move the file aside and start again, so a retry must be \
+                 allowed: {mapped}"
+            );
+        }
+    }
+
     /// Every variant `MigrationRunner` can still return must be non-retryable.
     ///
     /// This replaces `a_missing_snapshot_is_invalid_input_not_a_bug`, which asserted that
@@ -624,6 +697,13 @@ mod tests {
                     source: rusqlite::Error::QueryReturnedNoRows,
                 }),
                 snapshot: std::path::PathBuf::from("/tmp/whatever.db.snapshot"),
+            },
+            orxnud_store::migration::MigrationError::IncompleteHistory {
+                detail: "schema_meta records 3 versions from 1 to 14".to_owned(),
+            },
+            orxnud_store::migration::MigrationError::UnsupportedVersion {
+                found: 15,
+                supported: 14,
             },
         ];
         for e in cases {

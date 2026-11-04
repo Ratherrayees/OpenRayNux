@@ -79,7 +79,8 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use orxnud_domain::platform::{
-    FileFacts, FileId, FilesystemIdentity, SqliteMainDatabase, SqliteMainFacts,
+    FileFacts, FileId, FilesystemIdentity, FilesystemPrivacy, PrivacyError, PrivacyOutcome,
+    SqliteMainDatabase, SqliteMainFacts,
 };
 use orxnud_platform_fs::OsIdentity;
 use orxnud_store::StoreError;
@@ -233,6 +234,19 @@ fn the_two_names_would_have_had_two_locks() {
 /// not tell" and to "we checked" must be opposite.
 struct Unknowable;
 
+impl FilesystemPrivacy for Unknowable {
+    fn restrict_file_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        // The privacy operation is not what this double scripts: it scripts the
+        // *identity* answers. So it is answered by the real platform, and the
+        // database these tests open is restricted for real.
+        OsIdentity.restrict_file_to_owner(path)
+    }
+
+    fn restrict_dir_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        OsIdentity.restrict_dir_to_owner(path)
+    }
+}
+
 impl FilesystemIdentity for Unknowable {
     fn observe(&self, _path: &Path) -> FileFacts {
         FileFacts::Unknown {
@@ -357,6 +371,19 @@ impl Scripted {
         FileFacts::Unknown {
             platform: "a-platform-that-cannot-answer",
         }
+    }
+}
+
+impl FilesystemPrivacy for Scripted {
+    fn restrict_file_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        // The privacy operation is not what this double scripts: it scripts the
+        // *identity* answers. So it is answered by the real platform, and the
+        // database these tests open is restricted for real.
+        OsIdentity.restrict_file_to_owner(path)
+    }
+
+    fn restrict_dir_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        OsIdentity.restrict_dir_to_owner(path)
     }
 }
 

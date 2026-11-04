@@ -36,7 +36,9 @@ fn tid(s: &str) -> TaskId {
 fn open_engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -134,7 +136,7 @@ fn cancelling_an_in_flight_task_does_not_let_it_report_completion() {
 
     // The worker, unaware, tries to commit success.
     assert!(
-        !e.complete_task(&tid("t"), "w", NOW + 2, TaskState::Completed, true, None)
+        !e.complete_task(&tid("t"), "w", 0, NOW + 2, TaskState::Completed, true, None)
             .expect("complete"),
         "a cancelled task must not be marked completed by its ex-worker"
     );
@@ -144,7 +146,7 @@ fn cancelling_an_in_flight_task_does_not_let_it_report_completion() {
         "the task must still be cancelled, not completed"
     );
     assert_eq!(
-        claimed.state,
+        claimed.row.state,
         TaskState::Running,
         "the worker's own view is stale"
     );
@@ -161,8 +163,16 @@ fn cancelling_a_terminal_task_does_not_resurrect_it() {
         NOW,
     )
     .expect("enqueue");
-    let _ = e.claim_task("w", NOW).expect("claim");
-    let _ = e.complete_task(&tid("t"), "w", NOW, TaskState::Completed, true, None);
+    let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
+    let _ = e.complete_task(
+        &tid("t"),
+        "w",
+        claimed.claim_generation,
+        NOW,
+        TaskState::Completed,
+        true,
+        None,
+    );
     e.cancel_task(&tid("t"), NOW + 10)
         .expect("cancel is a no-op");
     assert_eq!(
@@ -190,12 +200,20 @@ fn a_shutdown_that_recovers_does_not_lose_accepted_work() {
             .expect("enqueue");
         }
         // Finish one, leave three running, leave two pending.
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let first_claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         for _ in 0..3 {
             let _ = e.claim_task("w", NOW).expect("claim");
         }
-        e.complete_task(&tid("t0"), "w", NOW, TaskState::Completed, true, None)
-            .expect("complete");
+        e.complete_task(
+            &tid("t0"),
+            "w",
+            first_claimed.claim_generation,
+            NOW,
+            TaskState::Completed,
+            true,
+            None,
+        )
+        .expect("complete");
     }
 
     let mut e = open_engine(&db);
@@ -278,19 +296,42 @@ fn an_idempotency_key_survives_a_restart_and_still_deduplicates() {
             NOW,
         )
         .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         let k = DurableEngine::idempotency_key(&tid("t"), "charge-card", "initial");
         assert!(
-            e.reserve_effect(&k, &tid("t"), 1, 1, "charge-card", false, NOW)
-                .expect("reserve")
+            e.reserve_effect(
+                &k,
+                &tid("t"),
+                "w",
+                claimed.claim_generation,
+                1,
+                1,
+                "charge-card",
+                false,
+                NOW
+            )
+            .expect("reserve")
         );
         k
     };
     for _ in 0..2 {
         let mut e = open_engine(&db);
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 1, 1, "charge-card", false, NOW)
-                .expect("reserve"),
+            !e.reserve_effect(
+                &key,
+                &tid("t"),
+                "w",
+                e.task(&tid("t"))
+                    .expect("read")
+                    .expect("present")
+                    .claim_generation,
+                1,
+                1,
+                "charge-card",
+                false,
+                NOW
+            )
+            .expect("reserve"),
             "a reservation must survive any number of restarts"
         );
     }
@@ -307,11 +348,13 @@ fn a_different_step_gets_a_different_key_across_a_restart() {
         NOW,
     )
     .expect("enqueue");
-    let _ = e.claim_task("w", NOW).expect("claim");
+    let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
     assert!(
         e.reserve_effect(
             &DurableEngine::idempotency_key(&tid("t"), "a", "initial"),
             &tid("t"),
+            "w",
+            claimed.claim_generation,
             1,
             1,
             "a",
@@ -326,6 +369,11 @@ fn a_different_step_gets_a_different_key_across_a_restart() {
         e.reserve_effect(
             &DurableEngine::idempotency_key(&tid("t"), "b", "initial"),
             &tid("t"),
+            "w",
+            e.task(&tid("t"))
+                .expect("read")
+                .expect("present")
+                .claim_generation,
             1,
             1,
             "b",
@@ -355,8 +403,10 @@ fn an_effect_recorded_as_unknown_is_not_reported_as_a_success() {
         e.reserve_effect(
             &key,
             &tid("t"),
+            "w",
+            claimed.claim_generation,
             1,
-            claimed.attempts,
+            claimed.row.attempts,
             "remote-call",
             false,
             NOW
@@ -375,8 +425,16 @@ fn an_effect_recorded_as_unknown_is_not_reported_as_a_success() {
         "an unknown effect is not a success"
     );
     assert!(
-        !e.complete_task(&tid("t"), "w", NOW + 1, TaskState::Completed, false, None)
-            .is_ok()
+        !e.complete_task(
+            &tid("t"),
+            "w",
+            0,
+            NOW + 1,
+            TaskState::Completed,
+            false,
+            None
+        )
+        .is_ok()
             || row.state != TaskState::Completed,
         "an unresolved-effect task must not be completable as a clean success"
     );
@@ -399,8 +457,18 @@ fn an_uncertain_effect_is_recorded_before_the_verification_state() {
     let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
     let key = DurableEngine::idempotency_key(&tid("t"), "remote", "initial");
     assert!(
-        e.reserve_effect(&key, &tid("t"), 1, claimed.attempts, "remote", false, NOW)
-            .expect("reserve")
+        e.reserve_effect(
+            &key,
+            &tid("t"),
+            "w",
+            claimed.claim_generation,
+            1,
+            claimed.row.attempts,
+            "remote",
+            false,
+            NOW
+        )
+        .expect("reserve")
     );
     assert!(
         e.resolve_effect(&key, EffectStatus::Unknown, None, NOW + 1)
@@ -409,6 +477,7 @@ fn an_uncertain_effect_is_recorded_before_the_verification_state() {
     let _ = e.complete_task(
         &tid("t"),
         "w",
+        claimed.claim_generation,
         NOW + 1,
         TaskState::NeedsVerification,
         true,
@@ -442,11 +511,12 @@ fn a_retry_after_a_restart_gets_a_new_attempt_and_nothing_carried_over() {
         )
         .expect("enqueue");
         let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
-        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.row.attempts, 1);
         // A retry delay, so the task is not immediately claimable before the crash.
         let _ = e.complete_task_with(
             &tid("t"),
             "w",
+            claimed.claim_generation,
             NOW,
             TaskState::Failed,
             false,
@@ -465,8 +535,8 @@ fn a_retry_after_a_restart_gets_a_new_attempt_and_nothing_carried_over() {
         .claim_task("w", NOW + HOUR)
         .expect("claim")
         .expect("claimed");
-    assert_eq!(retry.attempts, 2);
-    assert_eq!(retry.lease_holder.as_deref(), Some("w"));
+    assert_eq!(retry.row.attempts, 2);
+    assert_eq!(retry.row.lease_holder.as_deref(), Some("w"));
 
     // And the attempt history shows two distinct attempts, the first closed with
     // its error.
@@ -500,10 +570,11 @@ fn a_task_that_keeps_failing_dies_at_exactly_its_retry_budget() {
             .claim_task("w", NOW + i64::from(attempt) * 1_000)
             .expect("claim")
             .expect("a retry must be available until the budget is spent");
-        assert_eq!(claimed.attempts, attempt);
+        assert_eq!(claimed.row.attempts, attempt);
         let _ = e.complete_task_with(
             &tid("t"),
             "w",
+            claimed.claim_generation,
             NOW + i64::from(attempt) * 1_000,
             TaskState::Failed,
             false,
@@ -543,10 +614,14 @@ fn a_dead_lettered_task_is_reported_to_the_user_not_silently_dropped() {
     )
     .expect("enqueue");
     for attempt in 1..=3 {
-        let _ = e.claim_task("w", NOW + attempt).expect("claim");
+        let claimed = e
+            .claim_task("w", NOW + attempt)
+            .expect("claim")
+            .expect("claimed");
         let _ = e.complete_task_with(
             &tid("t"),
             "w",
+            claimed.claim_generation,
             NOW + attempt,
             TaskState::Failed,
             false,

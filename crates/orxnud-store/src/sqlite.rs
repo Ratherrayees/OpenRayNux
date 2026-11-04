@@ -163,6 +163,21 @@ pub enum StoreError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The database could not be restricted to its owner.
+    ///
+    /// Distinct from [`StoreError::Io`] on purpose: the file was readable and
+    /// writable, and the platform could not make it private to its owner. A
+    /// database other local users can read is not a state this product may
+    /// open, so the open is refused rather than performed with a note
+    /// attached.
+    #[error("database privacy: cannot restrict {path} to its owner: {reason}")]
+    Privacy {
+        /// The path involved.
+        path: String,
+        /// Why the platform could not do it.
+        reason: String,
+    },
 }
 
 /// Verifies the compiled SQLite meets the minimum.
@@ -255,6 +270,9 @@ pub struct Store {
     /// connection is closed before the lock is released — the order matters, because a
     /// released lock with a live connection is exactly the window S-31 exists to close.
     _ownership: crate::ownership::SharedOwnership,
+    /// Whether the database file was made owner-only, or whether the platform
+    /// has no owner-only mechanism to apply. Carried rather than assumed.
+    privacy: orxnud_domain::platform::PrivacyOutcome,
 }
 
 /// Maps an ownership refusal into the store's error vocabulary.
@@ -284,6 +302,15 @@ impl From<crate::alias::OpenFailure> for StoreError {
             },
             crate::alias::OpenFailure::Alias { path, reason } => StoreError::Ownership {
                 source: Box::new(crate::ownership::OwnershipError::AliasUnsafe { path, reason }),
+            },
+            // A privacy refusal is not an ownership refusal. The file has exactly
+            // one name and this process owns it; what failed is that the
+            // platform could not stop anyone else from reading it. Flattening
+            // the two would report "another process has it" for a database that
+            // nobody else has, and send an operator looking in the wrong place.
+            crate::alias::OpenFailure::Privacy { path, reason } => StoreError::Privacy {
+                path: path.display().to_string(),
+                reason: reason.to_string(),
             },
             crate::alias::OpenFailure::Sqlite { source, .. } => StoreError::Sqlite(source),
         }
@@ -343,7 +370,7 @@ impl Store {
         // before SQLite is asked to open anything, and again afterwards. A
         // database reachable through a second name is refused here rather than
         // opened and left to participate in nothing.
-        let (conn, ownership, sidecars) = crate::alias::open_shared(path, identity)?;
+        let (conn, ownership, sidecars, privacy) = crate::alias::open_shared(path, identity)?;
         let pragma = if critical {
             Pragma::critical()
         } else {
@@ -362,11 +389,36 @@ impl Store {
                 reason: f.reason,
             })
         })?;
+        // And then restricted to their owner, for the same reason the database
+        // itself was: SQLite creates them with the process's umask applied, and
+        // a `-wal` file holding the user's rows is as sensitive as the database
+        // beside it. After the verification, so a sidecar this module has just
+        // refused to touch is never modified.
+        sidecars.restrict_to_owner(identity)?;
         Ok(Self {
             conn,
             version,
             _ownership: ownership,
+            privacy,
         })
+    }
+
+    /// Whether the database this store holds is private to its owner.
+    ///
+    /// # Why this is asked rather than assumed
+    ///
+    /// [`orxnud_domain::platform::PrivacyOutcome::Restricted`] means the file was made
+    /// owner-only.
+    ///
+    /// [`orxnud_domain::platform::PrivacyOutcome::NotApplicable`] means the **platform**
+    /// has no owner-only mechanism — not that the file is private, and not that the
+    /// check was skipped. A caller that wants to know whether the user's data is
+    /// protected from other local accounts asks here; a caller that treats
+    /// `NotApplicable` as `Restricted` is the mistake this accessor exists to make
+    /// impossible.
+    #[must_use]
+    pub fn privacy_outcome(&self) -> orxnud_domain::platform::PrivacyOutcome {
+        self.privacy
     }
 
     /// Opens an in-memory store. **Tests only.**
@@ -391,6 +443,10 @@ impl Store {
             // process to open and nothing to coordinate. The lease is a no-op rather
             // than absent, so the type of `Store` does not change between the two.
             _ownership: crate::ownership::SharedOwnership::in_memory(),
+            // And there is no file to make private, so owner-only access does not
+            // apply. `NotApplicable` is the honest answer; `Restricted` would
+            // claim a protection that has no object.
+            privacy: orxnud_domain::platform::PrivacyOutcome::NotApplicable,
         })
     }
 

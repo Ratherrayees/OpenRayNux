@@ -50,7 +50,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use orxnud_domain::platform::{
-    FileFacts, FilesystemIdentity, FsContract, SqliteMainDatabase, SqliteMainFacts,
+    FileFacts, FilesystemIdentity, FilesystemPrivacy, FsContract, PrivacyError, PrivacyOutcome,
+    SqliteMainDatabase, SqliteMainFacts,
 };
 
 /// The number of directory entries that name this inode, or `None` where the platform
@@ -89,6 +90,63 @@ pub fn hard_link_count(meta: &std::fs::Metadata) -> Option<u64> {
     {
         let _ = meta;
         None
+    }
+}
+
+/// Opens a write target without following a final-component symlink, and without
+/// truncating what it opens.
+///
+/// # Why the caller must still check the link count
+///
+/// `O_NOFOLLOW` refuses a **symbolic link** in the final component, but it says nothing
+/// about a **hard link**: a hard link is an ordinary directory entry and opens normally.
+/// The caller must stat the returned descriptor with [`hard_link_count`] and refuse a
+/// count other than one before it writes, because a second name is a second route to an
+/// inode that may live outside the granted root.
+///
+/// # Why this opens without `O_TRUNC`
+///
+/// `File::create` follows a final-component symlink and truncates the target before the
+/// caller can inspect it. Opening without truncation makes the link-count decision
+/// happen while the file still has its old contents, so a refusal leaves the other name
+/// untouched. The caller truncates explicitly only after the checks pass.
+///
+/// # Platforms
+///
+/// Unix uses `O_CREAT | O_WRONLY | O_NOFOLLOW`. Elsewhere the operation is refused as
+/// unsupported rather than falling back to a follow-symlinks open: this helper exists for
+/// the Tier-1 write child, which has no Windows execution path, and a permissive fallback
+/// would silently restore the alias hole on the platform where it cannot be checked.
+///
+/// # Errors
+///
+/// The underlying open error. A final-component symlink is reported as an invalid-input
+/// error that says it is a symbolic link, rather than as a bare `ELOOP`.
+pub fn open_for_write_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => Ok(file),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the final path component is a symbolic link; refusing to follow it",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opening a write target without following a symbolic link is not              implemented on this platform",
+        ))
     }
 }
 
@@ -204,6 +262,343 @@ impl FilesystemIdentity for OsIdentity {
             SqliteMainFacts::NotApplicable
         }
     }
+}
+
+impl FilesystemPrivacy for OsIdentity {
+    fn restrict_file_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        // The answer is decided **before** the call, not inferred from its success:
+        // on a platform with no mode bits the underlying operation is a no-op that
+        // succeeds, and a success is not a restriction.
+        if !restriction_applied() {
+            return Ok(PrivacyOutcome::NotApplicable);
+        }
+        match restrict_file_to_owner(path) {
+            Ok(()) => Ok(PrivacyOutcome::Restricted),
+            // `restrict_file_to_owner` has exactly one way to report `InvalidInput`:
+            // the path is not a regular file. The mapping is therefore exact, not a
+            // heuristic on a shared error kind.
+            Err(source) if source.kind() == std::io::ErrorKind::InvalidInput => {
+                Err(PrivacyError::NotAFile {
+                    path: path.display().to_string(),
+                })
+            }
+            Err(source) => Err(PrivacyError::Unavailable {
+                path: path.display().to_string(),
+                reason: source.to_string(),
+            }),
+        }
+    }
+
+    fn restrict_dir_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        if !restriction_applied() {
+            return Ok(PrivacyOutcome::NotApplicable);
+        }
+        match restrict_to_owner(path) {
+            Ok(()) => Ok(PrivacyOutcome::Restricted),
+            // As above: `restrict_to_owner` has exactly one `InvalidInput`, and it
+            // means "not a directory".
+            Err(source) if source.kind() == std::io::ErrorKind::InvalidInput => {
+                Err(PrivacyError::NotADirectory {
+                    path: path.display().to_string(),
+                })
+            }
+            Err(source) => Err(PrivacyError::Unavailable {
+                path: path.display().to_string(),
+                reason: source.to_string(),
+            }),
+        }
+    }
+}
+
+/// What was observed about a path's owner-only status.
+///
+/// # Why this is an observation and not a capability
+///
+/// "This platform *can* express owner-only access" and "this path *is* owner-only" are
+/// different facts, and a diagnostic that reports the first while the operator reads it
+/// as the second is a false assurance about a security property. The distinction is
+/// what [`OwnerOnlyStatus`] exists to keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerOnlyStatus {
+    /// The path does not exist.
+    Absent,
+    /// The path exists and only its owner may reach it.
+    OwnerOnly,
+    /// The path exists and other accounts may reach it.
+    Permissive {
+        /// The mode that was observed, in octal.
+        mode: u32,
+    },
+    /// The platform has no owner-only mechanism, so the status could not be established.
+    ///
+    /// **Not a pass.** Nothing was measured, and nothing here claims otherwise. A
+    /// per-user ACL is a different mechanism with a different threat model.
+    NotApplicable,
+    /// The path could not be inspected.
+    Unreadable {
+        /// Why it could not be inspected.
+        reason: String,
+    },
+}
+
+/// Observes whether `path` is private to its owner.
+///
+/// **Observational, by construction.** Nothing is created, changed, restricted or
+/// removed: a diagnostic that repairs what it diagnoses is not a diagnostic, and a
+/// report that changed the state it was asked about could not be re-read to check
+/// the change.
+///
+/// # The mode it compares
+///
+/// `expected_mode` is the mode the path must have to be owner-only: `0o700` for a
+/// directory and `0o600` for a file. The comparison is exact on Unix, so a path at
+/// `0o750` — owner-only *plus* group read — is reported as permissive, which it is.
+///
+/// # Off Unix
+///
+/// There are no POSIX mode bits, so the answer is [`OwnerOnlyStatus::NotApplicable`]:
+/// the status could **not** be established. A per-user ACL is a different mechanism
+/// with a different threat model, and reporting it as owner-only would be claiming a
+/// protection nobody measured.
+#[must_use]
+pub fn observe_owner_only(path: &std::path::Path, expected_mode: u32) -> OwnerOnlyStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o7777;
+                if mode == expected_mode {
+                    OwnerOnlyStatus::OwnerOnly
+                } else {
+                    OwnerOnlyStatus::Permissive { mode }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => OwnerOnlyStatus::Absent,
+            Err(e) => OwnerOnlyStatus::Unreadable {
+                reason: e.to_string(),
+            },
+        }
+    }
+    // Existence is knowable everywhere; owner-only-ness is not.
+    #[cfg(not(unix))]
+    {
+        match std::fs::metadata(path) {
+            Ok(_) => OwnerOnlyStatus::NotApplicable,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => OwnerOnlyStatus::Absent,
+            Err(e) => OwnerOnlyStatus::Unreadable {
+                reason: e.to_string(),
+            },
+        }
+    }
+}
+
+/// Restricts the regular file at `file` to its owner (`0600`).
+///
+/// # Why it is not `std::fs::set_permissions`
+///
+/// `set_permissions` is a `chmod(2)` on a **path**. The kernel resolves the
+/// path at the moment of the syscall, so the object whose mode changes is
+/// whatever the name resolves to *then* — and a name that is a symbolic link
+/// changes the mode of its **target**. That is the shape of a
+/// time-of-check/time-of-use bug: a check that says "this path is a regular
+/// file" and a change that lands on a different object are two resolutions of
+/// one name.
+///
+/// This opens the path **once** and changes the mode through the descriptor it
+/// already holds. `File::set_permissions` is an `fchmod(2)` on that
+/// descriptor, so the mode changes on the object that was opened, and there is
+/// no second resolution of the name between the two. The object's kind is
+/// checked through the same descriptor (`File::metadata` is an `fstat(2)`), so
+/// the "is it a regular file?" answer and the "change its mode" answer describe
+/// the same object.
+///
+/// # What it does not do
+///
+/// It does not follow the caller's symlink policy for it. The store's own model
+/// is that a configured path is followed to its target — `resolve_lease_target`
+/// follows a chain of symbolic links to find the lease key — so a configured
+/// database that is a symbolic link is restricted **at its target**, which is
+/// the file SQLite opened and the file the lease names. Refusing the link
+/// instead would break a configuration the store already supports.
+///
+/// # Errors
+///
+/// An I/O error if the file cannot be opened or its mode cannot be changed, and
+/// [`std::io::ErrorKind::InvalidInput`] if the path is not a regular file.
+pub fn restrict_file_to_owner(file: &std::path::Path) -> std::io::Result<()> {
+    restrict_via_handle(file, 0o600, |meta| meta.is_file(), "a regular file")
+}
+
+/// Restricts `dir` to its owner, as far as this platform can express that.
+///
+/// # Why it lives here
+///
+/// It was in `orxnud-daemon` as an unconditional `std::os::unix::fs::PermissionsExt`,
+/// which is a mistake with two faces. Gate **G3** looked only for `cfg`, and this code
+/// had none, so the gate passed -- while the MSVC build failed outright, because
+/// `PermissionsExt` does not exist on Windows. V-29's "consequence of drift" predicted
+/// exactly this: *G3 only greps for `cfg`, not for a Linux type name.* A platform API
+/// used without a `cfg` is the same defect wearing a different hat, and G3 now detects
+/// `std::os::{unix,windows}` paths directly, so this specific hole is closed.
+///
+/// So the branch lives here, where `cfg` is permitted, and the portable core asks for the
+/// behaviour rather than reaching for the mechanism.
+///
+/// # What it does off Unix
+///
+/// Windows has no POSIX mode bits, and a portable owner-only spelling needs
+/// `windows-sys` plus `unsafe` -- which gate **G4** forbids outside a platform crate that
+/// has opted in, and this one has not.
+///
+/// **This function does not report that.** It is a low-level operation and its answer is
+/// "the mode was set" or an error. The *decision* belongs to the caller, and the caller
+/// gets it from [`FilesystemPrivacy::restrict_dir_to_owner`], which answers
+/// [`PrivacyOutcome::NotApplicable`] on a platform with no mode bits rather than a
+/// success that reads as a restriction.
+///
+/// What Windows actually offers is a per-user ACL on the state root, inherited from the
+/// per-user state root above it. That is a **different mechanism with a different threat
+/// model**: it is not owner-only, and it is not claimed to be. Windows sandbox isolation
+/// as a whole remains **NOT_PROVEN** (ADR-0035, V-29); this says nothing about it.
+///
+/// # How the mode is changed
+///
+/// Through a descriptor, not through the path: see [`restrict_file_to_owner`] for why.
+/// The object is also checked to be a directory through that same descriptor, so a
+/// `0600`-on-a-directory mistake cannot happen and the owner's own ability to
+/// traverse the directory cannot be taken away by a mistaken call.
+pub fn restrict_to_owner(dir: &std::path::Path) -> std::io::Result<()> {
+    restrict_via_handle(dir, 0o700, |meta| meta.is_dir(), "a directory")
+}
+
+/// Creates `dir` so that only its owner may enter it, and restricts an
+/// existing one to the same.
+///
+/// # Why the mode is set twice
+///
+/// The creation mode alone is not enough. `mkdir(2)` takes the mode **masked by
+/// the process's umask**, so a `0700` request can arrive as `0000` under a
+/// permissive umask — stricter than asked for, and useless, because the owner
+/// cannot enter the directory either. The second step sets the mode exactly,
+/// through a descriptor, and is what makes the result `0700` rather than
+/// "whatever the umask allowed".
+///
+/// The creation itself is still worth doing at `0700`: it is never *more*
+/// permissive than owner-only, so the window between `mkdir` and the exact
+/// `fchmod` is a window in which the directory is too strict rather than too
+/// open. That is the only direction a window should be allowed to fail in.
+///
+/// # What it does not touch
+///
+/// Missing **parents** are created with the platform's default mode, and an
+/// existing parent's mode is never changed. A state root is the one directory
+/// this product owns; the directories above it belong to the user's account
+/// layout, and changing their modes would be a side effect on a tree this
+/// program does not own. The leaf — the state root itself — is what gets
+/// restricted.
+///
+/// # What the answer means
+///
+/// [`PrivacyOutcome::Restricted`] when the directory is owner-only, and
+/// [`PrivacyOutcome::NotApplicable`] when the platform has no owner-only mechanism —
+/// which is not a pass, and which the caller must not record as one.
+///
+/// # Errors
+///
+/// An I/O error if the directory cannot be created or its mode cannot be set.
+pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<PrivacyOutcome> {
+    if !dir.is_dir() {
+        if let Some(parent) = dir.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.is_dir()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        // `AlreadyExists` is not a failure: another process may have created it
+        // between the check and here, and the restriction below is what decides
+        // what it is.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match std::fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    restrict_to_owner(dir)?;
+    Ok(if restriction_applied() {
+        PrivacyOutcome::Restricted
+    } else {
+        PrivacyOutcome::NotApplicable
+    })
+}
+
+/// Changes a path's mode through a descriptor, refusing a path of the wrong kind.
+///
+/// The two steps are one resolution of one name: the handle is opened once,
+/// the object's kind is read from that handle, and the mode is changed on that
+/// handle. There is no second lookup of the name between the check and the
+/// change.
+#[cfg(unix)]
+fn restrict_via_handle(
+    path: &std::path::Path,
+    mode: u32,
+    is_the_right_kind: fn(&std::fs::Metadata) -> bool,
+    what: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let handle = std::fs::File::open(path)?;
+    let meta = handle.metadata()?;
+    if !is_the_right_kind(&meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not {what}", path.display()),
+        ));
+    }
+    handle.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Off Unix there are no mode bits to set.
+///
+/// The refusal is not available either: `unsafe` is forbidden here, and the
+/// Windows equivalent is an ACL, which is a different mechanism with a
+/// different threat model. The **caller** is told, through
+/// [`PrivacyOutcome::NotApplicable`]; this function only says "nothing was changed",
+/// and a caller that reads that as a restriction is the failure
+/// [`PrivacyOutcome`] exists to prevent.
+#[cfg(not(unix))]
+fn restrict_via_handle(
+    path: &std::path::Path,
+    _mode: u32,
+    _is_the_right_kind: fn(&std::fs::Metadata) -> bool,
+    _what: &str,
+) -> std::io::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+/// Whether the restriction actually happened, as opposed to being possible.
+///
+/// The Unix implementation returns `true` because `restrict_via_handle` changed the
+/// mode; every other platform returns `false`, because there is no mode to change.
+/// This is the single place the distinction is made, so the answer cannot drift
+/// between the two call sites that need it.
+fn restriction_applied() -> bool {
+    cfg!(unix)
 }
 
 /// A filesystem error.
@@ -442,44 +837,6 @@ fn is_runnable(path: &std::path::Path) -> bool {
     #[cfg(not(unix))]
     {
         true
-    }
-}
-
-/// Restricts `dir` to its owner, as far as this platform can express that.
-///
-/// # Why it lives here
-///
-/// It was in `orxnud-daemon` as an unconditional `std::os::unix::fs::PermissionsExt`,
-/// which is a mistake with two faces. Gate **G3** looked only for `cfg`, and this code
-/// had none, so the gate passed -- while the MSVC build failed outright, because
-/// `PermissionsExt` does not exist on Windows. V-29's "consequence of drift" predicted
-/// exactly this: *G3 only greps for `cfg`, not for a Linux type name.* A platform API
-/// used without a `cfg` is the same defect wearing a different hat, and G3 now detects
-/// `std::os::{unix,windows}` paths directly, so this specific hole is closed.
-///
-/// So the branch lives here, where `cfg` is permitted, and the portable core asks for the
-/// behaviour rather than reaching for the mechanism.
-///
-/// # What it does off Unix
-///
-/// Windows has no POSIX mode bits, and a portable owner-only spelling needs
-/// `windows-sys` plus `unsafe` -- which gate **G4** forbids outside a platform crate that
-/// has opted in, and this one has not. Rather than invent a weaker-looking call that reads
-/// as though the restriction happened, this returns `Ok(())` and records the limit: a
-/// directory created under a per-user state root already inherits a per-user ACL, so the
-/// protection the caller wanted is present by a different mechanism. Windows sandbox
-/// isolation as a whole remains **NOT_PROVEN** (ADR-0035, V-29); this says nothing about
-/// it.
-pub fn restrict_to_owner(dir: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
     }
 }
 

@@ -956,7 +956,7 @@ mod rollforward {
         let c = Connection::open(&p).expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
         crate::migration::MigrationRunner::new(&c)
-            .migrate(&p)
+            .migrate(&p, &orxnud_platform_fs::OsIdentity)
             .expect("migrate");
         c.execute_batch("CREATE TABLE IF NOT EXISTS audit_note (id INTEGER PRIMARY KEY, t TEXT);")
             .expect("table");
@@ -1205,7 +1205,7 @@ mod scenarios {
         let c = Connection::open(&p).expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
         crate::migration::MigrationRunner::new(&c)
-            .migrate(&p)
+            .migrate(&p, &orxnud_platform_fs::OsIdentity)
             .expect("migrate");
         c.execute_batch("CREATE TABLE IF NOT EXISTS audit_note (id INTEGER PRIMARY KEY, t TEXT);")
             .expect("table");
@@ -1916,7 +1916,7 @@ mod ordering {
         let c = Connection::open(&p).expect("open");
         Pragma::critical().apply(&c).expect("pragmas");
         crate::migration::MigrationRunner::new(&c)
-            .migrate(&p)
+            .migrate(&p, &orxnud_platform_fs::OsIdentity)
             .expect("migrate");
         c.execute_batch("CREATE TABLE IF NOT EXISTS audit_note (id INTEGER PRIMARY KEY, t TEXT);")
             .expect("table");
@@ -2030,13 +2030,16 @@ mod ordering {
         // The snapshot the restore installs.
         let snapshot = {
             let c = Connection::open(&source).expect("open");
-            crate::backup::Backup::take(&c, &source).expect("snapshot")
+            crate::backup::Backup::take(&c, &source, &orxnud_platform_fs::OsIdentity)
+                .expect("snapshot")
         };
 
         record::clear();
         let guard = crate::backup::RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity)
             .expect("guard");
-        snapshot.restore(&guard).expect("restore");
+        snapshot
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
+            .expect("restore");
         drop(guard);
 
         let log = record::entries();
@@ -2077,13 +2080,16 @@ mod ordering {
 
         let snapshot = {
             let c = Connection::open(&source).expect("open");
-            crate::backup::Backup::take(&c, &source).expect("snapshot")
+            crate::backup::Backup::take(&c, &source, &orxnud_platform_fs::OsIdentity)
+                .expect("snapshot")
         };
 
         seams::arm(seams::Fault::DirectoryFlush);
         let guard = crate::backup::RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity)
             .expect("guard");
-        let err = snapshot.restore(&guard).expect_err("the flush must fail");
+        let err = snapshot
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
+            .expect_err("the flush must fail");
         seams::reset();
         assert!(format!("{err:?}").contains("injected"), "{err:?}");
 

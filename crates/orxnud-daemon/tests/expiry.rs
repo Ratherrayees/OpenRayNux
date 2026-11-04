@@ -57,8 +57,22 @@ impl SecretsContract for NoSecrets {
 }
 
 fn dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("orxnud-exp-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+    // A test path must never be reused across runs. The old name was
+    // `orxnud-exp-<pid>-<tag>`, so a crashed run that left a daemon or socket behind could
+    // collide with a later process whose pid was reused: the daemon then refused the stale
+    // endpoint with `EndpointExists` before the test did anything. The timestamp separates
+    // runs and the counter separates callers inside one process.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!(
+        "orxnud-exp-{}-{tag}-{nonce}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&d).expect("mkdir");
     d
 }
@@ -144,10 +158,13 @@ impl Serving {
         let _ = self.task.await;
     }
 
-    /// A crash: the serve task is dropped mid-flight, so nothing runs a graceful release and
-    /// whatever a holder had in memory stays in the database.
+    /// A crash: the serve task is aborted mid-flight, so no shutdown signal is sent and
+    /// whatever a holder had in memory stays in the database. Await the aborted handle so
+    /// the runtime's endpoint guard has actually run before the caller starts the next
+    /// daemon at the same path; otherwise the restart races the guard's unlink.
     async fn crash(self) {
         self.task.abort();
+        let _ = self.task.await;
     }
 }
 
@@ -218,18 +235,22 @@ fn propose(s: &Serving, task: &str, worker: &str, file: &str, max_steps: u32) ->
         "task/create",
         json!({"id": task, "max_steps": max_steps, "content": "governed"}),
     );
-    send(
+    let claimed = send(
         &s.endpoint,
         "cl",
         "task/claim",
         json!({"id": task, "worker": worker}),
     );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let reply = send(
         &s.endpoint,
         "p",
         "task/propose",
         json!({
             "task": task, "worker": worker, "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": file, "params": {"path": file, "contents": "x"}
         }),
     );
@@ -639,18 +660,22 @@ fn an_expired_read_approval_retains_no_observation() {
             "task/create",
             json!({"id": "rd1", "max_steps": 2, "content": "read a.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "cl",
             "task/claim",
             json!({"id": "rd1", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let p = send(
             &s.endpoint,
             "p",
             "task/propose",
             json!({
                 "task": "rd1", "worker": "w1", "capability": "filesystem/read-text",
+                "claim_generation": claim_generation,
                 "target": "a.txt", "params": {"path": "a.txt"}
             }),
         );

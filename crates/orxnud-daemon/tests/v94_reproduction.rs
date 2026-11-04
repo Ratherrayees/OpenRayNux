@@ -150,12 +150,16 @@ fn p1_20_a_consume_failure_must_not_let_the_capability_execute() {
         json!({"id": "p120", "worker": "w1"}),
     );
     assert!(claimed.get("result").is_some(), "claim failed: {claimed}");
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let p = send(
         s.ep(),
         "p",
         "task/propose",
         json!({
             "task": "p120", "worker": "w1", "capability": "text/word-count",
+            "claim_generation": claim_generation,
             "params": {"text": "one two three"}}),
     );
     let pid = p["result"]["proposal"]["proposal_id"]

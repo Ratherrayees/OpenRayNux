@@ -136,7 +136,9 @@ fn open_with(path: &Path, pragma: Pragma) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).expect("open");
     pragma.apply(&conn).expect("pragmas");
     pragma.verify(&conn).expect("verify");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     conn
 }
 
@@ -411,8 +413,16 @@ fn completion_latency_is_the_other_half_of_the_hot_path() {
     let t = Instant::now();
     for id in &ids {
         assert!(
-            e.complete_task(id, "w", NOW, TaskState::Completed, true, None)
-                .expect("complete"),
+            e.complete_task(
+                id,
+                "w",
+                e.task(id).expect("read").expect("present").claim_generation,
+                NOW,
+                TaskState::Completed,
+                true,
+                None
+            )
+            .expect("complete"),
             "the fence must accept a live lease"
         );
     }
@@ -508,8 +518,16 @@ fn a_bounded_concurrent_workload_stays_within_its_limit() {
     // Completing one frees a slot, and the next claim succeeds.
     let claimed = e.task(&tid(0)).expect("read").expect("present");
     assert!(
-        e.complete_task(&claimed.id, "w", NOW, TaskState::Completed, true, None)
-            .expect("complete")
+        e.complete_task(
+            &claimed.id,
+            "w",
+            claimed.claim_generation,
+            NOW,
+            TaskState::Completed,
+            true,
+            None
+        )
+        .expect("complete")
     );
     assert!(
         e.claim_task("w", NOW).expect("claim").is_some(),

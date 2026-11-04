@@ -295,6 +295,9 @@ fn create_list_claim_complete_runs_over_the_socket() {
             claimed["result"]["lease_expires_at_ms"].is_i64(),
             "a claim must report the lease it granted"
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         // list again: the claim is visible through the durable read path
         let listed = send(&s.endpoint, "4", "task/list", json!({}));
@@ -305,7 +308,7 @@ fn create_list_claim_complete_runs_over_the_socket() {
             &s.endpoint,
             "5",
             "task/complete",
-            json!({"id": "t-1", "worker": "w1"}),
+            json!({"id": "t-1", "worker": "w1", "claim_generation": claim_generation}),
         );
         assert_eq!(done["result"]["task"]["state"], "completed");
         assert_eq!(
@@ -341,17 +344,20 @@ fn a_completed_task_and_its_events_survive_a_restart() {
                 "task/create",
                 json!({"id": "t-1", "kind": "query", "content": "survive me"}),
             );
-            send(
+            let claimed = send(
                 &s.endpoint,
                 "2",
                 "task/claim",
                 json!({"id": "t-1", "worker": "w1"}),
             );
+            let claim_generation = claimed["result"]["claim_generation"]
+                .as_i64()
+                .expect("claim generation");
             send(
                 &s.endpoint,
                 "3",
                 "task/complete",
-                json!({"id": "t-1", "worker": "w1"}),
+                json!({"id": "t-1", "worker": "w1", "claim_generation": claim_generation}),
             );
             s.stop().await;
         }
@@ -439,11 +445,14 @@ fn a_crashed_run_leaves_a_lease_that_the_next_run_reclaims() {
             claimed["result"]["attempt"], 2,
             "recovery does not refund the attempt"
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let done = send(
             &s.endpoint,
             "5",
             "task/complete",
-            json!({"id": "t-1", "worker": "w2"}),
+            json!({"id": "t-1", "worker": "w2", "claim_generation": claim_generation}),
         );
         assert_eq!(done["result"]["task"]["state"], "completed");
         s.stop().await;
@@ -479,7 +488,7 @@ fn a_pending_task_cannot_be_completed_without_being_claimed() {
             &s.endpoint,
             "2",
             "task/complete",
-            json!({"id": "t-1", "worker": "anyone"}),
+            json!({"id": "t-1", "worker": "anyone", "claim_generation": 0}),
         );
         // `CONFLICT`: valid request, wrong state. The task is not in a state where
         // completing it is legal, and the recovery is to claim it first.
@@ -512,18 +521,21 @@ fn a_worker_cannot_complete_a_task_it_does_not_hold() {
             "task/create",
             json!({"id": "t-1", "kind": "query", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "2",
             "task/claim",
             json!({"id": "t-1", "worker": "owner"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         let stolen = send(
             &s.endpoint,
             "3",
             "task/complete",
-            json!({"id": "t-1", "worker": "intruder"}),
+            json!({"id": "t-1", "worker": "intruder", "claim_generation": claim_generation}),
         );
         // `CONFLICT`: another worker holding the lease is a race that was lost, not a bad
         // request and not a fault in the daemon.
@@ -535,7 +547,7 @@ fn a_worker_cannot_complete_a_task_it_does_not_hold() {
             &s.endpoint,
             "4",
             "task/complete",
-            json!({"id": "t-1", "worker": "owner"}),
+            json!({"id": "t-1", "worker": "owner", "claim_generation": claim_generation}),
         );
         assert_eq!(done["result"]["task"]["state"], "completed");
         s.stop().await;
@@ -998,17 +1010,20 @@ fn cancelling_a_terminal_task_is_a_no_op_that_succeeds_and_reports_the_truth() {
             "task/create",
             json!({"id": "t-1", "kind": "query", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "2",
             "task/claim",
             json!({"id": "t-1", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         send(
             &s.endpoint,
             "3",
             "task/complete",
-            json!({"id": "t-1", "worker": "w1"}),
+            json!({"id": "t-1", "worker": "w1", "claim_generation": claim_generation}),
         );
         let events_before = events_for(&root, "t-1").len();
 
@@ -1137,12 +1152,15 @@ fn a_cancelled_task_cannot_be_resurrected_by_a_late_completion() {
             "task/create",
             json!({"id": "t-1", "kind": "query", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "2",
             "task/claim",
             json!({"id": "t-1", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         // Cancel wins: the lease is gone.
         let cancelled = send(&s.endpoint, "3", "task/cancel", json!({"id": "t-1"}));
@@ -1154,7 +1172,7 @@ fn a_cancelled_task_cannot_be_resurrected_by_a_late_completion() {
             &s.endpoint,
             "4",
             "task/complete",
-            json!({"id": "t-1", "worker": "w1"}),
+            json!({"id": "t-1", "worker": "w1", "claim_generation": claim_generation}),
         );
         assert!(
             late.get("error").is_some(),
@@ -1316,12 +1334,15 @@ fn propose(s: &Serving, task: &str, worker: &str, file: &str, contents: &str) ->
         "task/create",
         json!({"id": task, "content": "governed"}),
     );
-    send(
+    let claimed = send(
         &s.endpoint,
         "c",
         "task/claim",
         json!({"id": task, "worker": worker}),
     );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let reply = send(
         &s.endpoint,
         "p",
@@ -1330,6 +1351,7 @@ fn propose(s: &Serving, task: &str, worker: &str, file: &str, contents: &str) ->
             "task": task,
             "worker": worker,
             "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": file,
             "params": {"path": file, "contents": contents},
         }),
@@ -1571,12 +1593,15 @@ fn the_lease_holder_does_not_become_the_proposer() {
             "task/create",
             json!({"id": "g4", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "g4", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let impostor = send(
             &s.endpoint,
             "p",
@@ -1584,6 +1609,7 @@ fn the_lease_holder_does_not_become_the_proposer() {
             json!({
                 "task": "g4", "worker": "not-the-lease-holder",
                 "capability": "filesystem/write-text", "target": "a.txt",
+                "claim_generation": claim_generation,
                 "params": {"path": "a.txt", "contents": "x"},
             }),
         );
@@ -1600,6 +1626,7 @@ fn the_lease_holder_does_not_become_the_proposer() {
             json!({
                 "task": "g4", "worker": "w1",
                 "capability": "filesystem/write-text", "target": "a.txt",
+                "claim_generation": claim_generation,
                 "params": {"path": "a.txt", "contents": "x"},
             }),
         );
@@ -1771,12 +1798,15 @@ fn the_proposal_commits_to_the_parameters_that_were_requested() {
             "task/create",
             json!({"id": "g8", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "g8", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let r = send(
             &s.endpoint,
             "p",
@@ -1784,6 +1814,7 @@ fn the_proposal_commits_to_the_parameters_that_were_requested() {
             json!({
                 "task": "g8", "worker": "w1",
                 "capability": "filesystem/write-text", "target": "p.txt",
+                "claim_generation": claim_generation,
                 "params": {"contents": "alpha", "path": "p.txt"},
             }),
         );
@@ -1866,12 +1897,15 @@ fn an_approval_for_one_proposal_does_not_execute_another() {
             "task/create",
             json!({"id": "xb", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "xb", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let pid_b = send(
             &s.endpoint,
             "p",
@@ -1879,6 +1913,7 @@ fn an_approval_for_one_proposal_does_not_execute_another() {
             json!({
                 "task": "xb", "worker": "w1",
                 "capability": "filesystem/write-text", "target": "b.txt",
+                "claim_generation": claim_generation,
                 "params": {"path": "b.txt", "contents": "beta"},
             }),
         )["result"]["proposal"]["proposal_id"]
@@ -2078,12 +2113,15 @@ fn an_ai_proposal_becomes_a_governed_action() {
             "task/create",
             json!({"id": "ai1", "content": "Create final.txt containing delegated governance works"}),
         );
-        send(&s.endpoint, "c", "task/claim", json!({"id": "ai1", "worker": "ai"}));
+        let claimed = send(&s.endpoint, "c", "task/claim", json!({"id": "ai1", "worker": "ai"}));
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let p = send(
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "ai1", "worker": "ai"}),
+            json!({"task": "ai1", "worker": "ai", "claim_generation": claim_generation}),
         );
         assert_eq!(p["result"]["proposed_by"], "ai", "the proposer is the model actor");
         assert_eq!(p["result"]["proposal"]["capability"], "filesystem/write-text");
@@ -2148,12 +2186,15 @@ fn a_malformed_ai_response_is_refused_without_writing_a_proposal() {
             "task/create",
             json!({"id": "m1", "content": "write something"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "m1", "worker": "ai"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         // `path` with no `contents`: a shape the capability declares but this request
         // does not satisfy. The refusal must happen at propose time, before a durable
@@ -2162,7 +2203,7 @@ fn a_malformed_ai_response_is_refused_without_writing_a_proposal() {
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "m1", "worker": "ai"}),
+            json!({"task": "m1", "worker": "ai", "claim_generation": claim_generation}),
         );
         let reason = refused["error"]["data"]["reason"]
             .as_str()
@@ -2210,18 +2251,21 @@ fn an_enabled_but_unoffered_capability_is_refused() {
             "task/create",
             json!({"id": "u1", "content": "count"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "u1", "worker": "ai"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         let refused = send(
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "u1", "worker": "ai"}),
+            json!({"task": "u1", "worker": "ai", "claim_generation": claim_generation}),
         );
         assert_eq!(
             refused["error"]["data"]["reason"], "proposal-capability-unknown",
@@ -2282,17 +2326,20 @@ fn every_enabled_capability_is_offered_to_the_model_with_its_declared_parameters
             "task/create",
             json!({"id": "n1", "content": "count words"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "n1", "worker": "ai"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         send(
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "n1", "worker": "ai"}),
+            json!({"task": "n1", "worker": "ai", "claim_generation": claim_generation}),
         );
 
         let ctx = seen
@@ -2377,6 +2424,8 @@ fn two_daemons_keep_separate_proposers() {
         )
         .await;
 
+        let mut good_generation = 0;
+        let mut bad_generation = 0;
         for (id, endpoint) in [("g1", &good.endpoint), ("b1", &bad.endpoint)] {
             send(
                 endpoint,
@@ -2384,7 +2433,15 @@ fn two_daemons_keep_separate_proposers() {
                 "task/create",
                 json!({"id": id, "content": "write a file"}),
             );
-            send(endpoint, "c", "task/claim", json!({"id": id, "worker": "ai"}));
+            let claimed = send(endpoint, "c", "task/claim", json!({"id": id, "worker": "ai"}));
+            let generation = claimed["result"]["claim_generation"]
+                .as_i64()
+                .expect("claim generation");
+            if id == "g1" {
+                good_generation = generation;
+            } else {
+                bad_generation = generation;
+            }
         }
 
         // Interleaved on purpose: if there were shared state, this is where it would
@@ -2393,7 +2450,7 @@ fn two_daemons_keep_separate_proposers() {
             &bad.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "b1", "worker": "ai"}),
+            json!({"task": "b1", "worker": "ai", "claim_generation": bad_generation}),
         );
         assert_eq!(
             bad_reply["error"]["data"]["reason"], "proposal-schema-mismatch",
@@ -2404,7 +2461,7 @@ fn two_daemons_keep_separate_proposers() {
             &good.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "g1", "worker": "ai"}),
+            json!({"task": "g1", "worker": "ai", "claim_generation": good_generation}),
         );
         assert_eq!(good_reply["result"]["proposed_by"], "ai", "{good_reply}");
         assert_eq!(good_reply["result"]["model"], "scripted/good");
@@ -2438,12 +2495,15 @@ fn the_ai_route_offers_no_authority_to_the_model() {
             "task/create",
             json!({"id": "ai2", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "ai2", "worker": "ai"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         // (a) The model cannot approve. `capability/approve` derives its approver from
         //     the trusted human, so a caller asserting one is simply ignored; there is no
@@ -2499,7 +2559,7 @@ fn the_ai_route_offers_no_authority_to_the_model() {
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "ai2", "worker": "ai"}),
+            json!({"task": "ai2", "worker": "ai", "claim_generation": claim_generation}),
         );
         assert_eq!(p["result"]["proposal"]["authority_root"], "local");
         s.stop().await;
@@ -2526,18 +2586,21 @@ fn an_ai_proposal_requires_the_lease_and_is_once_per_attempt() {
             "task/create",
             json!({"id": "ai3", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "ai3", "worker": "ai"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         let impostor = send(
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "ai3", "worker": "not-the-lease-holder"}),
+            json!({"task": "ai3", "worker": "not-the-lease-holder", "claim_generation": claim_generation}),
         );
         assert!(impostor.get("error").is_some(), "{impostor}");
 
@@ -2546,7 +2609,7 @@ fn an_ai_proposal_requires_the_lease_and_is_once_per_attempt() {
                 &s.endpoint,
                 "p",
                 "task/ai-propose",
-                json!({"task": "ai3", "worker": "ai"})
+                json!({"task": "ai3", "worker": "ai", "claim_generation": claim_generation})
             )
             .get("result")
             .is_some()
@@ -2555,7 +2618,7 @@ fn an_ai_proposal_requires_the_lease_and_is_once_per_attempt() {
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "ai3", "worker": "ai"}),
+            json!({"task": "ai3", "worker": "ai", "claim_generation": claim_generation}),
         );
         assert!(
             second.get("error").is_some(),

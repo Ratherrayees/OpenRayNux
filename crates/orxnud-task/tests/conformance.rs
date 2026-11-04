@@ -131,6 +131,7 @@ fn a_engine_that_checks_identity_but_not_liveness_fails_tp5() {
             &mut self,
             id: &TaskId,
             worker: &str,
+            _claim_generation: i64,
             _now_ms: i64,
             state: TaskState,
             effect_observed: bool,

@@ -65,7 +65,9 @@ fn open_engine(path: &Path) -> DurableEngine {
     let conn = Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -78,6 +80,7 @@ fn approved_waiting_task(path: &Path, id: &str, digest_hex: &str) {
         .claim_task("preparer", NOW)
         .expect("claim")
         .expect("a task to claim")
+        .row
         .attempts;
 
     let mut repo = TaskRepository::new(e.conn_mut());
@@ -100,6 +103,7 @@ fn approved_waiting_task(path: &Path, id: &str, digest_hex: &str) {
             "proposal-under-test",
             &tid(id),
             "preparer",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             r#"{"path":"out.txt","contents":"x"}"#,
@@ -399,6 +403,7 @@ fn a_failure_inside_propose_action_leaves_neither_proposal_nor_state_change() {
             "second-proposal",
             &tid("t"),
             "w",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             r#"{"path":"out.txt","contents":"x"}"#,
@@ -462,6 +467,7 @@ fn a_failure_after_the_proposal_row_leaves_the_task_unparked() {
             "p",
             &tid("t"),
             "w1",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             r#"{"path":"out.txt","contents":"x"}"#,

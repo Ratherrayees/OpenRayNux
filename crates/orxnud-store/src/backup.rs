@@ -140,6 +140,22 @@ pub enum BackupError {
         reason: String,
     },
 
+    /// The database or a copy of it could not be made private to its owner.
+    ///
+    /// **Not** an ownership failure, and kept apart from it on purpose. An
+    /// ownership refusal says another process holds the database; a privacy
+    /// refusal says the file was readable and could not be made unreadable to
+    /// other accounts. The second is a different fact with a different remedy, and
+    /// an operator sent to look for a competing process is being sent to the wrong
+    /// place.
+    #[error("refusing to restore: {path} could not be made private to its owner: {reason}")]
+    Privacy {
+        /// The path that could not be restricted.
+        path: String,
+        /// Why it could not be.
+        reason: String,
+    },
+
     /// Exclusive authority over the restore target could not be established.
     ///
     /// **This is the fail-closed arm of S-30's coordination rule.** It is raised when
@@ -196,6 +212,15 @@ impl From<crate::alias::OpenFailure> for BackupError {
             crate::alias::OpenFailure::Alias { path, reason } => BackupError::Ownership {
                 reason: format!("{}: {reason}", path.display()),
             },
+            // A privacy refusal is not an ownership refusal and not an
+            // unreadable file: the file was readable, and what failed is that
+            // it could not be made private to its owner. It keeps its own
+            // variant so an operator is not sent to look for a second name or
+            // for a broken file.
+            crate::alias::OpenFailure::Privacy { path, reason } => BackupError::Privacy {
+                path: path.display().to_string(),
+                reason: reason.to_string(),
+            },
             crate::alias::OpenFailure::Sqlite { path, source } => BackupError::Unreadable {
                 path: path.display().to_string(),
                 source,
@@ -205,18 +230,37 @@ impl From<crate::alias::OpenFailure> for BackupError {
 }
 
 /// What a verification established about a snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSnapshot {
     /// The schema version found in the snapshot.
     pub schema_version: u32,
     /// The number of rows across every table, as a cheap "it has content" check.
     pub total_rows: i64,
+    /// The **provenance identity** the snapshot carries: the identity of the
+    /// database it was taken from.
+    ///
+    /// `None` for a snapshot written by a build that predates the identity, and
+    /// `None` for a file that is not one of this store's databases at all. The
+    /// absence is carried rather than treated as a failure here, because a
+    /// verification answers "is this a database?", and the question "is this
+    /// *our* database?" is asked where the answer can be acted on: the
+    /// adoption in [`crate::migration::MigrationRunner::migrate`].
+    pub identity: Option<String>,
 }
 
 /// A verified snapshot beside the live database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backup {
     path: PathBuf,
+    /// Whether this call created the file at `path`.
+    ///
+    /// Only a snapshot this call took may be discarded. A snapshot that was adopted
+    /// (`Backup::existing`) may be another migrator's recovery obligation: its path was
+    /// already on disk, and removing it on *this* migrator's success would leave the
+    /// other migrator with nothing to restore. The migration lock serialises the
+    /// publication/discard sequence; this flag keeps a success from consuming a recovery
+    /// point it did not create.
+    owned: bool,
 }
 
 // Test-only: the per-thread hook fired between `Backup::take`'s copy and its verification.
@@ -351,9 +395,16 @@ impl Backup {
     /// The caller is responsible for having verified it; [`Self::verify`] is the
     /// way to do that. Exists so a caller that already holds a verified snapshot
     /// does not pay to take a second one.
+    ///
+    /// An adopted snapshot is not owned by this call: [`Self::discard`] leaves it in
+    /// place, because the file may be the recovery point a different migrator is
+    /// still entitled to restore.
     #[must_use]
     pub fn existing(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            owned: false,
+        }
     }
 
     /// The snapshot path.
@@ -364,11 +415,32 @@ impl Backup {
 
     /// Takes a snapshot of `conn` and **verifies** it before returning.
     ///
+    /// # The snapshot is private to its owner
+    ///
+    /// A snapshot is a **full copy** of the database: every task, every parameter a
+    /// model proposed to act on, the approval ledger and the audit journal. The
+    /// platform creates the staging file with the process's umask applied, which
+    /// under the common `022` is world-readable, so the file is restricted to
+    /// `0600` **before** it is published. The publication is a rename, and a rename
+    /// preserves the mode, so the snapshot at its canonical name is born private
+    /// rather than being tightened after the fact.
+    ///
+    /// That is why `identity` is a **required** argument with no default. A
+    /// snapshot-taking API that could not restrict what it takes would be a public
+    /// way to produce a world-readable copy of the user's entire durable state, and
+    /// the crate was already audited once for a parameter of that shape
+    /// (`snapshot_verified: bool`).
+    ///
     /// # Errors
     ///
     /// [`BackupError`] if the copy cannot be written, cannot be reopened, fails
-    /// `integrity_check`, or has no `schema_meta`.
-    pub fn take(conn: &Connection, db_path: &Path) -> Result<Self, BackupError> {
+    /// `integrity_check`, or has no `schema_meta`; and [`BackupError::Privacy`] if the
+    /// snapshot could not be made private to its owner.
+    pub fn take(
+        conn: &Connection,
+        db_path: &Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Self, BackupError> {
         let path = Self::path_for(db_path);
         // Built and verified at a unique staging name, then moved into place. See
         // `publish`.
@@ -381,13 +453,25 @@ impl Backup {
         // snapshot beside the database under a name no reader looks at. It accumulated one
         // file per failed publication, and -- because a later `take` only removes the
         // staging name it generated itself -- nothing ever reclaimed them.
-        let taken = Self::take_into(conn, &staging);
+        let taken = Self::take_into(conn, &staging, identity);
         #[cfg(test)]
         if taken.is_ok() {
             // The second seam point: verified, but not yet at its canonical name.
             Self::fire_before_publish();
         }
-        let published = taken.and_then(|()| Self::publish(&staging, &path));
+        // The staging file is restricted inside `take_into`, before the copy is
+        // even verified, so the snapshot is private at every name it ever has --
+        // including the staging name it has for the whole of the copy.
+        let published = taken
+            .and_then(|()| Self::publish(&staging, &path))
+            .and_then(|()| {
+                // The rename made the canonical name, but a crash can lose a directory
+                // entry that was never flushed. The snapshot is not a recovery point until
+                // its name is durable, so this is part of publishing, not an optimisation.
+                let parent = crate::recovery::parent_dir_of(&path)?;
+                crate::recovery::fsync_dir(&parent)?;
+                Ok(())
+            });
         if let Err(e) = published {
             // The staging file is never the recovery point: it has not been published, so
             // nothing can have been told to restore from it. Removing it cannot lose a
@@ -397,14 +481,34 @@ impl Backup {
             let _ = std::fs::remove_file(&staging);
             return Err(e);
         }
-        Ok(Self { path })
+        Ok(Self { path, owned: true })
+    }
+
+    /// Restricts a copy of the database to its owner.
+    ///
+    /// The same decision the store makes about the database itself, for the same
+    /// reason: an error is a **refusal** (the copy is not published and not left
+    /// behind), and a platform with no owner-only mechanism is recorded as such
+    /// rather than treated as a success that reads as a restriction.
+    fn restrict_private(path: &Path, identity: &dyn FilesystemIdentity) -> Result<(), BackupError> {
+        match identity.restrict_file_to_owner(path) {
+            Ok(_) => Ok(()),
+            Err(reason) => Err(BackupError::Privacy {
+                path: path.display().to_string(),
+                reason: reason.to_string(),
+            }),
+        }
     }
 
     /// Copies `conn` to `dst_path` and verifies the copy against `conn`.
     ///
     /// Split out of [`Self::take`] so the caller owns the staging file's lifetime: every
     /// `?` in here has to be able to remove it.
-    fn take_into(conn: &Connection, dst_path: &Path) -> Result<(), BackupError> {
+    fn take_into(
+        conn: &Connection,
+        dst_path: &Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<(), BackupError> {
         // Asked *before* the copy, and carried to the verification below rather than
         // re-read there. See `verify_against_source`.
         let source_was_unmigrated = !Self::has_schema_meta(conn);
@@ -433,6 +537,16 @@ impl Backup {
             // and its `Drop` is what finalises the copy.
         }
 
+        // The staged copy is made private to its owner **before** it is verified.
+        //
+        // Before, not after: the verification reads the staged file, and a
+        // world-readable copy of the whole database should not exist for even the
+        // duration of that read. And before the publication, because the
+        // publication is a rename and a rename preserves the mode -- so a file
+        // restricted here is born private at its canonical name rather than
+        // tightened after the fact.
+        Self::restrict_private(dst_path, identity)?;
+
         // The seam for the read-ordering test. It sits **between the copy and the
         // verification**, which is the only place a mutation of the source can change the
         // answer without changing the snapshot -- and that is precisely the defect.
@@ -452,6 +566,13 @@ impl Backup {
         // The verification result is used by the caller; it is computed here so a
         // failure is reported by `take` rather than discovered later.
         let _ = verified;
+
+        // Flush the verified copy before its name is published. A rename is durable
+        // only when the file's contents are on stable storage *and* the parent
+        // directory entry is flushed; doing only the rename leaves a crash window in
+        // which the canonical path names a truncated or absent snapshot. Restore
+        // already has this discipline; the pre-migration snapshot did not.
+        crate::recovery::fsync_file(dst_path).map_err(BackupError::from)?;
         Ok(())
     }
 
@@ -607,6 +728,20 @@ impl Backup {
             });
         }
 
+        // The provenance identity, read after the integrity check so that a
+        // corrupt file is still reported as corrupt rather than as unreadable.
+        //
+        // This is the one thing the verification can say that is not about the
+        // file's *shape*: which database it came from. `None` means the file
+        // carries no identity at all — a snapshot from a build that predates the
+        // provenance table, or a file that is not one of this store's databases.
+        let identity = crate::migration::read_database_identity(&conn).map_err(|source| {
+            BackupError::Unreadable {
+                path: path.display().to_string(),
+                source,
+            }
+        })?;
+
         let has_meta: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_meta';",
@@ -628,6 +763,7 @@ impl Backup {
             return Ok(VerifiedSnapshot {
                 schema_version: 0,
                 total_rows: 0,
+                identity,
             });
         }
 
@@ -666,6 +802,7 @@ impl Backup {
         Ok(VerifiedSnapshot {
             schema_version,
             total_rows,
+            identity,
         })
     }
 
@@ -709,7 +846,11 @@ impl Backup {
     /// permit is never transferable to a path it was not taken for. Before this,
     /// `restore` accepted both the snapshot and an unrelated path, which is the
     /// shape a "which database did I actually just overwrite?" incident needs.
-    pub(crate) fn restore(&self, guard: &RestoreGuard) -> Result<(), BackupError> {
+    pub(crate) fn restore(
+        &self,
+        guard: &RestoreGuard,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<(), BackupError> {
         use crate::recovery;
 
         let db_path: &Path = guard.path();
@@ -749,7 +890,22 @@ impl Backup {
             }
         }
 
-        // 2. Verify the **staged** image before anything is committed.
+        // 2. Make the staged image private to its owner, **before** it is verified
+        // and long before the intent that names it is published. The staged image is
+        // a full copy of the database, and the platform creates it with the
+        // process's umask applied — world-readable under the common `022`. The
+        // intent must never name an image another account can read, and a
+        // verification step that ran first would leave the image exposed for no
+        // reason: reading a `0600` file the owner just created is not a problem.
+        //
+        // A failure here removes the staged image and refuses the restore. The
+        // snapshot is untouched, so the recovery point survives a refusal.
+        if let Err(e) = Self::restrict_private(&staging, identity) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(e);
+        }
+
+        // 3. Verify the **staged** image before anything is committed.
         let expected = Connection::open(&self.path)
             .and_then(|c| logical_digest(&c))
             .map_err(|source| BackupError::Unreadable {
@@ -769,7 +925,7 @@ impl Backup {
             });
         }
 
-        // 3. Make the staged image durable, *then* publish the intent. The order is the
+        // 4. Make the staged image durable, *then* publish the intent. The order is the
         //    invariant: an intent naming an unsynced image would, after a crash, point at a
         //    truncated file.
         //
@@ -790,13 +946,13 @@ impl Backup {
         };
         recovery::publish_intent(&intent)?;
 
-        // 4. From here on, `recovery::install_staged` is the only path that touches the
+        // 6. From here on, `recovery::install_staged` is the only path that touches the
         //    live database, and it is the same function a later open runs to finish a
         //    restore this process did not survive. One implementation, so a rollback and
         //    a roll-forward cannot drift apart.
         recovery::install_staged(db_path, &staging, &staged_digest)?;
 
-        // 5. Verified. Clearing the intent is the last durable act; before it, a crash
+        // 7. Verified. Clearing the intent is the last durable act; before it, a crash
         //    simply repeats the install, which is idempotent.
         recovery::clear_intent(db_path)?;
         recovery::discard_prepared(db_path)?;
@@ -824,7 +980,7 @@ impl Backup {
         identity: &dyn FilesystemIdentity,
     ) -> Result<(), BackupError> {
         let guard = RestoreGuard::acquire_with(db_path, Some(lease), identity)?;
-        self.restore(&guard)
+        self.restore(&guard, identity)
     }
 
     /// Restore this snapshot, acquiring exclusive authority first.
@@ -857,16 +1013,23 @@ impl Backup {
         identity: &dyn FilesystemIdentity,
     ) -> Result<(), BackupError> {
         let guard = RestoreGuard::acquire(db_path, identity)?;
-        self.restore(&guard)
+        self.restore(&guard, identity)
     }
 
-    /// Deletes the snapshot.
+    /// Deletes the snapshot, but only when this call took it.
     ///
     /// Called after a migration succeeds, so a stale pre-migration copy is not left
     /// to be mistaken for a current one. Failure is not an error: the snapshot is
     /// no longer needed either way, and refusing to continue would mean a
     /// successful migration is reported as a failure.
+    ///
+    /// A snapshot created by [`Self::existing`] is **not** removed. The path was
+    /// already on disk when this call arrived, and it may be another migrator's
+    /// recovery obligation; see [`Self::existing`].
     pub fn discard(&self) {
+        if !self.owned {
+            return;
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -1033,7 +1196,8 @@ impl RestoreGuard {
         // reachable through a second name is refused before the checkpoint, because
         // the restore writes **through** the existing file and a second name would
         // then reach different content than the one being restored.
-        let (conn, exclusive, sidecars) = crate::alias::open_exclusive(db_path, held, identity)?;
+        let (conn, exclusive, sidecars, _privacy) =
+            crate::alias::open_exclusive(db_path, held, identity)?;
         // The sidecars are verified **before** the checkpoint and before anything
         // is staged or installed. A restore that runs against an aliased
         // sidecar would be writing through a write-ahead log or a wal-index
@@ -1114,7 +1278,9 @@ mod tests {
     fn migrated_db(path: &Path) -> Connection {
         let conn = Connection::open(path).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).migrate(path).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate(path, &orxnud_platform_fs::OsIdentity)
+            .expect("migrate");
         conn
     }
 
@@ -1161,7 +1327,8 @@ mod tests {
                 std::thread::spawn(move || {
                     let c = Connection::open(&p).expect("open");
                     barrier.wait();
-                    Backup::take(&c, &p).map(|b| b.path().to_path_buf())
+                    Backup::take(&c, &p, &orxnud_platform_fs::OsIdentity)
+                        .map(|b| b.path().to_path_buf())
                 })
             })
             .collect();
@@ -1282,7 +1449,7 @@ mod tests {
 
         for _ in 0..25 {
             let c = Connection::open(&path).expect("open");
-            Backup::take(&c, &path).expect("take");
+            Backup::take(&c, &path, &orxnud_platform_fs::OsIdentity).expect("take");
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let observed = poller.join().expect("poller");
@@ -1356,7 +1523,9 @@ mod tests {
         // Another thread migrates the source after our copy was taken.
         {
             let c = Connection::open(&path).expect("open");
-            MigrationRunner::new(&c).migrate(&path).expect("migrate");
+            MigrationRunner::new(&c)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
+                .expect("migrate");
             assert!(has_meta(&c), "precondition: the source is now migrated");
         }
 
@@ -1429,12 +1598,12 @@ mod tests {
             let other = Connection::open(&migrated).expect("hook: open a second connection");
             Pragma::critical().apply(&other).expect("hook: pragmas");
             MigrationRunner::new(&other)
-                .migrate(&migrated)
+                .migrate(&migrated, &orxnud_platform_fs::OsIdentity)
                 .expect("hook: migrate the source after the copy finished");
         });
 
         let conn = Connection::open(&path).expect("reopen for take");
-        let result = match Backup::take(&conn, &path) {
+        let result = match Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity) {
             Ok(b) => Ok(b.path().to_path_buf()),
             Err(e) => Err(e.to_string()),
         };
@@ -1497,7 +1666,7 @@ mod tests {
         });
 
         let conn = Connection::open(&path).expect("open");
-        Backup::take(&conn, &path).expect("take");
+        Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity).expect("take");
 
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -1505,7 +1674,7 @@ mod tests {
             "the seam must fire exactly once per take"
         );
         // One-shot: a second take must not re-run it.
-        Backup::take(&conn, &path).expect("second take");
+        Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity).expect("second take");
         assert_eq!(
             count.load(Ordering::SeqCst),
             1,
@@ -1537,7 +1706,8 @@ mod tests {
         let canonical = Backup::path_for(&path);
 
         // The good snapshot that must survive.
-        let first = Backup::take(&conn, &path).expect("first take");
+        let first =
+            Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity).expect("first take");
         assert_eq!(first.path(), canonical.as_path());
         let before = Backup::verify(&canonical).expect("the first snapshot verifies");
         assert_eq!(
@@ -1556,7 +1726,8 @@ mod tests {
             "the table is still there; it is the rows that are gone"
         );
 
-        let err = Backup::take(&conn, &path).expect_err("an empty snapshot must be refused");
+        let err = Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity)
+            .expect_err("an empty snapshot must be refused");
         assert!(
             matches!(err, BackupError::Empty { .. }),
             "the failure must be reported as an unverifiable snapshot, got {err:?}"
@@ -1616,7 +1787,7 @@ mod tests {
         let path = dir.join("state.db");
         let conn = migrated_db(&path);
         let canonical = Backup::path_for(&path);
-        Backup::take(&conn, &path).expect("first take");
+        Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity).expect("first take");
         let before = Backup::verify(&canonical).expect("first verifies");
 
         // Make the staged file disappear between the verification and the rename.
@@ -1640,7 +1811,8 @@ mod tests {
             std::fs::remove_file(&staged[0]).expect("remove the staged snapshot");
         });
 
-        let err = Backup::take(&conn, &path).expect_err("the rename must fail");
+        let err = Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity)
+            .expect_err("the rename must fail");
         assert!(
             matches!(err, BackupError::Io { .. }),
             "a failed rename is an I/O error at the destination, got {err:?}"
@@ -1695,7 +1867,8 @@ mod tests {
             "precondition: the destination is a directory, so publication must fail"
         );
 
-        let err = Backup::take(&conn, &path).expect_err("the rename must fail");
+        let err = Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity)
+            .expect_err("the rename must fail");
         assert!(
             matches!(err, BackupError::Io { .. }),
             "a failed rename is an I/O error at the destination, got {err:?}"
@@ -1746,7 +1919,7 @@ mod tests {
         let canonical = Backup::path_for(&path);
 
         // First publication.
-        Backup::take(&conn, &path).expect("first take");
+        Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity).expect("first take");
         let first = Backup::verify(&canonical).expect("first verifies");
 
         // Make the source observably different, then publish again over the same path.
@@ -1756,7 +1929,7 @@ mod tests {
             rusqlite::params![[1u8; 32], [2u8; 32]],
         )
         .expect("write a row the first snapshot cannot contain");
-        Backup::take(&conn, &path).expect("second take");
+        Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity).expect("second take");
         let second = Backup::verify(&canonical).expect("second verifies");
 
         assert_eq!(
@@ -1795,7 +1968,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let c = Connection::open(&p).expect("open");
                     barrier.wait();
-                    Backup::take(&c, &p).map(|_| ())
+                    Backup::take(&c, &p, &orxnud_platform_fs::OsIdentity).map(|_| ())
                 })
             })
             .collect();
@@ -1831,7 +2004,7 @@ mod tests {
         let d = dir("taken");
         let db = d.join("state.db");
         let conn = migrated_db(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         assert!(snapshot.path().is_file());
 
         let verified = Backup::verify(snapshot.path()).expect("verify");
@@ -1839,6 +2012,51 @@ mod tests {
         assert!(
             verified.total_rows >= 1,
             "a verified snapshot must have content"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **A published snapshot is flushed before it becomes a recovery point.**
+    ///
+    /// DATA-005 / S-11: `Backup::take` copied and verified the snapshot, then renamed it
+    /// into place without flushing either the file or the parent directory. A crash could
+    /// therefore leave the canonical name pointing at a truncated or absent file -- the
+    /// exact object a failed migration is told to restore. Restore already flushed both;
+    /// snapshots did not.
+    ///
+    /// The assertion is the recorded order, not just success: the staged file is flushed
+    /// before publication, and the parent directory entry is flushed after it. The
+    /// test-only record is compiled out of production.
+    #[test]
+    fn a_published_snapshot_flushes_the_file_then_the_parent_directory() {
+        let d = dir("snapshot-durable");
+        let db = d.join("state.db");
+        let conn = migrated_db(&db);
+
+        crate::recovery::record::clear();
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
+        let entries = crate::recovery::record::entries();
+
+        let file_flush = entries
+            .iter()
+            .position(|e| e.starts_with("fsync_file ") && e.contains(".staging-"))
+            .unwrap_or_else(|| panic!("the staged snapshot was never flushed: {entries:?}"));
+        let dir_flush = entries
+            .iter()
+            .position(|e| e == &format!("fsync_dir {}", d.display()))
+            .unwrap_or_else(|| {
+                panic!("the snapshot parent directory was never flushed: {entries:?}")
+            });
+        assert!(
+            file_flush < dir_flush,
+            "the file must be flushed before its directory entry is published: {entries:?}"
+        );
+        Backup::verify(snapshot.path()).expect("the durable snapshot must verify");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.starts_with("fsync_dir ") && e.contains(".staging-")),
+            "the staging name is not the published name: {entries:?}"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1855,7 +2073,7 @@ mod tests {
              INSERT INTO t (v) VALUES ('committed');",
         )
         .expect("write");
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
 
         let restored = Connection::open(snapshot.path()).expect("open snapshot");
         let v: String = restored
@@ -1871,7 +2089,7 @@ mod tests {
         let db = d.join("state.db");
         {
             let conn = migrated_db(&db);
-            let snapshot = Backup::take(&conn, &db).expect("take");
+            let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
             // Damage the live database after the snapshot.
             conn.execute_batch("DROP TABLE schema_meta;")
                 .expect("damage");
@@ -1884,7 +2102,9 @@ mod tests {
             // S-30: a restore is only reachable with a permit.
             let guard =
                 RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
-            snapshot.restore(&guard).expect("restore");
+            snapshot
+                .restore(&guard, &orxnud_platform_fs::OsIdentity)
+                .expect("restore");
         }
         let after = Connection::open(&db).expect("reopen");
         let n: i64 = after
@@ -1976,7 +2196,7 @@ mod tests {
         let db = d.join("state.db");
 
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         // Post-snapshot state, committed after the snapshot was taken.
         conn.execute_batch("INSERT INTO notes VALUES (2, 'POST-SNAPSHOT-IN-WAL');")
             .expect("post write");
@@ -1988,7 +2208,9 @@ mod tests {
 
         let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity)
             .expect("acquire: quiescing must succeed");
-        snapshot.restore(&guard).expect("restore");
+        snapshot
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
+            .expect("restore");
 
         let after = rows(&db).expect("restored database must be readable");
         assert_eq!(
@@ -2007,7 +2229,7 @@ mod tests {
         let db = d.join("state.db");
 
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         conn.execute_batch("INSERT INTO notes VALUES (2, 'POST-SNAPSHOT-IN-WAL');")
             .expect("post write");
         stash_sidecars(&db, &d);
@@ -2017,7 +2239,9 @@ mod tests {
         std::fs::copy(d.join("stale-shm"), db.with_file_name("state.db-shm")).expect("replay -shm");
 
         let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
-        snapshot.restore(&guard).expect("restore");
+        snapshot
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
+            .expect("restore");
 
         let after = rows(&db).expect("restored database must be readable");
         assert_eq!(
@@ -2042,7 +2266,7 @@ mod tests {
         // A snapshot whose logical content cannot match the target at all: the
         // target keeps a row the snapshot never had.
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         conn.execute_batch("INSERT INTO notes VALUES (2, 'EXTRA-NOT-IN-SNAPSHOT');")
             .expect("extra");
         drop(conn);
@@ -2053,7 +2277,7 @@ mod tests {
             .expect("corrupt snapshot");
 
         let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
-        let outcome = snapshot.restore(&guard);
+        let outcome = snapshot.restore(&guard, &orxnud_platform_fs::OsIdentity);
 
         match outcome {
             Ok(()) => panic!(
@@ -2140,7 +2364,7 @@ mod tests {
         let d = restore_dir("guard-prevents");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         conn.execute_batch("INSERT INTO notes VALUES (2, 'POST');")
             .expect("post");
         stash_sidecars(&db, &d);
@@ -2155,7 +2379,9 @@ mod tests {
             !wal.exists() || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) == 0,
             "acquiring authority must leave no live write-ahead log behind to replay"
         );
-        snapshot.restore(&guard).expect("restore");
+        snapshot
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
+            .expect("restore");
         assert_eq!(rows(&db).expect("readable"), "PRE-SNAPSHOT-ONLY");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2179,7 +2405,7 @@ mod tests {
         let d = restore_dir("live-idle");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         conn.execute_batch("INSERT INTO notes VALUES (2, 'POST');")
             .expect("post");
 
@@ -2198,7 +2424,7 @@ mod tests {
              refusing more than it needs to",
         );
         snapshot
-            .restore(&guard)
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
             .expect("restore with an idle independent handle open must succeed");
         assert_eq!(rows(&db).expect("readable"), "PRE-SNAPSHOT-ONLY");
         assert_eq!(
@@ -2217,7 +2443,7 @@ mod tests {
         let d = restore_dir("live-active");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         conn.execute_batch("INSERT INTO notes VALUES (2, 'POST');")
             .expect("post");
 
@@ -2271,7 +2497,7 @@ mod tests {
         let d = restore_dir("bypass");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        Backup::take(&conn, &db).expect("take");
+        Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
 
         // A reader is live. `acquire` refuses...
         let independent = Connection::open(&db).expect("handle");
@@ -2299,6 +2525,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// **The restore staging image is private to its owner.**
+    ///
+    /// The staged image is a **complete copy** of the database, and the platform
+    /// creates it with the process's umask applied — world-readable under the
+    /// common `022`. It is restricted to `0600` before anything verifies it and
+    /// long before the intent that names it is published, so an intent never
+    /// names an image another account can read.
+    ///
+    /// The image is transient: a successful restore installs it and removes it.
+    /// So the observation is made on a restore that **fails part-way through the
+    /// install**, which is exactly the moment the crate's own fault seam exists
+    /// for — and the failed restore leaves the staged image on disk, because the
+    /// roll-forward needs it to finish what the interrupted process started.
+    /// That is the production path, not a simulation of it.
+    #[test]
+    fn the_restore_staging_image_is_private_to_its_owner() {
+        let d = restore_dir("staging-privacy");
+        let db = d.join("state.db");
+        let conn = restore_fixture(&db);
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
+        conn.execute_batch("INSERT INTO notes VALUES (2, 'POST');")
+            .expect("post");
+        drop(conn);
+
+        let guard = RestoreGuard::acquire(&db, &orxnud_platform_fs::OsIdentity).expect("acquire");
+
+        // The install fails part-way through, so the staged image is still on
+        // disk when the refusal comes back.
+        crate::recovery::seams::arm(crate::recovery::seams::Fault::DuringCopy);
+        let outcome = snapshot.restore(&guard, &orxnud_platform_fs::OsIdentity);
+        assert!(
+            outcome.is_err(),
+            "precondition: the install must have been interrupted, or there is no staged \
+             image to observe"
+        );
+        assert!(
+            crate::recovery::seams::fired(crate::recovery::seams::Fault::DuringCopy),
+            "precondition: the injected fault must have fired"
+        );
+
+        let staging = crate::recovery::staging_path_for(&db);
+        assert!(
+            staging.exists(),
+            "precondition: the interrupted restore must have left the staged image behind, \
+             because the roll-forward needs it"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&staging).expect("stat the staged image");
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                0o600,
+                "the staged image is a complete copy of the database and must be private \
+                 to its owner"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// **Criterion 5** — a restore that cannot complete reports an error.
     ///
     /// Injects the realistic interruption: the target is removed between acquiring
@@ -2310,7 +2597,7 @@ mod tests {
         let d = restore_dir("interrupted");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         conn.execute_batch("INSERT INTO notes VALUES (2, 'POST');")
             .expect("post");
         drop(conn);
@@ -2329,7 +2616,7 @@ mod tests {
                 .expect("make the target read-only");
         }
 
-        let outcome = snapshot.restore(&guard);
+        let outcome = snapshot.restore(&guard, &orxnud_platform_fs::OsIdentity);
 
         #[cfg(unix)]
         {
@@ -2361,7 +2648,7 @@ mod tests {
         let d = restore_dir("unverifiable");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
 
         // Corrupt it, then confirm the strict verification API refuses it. The
         // empty-database variant is the one that would be most destructive to
@@ -2392,7 +2679,7 @@ mod tests {
         let d = restore_dir("public-refuses");
         let db = d.join("state.db");
         let conn = restore_fixture(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
 
         let reader = Connection::open(&db).expect("reader");
         reader
@@ -2481,14 +2768,40 @@ mod tests {
     fn restoring_from_a_missing_snapshot_is_an_error() {
         let b = Backup {
             path: PathBuf::from("/nonexistent/x.bak"),
+            owned: false,
         };
         let d = restore_dir("missing-snap");
         let target = d.join("target.db");
         Connection::open(&target).expect("create target");
         let guard =
             RestoreGuard::acquire(&target, &orxnud_platform_fs::OsIdentity).expect("acquire");
-        let err = b.restore(&guard).expect_err("must fail");
+        let err = b
+            .restore(&guard, &orxnud_platform_fs::OsIdentity)
+            .expect_err("must fail");
         assert!(matches!(err, BackupError::Missing(_)), "{err}");
+    }
+
+    /// An adopted snapshot is not this call's to remove.
+    ///
+    /// `MigrationRunner::migrate` adopts a snapshot that a previous (or concurrent)
+    /// migrator published, because it may be the only pre-migration copy. If the
+    /// adopting migration then succeeds and discarded that path, the migrator that
+    /// published it would be left with a recovery obligation naming a missing file.
+    #[test]
+    fn discard_does_not_remove_an_adopted_snapshot() {
+        let d = dir("discard-adopted");
+        let db = d.join("state.db");
+        let conn = migrated_db(&db);
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
+        let path = snapshot.path().to_path_buf();
+        drop(snapshot);
+
+        Backup::existing(path.clone()).discard();
+        assert!(
+            path.exists(),
+            "an adopted snapshot may be another migrator's recovery point and must survive"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -2496,7 +2809,7 @@ mod tests {
         let d = dir("discard");
         let db = d.join("state.db");
         let conn = migrated_db(&db);
-        let snapshot = Backup::take(&conn, &db).expect("take");
+        let snapshot = Backup::take(&conn, &db, &orxnud_platform_fs::OsIdentity).expect("take");
         snapshot.discard();
         assert!(!snapshot.path().exists());
         // Idempotent: a successful migration must not be reported as failed just

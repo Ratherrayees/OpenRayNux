@@ -148,6 +148,18 @@ pub enum TaskRepoError {
         expected: &'static str,
     },
 
+    /// The caller's lease was replaced, expired, or released before its write reached
+    /// the persistence boundary.
+    ///
+    /// This is a normal concurrency refusal, not a storage failure: a stale claimant
+    /// must stop without being allowed to create an effect reservation or mutate its
+    /// successor's task state.
+    #[error("task {id} is no longer held by that claim")]
+    ClaimFenced {
+        /// The task whose claim no longer matches.
+        id: String,
+    },
+
     /// The task's current execution still has an unresolved side effect, so it cannot
     /// be handed back to a human for a fresh approval.
     ///
@@ -177,7 +189,8 @@ pub enum TaskRepoError {
     /// break both.
     #[error(
         "task {id} step {step_no} attempt {attempt_no} has an unresolved side effect, \
-         so its outcome must be established before another proposal is accepted"
+         so its outcome must be established before another proposal is accepted or \
+         the task is cancelled"
     )]
     EffectOutcomeUnresolved {
         /// The task.
@@ -302,6 +315,12 @@ pub struct TaskRow {
     pub payload: Option<String>,
     /// Attempts made.
     pub attempts: u32,
+    /// Monotonic identity of the most recently granted claim.
+    ///
+    /// Unlike `attempts`, this counter is never reset at a step boundary. A holder and
+    /// deadline identify a lease shape, not the acquisition that granted it; this value
+    /// identifies that acquisition and fences same-name reclaims.
+    pub claim_generation: i64,
     /// Attempt ceiling before dead-lettering.
     pub max_attempts: u32,
     /// Lease expiry, ms since epoch.
@@ -479,6 +498,8 @@ pub struct ClaimedTask {
     pub row: TaskRow,
     /// The attempt number, 1-based.
     pub attempt_no: u32,
+    /// The durable generation minted by this acquisition.
+    pub claim_generation: i64,
     /// The lease expiry granted.
     pub lease_expires_at_ms: i64,
 }
@@ -678,6 +699,27 @@ impl ProposalRow {
     }
 }
 
+/// A governed proposal together with the fresh execution claim it opened.
+///
+/// The generation is returned by the same conditional write that re-enters `running`.
+/// Looking it up after the transaction would make it possible to hand a caller a newer
+/// claimant's generation after recovery or another process has already taken the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionClaim {
+    /// The approved proposal being executed.
+    pub proposal: ProposalRow,
+    /// The durable fencing generation minted for this execution lease.
+    pub claim_generation: i64,
+}
+
+impl std::ops::Deref for ExecutionClaim {
+    type Target = ProposalRow;
+
+    fn deref(&self) -> &Self::Target {
+        &self.proposal
+    }
+}
+
 /// An approval, bound to exactly one attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRow {
@@ -720,7 +762,7 @@ impl ApprovalRow {
 /// and that is exactly how `payload` came to be written but never read: the insert
 /// statement and the read statements had nothing to keep them in step, so adding a
 /// column to one silently did nothing to the other.
-const TASK_COLUMNS: &str = "id, kind, state, priority, payload, attempts, max_attempts, \
+const TASK_COLUMNS: &str = "id, kind, state, priority, payload, attempts, claim_generation, max_attempts, \
      lease_expires_at_ms, lease_holder, idempotent, effect_observed, run_after_ms, \
      catch_up, last_error, cancel_requested_at_ms, schedule_id, fire_time_ms, \
      created_at_ms, updated_at_ms, dead_lettered_at_ms, completed_at_ms, \
@@ -862,6 +904,7 @@ struct FenceRow {
     state: String,
     holder: Option<String>,
     expiry: Option<i64>,
+    claim_generation: i64,
     max_steps: i64,
     steps_completed: i64,
 }
@@ -877,6 +920,8 @@ pub struct VerifiedStep<'a> {
     pub task_id: TaskId,
     /// The worker whose lease is being spent.
     pub worker: &'a str,
+    /// The generation returned by the claim that authorised this completion.
+    pub claim_generation: i64,
     /// The logical step being completed.
     pub step_no: u32,
     /// The proposal this execution came from, checked to belong to `step_no`.
@@ -1005,7 +1050,7 @@ impl From<rusqlite::Error> for TaskRepoError {
     }
 }
 
-type Taken = (String, String, i64, i64);
+type Taken = (String, String, i64, i64, i64);
 
 /// Takes the lease, for either entry point.
 ///
@@ -1043,32 +1088,34 @@ fn take_lease(
                     lease_holder           = ?1,
                     lease_expires_at_ms    = ?2,
                     attempts               = attempts + 1,
+                    claim_generation       = claim_generation + 1,
                     updated_at_ms          = ?3
               WHERE id = ({NEXT})
-             RETURNING id, kind, lease_expires_at_ms, attempts;"
+             RETURNING id, kind, lease_expires_at_ms, attempts, claim_generation;"
         ),
         Some(_) => "UPDATE tasks
                 SET state                  = 'running',
                     lease_holder           = ?1,
                     lease_expires_at_ms    = ?2,
                     attempts               = attempts + 1,
+                    claim_generation       = claim_generation + 1,
                     updated_at_ms          = ?3
               WHERE id = ?4
                 AND state = 'pending'
                 AND run_after_ms <= ?3
                 AND attempts < max_attempts
-             RETURNING id, kind, lease_expires_at_ms, attempts;"
+             RETURNING id, kind, lease_expires_at_ms, attempts, claim_generation;"
             .to_owned(),
     };
     let bound = now_ms.saturating_add(lease_ms);
     let taken = match target {
         None => tx.query_row(&sql, rusqlite::params![worker, bound, now_ms], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         }),
         Some(id) => tx.query_row(
             &sql,
             rusqlite::params![worker, bound, now_ms, id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ),
     };
     Ok(taken.optional()?)
@@ -1337,7 +1384,8 @@ impl<'a> TaskRepository<'a> {
         // same ordering `complete_with` uses, for the same reason.
         let current: Option<FenceRow> = tx
             .query_row(
-                "SELECT state, lease_holder, lease_expires_at_ms, max_steps, steps_completed
+                "SELECT state, lease_holder, lease_expires_at_ms, claim_generation,
+                        max_steps, steps_completed
                    FROM tasks WHERE id = ?1;",
                 rusqlite::params![done.task_id.as_str()],
                 |r| {
@@ -1345,8 +1393,9 @@ impl<'a> TaskRepository<'a> {
                         state: r.get(0)?,
                         holder: r.get(1)?,
                         expiry: r.get(2)?,
-                        max_steps: r.get(3)?,
-                        steps_completed: r.get(4)?,
+                        claim_generation: r.get(3)?,
+                        max_steps: r.get(4)?,
+                        steps_completed: r.get(5)?,
                     })
                 },
             )
@@ -1355,6 +1404,7 @@ impl<'a> TaskRepository<'a> {
             state: from_raw,
             holder,
             expiry,
+            claim_generation,
             max_steps,
             steps_completed,
         }) = current
@@ -1378,8 +1428,12 @@ impl<'a> TaskRepository<'a> {
                 ),
             })));
         }
-        // Both halves of the lease fence (ADR-0032): the holder *and* a live lease.
-        if holder.as_deref() != Some(done.worker) || expiry.is_none_or(|e| done.recorded_at_ms >= e)
+        // This is a three-part fence: holder and expiry prevent the two ADR-0032 lease
+        // failures; the database-minted claim generation prevents a recovered invocation
+        // using the same worker name from acting on its successor's lease.
+        if holder.as_deref() != Some(done.worker)
+            || claim_generation != done.claim_generation
+            || expiry.is_none_or(|e| done.recorded_at_ms >= e)
         {
             return Err(TaskRepoError::Corrupt(Box::new(CorruptRowDetail {
                 id: done.task_id.to_string(),
@@ -1539,13 +1593,15 @@ impl<'a> TaskRepository<'a> {
               WHERE id          = ?1
                 AND lease_holder = ?2
                 AND lease_expires_at_ms IS NOT NULL
-                AND lease_expires_at_ms > ?3;",
+                AND lease_expires_at_ms > ?3
+                AND claim_generation = ?6;",
             rusqlite::params![
                 done.task_id.as_str(),
                 done.worker,
                 done.recorded_at_ms,
                 next_state.as_wire_str(),
                 new_completed,
+                done.claim_generation,
             ],
         )?;
         if changed == 0 {
@@ -1675,26 +1731,27 @@ impl<'a> TaskRepository<'a> {
         // lease clauses refuse a boundary row that somehow still carries one, and the
         // counter clause is what stops a finished task being re-entered.
         let bound = now_ms.saturating_add(lease_ms);
-        let taken: Option<(String, String, i64, i64)> = tx
+        let taken: Option<Taken> = tx
             .query_row(
                 "UPDATE tasks
                     SET state               = 'running',
                         lease_holder        = ?2,
                         lease_expires_at_ms = ?3,
                         attempts            = attempts + 1,
+                        claim_generation    = claim_generation + 1,
                         updated_at_ms       = ?4
                   WHERE id                   = ?1
                     AND state                = 'awaiting-next-step'
                     AND lease_holder         IS NULL
                     AND lease_expires_at_ms IS NULL
                     AND steps_completed      < max_steps
-                 RETURNING id, kind, lease_expires_at_ms, attempts;",
+                 RETURNING id, kind, lease_expires_at_ms, attempts, claim_generation;",
                 rusqlite::params![id.as_str(), worker, bound, now_ms],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
 
-        let Some((taken_id, kind, lease_expires_at_ms, attempts)) = taken else {
+        let Some((taken_id, kind, lease_expires_at_ms, attempts, claim_generation)) = taken else {
             // The loser of a race lands here: the winner's transaction already moved the
             // state and wrote the lease, so this statement matched nothing. Reported as the
             // contention it is, using the existing refusal vocabulary.
@@ -1717,6 +1774,7 @@ impl<'a> TaskRepository<'a> {
         Ok(TargetedClaimOutcome::Claimed(Box::new(ClaimedTask {
             row,
             attempt_no,
+            claim_generation,
             lease_expires_at_ms,
         })))
     }
@@ -1966,7 +2024,7 @@ impl<'a> TaskRepository<'a> {
     ) -> Result<ClaimOutcome, TaskRepoError> {
         let tx = self.tx()?;
 
-        let Some((id, kind, lease_expires_at_ms, attempts)) =
+        let Some((id, kind, lease_expires_at_ms, attempts, claim_generation)) =
             take_lease(&tx, worker, now_ms, lease_ms, None)?
         else {
             // Nothing claimable. A task past its budget is not claimable either --
@@ -2012,6 +2070,7 @@ impl<'a> TaskRepository<'a> {
         let claimed = ClaimedTask {
             row,
             attempt_no,
+            claim_generation,
             lease_expires_at_ms,
         };
         Ok(ClaimOutcome::Claimed(Box::new(claimed)))
@@ -2045,7 +2104,7 @@ impl<'a> TaskRepository<'a> {
         let tx = self.tx()?;
 
         let taken = take_lease(&tx, worker, now_ms, lease_ms, Some(id))?;
-        let Some((taken_id, kind, lease_expires_at_ms, attempts)) = taken else {
+        let Some((taken_id, kind, lease_expires_at_ms, attempts, claim_generation)) = taken else {
             let refusal: Option<(String, String, i64, i64, i64)> = tx
                 .query_row(
                     "SELECT id, state, run_after_ms, attempts, max_attempts
@@ -2086,6 +2145,7 @@ impl<'a> TaskRepository<'a> {
         let claimed = ClaimedTask {
             row,
             attempt_no,
+            claim_generation,
             lease_expires_at_ms,
         };
         Ok(TargetedClaimOutcome::Claimed(Box::new(claimed)))
@@ -2106,16 +2166,27 @@ impl<'a> TaskRepository<'a> {
     /// unrecognisable. There is no `CorruptRow` variant: an unrecognisable stored
     /// state is reported as [`TaskRepoError::UnknownState`], and a transition the
     /// stored state cannot support is reported as `TaskRepoError::Corrupt`.
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         to: TaskState,
         effect_observed: bool,
         error: Option<&str>,
     ) -> Result<bool, TaskRepoError> {
-        self.complete_with(id, worker, now_ms, to, effect_observed, error, 0)
+        self.complete_with(
+            id,
+            worker,
+            claim_generation,
+            now_ms,
+            to,
+            effect_observed,
+            error,
+            0,
+        )
     }
 
     /// [`Self::complete`], with an explicit retry delay.
@@ -2140,13 +2211,87 @@ impl<'a> TaskRepository<'a> {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         to: TaskState,
         effect_observed: bool,
         error: Option<&str>,
         retry_delay_ms: i64,
     ) -> Result<bool, TaskRepoError> {
+        self.complete_with_impl(
+            id,
+            worker,
+            claim_generation,
+            to,
+            effect_observed,
+            error,
+            retry_delay_ms,
+            move || now_ms,
+        )
+    }
+
+    /// [`Self::complete_with`], with the lease clock sampled **inside** the
+    /// `IMMEDIATE` transaction.
+    ///
+    /// `now` is called after `tx()` has acquired SQLite's write lock and
+    /// before the fence is evaluated. That ordering is what makes the lease check
+    /// authoritative when the caller may have waited between deciding to complete
+    /// and reaching this write: a timestamp captured before a provider call is
+    /// not a statement about the row's lease at the moment the row is changed.
+    ///
+    /// Deterministic callers keep [`Self::complete_with`] with a fixed timestamp;
+    /// a production path that can span a wait uses this one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::complete_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_with_at_write<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        to: TaskState,
+        effect_observed: bool,
+        error: Option<&str>,
+        retry_delay_ms: i64,
+        now: F,
+    ) -> Result<bool, TaskRepoError>
+    where
+        F: FnOnce() -> i64,
+    {
+        self.complete_with_impl(
+            id,
+            worker,
+            claim_generation,
+            to,
+            effect_observed,
+            error,
+            retry_delay_ms,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_with_impl<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        to: TaskState,
+        effect_observed: bool,
+        error: Option<&str>,
+        retry_delay_ms: i64,
+        now: F,
+    ) -> Result<bool, TaskRepoError>
+    where
+        F: FnOnce() -> i64,
+    {
         let tx = self.tx()?;
+        // The lease clock is read *after* `tx` has taken the write lock. Reading it
+        // before the lock would let a lock wait move the row past its lease while
+        // the fence still compared against the earlier instant.
+        let now_ms = now();
 
         // INVARIANT: the fence is evaluated **before** the legality check, and
         // inside the same IMMEDIATE transaction, so the two cannot disagree and
@@ -2155,15 +2300,16 @@ impl<'a> TaskRepository<'a> {
         // The ordering is load-bearing. A worker whose task was cancelled, or whose
         // lease expired, must be told "you do not hold this" -- not "illegal
         // transition", which would blame the worker for something the engine did.
-        let current: Option<(String, Option<String>, Option<i64>)> = tx
+        let current: Option<(String, Option<String>, Option<i64>, i64)> = tx
             .query_row(
-                "SELECT state, lease_holder, lease_expires_at_ms FROM tasks WHERE id = ?1;",
+                "SELECT state, lease_holder, lease_expires_at_ms, claim_generation
+                   FROM tasks WHERE id = ?1;",
                 [id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
 
-        let Some((from_raw, holder, expiry)) = current else {
+        let Some((from_raw, holder, expiry, current_generation)) = current else {
             tx.commit()?;
             return Ok(false);
         };
@@ -2171,7 +2317,10 @@ impl<'a> TaskRepository<'a> {
             .ok_or_else(|| unknown_state(id.to_string(), from_raw.clone()))?;
 
         // Both halves of the fence, checked together (ADR-0032's finding).
-        if holder.as_deref() != Some(worker) || expiry.is_none_or(|e| now_ms >= e) {
+        if holder.as_deref() != Some(worker)
+            || expiry.is_none_or(|e| now_ms >= e)
+            || current_generation != claim_generation
+        {
             tx.commit()?;
             return Ok(false);
         }
@@ -2245,7 +2394,8 @@ impl<'a> TaskRepository<'a> {
               WHERE id          = ?1
                 AND lease_holder = ?2
                 AND lease_expires_at_ms IS NOT NULL
-                AND lease_expires_at_ms > ?3;",
+                AND lease_expires_at_ms > ?3
+                AND claim_generation = ?8;",
             rusqlite::params![
                 id.as_str(),
                 worker,
@@ -2254,6 +2404,7 @@ impl<'a> TaskRepository<'a> {
                 effect_observed,
                 error,
                 retry_delay_ms,
+                claim_generation,
             ],
         )?;
 
@@ -2321,16 +2472,66 @@ impl<'a> TaskRepository<'a> {
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<bool, TaskRepoError> {
-        let changed = write(self.conn.execute(
+        self.heartbeat_impl(id, worker, claim_generation, lease_ms, move || now_ms)
+    }
+
+    /// [`Self::heartbeat`], with the lease clock sampled **inside** the
+    /// `IMMEDIATE` transaction.
+    ///
+    /// The clock is called after `tx()` has acquired SQLite's write lock.
+    /// That is what keeps `lease_expires_at_ms > now` from being evaluated against
+    /// a time captured before a lock wait: a renewal that waited past the expiry
+    /// is a refused renewal, not a resurrection.
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error.
+    pub fn heartbeat_at_write<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        lease_ms: i64,
+        now: F,
+    ) -> Result<bool, TaskRepoError>
+    where
+        F: FnOnce() -> i64,
+    {
+        self.heartbeat_impl(id, worker, claim_generation, lease_ms, now)
+    }
+
+    fn heartbeat_impl<F>(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        lease_ms: i64,
+        now: F,
+    ) -> Result<bool, TaskRepoError>
+    where
+        F: FnOnce() -> i64,
+    {
+        let tx = self.tx()?;
+        let now_ms = now();
+        let changed = write(tx.execute(
             "UPDATE tasks
                 SET lease_expires_at_ms = ?4, updated_at_ms = ?3
               WHERE id = ?1 AND lease_holder = ?2
-                AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3;",
-            rusqlite::params![id.as_str(), worker, now_ms, now_ms.saturating_add(lease_ms)],
+                AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3
+                AND claim_generation = ?5;",
+            rusqlite::params![
+                id.as_str(),
+                worker,
+                now_ms,
+                now_ms.saturating_add(lease_ms),
+                claim_generation,
+            ],
         ))?;
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -2348,9 +2549,20 @@ impl<'a> TaskRepository<'a> {
     /// A task that is already terminal is left alone — cancelling a completed task
     /// would be resurrection.
     ///
+    /// **A pending effect blocks cancellation.** Cancellation is terminal, and
+    /// [`Self::recover`] only looks at a running, leased task; making the task
+    /// `cancelled` would therefore hide a reserved effect whose outcome may already
+    /// exist. The same invariant [`Self::propose_action`] enforces before it releases
+    /// a lease applies here: a reserved unresolved effect must either remain on a
+    /// recoverable running execution or be resolved first. The guard is deliberately
+    /// **whole-task** rather than scoped to the current attempt, because cancellation
+    /// ends every attempt.
+    ///
     /// # Errors
     ///
-    /// [`TaskRepoError::NotFound`] if there is no such task, or any SQLite error.
+    /// [`TaskRepoError::NotFound`] if there is no such task,
+    /// [`TaskRepoError::EffectOutcomeUnresolved`] if any effect for it is still
+    /// `pending`, or any SQLite error.
     pub fn request_cancel(&mut self, id: &TaskId, now_ms: i64) -> Result<(), TaskRepoError> {
         // Step 1: durably record the request.
         {
@@ -2371,6 +2583,30 @@ impl<'a> TaskRepository<'a> {
             if from_state.is_terminal() {
                 tx.commit()?;
                 return Ok(());
+            }
+            // Cancellation is terminal. If any effect for this task is still
+            // `pending`, its outcome may already exist, and the task would stop
+            // being something recovery looks at. Refuse before recording the
+            // request: a cancellation request that cannot be acted on is not a
+            // useful durable fact, and recording one would suggest otherwise.
+            let unresolved: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT COALESCE(e.step_no, t.steps_completed + 1), e.attempt_no
+                       FROM task_effects e
+                       JOIN tasks t ON t.id = e.task_id
+                      WHERE e.task_id = ?1 AND e.status = 'pending'
+                      ORDER BY e.reserved_at_ms, e.idempotency_key
+                      LIMIT 1;",
+                    [id.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((step_no, attempt_no)) = unresolved {
+                return Err(TaskRepoError::EffectOutcomeUnresolved {
+                    id: id.to_string(),
+                    step_no: u32::try_from(step_no).unwrap_or(u32::MAX),
+                    attempt_no: u32::try_from(attempt_no).unwrap_or(u32::MAX),
+                });
             }
             tx.execute(
                 "UPDATE tasks SET cancel_requested_at_ms = ?2, updated_at_ms = ?2
@@ -2487,6 +2723,7 @@ impl<'a> TaskRepository<'a> {
         proposal_id: &str,
         task_id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         capability: &str,
         target: Option<&str>,
         canonical_params: &str,
@@ -2495,7 +2732,91 @@ impl<'a> TaskRepository<'a> {
         step_no: u32,
         now_ms: i64,
     ) -> Result<ProposalRow, TaskRepoError> {
+        self.propose_action_impl(
+            proposal_id,
+            task_id,
+            worker,
+            claim_generation,
+            capability,
+            target,
+            canonical_params,
+            proposer_json,
+            authority_root,
+            step_no,
+            move || now_ms,
+        )
+    }
+
+    /// [`Self::propose_action`], with the lease clock sampled **inside** the
+    /// `IMMEDIATE` transaction.
+    ///
+    /// `now` is called after `tx()` has acquired SQLite's write lock and
+    /// before the lease fence is evaluated. The proposal's `created_at_ms` and the
+    /// event timestamp are the same instant as the fence, rather than a timestamp
+    /// captured before a provider call that may have taken longer than the lease.
+    ///
+    /// Deterministic callers keep [`Self::propose_action`] with a fixed timestamp;
+    /// a production path that can span a wait uses this one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::propose_action`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_action_at_write<F>(
+        &mut self,
+        proposal_id: &str,
+        task_id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        capability: &str,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer_json: &str,
+        authority_root: Option<&str>,
+        step_no: u32,
+        now: F,
+    ) -> Result<ProposalRow, TaskRepoError>
+    where
+        F: FnOnce() -> i64,
+    {
+        self.propose_action_impl(
+            proposal_id,
+            task_id,
+            worker,
+            claim_generation,
+            capability,
+            target,
+            canonical_params,
+            proposer_json,
+            authority_root,
+            step_no,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propose_action_impl<F>(
+        &mut self,
+        proposal_id: &str,
+        task_id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
+        capability: &str,
+        target: Option<&str>,
+        canonical_params: &str,
+        proposer_json: &str,
+        authority_root: Option<&str>,
+        step_no: u32,
+        now: F,
+    ) -> Result<ProposalRow, TaskRepoError>
+    where
+        F: FnOnce() -> i64,
+    {
         let tx = self.tx()?;
+        // The lease clock is read *after* `tx` has taken the write lock. Reading it
+        // before the lock would let a lock wait move the row past its lease while
+        // the fence still compared against the earlier instant.
+        let now_ms = now();
 
         // `lease_holder` is nullable — the schema says a lease is `(holder IS NULL) =
         // (expires IS NULL)` — so it is read as `Option<String>`.
@@ -2508,11 +2829,21 @@ impl<'a> TaskRepository<'a> {
         // guard was written to produce — which is how `propose_action` reported
         // `INTERNAL_ERROR` for a plain wrong-state request. Every existing test passed
         // because they all propose while holding a lease, where the column is non-null.
-        let row: (String, Option<String>, Option<i64>, u32, i64) = tx.query_row(
-            "SELECT state, lease_holder, lease_expires_at_ms, attempts, max_steps
+        let row: (String, Option<String>, Option<i64>, i64, u32, i64) = tx.query_row(
+            "SELECT state, lease_holder, lease_expires_at_ms, claim_generation, attempts,
+                    max_steps
                FROM tasks WHERE id = ?1;",
             rusqlite::params![task_id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )?;
         let state = TaskState::from_wire_str(&row.0).ok_or_else(|| {
             TaskRepoError::UnknownState(Box::new(UnknownStateDetail {
@@ -2529,7 +2860,10 @@ impl<'a> TaskRepository<'a> {
         }
         // Ownership of the task, not authority over it. A proposal from a worker that
         // does not hold the live lease would let any caller speak for a running task.
-        if row.1.as_deref() != Some(worker) || row.2.is_none_or(|e| now_ms >= e) {
+        if row.1.as_deref() != Some(worker)
+            || row.2.is_none_or(|e| now_ms >= e)
+            || row.3 != claim_generation
+        {
             return Err(TaskRepoError::ProposalNotInState {
                 id: proposal_id.to_owned(),
                 status: format!("the caller does not hold the live lease on {}", task_id),
@@ -2542,7 +2876,7 @@ impl<'a> TaskRepository<'a> {
         // for. What the repository does is refuse it: the step must be one the task has, and
         // it must be the step actually being worked on. That second check is what stops a
         // stale caller from proposing step 1 again after the task moved to step 2.
-        let max_steps = row.4 as u32;
+        let max_steps = row.5 as u32;
         validate_step_no(max_steps, step_no)
             .map_err(|e| TaskRepoError::InvalidComposition(Box::new(e)))?;
         let steps_completed: i64 = tx.query_row(
@@ -2575,7 +2909,7 @@ impl<'a> TaskRepository<'a> {
         // idempotent is deliberately returned to `pending` by recovery so it can be
         // retried, and its own stale row must not block that retry. That row is at an
         // earlier `attempt_no`, so it does not match.
-        let current_attempt: u32 = row.3;
+        let current_attempt: u32 = row.4;
         let unresolved: i64 = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM task_effects e
                WHERE e.task_id = ?1
@@ -2601,7 +2935,7 @@ impl<'a> TaskRepository<'a> {
             rusqlite::params![
                 proposal_id,
                 task_id.as_str(),
-                row.3,
+                row.4,
                 step_no,
                 capability,
                 target,
@@ -2611,7 +2945,7 @@ impl<'a> TaskRepository<'a> {
                 now_ms,
             ],
         )
-        .map_err(|e| classify_proposal_insert(e, &tx, proposal_id, task_id, row.3, step_no))?;
+        .map_err(|e| classify_proposal_insert(e, &tx, proposal_id, task_id, row.4, step_no))?;
 
         // `WaitingForUser` and the lease release in one statement, so there is no
         // interleaving in which the task is waiting while still holding a lease.
@@ -2630,8 +2964,13 @@ impl<'a> TaskRepository<'a> {
                     lease_holder = NULL,
                     lease_expires_at_ms = NULL,
                     updated_at_ms = ?2
-              WHERE id = ?1 AND state = 'running';",
-            rusqlite::params![task_id.as_str(), now_ms],
+              WHERE id = ?1
+                AND state = 'running'
+                AND lease_holder = ?3
+                AND lease_expires_at_ms IS NOT NULL
+                AND lease_expires_at_ms > ?2
+                AND claim_generation = ?4;",
+            rusqlite::params![task_id.as_str(), now_ms, worker, claim_generation],
         )?;
         if changed == 0 {
             // Refused before the event. Rolling back also takes the proposal row with
@@ -2653,7 +2992,7 @@ impl<'a> TaskRepository<'a> {
             Some(state),
             Some(TaskState::WaitingForUser),
             Some(worker),
-            Some(row.3),
+            Some(row.4),
             Some(proposal_id),
         )?;
 
@@ -2832,7 +3171,7 @@ impl<'a> TaskRepository<'a> {
         worker: &str,
         now_ms: i64,
         lease_ms: i64,
-    ) -> Result<ProposalRow, TaskRepoError> {
+    ) -> Result<ExecutionClaim, TaskRepoError> {
         let tx = self.tx()?;
 
         let proposal: Option<(String, String, u32, u32)> = tx
@@ -2893,27 +3232,32 @@ impl<'a> TaskRepository<'a> {
             )));
         }
 
-        let changed = tx.execute(
-            "UPDATE tasks
+        let claim_generation: Option<i64> = tx
+            .query_row(
+                "UPDATE tasks
                 SET state = 'running',
                     lease_holder = ?2,
                     lease_expires_at_ms = ?3,
+                    claim_generation = claim_generation + 1,
                     updated_at_ms = ?4
-              WHERE id = ?1 AND state = 'waiting-for-user';",
-            rusqlite::params![
-                task_id.as_str(),
-                worker,
-                now_ms.saturating_add(lease_ms),
-                now_ms
-            ],
-        )?;
-        if changed == 0 {
+              WHERE id = ?1 AND state = 'waiting-for-user'
+             RETURNING claim_generation;",
+                rusqlite::params![
+                    task_id.as_str(),
+                    worker,
+                    now_ms.saturating_add(lease_ms),
+                    now_ms
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(claim_generation) = claim_generation else {
             return Err(TaskRepoError::ProposalNotInState {
                 id: proposal_id.to_owned(),
                 status: "the task stopped matching before the execution lease was taken".to_owned(),
                 expected: "waiting-for-user",
             });
-        }
+        };
 
         log(
             &tx,
@@ -2927,8 +3271,13 @@ impl<'a> TaskRepository<'a> {
             Some(proposal_id),
         )?;
         tx.commit()?;
-        self.proposal_by_id(proposal_id)?
-            .ok_or_else(|| TaskRepoError::NoSuchProposal(proposal_id.to_owned()))
+        let proposal = self
+            .proposal_by_id(proposal_id)?
+            .ok_or_else(|| TaskRepoError::NoSuchProposal(proposal_id.to_owned()))?;
+        Ok(ExecutionClaim {
+            proposal,
+            claim_generation,
+        })
     }
 
     /// Takes the execution lease for an approved proposal, **without** spending an
@@ -2958,7 +3307,7 @@ impl<'a> TaskRepository<'a> {
         worker: &str,
         now_ms: i64,
         lease_ms: i64,
-    ) -> Result<ProposalRow, TaskRepoError> {
+    ) -> Result<ExecutionClaim, TaskRepoError> {
         let tx = self.tx()?;
         let row: Option<(String, String, u32)> = tx
             .query_row(
@@ -3009,21 +3358,26 @@ impl<'a> TaskRepository<'a> {
         // already treats the zero-row case as a refusal rather than a success; this
         // function did not, and returned `Ok` while granting a lease it had not
         // written and logging a transition that had not occurred.
-        let changed = tx.execute(
-            "UPDATE tasks
+        let claim_generation: Option<i64> = tx
+            .query_row(
+                "UPDATE tasks
                 SET state = 'running',
                     lease_holder = ?2,
                     lease_expires_at_ms = ?3,
+                    claim_generation = claim_generation + 1,
                     updated_at_ms = ?4
-              WHERE id = ?1 AND state = 'waiting-for-user';",
-            rusqlite::params![
-                task_id.as_str(),
-                worker,
-                now_ms.saturating_add(lease_ms),
-                now_ms
-            ],
-        )?;
-        if changed == 0 {
+              WHERE id = ?1 AND state = 'waiting-for-user'
+             RETURNING claim_generation;",
+                rusqlite::params![
+                    task_id.as_str(),
+                    worker,
+                    now_ms.saturating_add(lease_ms),
+                    now_ms
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(claim_generation) = claim_generation else {
             // Refused before the event, so the log cannot claim a transition that did
             // not happen, and the transaction rolls the whole operation back.
             return Err(TaskRepoError::ProposalNotInState {
@@ -3031,7 +3385,7 @@ impl<'a> TaskRepository<'a> {
                 status: "the task stopped matching before the execution lease was taken".to_owned(),
                 expected: "waiting-for-user",
             });
-        }
+        };
         log(
             &tx,
             Some(&task),
@@ -3044,8 +3398,13 @@ impl<'a> TaskRepository<'a> {
             Some(id),
         )?;
         tx.commit()?;
-        self.proposal_by_id(id)?
-            .ok_or_else(|| TaskRepoError::NoSuchProposal(id.to_owned()))
+        let proposal = self
+            .proposal_by_id(id)?
+            .ok_or_else(|| TaskRepoError::NoSuchProposal(id.to_owned()))?;
+        Ok(ExecutionClaim {
+            proposal,
+            claim_generation,
+        })
     }
 
     // ---------------------------------------------------------------- recover
@@ -3472,6 +3831,8 @@ impl<'a> TaskRepository<'a> {
         &mut self,
         idempotency_key: &str,
         task_id: &TaskId,
+        worker: &str,
+        claim_generation: i64,
         step_no: u32,
         attempt_no: u32,
         step_key: &str,
@@ -3479,6 +3840,28 @@ impl<'a> TaskRepository<'a> {
         now_ms: i64,
     ) -> Result<Option<ReservedEffect>, TaskRepoError> {
         let tx = self.tx()?;
+        // An effect reservation is the durable decision to dispatch an external action.
+        // It therefore spends the execution claim just as completion and proposal writes
+        // do. The preflight makes the refusal precise; the `INSERT ... SELECT` below
+        // repeats every predicate at the mutation boundary.
+        let holds_claim: bool = tx.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM tasks
+                 WHERE id = ?1
+                   AND state = 'running'
+                   AND lease_holder = ?2
+                   AND lease_expires_at_ms IS NOT NULL
+                   AND lease_expires_at_ms > ?3
+                   AND claim_generation = ?4
+            );",
+            rusqlite::params![task_id.as_str(), worker, now_ms, claim_generation],
+            |r| r.get(0),
+        )?;
+        if !holds_claim {
+            return Err(TaskRepoError::ClaimFenced {
+                id: task_id.to_string(),
+            });
+        }
         // A plain `INSERT`, not `INSERT OR IGNORE` (V-94). `OR IGNORE` resolves a
         // primary-key collision, a NOT NULL failure and a CHECK failure the same way --
         // the row is skipped and the statement reports zero rows -- so `Ok(None)` used to
@@ -3493,15 +3876,27 @@ impl<'a> TaskRepository<'a> {
             "INSERT INTO task_effects
                 (idempotency_key, task_id, step_no, attempt_no, step_key, status, idempotent,
                  reserved_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7);",
+             SELECT ?1, ?2, ?5, ?6, ?7, 'pending', ?8, ?9
+              WHERE EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = ?2
+                       AND state = 'running'
+                       AND lease_holder = ?3
+                       AND lease_expires_at_ms IS NOT NULL
+                       AND lease_expires_at_ms > ?4
+                       AND claim_generation = ?10
+              );",
             rusqlite::params![
                 idempotency_key,
                 task_id.as_str(),
+                worker,
+                now_ms,
                 step_no,
                 attempt_no,
                 step_key,
                 i64::from(idempotent),
-                now_ms
+                now_ms,
+                claim_generation,
             ],
         ) {
             Ok(n) => n,
@@ -4213,7 +4608,7 @@ fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<TaskRow, TaskRep
             }))));
         }
     };
-    let schedule_raw: Option<String> = r.get(15)?;
+    let schedule_raw: Option<String> = r.get(16)?;
 
     Ok(Ok(TaskRow {
         id: TaskId::new(id),
@@ -4222,23 +4617,24 @@ fn decode_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<TaskRow, TaskRep
         priority: r.get(3)?,
         payload: r.get(4)?,
         attempts: r.get(5)?,
-        max_attempts: r.get(6)?,
-        lease_expires_at_ms: r.get(7)?,
-        lease_holder: r.get(8)?,
-        idempotent: r.get::<_, i64>(9)? != 0,
-        effect_observed: r.get::<_, i64>(10)? != 0,
-        run_after_ms: r.get(11)?,
-        catch_up: r.get::<_, i64>(12)? != 0,
-        last_error: r.get(13)?,
-        cancel_requested_at_ms: r.get(14)?,
+        claim_generation: r.get(6)?,
+        max_attempts: r.get(7)?,
+        lease_expires_at_ms: r.get(8)?,
+        lease_holder: r.get(9)?,
+        idempotent: r.get::<_, i64>(10)? != 0,
+        effect_observed: r.get::<_, i64>(11)? != 0,
+        run_after_ms: r.get(12)?,
+        catch_up: r.get::<_, i64>(13)? != 0,
+        last_error: r.get(14)?,
+        cancel_requested_at_ms: r.get(15)?,
         schedule_id: schedule_raw.map(ScheduleId::new),
-        fire_time_ms: r.get(16)?,
-        created_at_ms: r.get(17)?,
-        updated_at_ms: r.get(18)?,
-        dead_lettered_at_ms: r.get(19)?,
-        terminal_at_ms: r.get(20)?,
-        max_steps: r.get(21)?,
-        steps_completed: r.get(22)?,
+        fire_time_ms: r.get(17)?,
+        created_at_ms: r.get(18)?,
+        updated_at_ms: r.get(19)?,
+        dead_lettered_at_ms: r.get(20)?,
+        terminal_at_ms: r.get(21)?,
+        max_steps: r.get(22)?,
+        steps_completed: r.get(23)?,
     }))
 }
 
@@ -4904,6 +5300,7 @@ mod tests {
             repo.complete(
                 &tid("t1"),
                 "w1",
+                1,
                 NOW,
                 TaskState::Failed,
                 false,
@@ -4924,9 +5321,16 @@ mod tests {
         };
         assert_eq!(second.attempt_no, 2, "the retry is the second attempt");
         assert!(
-            repo.complete(&tid("t1"), "w2", NOW + 2, TaskState::Completed, true, None)
-                .expect("complete"),
-            "the retry's holder completes"
+            repo.complete(
+                &tid("t1"),
+                "w2",
+                2,
+                NOW + 2,
+                TaskState::Completed,
+                true,
+                None
+            )
+            .expect("complete"),
         );
     }
 
@@ -4938,7 +5342,7 @@ mod tests {
         repo.claim_specific(&tid("t1"), "w", NOW, LEASE)
             .expect("claim");
         assert!(
-            repo.complete(&tid("t1"), "w", NOW, TaskState::Completed, true, None)
+            repo.complete(&tid("t1"), "w", 1, NOW, TaskState::Completed, true, None)
                 .expect("complete"),
             "the fence should accept this completion"
         );
@@ -4962,6 +5366,7 @@ mod tests {
                 .complete(
                     &tid("t1"),
                     "intruder",
+                    1,
                     NOW,
                     TaskState::Completed,
                     true,
@@ -4978,6 +5383,7 @@ mod tests {
                 .complete(
                     &tid("t1"),
                     "holder",
+                    1,
                     expired,
                     TaskState::Completed,
                     true,
@@ -4996,6 +5402,7 @@ mod tests {
             repo.complete(
                 &tid("t1"),
                 "holder",
+                1,
                 NOW + 1,
                 TaskState::Completed,
                 true,
@@ -5033,9 +5440,16 @@ mod tests {
         };
         assert_eq!(got.attempt_no, 2, "recovery does not refund the attempt");
         assert!(
-            repo.complete(&tid("t1"), "w2", NOW + 3, TaskState::Completed, true, None)
-                .expect("complete"),
-            "the second holder must be able to complete"
+            repo.complete(
+                &tid("t1"),
+                "w2",
+                2,
+                NOW + 3,
+                TaskState::Completed,
+                true,
+                None
+            )
+            .expect("complete"),
         );
     }
 
@@ -5165,7 +5579,7 @@ mod tests {
             panic!("expected a claim");
         };
         assert!(
-            repo.complete(&tid("t"), "w", NOW, TaskState::Completed, true, None)
+            repo.complete(&tid("t"), "w", 1, NOW, TaskState::Completed, true, None)
                 .expect("complete")
         );
         let row = repo.get(&tid("t")).expect("get").expect("present");
@@ -5208,7 +5622,15 @@ mod tests {
         let _ = repo.claim("owner", NOW, LEASE).expect("claim");
         assert!(
             !repo
-                .complete(&tid("t"), "impostor", NOW, TaskState::Completed, true, None)
+                .complete(
+                    &tid("t"),
+                    "impostor",
+                    1,
+                    NOW,
+                    TaskState::Completed,
+                    true,
+                    None
+                )
                 .expect("complete"),
             "a non-holder must not commit"
         );
@@ -5232,7 +5654,15 @@ mod tests {
         let after = NOW + cl.lease_expires_at_ms - NOW; // strictly past expiry
         assert!(
             !repo
-                .complete(&tid("t"), "zombie", after, TaskState::Completed, true, None)
+                .complete(
+                    &tid("t"),
+                    "zombie",
+                    1,
+                    after,
+                    TaskState::Completed,
+                    true,
+                    None
+                )
                 .expect("complete"),
             "an expired lease was allowed to commit"
         );
@@ -5255,7 +5685,15 @@ mod tests {
         };
         assert!(
             !repo
-                .complete(&tid("t"), "zombie", later, TaskState::Completed, true, None)
+                .complete(
+                    &tid("t"),
+                    "zombie",
+                    1,
+                    later,
+                    TaskState::Completed,
+                    true,
+                    None
+                )
                 .expect("complete"),
             "a zombie must not commit after its task was re-claimed"
         );
@@ -5271,6 +5709,7 @@ mod tests {
         let _ = repo.complete(
             &tid("t"),
             "zombie",
+            1,
             NOW + LEASE + 1,
             TaskState::Completed,
             true,
@@ -5290,7 +5729,7 @@ mod tests {
         let _ = repo.claim("zombie", NOW, LEASE).expect("claim");
         assert!(
             !repo
-                .heartbeat(&tid("t"), "zombie", NOW + LEASE + 1, LEASE)
+                .heartbeat(&tid("t"), "zombie", 1, NOW + LEASE + 1, LEASE)
                 .expect("hb")
         );
         let row = repo.get(&tid("t")).expect("get").expect("present");
@@ -5308,7 +5747,7 @@ mod tests {
         insert(&mut repo, "t", TaskKind::Query);
         let _ = repo.claim("w", NOW, LEASE).expect("claim");
         assert!(
-            repo.heartbeat(&tid("t"), "w", NOW + 1_000, LEASE)
+            repo.heartbeat(&tid("t"), "w", 1, NOW + 1_000, LEASE)
                 .expect("hb")
         );
         assert_eq!(
@@ -5378,11 +5817,79 @@ mod tests {
         // The in-flight worker cannot commit afterwards: the fence rejects it.
         assert!(
             !repo
-                .complete(&tid("t"), "w", NOW + 1, TaskState::Completed, true, None)
+                .complete(&tid("t"), "w", 1, NOW + 1, TaskState::Completed, true, None)
                 .expect("complete"),
             "a worker whose task was cancelled must not commit"
         );
         let _ = cl;
+    }
+
+    #[test]
+    fn cancelling_a_task_with_a_pending_effect_is_refused_and_leaves_it_running() {
+        // Cancellation is terminal and recovery only visits running, leased tasks.
+        // Making this task cancelled while its effect is still `pending` would hide
+        // a dispatch whose outcome may already exist.
+        let mut c = mem();
+        let mut repo = TaskRepository::new(&mut c);
+        insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(_) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected a claim");
+        };
+        let reserved = repo
+            .reserve_effect("key", &tid("t"), "w", 1, 1, 1, "step", false, NOW)
+            .expect("reserve");
+        assert!(reserved.is_some(), "precondition: a pending effect exists");
+
+        let err = repo
+            .request_cancel(&tid("t"), NOW + 1)
+            .expect_err("a pending effect must block cancellation");
+        assert!(matches!(
+            err,
+            TaskRepoError::EffectOutcomeUnresolved {
+                step_no: 1,
+                attempt_no: 1,
+                ..
+            }
+        ));
+
+        let row = repo.get(&tid("t")).expect("get").expect("present");
+        assert_eq!(
+            row.state,
+            TaskState::Running,
+            "the task must remain recoverable"
+        );
+        assert!(
+            row.lease_holder.is_some(),
+            "the lease must not be stripped by a refused cancellation"
+        );
+        assert_eq!(
+            row.cancel_requested_at_ms, None,
+            "a refusal is not a recorded request"
+        );
+        let kinds: Vec<String> = repo
+            .events_for(&tid("t"))
+            .expect("events")
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| k == "cancelled" || k == "cancel-requested"),
+            "a refused cancellation must write neither event: {kinds:?}"
+        );
+
+        // Once the outcome is explicitly resolved, cancellation is allowed again.
+        assert!(
+            repo.resolve_effect("key", EffectStatus::Unknown, None, NOW + 2)
+                .expect("resolve")
+        );
+        repo.request_cancel(&tid("t"), NOW + 3)
+            .expect("cancel after resolution");
+        assert_eq!(
+            repo.get(&tid("t")).expect("get").expect("present").state,
+            TaskState::Cancelled
+        );
     }
 
     #[test]
@@ -5391,7 +5898,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Query);
         let _ = repo.claim("w", NOW, LEASE).expect("claim");
-        repo.complete(&tid("t"), "w", NOW, TaskState::Completed, true, None)
+        repo.complete(&tid("t"), "w", 1, NOW, TaskState::Completed, true, None)
             .expect("complete");
         repo.request_cancel(&tid("t"), NOW + 10)
             .expect("cancel is a no-op");
@@ -5476,6 +5983,7 @@ mod tests {
                 repo.complete(
                     &tid("t"),
                     "w",
+                    cl.claim_generation,
                     NOW + i,
                     TaskState::Failed,
                     false,
@@ -5506,8 +6014,18 @@ mod tests {
         insert(&mut repo, "t", TaskKind::Query);
         // Exhaust it by direct completion.
         for i in 0..3 {
-            let _ = repo.claim("w", NOW + i, LEASE).expect("claim");
-            let _ = repo.complete(&tid("t"), "w", NOW + i, TaskState::Failed, false, Some("e"));
+            let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW + i, LEASE).expect("claim") else {
+                panic!("expected claim");
+            };
+            let _ = repo.complete(
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                NOW + i,
+                TaskState::Failed,
+                false,
+                Some("e"),
+            );
         }
         assert_eq!(
             repo.get(&tid("t")).expect("get").expect("present").state,
@@ -5538,10 +6056,7 @@ mod tests {
             .expect("force");
         let mut repo = TaskRepository::new(&mut c);
         let outcome = repo.claim("w", NOW, LEASE).expect("claim");
-        assert!(
-            matches!(outcome, ClaimOutcome::DeadLettered { .. }),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, ClaimOutcome::DeadLettered { .. }),);
         assert_eq!(
             repo.get(&tid("t")).expect("get").expect("present").state,
             TaskState::DeadLettered
@@ -5562,8 +6077,16 @@ mod tests {
         };
         assert_eq!(first.attempt_no, 1);
         assert!(
-            repo.complete(&tid("t"), "w", NOW, TaskState::Failed, false, Some("boom"))
-                .expect("fail")
+            repo.complete(
+                &tid("t"),
+                "w",
+                1,
+                NOW,
+                TaskState::Failed,
+                false,
+                Some("boom")
+            )
+            .expect("fail")
         );
 
         let row = repo.get(&tid("t")).expect("get").expect("present");
@@ -5590,6 +6113,7 @@ mod tests {
         repo.complete_with(
             &tid("t"),
             "w",
+            1,
             NOW,
             TaskState::Failed,
             false,
@@ -5621,9 +6145,20 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         for i in 0..3 {
-            let _ = repo.claim("w", NOW + i, LEASE).expect("claim");
-            repo.complete(&tid("t"), "w", NOW + i, TaskState::Failed, false, Some("e"))
-                .expect("fail");
+            let claim_gen = match repo.claim("w", NOW + i, LEASE).expect("claim") {
+                ClaimOutcome::Claimed(cl) => cl.claim_generation,
+                _ => 0,
+            };
+            repo.complete(
+                &tid("t"),
+                "w",
+                claim_gen,
+                NOW + i,
+                TaskState::Failed,
+                false,
+                Some("e"),
+            )
+            .expect("fail");
             let row = repo.get(&tid("t")).expect("get").expect("present");
             let expected = if i == 2 {
                 TaskState::DeadLettered
@@ -5641,14 +6176,19 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
         let _ = repo.claim("w", NOW, LEASE).expect("claim");
-        repo.complete(&tid("t"), "w", NOW, TaskState::Failed, false, Some("boom"))
-            .expect("fail");
+        repo.complete(
+            &tid("t"),
+            "w",
+            1,
+            NOW,
+            TaskState::Failed,
+            false,
+            Some("boom"),
+        )
+        .expect("fail");
         let row = repo.get(&tid("t")).expect("get").expect("present");
         assert_eq!(row.attempts, 1);
-        assert!(
-            row.lease_holder.is_none(),
-            "a failed task must not still be leased"
-        );
+        assert!(row.lease_holder.is_none(),);
     }
 
     #[test]
@@ -5695,12 +6235,35 @@ mod tests {
         let mut c = mem();
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected claim");
+        };
         let first = repo
-            .reserve_effect("key-1", &tid("t"), 1, 1, "step-1", false, NOW)
+            .reserve_effect(
+                "key-1",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                1,
+                "step-1",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(first.is_some());
         let second = repo
-            .reserve_effect("key-1", &tid("t"), 1, 2, "step-1", false, NOW)
+            .reserve_effect(
+                "key-1",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                2,
+                "step-1",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(
             second.is_none(),
@@ -5713,6 +6276,9 @@ mod tests {
         let mut c = mem();
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected claim");
+        };
         for (i, status) in [
             EffectStatus::Observed,
             EffectStatus::Unknown,
@@ -5723,7 +6289,17 @@ mod tests {
         {
             let key = format!("k{i}");
             let _ = repo
-                .reserve_effect(&key, &tid("t"), 1, 1, "s", false, NOW)
+                .reserve_effect(
+                    &key,
+                    &tid("t"),
+                    "w",
+                    cl.claim_generation,
+                    1,
+                    1,
+                    "s",
+                    false,
+                    NOW,
+                )
                 .expect("reserve");
             assert!(
                 repo.resolve_effect(&key, status, None, NOW + 1)
@@ -5752,13 +6328,23 @@ mod tests {
         insert(&mut repo, "t", TaskKind::Workflow);
 
         // Attempt 1 runs and its lease expires (a crash).
-        let ClaimOutcome::Claimed(_) = repo.claim("w", NOW, LEASE).expect("claim") else {
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
             panic!("expected the task to be claimable to begin with");
         };
 
         // A non-idempotent effect on that attempt, resolved `not-performed`.
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .reserve_effect(
+                "k",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                1,
+                "s",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::NotPerformed, None, NOW + 1)
@@ -5797,12 +6383,22 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
 
-        let ClaimOutcome::Claimed(_) = repo.claim("w", NOW, LEASE).expect("claim") else {
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
             panic!("expected the task to be claimable to begin with");
         };
 
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .reserve_effect(
+                "k",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                1,
+                "s",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Unknown, None, NOW + 1)
@@ -5827,8 +6423,21 @@ mod tests {
         let mut c = mem();
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected claim");
+        };
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .reserve_effect(
+                "k",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                1,
+                "s",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Pending, None, NOW)
@@ -5841,8 +6450,21 @@ mod tests {
         let mut c = mem();
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected claim");
+        };
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .reserve_effect(
+                "k",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                1,
+                "s",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(
             repo.resolve_effect("k", EffectStatus::Unknown, None, NOW)
@@ -5863,8 +6485,21 @@ mod tests {
         let mut c = mem();
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected claim");
+        };
         let _ = repo
-            .reserve_effect("k", &tid("t"), 1, 1, "s", false, NOW)
+            .reserve_effect(
+                "k",
+                &tid("t"),
+                "w",
+                cl.claim_generation,
+                1,
+                1,
+                "s",
+                false,
+                NOW,
+            )
             .expect("reserve");
         assert!(!repo.all_effects_resolved(&tid("t")).expect("resolved?"));
         let _ = repo.resolve_effect("k", EffectStatus::Unknown, None, NOW);
@@ -6110,7 +6745,15 @@ mod tests {
             .expect("record");
 
         let _ = repo
-            .complete(&tid("t"), "w", NOW, TaskState::Failed, false, Some("boom"))
+            .complete(
+                &tid("t"),
+                "w",
+                1,
+                NOW,
+                TaskState::Failed,
+                false,
+                Some("boom"),
+            )
             .expect("fail");
         let ClaimOutcome::Claimed(second) = repo.claim("w", NOW + 1, LEASE).expect("claim") else {
             panic!("expected a retry");
@@ -6128,7 +6771,6 @@ mod tests {
             repo.approval_for_attempt(&tid("t"), 1, 2)
                 .expect("a2")
                 .is_none(),
-            "the retry must not inherit the approval"
         );
     }
 
@@ -6202,7 +6844,7 @@ mod tests {
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Query);
         let _ = repo.claim("w", NOW, LEASE).expect("claim");
-        let _ = repo.complete(&tid("t"), "w", NOW, TaskState::Completed, true, None);
+        let _ = repo.complete(&tid("t"), "w", 1, NOW, TaskState::Completed, true, None);
         let events = repo.events_for(&tid("t")).expect("events");
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["enqueued", "claimed", "completed"]);
@@ -6230,6 +6872,7 @@ mod tests {
         let _ = repo.complete(
             &tid("t"),
             "zombie",
+            1,
             NOW + LEASE + 1,
             TaskState::Completed,
             true,
@@ -6307,11 +6950,16 @@ mod tests {
         let mut c = mem();
         let mut repo = TaskRepository::new(&mut c);
         insert(&mut repo, "t", TaskKind::Workflow);
+        let ClaimOutcome::Claimed(cl) = repo.claim("w", NOW, LEASE).expect("claim") else {
+            panic!("expected claim");
+        };
         for i in 0..3 {
             let _ = repo
                 .reserve_effect(
                     &format!("k{i}"),
                     &tid("t"),
+                    "w",
+                    cl.claim_generation,
                     1,
                     1,
                     &format!("s{i}"),
@@ -6337,7 +6985,7 @@ mod tests {
         let _ = repo.claim("w", NOW, LEASE).expect("claim");
         // Running -> Pending is not a legal transition.
         let err = repo
-            .complete(&tid("t"), "w", NOW, TaskState::Pending, false, None)
+            .complete(&tid("t"), "w", 1, NOW, TaskState::Pending, false, None)
             .expect_err("must refuse");
         assert!(matches!(err, TaskRepoError::Corrupt(_)), "{err}");
     }
@@ -6360,11 +7008,7 @@ mod tests {
         hex.push_str(&"a".repeat(61));
         hex.push('\u{00e9}'); // bytes 61..63, so byte 62 is this character's second half
         hex.push('a');
-        assert_eq!(
-            hex.len(),
-            APPROVAL_DIGEST_BYTES * 2,
-            "the fixture must satisfy the length gate that used to be checked first"
-        );
+        assert_eq!(hex.len(), APPROVAL_DIGEST_BYTES * 2,);
         assert_eq!(
             hex.chars().count(),
             63,
@@ -7217,12 +7861,18 @@ mod composition_tests {
         worker: &str,
         proposal_id: &str,
     ) -> Result<ProposalRow, TaskRepoError> {
-        repo.claim_specific(&tid(task), worker, NOW, NOW + 60_000)
-            .expect("claim");
+        let claim_generation = match repo
+            .claim_specific(&tid(task), worker, NOW, NOW + 60_000)
+            .expect("claim")
+        {
+            TargetedClaimOutcome::Claimed(cl) => cl.claim_generation,
+            _ => 0,
+        };
         repo.propose_action(
             proposal_id,
             &tid(task),
             worker,
+            claim_generation,
             "filesystem/write-text",
             Some("a.txt"),
             "{}",
@@ -7345,11 +7995,17 @@ mod advancement_tests {
     /// Claim the task and propose the step a worker is currently on, which is what the
     /// runtime does before dispatching. `step` is what the caller believes it is running;
     /// the repository validates it rather than believing it.
-    fn start_step(c: &mut Connection, step: u32, attempt_proposal: &str) -> ProposalRow {
+    fn start_step(c: &mut Connection, step: u32, attempt_proposal: &str) -> ExecutionClaim {
         let mut repo = TaskRepository::new(&mut *c);
-        repo.claim_specific(&tid("t"), "w", NOW, NOW + LEASE)
-            .expect("claim");
-        propose_and_resume(repo, step, attempt_proposal)
+        let claim_generation = match repo
+            .claim_specific(&tid("t"), "w", NOW, NOW + LEASE)
+            .expect("claim")
+        {
+            TargetedClaimOutcome::Claimed(cl) => cl.claim_generation,
+            _ => 0,
+        };
+        set_current_gen(claim_generation);
+        propose_and_resume(repo, step, attempt_proposal, claim_generation)
     }
 
     /// The second half of starting a step: propose, approve, and take the execution lease.
@@ -7360,11 +8016,13 @@ mod advancement_tests {
         mut repo: TaskRepository<'_>,
         step: u32,
         attempt_proposal: &str,
-    ) -> ProposalRow {
+        claim_generation: i64,
+    ) -> ExecutionClaim {
         repo.propose_action(
             attempt_proposal,
             &tid("t"),
             "w",
+            claim_generation,
             "filesystem/write-text",
             Some("a.txt"),
             "{}",
@@ -7380,14 +8038,28 @@ mod advancement_tests {
         // runtime does.
         repo.decide_proposal(attempt_proposal, "approved", NOW)
             .expect("approve");
-        repo.begin_approved_execution(attempt_proposal, "w", NOW, LEASE)
-            .expect("resume")
+        let resumed = repo
+            .begin_approved_execution(attempt_proposal, "w", NOW, LEASE)
+            .expect("resume");
+        set_current_gen(resumed.claim_generation);
+        resumed
+    }
+
+    thread_local! {
+        static CURRENT_GEN: std::cell::Cell<i64> = std::cell::Cell::new(1);
+    }
+    fn set_current_gen(g: i64) {
+        CURRENT_GEN.with(|c| c.set(g));
+    }
+    fn current_gen() -> i64 {
+        CURRENT_GEN.with(|c| c.get())
     }
 
     fn verified(step: u32, proposal_id: &str) -> VerifiedStep<'_> {
         VerifiedStep {
             task_id: tid("t"),
             worker: "w",
+            claim_generation: current_gen(),
             step_no: step,
             proposal_id,
             status: StepStatus::Verified,
@@ -7416,7 +8088,7 @@ mod advancement_tests {
     }
 
     /// A task left `running` with a live lease, having proposed `step`.
-    fn running_on(c: &mut Connection, step: u32, proposal_id: &str) -> ProposalRow {
+    fn running_on(c: &mut Connection, step: u32, proposal_id: &str) -> ExecutionClaim {
         start_step(c, step, proposal_id)
     }
 
@@ -7435,7 +8107,18 @@ mod advancement_tests {
         );
         // Claiming establishes the lease and nothing else, so the step's proposal follows
         // exactly as it did for step 1.
-        propose_and_resume(TaskRepository::new(&mut *c), step, proposal_id);
+        let claim_generation = TaskRepository::new(&mut *c)
+            .get(&tid("t"))
+            .expect("get")
+            .expect("present")
+            .claim_generation;
+        set_current_gen(claim_generation);
+        propose_and_resume(
+            TaskRepository::new(&mut *c),
+            step,
+            proposal_id,
+            claim_generation,
+        );
     }
 
     // ------------------------------------------------- multi-step advancement
@@ -7583,6 +8266,7 @@ mod advancement_tests {
             "p9",
             &tid("t"),
             "w",
+            1,
             "filesystem/write-text",
             Some("a.txt"),
             "{}",
@@ -7864,7 +8548,18 @@ mod advancement_tests {
         let mut c = mem_task(3);
         running_on(&mut c, 1, "p1");
         // Step 2 has not been reached: steps_completed is still 0.
-        let out = TaskRepository::new(&mut c).complete_verified_step(&verified(2, "p1"));
+        let out = TaskRepository::new(&mut c).complete_verified_step(&VerifiedStep {
+            task_id: tid("t"),
+            worker: "w",
+            claim_generation: 2,
+            step_no: 2,
+            proposal_id: "p1",
+            status: StepStatus::Verified,
+            verification: Some("{\"checked\":true}".into()),
+            structured_output: Some("{\"lines\":1}".into()),
+            artifacts: Some("[\"a.txt\"]".into()),
+            recorded_at_ms: NOW,
+        });
         assert!(
             matches!(out, Err(TaskRepoError::InvalidComposition(_))),
             "step 2 is not the step being executed: {out:?}"
@@ -7891,7 +8586,7 @@ mod advancement_tests {
         // Counter says two steps are done; no results exist, so the primary key cannot help.
         c.execute(
             "UPDATE tasks SET steps_completed = 2, state = 'running', lease_holder = 'w',
-                            lease_expires_at_ms = ?1 WHERE id = 't';",
+                            lease_expires_at_ms = ?1, claim_generation = 1 WHERE id = 't';",
             rusqlite::params![NOW + LEASE],
         )
         .expect("wind the counter forward");
@@ -7932,7 +8627,7 @@ mod advancement_tests {
         let mut c = mem_task(3);
         c.execute(
             "UPDATE tasks SET steps_completed = 1, state = 'running', lease_holder = 'w',
-                            lease_expires_at_ms = ?1 WHERE id = 't';",
+                            lease_expires_at_ms = ?1, claim_generation = 2 WHERE id = 't';",
             rusqlite::params![NOW + LEASE],
         )
         .expect("one step done");
@@ -7947,7 +8642,18 @@ mod advancement_tests {
         .expect("a proposal for step 1");
 
         // Step 2 is genuinely the current step, so the identity guard is satisfied...
-        let out = TaskRepository::new(&mut c).complete_verified_step(&verified(2, "p1"));
+        let out = TaskRepository::new(&mut c).complete_verified_step(&VerifiedStep {
+            task_id: tid("t"),
+            worker: "w",
+            claim_generation: 2,
+            step_no: 2,
+            proposal_id: "p1",
+            status: StepStatus::Verified,
+            verification: Some("{\"checked\":true}".into()),
+            structured_output: Some("{\"lines\":1}".into()),
+            artifacts: Some("[\"a.txt\"]".into()),
+            recorded_at_ms: NOW,
+        });
         assert!(
             matches!(out, Err(TaskRepoError::InvalidComposition(_))),
             "step 1's proposal must not advance step 2: {out:?}"
@@ -7984,6 +8690,7 @@ mod advancement_tests {
                 "p1",
                 &tid("t"),
                 "w",
+                1,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8010,6 +8717,7 @@ mod advancement_tests {
                 "p3",
                 &tid("t"),
                 "w",
+                2,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8124,6 +8832,7 @@ mod next_step_claim_tests {
                 "p1",
                 &tid("t"),
                 "worker-a",
+                1,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8142,6 +8851,7 @@ mod next_step_claim_tests {
             .complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "worker-a",
+                claim_generation: 2,
                 step_no: 1,
                 proposal_id: "p1",
                 status: StepStatus::Verified,
@@ -8286,6 +8996,7 @@ mod next_step_claim_tests {
             .complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "worker-b",
+                claim_generation: 4,
                 step_no: 2,
                 proposal_id: "p2",
                 status: StepStatus::Verified,
@@ -8319,6 +9030,7 @@ mod next_step_claim_tests {
         let forged = VerifiedStep {
             task_id: tid("t"),
             worker: "worker-a",
+            claim_generation: 2,
             step_no: 2,
             proposal_id: "p2",
             status: StepStatus::Verified,
@@ -8373,6 +9085,7 @@ mod next_step_claim_tests {
         let ok = VerifiedStep {
             task_id: tid("t"),
             worker: "worker-b",
+            claim_generation: 3,
             step_no: 2,
             proposal_id: "p2",
             status: StepStatus::Verified,
@@ -8424,6 +9137,7 @@ mod next_step_claim_tests {
                 "p2",
                 &tid("t"),
                 "worker-b",
+                3,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8479,6 +9193,7 @@ mod next_step_claim_tests {
                 "p1",
                 &tid("t"),
                 "worker-a",
+                1,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8499,6 +9214,7 @@ mod next_step_claim_tests {
             .complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "worker-a",
+                claim_generation: 2,
                 step_no: 1,
                 proposal_id: "p1",
                 status: StepStatus::Verified,
@@ -8531,6 +9247,7 @@ mod next_step_claim_tests {
                 "p1",
                 &tid("t"),
                 "w",
+                1,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8549,6 +9266,7 @@ mod next_step_claim_tests {
             .complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "w",
+                claim_generation: 2,
                 step_no: 1,
                 proposal_id: "p1",
                 status: StepStatus::Verified,
@@ -8579,7 +9297,9 @@ mod next_step_claim_tests {
         {
             let mut c = Connection::open(&path).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).migrate(&path).expect("migrate");
+            MigrationRunner::new(&c)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
+                .expect("migrate");
             TaskRepository::new(&mut c)
                 .insert(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
                 .expect("insert");
@@ -8744,6 +9464,7 @@ mod next_step_claim_tests {
                 "p1",
                 &tid("t"),
                 "w",
+                1,
                 "filesystem/write-text",
                 Some("a.txt"),
                 "{}",
@@ -8762,6 +9483,7 @@ mod next_step_claim_tests {
             .complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "w",
+                claim_generation: 2,
                 step_no: 1,
                 proposal_id: "p1",
                 status: StepStatus::Verified,
@@ -8800,6 +9522,7 @@ mod next_step_claim_tests {
                     "p2",
                     &tid("t"),
                     "worker-b",
+                    3,
                     "filesystem/write-text",
                     Some("b.txt"),
                     "{}",
@@ -8848,6 +9571,7 @@ mod next_step_claim_tests {
             .complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "worker-b",
+                claim_generation: 4,
                 step_no: 2,
                 proposal_id: "p2",
                 status: StepStatus::Verified,
@@ -8885,6 +9609,7 @@ mod next_step_claim_tests {
                     "p1",
                     &tid("t"),
                     "worker-a",
+                    1,
                     "filesystem/write-text",
                     Some("a.txt"),
                     "{}",
@@ -8915,6 +9640,7 @@ mod next_step_claim_tests {
             repo.complete_verified_step(&VerifiedStep {
                 task_id: tid("t"),
                 worker: "worker-a",
+                claim_generation: 2,
                 step_no: 1,
                 proposal_id: "p1",
                 status: StepStatus::Verified,
@@ -8961,6 +9687,7 @@ mod next_step_claim_tests {
                     "p2",
                     &tid("t"),
                     "worker-b",
+                    3,
                     "filesystem/write-text",
                     Some("b.txt"),
                     "{}",

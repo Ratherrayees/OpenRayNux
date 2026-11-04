@@ -84,6 +84,7 @@ impl TaskEngine for BrokenEngine {
         &mut self,
         _id: &orxnud_domain::TaskId,
         _worker: &str,
+        _claim_generation: i64,
         _now_ms: i64,
         _state: orxnud_domain::TaskState,
         _effect_observed: bool,

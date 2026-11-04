@@ -87,7 +87,9 @@ mod tests {
     fn open(p: &std::path::Path) -> Connection {
         let conn = Connection::open(p).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).migrate(p).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate(p, &orxnud_platform_fs::OsIdentity)
+            .expect("migrate");
         conn
     }
 

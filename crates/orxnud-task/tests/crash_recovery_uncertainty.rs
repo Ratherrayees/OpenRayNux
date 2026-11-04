@@ -75,7 +75,9 @@ fn open_engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -107,7 +109,7 @@ fn child_main() -> ! {
         .expect("claim")
         .expect("the child must claim its own task");
     assert_eq!(
-        claimed.state,
+        claimed.row.state,
         TaskState::Running,
         "the claim must be durable before the effect is reserved"
     );
@@ -133,12 +135,17 @@ fn child_main() -> ! {
         e.reserve_effect(
             &key,
             &tid("v93-task"),
+            "doomed-worker",
+            e.task(&tid("v93-task"))
+                .expect("read")
+                .expect("present")
+                .claim_generation,
             // This harness drives a single-step task, so the step is 1. Written
             // explicitly rather than left to a default, because the recovery predicate
             // now matches on it and a wrong value here would make every crash test
             // assert the wrong thing.
             1,
-            claimed.attempts,
+            claimed.row.attempts,
             effect_step,
             effect_idempotent,
             NOW
@@ -882,13 +889,23 @@ fn a_reservation_records_the_effects_repeat_safety() {
         NOW,
     )
     .expect("enqueue");
-    e.claim_task("w", NOW).expect("claim").expect("claimed");
+    let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
 
     for (step, idempotent) in [("count", true), ("external-call", false)] {
         let key = DurableEngine::idempotency_key(&tid("v93-task"), step, "initial");
         assert!(
-            e.reserve_effect(&key, &tid("v93-task"), 1, 1, step, idempotent, NOW)
-                .expect("reserve"),
+            e.reserve_effect(
+                &key,
+                &tid("v93-task"),
+                "w",
+                claimed.claim_generation,
+                1,
+                1,
+                step,
+                idempotent,
+                NOW
+            )
+            .expect("reserve"),
             "reserve {step}"
         );
     }
@@ -936,7 +953,9 @@ fn a_claim_from_another_connection_never_observes_a_recoverable_uncertain_task()
     let other = {
         let conn = rusqlite::Connection::open(&db).expect("second connection");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).migrate(&db).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate(&db, &orxnud_platform_fs::OsIdentity)
+            .expect("migrate");
         conn
     };
 
@@ -1080,6 +1099,7 @@ fn an_approval_is_spent_once_and_a_crash_after_it_still_needs_verification() {
             .claim_task("doomed-worker", NOW)
             .expect("claim")
             .expect("claimed")
+            .row
             .attempts;
 
         let mut repo = TaskRepository::new(e.conn_mut());
@@ -1088,6 +1108,7 @@ fn an_approval_is_spent_once_and_a_crash_after_it_still_needs_verification() {
                 "p",
                 &tid("v93-task"),
                 "doomed-worker",
+                1,
                 "filesystem/write-text",
                 Some("out.txt"),
                 r#"{"path":"out.txt","contents":"x"}"#,
@@ -1130,6 +1151,11 @@ fn an_approval_is_spent_once_and_a_crash_after_it_still_needs_verification() {
             e.reserve_effect(
                 &key,
                 &tid("v93-task"),
+                "doomed-worker",
+                e.task(&tid("v93-task"))
+                    .expect("read")
+                    .expect("present")
+                    .claim_generation,
                 1,
                 attempt,
                 "external-call",
@@ -1174,6 +1200,7 @@ fn a_refused_approval_spend_grants_no_lease() {
             "p",
             &tid("v93-task"),
             "w",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             r#"{"path":"out.txt","contents":"x"}"#,

@@ -298,7 +298,7 @@ impl Daemon {
             // need a capability that actually executes; this is how they get one.
             //
             // It does NOT satisfy R-1 option 2 (owner, bounded period, review date). See the open
-            // owner decision in `docs/18` section 12.
+            // owner decision recorded in `docs/12-verification-register.md` V-67 (R-1).
             .arg("--permit-argv-payload-exposure-for-tests")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

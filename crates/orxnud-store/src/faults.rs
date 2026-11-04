@@ -301,7 +301,8 @@ mod atomicity {
         Pragma::critical().apply(&c).expect("pragmas");
         let r = MigrationRunner::new(&c);
         if r.applied_version().expect("version") == 0 {
-            r.migrate(path).expect("migrate");
+            r.migrate(path, &orxnud_platform_fs::OsIdentity)
+                .expect("migrate");
         }
         c
     }
@@ -344,6 +345,7 @@ mod atomicity {
             "p1",
             &TaskId::new("t"),
             "w",
+            1,
             "filesystem/write-text",
             Some("a.txt"),
             "{}",
@@ -432,6 +434,7 @@ mod atomicity {
                 let _ = repo.complete_with(
                     &TaskId::new("t"),
                     "w",
+                    1,
                     NOW,
                     TaskState::Completed,
                     true,
@@ -454,6 +457,7 @@ mod atomicity {
                 let _ = repo.complete_verified_step(&VerifiedStep {
                     task_id: TaskId::new("t"),
                     worker: "w",
+                    claim_generation: 2,
                     step_no: 1,
                     proposal_id: "p1",
                     status: StepStatus::Verified,
@@ -593,6 +597,7 @@ mod atomicity {
         let advance = TaskRepository::new(&mut c).complete_verified_step(&VerifiedStep {
             task_id: TaskId::new("t"),
             worker: "w",
+            claim_generation: 2,
             step_no: 1,
             proposal_id: "p1",
             status: StepStatus::Verified,
@@ -748,6 +753,7 @@ mod atomicity {
             repo.complete_with(
                 &TaskId::new("t"),
                 "w2",
+                2,
                 NOW + LEASE + 2,
                 TaskState::Completed,
                 true,

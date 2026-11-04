@@ -33,7 +33,8 @@
 use std::path::{Path, PathBuf};
 
 use orxnud_domain::platform::{
-    FileFacts, FileId, FilesystemIdentity, SqliteMainDatabase, SqliteMainFacts,
+    FileFacts, FileId, FilesystemIdentity, FilesystemPrivacy, PrivacyError, PrivacyOutcome,
+    SqliteMainDatabase, SqliteMainFacts,
 };
 use orxnud_platform_fs::OsIdentity;
 use orxnud_store::StoreError;
@@ -416,7 +417,8 @@ fn the_restore_path_refuses_an_aliased_sidecar() {
     // A real database, a real snapshot, and known content.
     let snapshot = {
         let store = open_with_content(&db);
-        let snapshot = Backup::take(store.conn(), &db).expect("take the snapshot");
+        let snapshot = Backup::take(store.conn(), &db, &orxnud_platform_fs::OsIdentity)
+            .expect("take the snapshot");
         drop(store);
         snapshot
     };
@@ -551,6 +553,19 @@ fn the_ordinary_wal_lifecycle_is_accepted() {
 struct UnknownFor {
     unknown: PathBuf,
     identity: FileId,
+}
+
+impl FilesystemPrivacy for UnknownFor {
+    fn restrict_file_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        // The privacy operation is not what this double scripts: it scripts the
+        // *identity* answers. So it is answered by the real platform, and the
+        // database these tests open is restricted for real.
+        OsIdentity.restrict_file_to_owner(path)
+    }
+
+    fn restrict_dir_to_owner(&self, path: &Path) -> Result<PrivacyOutcome, PrivacyError> {
+        OsIdentity.restrict_dir_to_owner(path)
+    }
 }
 
 impl FilesystemIdentity for UnknownFor {

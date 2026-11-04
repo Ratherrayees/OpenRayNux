@@ -67,7 +67,9 @@ fn open(path: &Path) -> rusqlite::Connection {
     // Verification on open is not ceremony: a pragma that silently failed to apply
     // is indistinguishable from one that was never set until the disk loses power.
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     conn
 }
 
@@ -118,8 +120,9 @@ fn a_weakened_durability_setting_is_caught_by_verification() {
     //
     // Measured on this build (SQLite 3.53.2 bundled, rusqlite 0.40.2): a raw
     // `Connection::open` already reports `synchronous = 2` (FULL), because
-    // `SQLITE_DEFAULT_SYNCHRONOUS` is 2, and rusqlite enables foreign keys on
-    // open. So "we forgot to set it" is not the failure mode — **someone weakening
+    // `SQLITE_DEFAULT_SYNCHRONOUS` is 2, and the bundled `libsqlite3-sys` compiles
+    // SQLite with `SQLITE_DEFAULT_FOREIGN_KEYS=1`; it is not rusqlite turning them
+    // on. So "we forgot to set it" is not the failure mode — **someone weakening
     // it** is, which is exactly what ADR-0032 found in `apalis-sqlite`
     // (`synchronous = OFF`).
     //
@@ -220,12 +223,10 @@ fn a_task_survives_a_restart_with_its_attempts_and_leases() {
         e.enqueue_new(&NewTask::new(tid("t1"), TaskKind::Query, NOW), NOW)
             .expect("enqueue");
         let claimed = e.claim_task("w1", NOW).expect("claim").expect("claimed");
-        assert_eq!(claimed.state, TaskState::Running);
+        assert_eq!(claimed.row.state, TaskState::Running);
         e.enqueue_new(&NewTask::new(tid("t2"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        claimed
-            .lease_expires_at_ms
-            .expect("a claimed task carries a lease expiry")
+        claimed.lease_expires_at_ms
     };
 
     // A restart is a new process: drop everything, reopen.
@@ -256,19 +257,42 @@ fn an_idempotency_reservation_survives_a_restart() {
         let mut e = engine(&path);
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
         let k = DurableEngine::idempotency_key(&tid("t"), "send", "initial");
         assert!(
-            e.reserve_effect(&k, &tid("t"), 1, 1, "send", false, NOW)
-                .expect("reserve")
+            e.reserve_effect(
+                &k,
+                &tid("t"),
+                "w",
+                claimed.claim_generation,
+                1,
+                1,
+                "send",
+                false,
+                NOW
+            )
+            .expect("reserve")
         );
         k
     };
     {
         let mut e = engine(&path);
         assert!(
-            !e.reserve_effect(&key, &tid("t"), 1, 2, "send", false, NOW)
-                .expect("reserve"),
+            !e.reserve_effect(
+                &key,
+                &tid("t"),
+                "w",
+                e.task(&tid("t"))
+                    .expect("read")
+                    .expect("present")
+                    .claim_generation,
+                1,
+                2,
+                "send",
+                false,
+                NOW
+            )
+            .expect("reserve"),
             "the reservation must survive the restart"
         );
     }
@@ -317,8 +341,16 @@ fn the_transition_log_survives_a_restart_and_keeps_its_order() {
         let mut e = engine(&path);
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Query, NOW), NOW)
             .expect("enqueue");
-        let _ = e.claim_task("w", NOW).expect("claim");
-        let _ = e.complete_task(&tid("t"), "w", NOW, TaskState::Completed, true, None);
+        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
+        let _ = e.complete_task(
+            &tid("t"),
+            "w",
+            claimed.claim_generation,
+            NOW,
+            TaskState::Completed,
+            true,
+            None,
+        );
     }
     let e = engine(&path);
     let events = orxnud_store::task_repo::TaskRepository::new_readonly(e.conn())
@@ -346,8 +378,7 @@ fn a_clean_restart_runs_recovery_and_finds_a_live_lease_to_orphan() {
             .claim_task("w", NOW)
             .expect("claim")
             .expect("claimed")
-            .lease_expires_at_ms
-            .expect("e");
+            .lease_expires_at_ms;
         assert_eq!(e.live_leases(NOW).expect("live"), 1);
     }
     let mut e = engine(&path);
@@ -380,15 +411,23 @@ fn a_reclaimed_task_can_be_claimed_by_a_different_worker_after_restart() {
         .claim_task("w2", NOW + 1)
         .expect("claim")
         .expect("claimed");
-    assert_eq!(claimed.lease_holder.as_deref(), Some("w2"));
+    assert_eq!(claimed.row.lease_holder.as_deref(), Some("w2"));
     assert_eq!(
-        claimed.attempts, 2,
+        claimed.row.attempts, 2,
         "the reclaim is a new attempt, not a continuation"
     );
     // And the previous worker cannot commit into it.
     assert!(
-        !e.complete_task(&tid("t"), "w1", NOW + 1, TaskState::Completed, true, None)
-            .expect("complete")
+        !e.complete_task(
+            &tid("t"),
+            "w1",
+            0,
+            NOW + 1,
+            TaskState::Completed,
+            true,
+            None
+        )
+        .expect("complete")
     );
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -402,10 +441,11 @@ fn a_task_dead_lettered_before_a_restart_is_not_requeued_after_it() {
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
         for i in 0..3 {
-            let _ = e.claim_task("w", NOW + i).expect("claim");
+            let claimed = e.claim_task("w", NOW + i).expect("claim").expect("claimed");
             let _ = e.complete_task_with(
                 &tid("t"),
                 "w",
+                claimed.claim_generation,
                 NOW + i,
                 TaskState::Failed,
                 false,
@@ -443,7 +483,7 @@ fn migrations_are_idempotent_across_repeated_opens() {
         );
         assert!(
             MigrationRunner::new(&conn)
-                .migrate(&path)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
                 .expect("run")
                 .is_empty(),
             "a second run must apply nothing"
@@ -473,7 +513,9 @@ fn a_migration_on_an_existing_file_takes_a_verified_snapshot() {
     );
 
     // Nothing is pending, so no snapshot is taken and none is left behind.
-    let applied = MigrationRunner::new(&conn).migrate(&path).expect("migrate");
+    let applied = MigrationRunner::new(&conn)
+        .migrate(&path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     assert!(applied.is_empty());
     assert!(
         !orxnud_store::backup::Backup::path_for(&path).exists(),
@@ -507,7 +549,9 @@ fn a_no_op_migration_takes_no_snapshot_and_leaves_none_behind() {
     let path = db_in(&d);
     let conn = open(&path);
 
-    let applied = MigrationRunner::new(&conn).migrate(&path).expect("migrate");
+    let applied = MigrationRunner::new(&conn)
+        .migrate(&path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     assert!(
         applied.is_empty(),
         "precondition: the database is already current, so nothing should be applied"
@@ -529,7 +573,9 @@ fn a_failed_migration_leaves_the_database_readable_and_restores_the_snapshot() {
         let conn = open(&path);
         // Take the snapshot the way `migrate` would, then damage the schema the way
         // a half-applied migration would.
-        let snapshot = orxnud_store::backup::Backup::take(&conn, &path).expect("snapshot");
+        let snapshot =
+            orxnud_store::backup::Backup::take(&conn, &path, &orxnud_platform_fs::OsIdentity)
+                .expect("snapshot");
         conn.execute_batch("CREATE TABLE half_applied (x INTEGER);")
             .expect("damage");
         assert!(
@@ -584,6 +630,12 @@ fn a_fresh_database_reaches_the_current_version_and_creates_only_the_task_schema
             // single-use ledger. Both were process-local until migration 6, so a
             // fresh database now creates them alongside the task tables.
             "audit_log",
+            // The provenance identity: what binds a pre-migration snapshot to the
+            // database it protects. Present on a fresh database for the same
+            // reason the task tables are — it is part of the shape a database
+            // this store owns has, and it is created before the first snapshot
+            // is taken so that every snapshot carries it.
+            "database_identity",
             "schedule_fires",
             "schedules",
             "schema_meta",
@@ -711,7 +763,7 @@ fn n_workers_sharing_a_file_produce_exactly_one_winner_per_task() {
             for _ in 0..4 {
                 match e.claim_task(&format!("w{w}"), NOW) {
                     Ok(Some(row)) => {
-                        claimed.lock().expect("lock").push(row.id.to_string());
+                        claimed.lock().expect("lock").push(row.row.id.to_string());
                     }
                     Ok(None) => {}
                     // A `SQLITE_BUSY` under six writers is a *retryable* conflict, and

@@ -520,6 +520,14 @@ pub struct Runtime<S: SecretsContract> {
     /// at all, and the alternative — a `&'static` obtained by transmuting a borrow — is
     /// exactly what gate **G4** exists to forbid.
     governed: Arc<tokio::sync::Mutex<(Daemon, S, TaskService)>>,
+    /// Whether the state root was made owner-only, or the platform has no
+    /// owner-only mechanism to apply.
+    ///
+    /// Carried so the daemon can *report* it. On a platform with no mechanism the
+    /// answer is `NotApplicable`, which is not a pass: the state root inherits the
+    /// ACL of the per-user state root above it, which is a different mechanism with a
+    /// different threat model, and it is not owner-only.
+    privacy: orxnud_domain::platform::PrivacyOutcome,
     /// Approved, verified reads waiting to inform the next proposal.
     ///
     /// Its own small lock rather than the governed one, and deliberately: the governed mutex
@@ -618,6 +626,37 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         Self::build(paths, secrets, Some(proposer)).await
     }
 
+    /// Starts a runtime whose task subsystem uses `engine_limits`.
+    ///
+    /// A test affordance, in the same shape as
+    /// [`Self::start_permitting_argv_payload_exposure`]: the lease duration and the other
+    /// task bounds are production policy, and a test that has to wait out a 30-second
+    /// lease to see a lease lapse is a test that runs for half a minute.
+    ///
+    /// It is a *runtime construction* parameter, not a per-request one: nothing in the
+    /// request path can ask for a different lease, so the lease policy is still exactly
+    /// what the runtime was built with.
+    ///
+    /// **Delete this when the lease-lifecycle behaviour it exists to exercise is covered
+    /// another way.** Until then it is a test affordance wearing a production signature,
+    /// and it is visible — this name is greppable, the call lands in review, and it is
+    /// used by nothing outside the test suites.
+    pub async fn start_with_engine_limits(
+        paths: Paths,
+        secrets: S,
+        proposer: Arc<dyn crate::proposer::ProposalProvider>,
+        engine_limits: EngineLimits,
+    ) -> Result<Self, RuntimeError> {
+        Self::finish(
+            paths.clone(),
+            secrets,
+            Daemon::compose(paths),
+            Some(proposer),
+            engine_limits,
+        )
+        .await
+    }
+
     /// Starts a runtime that **grants** the argv-payload exception for this process.
     ///
     /// The only way left to grant it. There is deliberately no configuration key and no
@@ -639,7 +678,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         secrets: S,
     ) -> Result<Self, RuntimeError> {
         let daemon = Daemon::compose(paths.clone()).with_argv_payload_exception_for_this_process();
-        Self::finish(paths, secrets, daemon, None).await
+        Self::finish(paths, secrets, daemon, None, EngineLimits::default()).await
     }
 
     async fn build(
@@ -647,7 +686,14 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         secrets: S,
         proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
     ) -> Result<Self, RuntimeError> {
-        Self::finish(paths.clone(), secrets, Daemon::compose(paths), proposer).await
+        Self::finish(
+            paths.clone(),
+            secrets,
+            Daemon::compose(paths),
+            proposer,
+            EngineLimits::default(),
+        )
+        .await
     }
 
     /// Everything after the daemon is composed.
@@ -662,7 +708,24 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         secrets: S,
         mut daemon: Daemon,
         proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
+        engine_limits: EngineLimits,
     ) -> Result<Self, RuntimeError> {
+        // 0. The state root, made private to its owner.
+        //
+        // Before anything is created inside it. The platform creates the
+        // database and the socket with the process's umask applied, so without
+        // this the root would be `0755` and everything in it world-readable —
+        // and the window between the platform creating a file and the store
+        // restricting it would be a window in which another account could open
+        // it.
+        //
+        // Fatal if it fails. A daemon that cannot make its own state private
+        // should not serve requests against it, and there is no degraded mode
+        // here to fall back to.
+        let privacy = paths
+            .ensure_state_root()
+            .map_err(|e| RuntimeError::SecurityState(format!("state root: {e}")))?;
+
         // 1 + 2 + 3. Durable security state, verified, attached.
         daemon
             .attach_durable_security_state(&paths.database)
@@ -673,7 +736,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         //    work, so a request never arrives at an unrecovered queue.
         let tasks = TaskService::open(
             &paths.database,
-            EngineLimits::default(),
+            engine_limits,
             &daemon.components().identity,
         )
         .map_err(|e| RuntimeError::TaskSubsystem(e.to_string()))?;
@@ -703,6 +766,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
             endpoint: bound,
             listener: Arc::new(listener),
             governed,
+            privacy,
             observations: Arc::new(std::sync::Mutex::new(
                 crate::observation::ObservationStore::new(),
             )),
@@ -785,6 +849,16 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     #[must_use]
     pub async fn is_durable(&self) -> bool {
         self.governed.lock().await.0.has_durable_audit()
+    }
+
+    /// Whether the state root is private to its owner.
+    ///
+    /// `Restricted` when the state root was made owner-only, and `NotApplicable`
+    /// when the platform has no owner-only mechanism to apply. The second is **not**
+    /// a pass, and this is the accessor a caller uses instead of assuming.
+    #[must_use]
+    pub fn privacy_outcome(&self) -> orxnud_domain::platform::PrivacyOutcome {
+        self.privacy
     }
 
     /// Whether the durable audit journal was found fully settled when it was loaded.
@@ -1600,6 +1674,7 @@ async fn ai_propose<S: SecretsContract>(
     check_len("task", &task_id, MAX_TASK_ID_BYTES)?;
     let worker = required_str(&params, "worker")?;
     check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
+    let claim_generation = required_claim_generation(&params)?;
 
     // The gather/call/persist split, written out here rather than hidden behind a helper,
     // because **the release is the whole point** and a reader should not have to know a
@@ -1615,11 +1690,17 @@ async fn ai_propose<S: SecretsContract>(
     // Everything `persist_proposal` and `complete_task_with` need is re-validated by the
     // store inside its own transaction, so a task that changed state during the call is
     // refused at the write rather than written on stale knowledge.
-    let (asked, now) = {
+    //
+    // `gathered_at` is the time of the *pre-call* read and is used only to name the
+    // proposal. It is deliberately **not** the timestamp the lease fence uses: the
+    // final write samples its own clock inside the store's `IMMEDIATE` transaction
+    // (`propose_action_at_write` / `complete_task_with_at_write`), so a provider call
+    // that outlived the lease cannot pass a fence by presenting a pre-wait time.
+    let (asked, gathered_at) = {
         let mut g = governed.lock().await;
-        let now = g.2.clock_now_ms();
+        let gathered_at = g.2.clock_now_ms();
         let ask = gather_proposal_context(&mut g, provider, &task_id, observations)?;
-        (ask, now)
+        (ask, gathered_at)
     };
     let text = call_provider(provider, &asked.ctx).await?;
     let asked = interpret_provider_answer(text, &asked)?;
@@ -1633,14 +1714,15 @@ async fn ai_propose<S: SecretsContract>(
         // the task, it answered a question the runtime asked. See ADR-0047.
         crate::proposer::ProposalOutcome::Done { summary } => {
             let finished =
-                g.2.complete_task_with(
+                g.2.complete_task_with_at_write(
                     &TaskId::new(task_id.as_str()),
                     &worker,
-                    now,
+                    claim_generation,
                     TaskState::Completed,
                     false,
                     Some(&format!("no work required: {summary}")),
                     None,
+                    crate::task_service::now_ms,
                 )
                 .map_err(task_fault)?;
             return Ok(json!({
@@ -1665,7 +1747,7 @@ async fn ai_propose<S: SecretsContract>(
     };
 
     let canonical = orxnud_policy::canonical_params(&validated.params);
-    let proposal_id = format!("p-{task_id}-{now}");
+    let proposal_id = format!("p-{task_id}-{gathered_at}");
     // The provider instance that just answered is the only authority on which model
     // produced this text. Read from it rather than from configuration, so the audit cannot
     // name a model that did not answer.
@@ -1681,10 +1763,10 @@ async fn ai_propose<S: SecretsContract>(
             proposal_id: &proposal_id,
             task_id: &task_id,
             worker: &worker,
+            claim_generation,
             validated: &validated,
             canonical_params: canonical.as_str(),
             proposer: &proposer,
-            now,
         },
     )?;
 
@@ -1724,6 +1806,12 @@ async fn ai_propose<S: SecretsContract>(
 /// to `http_provider.rs`'s 60 s — hold the single mutex that every other request needs,
 /// including `daemon/status`. Concurrency at the transport was therefore necessary but
 /// not sufficient: a spawned connection would still queue behind the mutex.
+///
+/// **Both** model routes now split the same way, and for the same reason:
+/// `task/ai-propose` releases the governed mutex before it asks the model, and so does
+/// `task/continue` — the boundary crossing and the gathering happen under the lock, the
+/// model is asked with none held, and the write takes it again. A slow model therefore
+/// holds nothing that another request needs.
 ///
 /// Everything here is local durable state and an in-memory scan. None of it waits on
 /// anything outside the process, so holding the mutex across it costs nothing and is the
@@ -1953,15 +2041,20 @@ fn persist_proposal<S: SecretsContract>(
     // From here the model is out of the picture. What follows is the same path a human
     // worker would take, and the proposer is an `Actor::Ai` derived from the task — never
     // from the worker holding the lease.
-    g.2.propose_action(
+    //
+    // The clock is sampled inside the store's `IMMEDIATE` transaction, not passed in
+    // from before the provider call: the lease fence must measure the row as it is at
+    // the write, not as it was before the wait.
+    g.2.propose_action_at_write(
         write.proposal_id,
         &TaskId::new(write.task_id),
         write.worker,
+        write.claim_generation,
         &orxnud_domain::CapabilityId::new(write.validated.capability.as_str()),
         write.validated.target.as_deref(),
         write.canonical_params,
         write.proposer,
-        write.now,
+        crate::task_service::now_ms,
     )
     .map_err(task_fault)
 }
@@ -1979,14 +2072,14 @@ struct ProposalWrite<'a> {
     task_id: &'a str,
     /// The worker holding the lease. Never the proposer — see `proposer`.
     worker: &'a str,
+    /// The durable generation minted for the worker's current claim.
+    claim_generation: i64,
     /// The validated action.
     validated: &'a crate::proposer::ValidatedProposal,
     /// Its parameters, already canonicalised.
     canonical_params: &'a str,
     /// Who is asking. Always a delegated actor, never the lease holder.
     proposer: &'a orxnud_domain::actor::Actor,
-    /// When.
-    now: i64,
 }
 
 /// Advances a task across one step boundary and proposes what comes next.
@@ -2025,6 +2118,13 @@ struct ProposalWrite<'a> {
 /// proposal, which is recoverable in the ordinary way: the lease expires and the task
 /// returns to a claimable boundary.
 ///
+/// The same is true of the **governed mutex**: it is not held across the model's network
+/// round trip either, so a slow model holds nothing another request needs. What replaces
+/// it is the store's own fencing — `claim_next_step` is a conditional UPDATE, and
+/// `propose_action` re-reads the task and its live lease holder inside its own
+/// transaction — so a task claimed away, completed, cancelled or let-expire while the
+/// model was being asked is refused **at the write**, not written on stale knowledge.
+///
 /// # Errors
 ///
 /// [`RequestError::ProviderRefused`] if no provider is configured or the model cannot be
@@ -2057,79 +2157,192 @@ async fn continue_task<S: SecretsContract>(
     check_len("worker", &worker, MAX_TASK_ID_BYTES)?;
 
     let id = TaskId::new(task_id.as_str());
-    let mut g = governed.lock().await;
-    let now = g.2.clock_now_ms();
 
-    // Refused with the task's own state rather than a claim refusal, because the two mean
-    // different things to a caller: this task has no boundary to cross, which is a fact
-    // about the task, whereas a claim refusal is about losing a race.
-    let before =
-        g.2.task(&id)
-            .map_err(task_fault)?
-            .ok_or_else(|| RequestError::NotFound {
-                reason: "task-not-found".to_owned(),
-                // The id is the caller's own, so naming it discloses nothing, and a client
-                // fixing a stale reference needs to see which reference missed.
-                detail: Some(format!("no task {task_id:?}")),
-            })?;
-    if before.state != TaskState::AwaitingNextStep {
-        return Err(RequestError::Conflict {
-            reason: "not-at-boundary".to_owned(),
-            detail: Some(format!(
-                "task is {:?}, not {:?}; only a task between steps can be continued",
-                before.state,
-                TaskState::AwaitingNextStep
-            )),
-        });
-    }
-
-    // The one boundary crossing. Whoever gets here owns the next logical step; a second
-    // caller in the same instant is refused by the conditional UPDATE inside the store,
-    // not by anything this runtime decided.
-    let claimed =
-        g.2.claim_next_step(&id, &worker, now)
-            .map_err(|e| match e {
-                TaskFault::NotClaimable(r) => RequestError::Declined {
-                    reason: r.as_str().to_owned(),
-                    detail: Some(format!("the next step was not claimed: {r:?}")),
-                },
-                other => task_fault(other),
-            })?;
-    // The claimed step is `steps_completed + 1` of the row the claim returned, read from
-    // durable state rather than counted here.
-    let step = claimed.row.steps_completed + 1;
-
-    // From here the boundary is crossed, so every failure has to put it back — otherwise
-    // the task is left holding a lease for a step that will never be proposed and
-    // continuation can never be retried.
-    // The same gather/call/persist split as `ai_propose`, and for the same reason.
+    // The same gather/call/persist split as `ai_propose`, and for the same reason: the
+    // model is asked with **no governed lock held**, so a slow model does not hold the
+    // daemon's single-writer mutex for the length of its network round trip.
     //
-    // Here it additionally lines up with what this function's own documentation already
-    // promised: "the claim and the proposal are not atomic, deliberately -- a model call
-    // can take seconds". The claim commits first, the boundary is released again if the
-    // model cannot be asked, and a crash between the two leaves a `Running` task with no
-    // proposal that recovers the ordinary way. Releasing the *mutex* across the call
-    // extends that same window to the daemon's other clients: nothing here claims the task
-    // was untouched, only that the claim is fenced and the boundary releasable, both of
-    // which the store enforces.
-    let asked = {
-        let ask = gather_proposal_context(&mut g, provider, &task_id, observations);
-        let call = match ask {
-            Ok(ask) => call_provider(provider, &ask.ctx)
-                .await
-                .and_then(|text| interpret_provider_answer(text, &ask)),
-            Err(e) => Err(e),
-        };
-        match call {
-            Ok(asked) => asked,
+    // Three phases, in this order:
+    //
+    //   lock   -> read the task, claim the next boundary, gather what the model will
+    //              be shown, and record the disclosure the request will carry
+    //   drop the lock
+    //   ask the model                                              (up to 60s, no lock)
+    //   lock   -> persist, under the repository's own fencing
+    //
+    // What the lock is for here is *ordering*, not correctness: the reads, the
+    // boundary crossing and the gathering happen together, so two continuations
+    // cannot both be in the pre-claim state when they claim. The **store** is the
+    // authority for what may then be written: `claim_next_step` is a conditional
+    // UPDATE inside one transaction, and `propose_action` re-reads the task and its
+    // live lease holder inside its own transaction and refuses unless the task is
+    // still `Running` under *this worker's* live lease. A task claimed away,
+    // completed, cancelled or let-expire while the model was being asked is
+    // therefore refused **at the write**, not written on stale knowledge.
+    //
+    // The claim and the proposal are not atomic, deliberately: a model call can take
+    // seconds, and holding a write transaction across one would hold the single
+    // SQLite writer for the duration of a network round trip. So the claim commits
+    // first, the boundary is released again if the model cannot be asked, and a crash
+    // between the two leaves a `Running` task with no proposal that recovers the
+    // ordinary way.
+    //
+    // `claimed_at` is the time the claim was taken. It names the proposal and is used
+    // nowhere else: the final write samples its own clock inside the store's
+    // `IMMEDIATE` transaction, after the provider wait, so the lease fence cannot be
+    // satisfied by a timestamp captured before that wait.
+    let (asked, claimed_at, step, before, renewal_interval, claim_generation) = {
+        let mut g = governed.lock().await;
+        let claimed_at = g.2.clock_now_ms();
+
+        // Refused with the task's own state rather than a claim refusal, because the two mean
+        // different things to a caller: this task has no boundary to cross, which is a fact
+        // about the task, whereas a claim refusal is about losing a race.
+        let before =
+            g.2.task(&id)
+                .map_err(task_fault)?
+                .ok_or_else(|| RequestError::NotFound {
+                    reason: "task-not-found".to_owned(),
+                    // The id is the caller's own, so naming it discloses nothing, and a client
+                    // fixing a stale reference needs to see which reference missed.
+                    detail: Some(format!("no task {task_id:?}")),
+                })?;
+        if before.state != TaskState::AwaitingNextStep {
+            return Err(RequestError::Conflict {
+                reason: "not-at-boundary".to_owned(),
+                detail: Some(format!(
+                    "task is {:?}, not {:?}; only a task between steps can be continued",
+                    before.state,
+                    TaskState::AwaitingNextStep
+                )),
+            });
+        }
+
+        // The one boundary crossing. Whoever gets here owns the next logical step; a second
+        // caller in the same instant is refused by the conditional UPDATE inside the store,
+        // not by anything this runtime decided.
+        let claimed =
+            g.2.claim_next_step(&id, &worker, claimed_at)
+                .map_err(|e| match e {
+                    TaskFault::NotClaimable(r) => RequestError::Declined {
+                        reason: r.as_str().to_owned(),
+                        detail: Some(format!("the next step was not claimed: {r:?}")),
+                    },
+                    other => task_fault(other),
+                })?;
+        // The claimed step is `steps_completed + 1` of the row the claim returned, read from
+        // durable state rather than counted here.
+        let step = claimed.row.steps_completed + 1;
+
+        // From here the boundary is crossed, so every failure has to put it back — otherwise
+        // the task is left holding a lease for a step that will never be proposed and
+        // continuation can never be retried.
+        match gather_proposal_context(&mut g, provider, &task_id, observations) {
+            Ok(ask) => (
+                ask,
+                claimed_at,
+                step,
+                before,
+                renewal_interval(&g.2),
+                claimed.claim_generation,
+            ),
             Err(e) => {
                 let why = e.to_string();
-                release_to_boundary(&mut g, &id, &worker, now, &why);
+                release_to_boundary(&mut g, &id, &worker, claimed.claim_generation, &why);
                 return Err(e);
             }
         }
+        // The governed lock is released here, before the model is asked.
     };
 
+    // The model is asked with no governed lock held. The provider call reads no
+    // governed state, and the answer is validated against the menu that was built
+    // for it, so nothing here needs the lock.
+    //
+    // # The claim is renewed while the model is being asked
+    //
+    // The claim is a lease of `lease_duration_ms` — 30 s by default — and the
+    // provider's own timeout is 60 s, so a call that runs to its timeout
+    // outlives the claim. The store would then refuse the proposal, correctly,
+    // but for a reason that has nothing to do with a race: the claim simply
+    // lapsed while the model was thinking.
+    //
+    // So the claim is renewed on a timer while the model is asked. The renewal is
+    // the store's own fenced `heartbeat` — `WHERE id = ? AND lease_holder = ?
+    // AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?` — so it
+    // extends only a lease *this worker* still holds and that has not yet
+    // lapsed. It cannot revive a cancelled task (a cancel clears the lease), a
+    // task another worker has taken, or a task whose lease has already expired.
+    //
+    // Each tick takes the governed mutex **only** for the write and releases it
+    // immediately, so the daemon's other routes are not held up between ticks.
+    // The ticks stop the moment the model answers, fails, or the request is
+    // cancelled — the whole wait is one future, and dropping it drops the
+    // renewal with it, so there is no ticker left running behind a caller that
+    // has gone.
+    let mut provider_call = std::pin::pin!(call_provider(provider, &asked.ctx));
+    let call = loop {
+        tokio::select! {
+            biased;
+            answered = &mut provider_call => {
+                break answered.and_then(|text| interpret_provider_answer(text, &asked));
+            }
+            _ = tokio::time::sleep(renewal_interval) => {
+                let mut g = governed.lock().await;
+                // The heartbeat samples its clock inside the store's write transaction,
+                // so a tick that waited for the writer cannot extend a lease that lapsed
+                // while it was queued.
+                let renewed = match g.2.heartbeat_at_write(
+                    &id,
+                    &worker,
+                    claim_generation,
+                    crate::task_service::now_ms,
+                ) {
+                    Ok(renewed) => renewed,
+                    Err(e) => {
+                        drop(g);
+                        break Err(task_fault(e));
+                    }
+                };
+                drop(g);
+                if !renewed {
+                    // The claim is gone: it was cancelled, another worker took
+                    // the task, or the lease lapsed. Nothing this request could
+                    // write has anywhere to go, so it says so rather than waiting
+                    // out a model whose answer would be refused anyway. The
+                    // boundary is put back by the error path below.
+                    break Err(RequestError::Conflict {
+                        reason: "claim-lost".to_owned(),
+                        detail: Some(
+                            "the claim on this task was lost while the model was being asked"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    };
+    let asked = match call {
+        Ok(asked) => asked,
+        Err(e) => {
+            // The boundary goes back, so the step can be retried. That is a write, so
+            // the lock is taken again for it — briefly, and only on the failure path.
+            let why = e.to_string();
+            let mut g = governed.lock().await;
+            release_to_boundary(&mut g, &id, &worker, claim_generation, &why);
+            return Err(e);
+        }
+    };
+
+    // The lock is taken again for the write, and the store's own fencing decides
+    // whether the write is allowed: the task must still be `Running` under this
+    // worker's live lease, or the proposal is refused and the boundary released.
+    //
+    // The fence's clock is read *inside* the store's `IMMEDIATE` transaction, after
+    // the provider wait, so a lease that lapsed without a refusal from the heartbeat
+    // loop is still refused here. A pre-wait timestamp would make this check
+    // vacuous.
+    let mut g = governed.lock().await;
     let disclosed_json = disclosure_json(&asked.disclosed);
     match asked.outcome {
         // The model says the work is finished. Completed through the same fenced engine
@@ -2140,14 +2353,15 @@ async fn continue_task<S: SecretsContract>(
         // so there is nothing here it could have been used to smuggle (ADR-0047).
         crate::proposer::ProposalOutcome::Done { summary } => {
             let finished =
-                g.2.complete_task_with(
+                g.2.complete_task_with_at_write(
                     &id,
                     &worker,
-                    now,
+                    claim_generation,
                     TaskState::Completed,
                     false,
                     Some(&format!("no work required: {summary}")),
                     None,
+                    crate::task_service::now_ms,
                 )
                 .map_err(task_fault)?;
             Ok(json!({
@@ -2178,7 +2392,7 @@ async fn continue_task<S: SecretsContract>(
         }
         crate::proposer::ProposalOutcome::Step(validated) => {
             let canonical = orxnud_policy::canonical_params(&validated.params);
-            let proposal_id = format!("p-{task_id}-{now}");
+            let proposal_id = format!("p-{task_id}-{claimed_at}");
             let proposer = delegated_actor(
                 &delegated_by,
                 &task_id,
@@ -2191,16 +2405,16 @@ async fn continue_task<S: SecretsContract>(
                     proposal_id: &proposal_id,
                     task_id: &task_id,
                     worker: &worker,
+                    claim_generation,
                     validated: &validated,
                     canonical_params: canonical.as_str(),
                     proposer: &proposer,
-                    now,
                 },
             ) {
                 Ok(row) => row,
                 Err(e) => {
                     let why = e.to_string();
-                    release_to_boundary(&mut g, &id, &worker, now, &why);
+                    release_to_boundary(&mut g, &id, &worker, claim_generation, &why);
                     return Err(e);
                 }
             };
@@ -2338,6 +2552,22 @@ fn release_observations<S: SecretsContract>(
     Ok(crate::observation::DisclosureBatch::from_released(released))
 }
 
+/// How often a claimed step's lease is renewed while the model is being asked.
+///
+/// A third of the lease, which is the cadence the engine's own limits document:
+/// "A heartbeat every 10 s gives three chances to renew before expiry" (30 s
+/// lease, 10 s heartbeat). A third of the *live* lease means a renewal that is
+/// delayed once still has two chances left, and a renewal that is delayed twice
+/// has one.
+///
+/// The interval is derived from the engine's own limits rather than written down
+/// here, so a runtime built with a shorter lease renews on the shorter cadence
+/// instead of against a constant that belongs to another configuration.
+fn renewal_interval(tasks: &TaskService) -> std::time::Duration {
+    let lease_ms = tasks.limits().lease_duration_ms;
+    std::time::Duration::from_millis(u64::try_from(lease_ms / 3).unwrap_or(1).max(1))
+}
+
 /// Returns a claimed step to its boundary so continuation can be retried.
 ///
 /// The claim and the proposal are two writes, and only the second one is wanted if the
@@ -2354,17 +2584,20 @@ fn release_to_boundary<S: SecretsContract>(
     g: &mut (Daemon, S, TaskService),
     id: &TaskId,
     worker: &str,
-    now: i64,
+    claim_generation: i64,
     why: &str,
 ) {
-    if let Err(e) = g.2.complete_task_with(
+    // The release is itself a fenced state change, so it samples the clock where the
+    // write happens rather than inheriting a timestamp captured before the failed call.
+    if let Err(e) = g.2.complete_task_with_at_write(
         id,
         worker,
-        now,
+        claim_generation,
         TaskState::AwaitingNextStep,
         false,
         Some(why),
         None,
+        crate::task_service::now_ms,
     ) {
         tracing::error!(
             error = ?e,
@@ -3062,6 +3295,7 @@ fn settle_unverified(
     tasks: &mut TaskService,
     task_id: &TaskId,
     worker: &str,
+    claim_generation: i64,
     // Grouped so the call site reads as the three facts it is passing and the arity stays
     // under the lint's limit without an `#[allow]`.
     finding: (Certainty, bool, &str),
@@ -3101,7 +3335,16 @@ fn settle_unverified(
     // authority ended while the capability was running, which is a fact the caller needs
     // and not an internal fault -- so it is mapped to `CONFLICT` by the V-90 taxonomy.
     let row = tasks
-        .complete_task_with(task_id, worker, now_ms, target, false, Some(&detail), None)
+        .complete_task_with(
+            task_id,
+            worker,
+            claim_generation,
+            now_ms,
+            target,
+            false,
+            Some(&detail),
+            None,
+        )
         .map_err(|f| match f {
             TaskFault::Fenced => RequestError::Conflict {
                 reason: "lease-lost-during-execution".to_owned(),
@@ -3197,6 +3440,27 @@ fn unverified_reason(o: &orxnud_capability::verification::VerificationOutcome) -
             "the effect could not be established"
         }
     }
+}
+
+/// Rebuilds the inert action from the durable proposal.
+///
+/// `step` is the **logical step** (`proposal.step_no`), not the attempt number. A
+/// retried step keeps its step number and advances its attempt, so the two are not
+/// interchangeable: the capability-facing step and the policy's correlation label both
+/// read this field, and passing `attempt_no` made a retry claim to be a different step.
+fn action_from_proposal(
+    proposal: &orxnud_store::task_repo::ProposalRow,
+    params: serde_json::Value,
+) -> orxnud_domain::ActionRequest {
+    orxnud_domain::ActionRequest::new(
+        proposal.task_id.clone(),
+        orxnud_domain::ids::RunId::new(proposal.task_id.as_str()),
+        proposal.step_no,
+        orxnud_domain::CapabilityId::new(proposal.capability.as_str()),
+        params,
+        orxnud_domain::DataClass::Public,
+        orxnud_domain::DataClass::Public,
+    )
 }
 
 /// The wire projection of one proposal row.
@@ -3431,6 +3695,8 @@ async fn execute_proposal<S: SecretsContract>(
         .reserve_effect(
             &effect_key,
             &proposal.task_id,
+            &worker,
+            began.claim_generation,
             // From the proposal, not recomputed. The proposal is the durable record of
             // which step and attempt this execution is, and the reservation has to
             // describe the same execution `recover()` will later ask about.
@@ -3473,15 +3739,7 @@ async fn execute_proposal<S: SecretsContract>(
             });
         }
     };
-    let action = orxnud_domain::ActionRequest::new(
-        proposal.task_id.clone(),
-        orxnud_domain::ids::RunId::new(proposal.task_id.as_str()),
-        proposal.attempt_no,
-        orxnud_domain::CapabilityId::new(proposal.capability.as_str()),
-        stored_params,
-        orxnud_domain::DataClass::Public,
-        orxnud_domain::DataClass::Public,
-    );
+    let action = action_from_proposal(&proposal, stored_params);
     let context = orxnud_domain::InvocationContext::new(
         format!("proposal-{proposal_id}"),
         30_000,
@@ -3644,6 +3902,7 @@ async fn execute_proposal<S: SecretsContract>(
         let step = orxnud_store::task_repo::VerifiedStep {
             task_id: began.task_id.clone(),
             worker: &worker,
+            claim_generation: began.claim_generation,
             step_no,
             proposal_id: &proposal_id,
             status: orxnud_store::task_repo::StepStatus::Verified,
@@ -3677,6 +3936,7 @@ async fn execute_proposal<S: SecretsContract>(
             &mut g.2,
             &began.task_id,
             &worker,
+            began.claim_generation,
             (
                 certainty_of(&o.verification),
                 idempotent,
@@ -5272,6 +5532,7 @@ async fn tasks<S: SecretsContract>(
             Ok(json!({
                 "task": task_json(&claimed.row),
                 "attempt": claimed.attempt_no,
+                "claim_generation": claimed.claim_generation,
                 "lease_expires_at_ms": claimed.lease_expires_at_ms,
             }))
         }
@@ -5283,8 +5544,15 @@ async fn tasks<S: SecretsContract>(
             // `Completed` is fixed by the method name, and it is reachable only from
             // `running` through the engine's fence. A `pending` task has no lease, so
             // this cannot complete one — the refusal comes back as `fenced`.
+            let claim_generation = required_claim_generation(&params)?;
             let row = tasks
-                .complete_task(&TaskId::new(id), &worker, now, TaskState::Completed)
+                .complete_task(
+                    &TaskId::new(id),
+                    &worker,
+                    claim_generation,
+                    now,
+                    TaskState::Completed,
+                )
                 .map_err(task_fault)?;
             Ok(json!({ "task": task_json(&row) }))
         }
@@ -5324,11 +5592,13 @@ async fn tasks<S: SecretsContract>(
             // Derived from the task and the instant, so two proposals for one attempt in
             // the same millisecond collide in the primary key rather than both existing.
             let proposal_id = format!("p-{task_id}-{now}");
+            let claim_generation = required_claim_generation(&params)?;
             let row = tasks
                 .propose_action(
                     &proposal_id,
                     &TaskId::new(task_id.as_str()),
                     &worker,
+                    claim_generation,
                     &orxnud_domain::CapabilityId::new(capability.as_str()),
                     target,
                     canonical.as_str(),
@@ -5450,6 +5720,7 @@ fn task_json(row: &orxnud_store::task_repo::TaskRow) -> serde_json::Value {
         "state": row.state.as_wire_str(),
         "priority": row.priority,
         "attempts": row.attempts,
+        "claim_generation": row.claim_generation,
         "max_attempts": row.max_attempts,
         // The step bound next to the attempt bound, because a caller that set one wants
         // to see the other: `max_steps` is what decides whether a verified step finishes
@@ -5471,6 +5742,28 @@ fn task_json(row: &orxnud_store::task_repo::TaskRow) -> serde_json::Value {
         "fire_time_ms": row.fire_time_ms,
         "last_error": row.last_error,
     })
+}
+
+/// Reads a required claim generation.
+///
+/// The generation is the only value that names one lease acquisition. A request that
+/// does not carry it cannot be attributed to a claim, so it is refused rather than
+/// defaulted to a value that might match a newer claimant.
+fn required_claim_generation(params: &serde_json::Value) -> Result<i64, RequestError> {
+    match params.get("claim_generation") {
+        Some(serde_json::Value::Number(n)) => n.as_i64().ok_or_else(|| {
+            RequestError::Invalid("`claim_generation` must be an integer".to_owned())
+        }),
+        Some(serde_json::Value::String(s)) => s
+            .parse::<i64>()
+            .map_err(|_| RequestError::Invalid("`claim_generation` must be an integer".to_owned())),
+        None | Some(serde_json::Value::Null) => Err(RequestError::Invalid(
+            "`claim_generation` is required".to_owned(),
+        )),
+        Some(_) => Err(RequestError::Invalid(
+            "`claim_generation` must be an integer".to_owned(),
+        )),
+    }
 }
 
 /// Reads a required string parameter.
@@ -5856,7 +6149,8 @@ mod tests {
                         now,
                     )
                     .expect("the task");
-                tasks.claim_task(&task_id, "w1", now).expect("the claim");
+                let claimed = tasks.claim_task(&task_id, "w1", now).expect("the claim");
+                let claim_generation = claimed.claim_generation;
 
                 let governed = tokio::sync::Mutex::new((daemon, NoSecrets, tasks));
                 let observations =
@@ -5875,7 +6169,7 @@ mod tests {
                 let proposed = ai_propose(
                     &request(
                         "task/ai-propose",
-                        serde_json::json!({"task": task_id.to_string(), "worker": "w1"}),
+                        serde_json::json!({"task": task_id.to_string(), "worker": "w1", "claim_generation": claim_generation}),
                     ),
                     AuthenticatedPrincipal::InstallationOwner,
                     &governed,
@@ -6259,7 +6553,8 @@ mod tests {
                     now,
                 )
                 .expect("the task");
-            tasks.claim_task(&task_id, "w1", now).expect("the claim");
+            let claimed = tasks.claim_task(&task_id, "w1", now).expect("the claim");
+            let claim_generation = claimed.claim_generation;
 
             let governed = tokio::sync::Mutex::new((daemon, NoSecrets, tasks));
             let observations = std::sync::Mutex::new(crate::observation::ObservationStore::new());
@@ -6278,7 +6573,7 @@ mod tests {
             let proposed = ai_propose(
                 &request(
                     "task/ai-propose",
-                    serde_json::json!({"task": task_id.to_string(), "worker": "w1"}),
+                    serde_json::json!({"task": task_id.to_string(), "worker": "w1", "claim_generation": claim_generation}),
                 ),
                 AuthenticatedPrincipal::InstallationOwner,
                 &governed,
@@ -6859,6 +7154,24 @@ mod tests {
                 status: "approved".to_owned(),
                 decided_at_ms: None,
             }
+        }
+
+        #[test]
+        fn the_action_step_is_the_logical_step_not_the_attempt() {
+            let mut proposal = ai_proposal("scripted/none");
+            proposal.step_no = 7;
+            proposal.attempt_no = 3;
+
+            let action = action_from_proposal(&proposal, json!({"path": "a.txt"}));
+
+            assert_eq!(
+                action.step, 7,
+                "the capability and the policy must see the logical step"
+            );
+            assert_ne!(
+                action.step, proposal.attempt_no,
+                "a retry keeps its step; the attempt is not a step"
+            );
         }
 
         fn approval() -> orxnud_domain::ApprovalRecord {
@@ -7512,7 +7825,9 @@ mod effect_status_for_dispatch_failure_tests {
         {
             let mut c = rusqlite::Connection::open(&db).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).migrate(&db).expect("migrate");
+            MigrationRunner::new(&c)
+                .migrate(&db, &orxnud_platform_fs::OsIdentity)
+                .expect("migrate");
             let mut repo = TaskRepository::new(&mut c);
             repo.insert(&NewTask::new(tid.clone(), TaskKind::Query, NOW), NOW)
                 .expect("insert");
@@ -7521,9 +7836,19 @@ mod effect_status_for_dispatch_failure_tests {
                 Ok(TargetedClaimOutcome::Claimed(_))
             ));
             // Non-idempotent, which is the only case where repeating the effect can do harm.
-            repo.reserve_effect(&key, &tid, 1, 1, "filesystem/write-text", false, NOW)
-                .expect("reserve")
-                .expect("inserted");
+            repo.reserve_effect(
+                &key,
+                &tid,
+                "w1",
+                1,
+                1,
+                1,
+                "filesystem/write-text",
+                false,
+                NOW,
+            )
+            .expect("reserve")
+            .expect("inserted");
             assert!(
                 repo.resolve_effect(&key, status, None, NOW + 1)
                     .expect("resolve")
@@ -7861,7 +8186,9 @@ mod effect_status_for_dispatch_failure_tests {
         {
             let mut c = rusqlite::Connection::open(&db).expect("open");
             Pragma::critical().apply(&c).expect("pragmas");
-            MigrationRunner::new(&c).migrate(&db).expect("migrate");
+            MigrationRunner::new(&c)
+                .migrate(&db, &orxnud_platform_fs::OsIdentity)
+                .expect("migrate");
             let mut repo = TaskRepository::new(&mut c);
             repo.insert(
                 &NewTask::new(TaskId::new("k1-task"), TaskKind::Query, NOW),
@@ -7880,6 +8207,8 @@ mod effect_status_for_dispatch_failure_tests {
                 repo.reserve_effect(
                     &key,
                     &TaskId::new("k1-task"),
+                    "w1",
+                    1,
                     1,
                     1,
                     "filesystem/write-text",
@@ -8049,7 +8378,9 @@ mod effect_status_for_dispatch_failure_tests {
             {
                 let mut c = rusqlite::Connection::open(&db).expect("open");
                 Pragma::critical().apply(&c).expect("pragmas");
-                MigrationRunner::new(&c).migrate(&db).expect("migrate");
+                MigrationRunner::new(&c)
+                    .migrate(&db, &orxnud_platform_fs::OsIdentity)
+                    .expect("migrate");
                 let mut repo = TaskRepository::new(&mut c);
                 repo.insert(&NewTask::new(tid.clone(), TaskKind::Query, NOW), NOW)
                     .expect("insert");
@@ -8059,9 +8390,19 @@ mod effect_status_for_dispatch_failure_tests {
                 ));
                 // Non-idempotent, because that is the only case where repeating the
                 // effect can do harm.
-                repo.reserve_effect(&key, &tid, 1, 1, "filesystem/write-text", false, NOW)
-                    .expect("reserve")
-                    .expect("inserted");
+                repo.reserve_effect(
+                    &key,
+                    &tid,
+                    "w1",
+                    1,
+                    1,
+                    1,
+                    "filesystem/write-text",
+                    false,
+                    NOW,
+                )
+                .expect("reserve")
+                .expect("inserted");
                 assert!(
                     repo.resolve_effect(&key, status, None, NOW + 1)
                         .expect("resolve")

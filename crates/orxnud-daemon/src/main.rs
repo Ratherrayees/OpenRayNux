@@ -585,6 +585,11 @@ async fn serve(
         eprintln!("{}", argv_payload_banner(&exposure));
     }
 
+    // The state root's privacy status, printed before the endpoint is announced: an
+    // operator reading a log that says "serving" should not have to guess whether
+    // the durable state underneath is private.
+    eprintln!("{}", privacy_banner(runtime.privacy_outcome()));
+
     let endpoint = runtime.endpoint().to_path_buf();
     eprintln!(
         "orxnud: serving {} on {} (durable audit: {})",
@@ -658,6 +663,9 @@ fn doctor(paths: &Paths) {
     };
     let endpoint = orxnud_platform_ipc::endpoint_for(&paths.root);
     let socket_present = endpoint.exists();
+    // The two observations the report below is built from. Read, never written.
+    let root_privacy = orxnud_platform_fs::observe_owner_only(&paths.root, 0o700);
+    let database_privacy = orxnud_platform_fs::observe_owner_only(&paths.database, 0o600);
 
     println!("orxnud {}", env!("CARGO_PKG_VERSION"));
     println!(
@@ -692,10 +700,100 @@ fn doctor(paths: &Paths) {
     // create a user namespace and every Tier-1 capability is refused. So the guarantees
     // are printed too, and the verdict says whether a Tier-1 capability can run here.
     print!("{}", orxnud_platform_sandbox::host_capability().report());
+    // The privacy of the installation, **as observed**.
+    //
+    // This used to report the *platform's capability* -- "this build has Unix mode
+    // bits, therefore the state root is owner-only" -- and that was false about the
+    // installation in front of the operator. A state root left at 0755 by a build
+    // that did not restrict it is world-readable, and `doctor` said it was not.
+    //
+    // So the modes are read and reported. `doctor` creates nothing and changes
+    // nothing: it is a diagnosis, and a diagnosis that repairs what it diagnoses
+    // cannot be re-read to check the repair.
+    println!(
+        "state root privacy: {}",
+        owner_only_summary("the state root", &root_privacy)
+    );
+    println!(
+        "database privacy: {}",
+        owner_only_summary("the database", &database_privacy)
+    );
     println!("durable security state: the audit_log and spent_approvals tables inside");
     println!("  {}", paths.database.display());
     println!("  both are attached and verified before the endpoint is bound");
     println!("(no paths were created; --doctor only reports)");
+}
+
+/// The startup banner for the state root's privacy status.
+///
+/// Extracted for the same reason as the argv banner: the wording an operator
+/// reads is a testable value, and this one carries a claim that must not be
+/// overstated.
+///
+/// The wording differs by outcome, and the difference is the whole point.
+/// `Restricted` says the state root is owner-only. `NotApplicable` says the
+/// platform has no owner-only mechanism, that the state root inherits the ACL
+/// of the per-user state root above it, and that this is **not** owner-only and
+/// is unproven here (V-29). It does not say the daemon is unsafe, because the
+/// daemon does not run on such a platform at all — the local IPC transport
+/// refuses there — and it does not claim a protection that was not applied.
+fn privacy_banner(outcome: orxnud_domain::platform::PrivacyOutcome) -> String {
+    match outcome {
+        orxnud_domain::platform::PrivacyOutcome::Restricted => {
+            "orxnud: state root privacy RESTRICTED -- the state root was made owner-only \
+             (0700) before anything was created inside it, and the database was opened \
+             only after it too was made owner-only (0600). A snapshot beside them -- \
+             taken or adopted -- and a restore staging image are made owner-only too."
+                .to_owned()
+        }
+        orxnud_domain::platform::PrivacyOutcome::NotApplicable => {
+            "orxnud: state root privacy NOT APPLICABLE -- this platform has no \
+             owner-only file mechanism, so no mode was set. The state root inherits \
+             the ACL of the per-user state root above it, which is a different \
+             mechanism with a different threat model: it is NOT owner-only, and it \
+             is unproven here (V-29). Nothing in this daemon claims otherwise."
+                .to_owned()
+        }
+    }
+}
+
+/// The operator-facing text for one observed owner-only status.
+///
+/// # Why this says what was observed
+///
+/// The wording is the whole point. A report that says "owner-only" must have
+/// **looked**; a report that says "this platform supports owner-only access" is
+/// saying something else, and an operator reading it as the first would be
+/// misled about the state of their own data.
+///
+/// So the five states are distinguished, and the compliant one carries the mode
+/// that was seen:
+///
+/// * **owner-only** -- the path is at the mode it must be;
+/// * **NOT owner-only** -- the path exists and other accounts may reach it, and
+///   the mode that was observed is named;
+/// * **absent** -- there is nothing to be private;
+/// * **unverified** -- the path could not be inspected, so nothing is claimed;
+/// * **not applicable** -- the platform has no owner-only mechanism, so the
+///   status could not be established at all.
+fn owner_only_summary(what: &str, status: &orxnud_platform_fs::OwnerOnlyStatus) -> String {
+    use orxnud_platform_fs::OwnerOnlyStatus as S;
+    match status {
+        S::OwnerOnly => format!("owner-only ({what} is private to its owner)"),
+        S::Permissive { mode } => {
+            format!("NOT owner-only ({what} is at mode {mode:04o}; another account may reach it)")
+        }
+        S::Absent => format!("absent ({what} does not exist)"),
+        S::Unreadable { reason } => {
+            format!("unverified (could not inspect {what}: {reason})")
+        }
+        S::NotApplicable => format!(
+            "not applicable -- this platform has no owner-only file mechanism, so the \
+             protection of {what} could not be established; the directory inherits the \
+             ACL of the per-user state root above it, which is NOT owner-only, and is \
+             unproven (V-29)"
+        ),
+    }
 }
 
 /// The startup banner for the argv-payload disclosure.

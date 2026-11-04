@@ -70,6 +70,12 @@ pub struct TaskRecord {
     pub lease_expires_at_ms: Option<i64>,
     /// The worker currently holding the lease, if any.
     pub lease_holder: Option<String>,
+    /// The durable claim generation returned when this record was claimed.
+    ///
+    /// A completion must present this value as well as the worker name: the worker can
+    /// reclaim a recovered task under the same name, while this generation names exactly
+    /// one acquisition.
+    pub claim_generation: i64,
     /// Whether repeating this task is safe.
     pub idempotent: bool,
     /// Whether an external effect has been observed.
@@ -93,6 +99,7 @@ impl TaskRecord {
             attempts: 0,
             lease_expires_at_ms: None,
             lease_holder: None,
+            claim_generation: 0,
             idempotent: kind.idempotent_by_default(),
             effect_observed: false,
             last_error: None,
@@ -152,10 +159,12 @@ pub trait TaskEngine {
     /// **Must** return an error if the caller's lease has expired **or** the task
     /// has been re-claimed. That refusal is TP-5's entire mechanism, and an
     /// engine that cannot refuse here is non-conforming.
+    #[allow(clippy::too_many_arguments)]
     fn complete(
         &mut self,
         id: &TaskId,
         worker: &str,
+        claim_generation: i64,
         now_ms: i64,
         state: TaskState,
         effect_observed: bool,
@@ -290,6 +299,7 @@ property!(tp2_exactly_once_where_required, |e, c| {
     e.complete(
         &tid,
         "w1",
+        rec.claim_generation,
         c.now_ms(),
         TaskState::NeedsVerification,
         true,
@@ -469,6 +479,7 @@ property!(tp5_expired_leases_cannot_execute, |e, c| {
     if e.complete(
         &t1id,
         "zombie",
+        r.claim_generation,
         c.now_ms(),
         TaskState::Completed,
         true,
@@ -497,10 +508,9 @@ property!(tp5_expired_leases_cannot_execute, |e, c| {
     let second = e
         .claim("zombie2", c.now_ms())
         .map_err(|err| violation(format!("claim failed: {err}")))?;
-    if let Claim::Claimed(_) = second {
-    } else {
+    let Claim::Claimed(second_claim) = second else {
         return Err(violation("expected to claim the second task"));
-    }
+    };
     c.advance(lease_ms + 1);
     e.recover(c.now_ms())
         .map_err(|err| violation(format!("recover failed: {err}")))?;
@@ -513,6 +523,7 @@ property!(tp5_expired_leases_cannot_execute, |e, c| {
         && e.complete(
             &t2id,
             "zombie2",
+            second_claim.claim_generation,
             c.now_ms(),
             TaskState::Completed,
             true,
@@ -552,6 +563,7 @@ property!(tp6_retries_never_inherit_approvals, |e, c| {
     e.complete(
         &tid,
         "w1",
+        rec.claim_generation,
         c.now_ms(),
         TaskState::Failed,
         false,
@@ -630,6 +642,7 @@ property!(tp11_dead_letter_is_terminal, |e, c| {
                 e.complete(
                     &tid,
                     "w",
+                    r.claim_generation,
                     c.now_ms(),
                     TaskState::Failed,
                     false,
@@ -669,12 +682,19 @@ property!(tp12_side_effects_are_accounted_for, |e, c| {
     let first = e
         .claim("w1", c.now_ms())
         .map_err(|err| violation(format!("claim failed: {err}")))?;
-    if let Claim::Claimed(_) = first {
-    } else {
+    let Claim::Claimed(first_claim) = first else {
         return Err(violation("expected to claim"));
-    }
-    e.complete(&t1id, "w1", c.now_ms(), TaskState::Completed, true, None)
-        .map_err(|err| violation(format!("complete failed: {err}")))?;
+    };
+    e.complete(
+        &t1id,
+        "w1",
+        first_claim.claim_generation,
+        c.now_ms(),
+        TaskState::Completed,
+        true,
+        None,
+    )
+    .map_err(|err| violation(format!("complete failed: {err}")))?;
     let Some(a) = e.get(&t1id) else {
         return Err(violation("completed task vanished"));
     };
@@ -691,13 +711,13 @@ property!(tp12_side_effects_are_accounted_for, |e, c| {
     let second = e
         .claim("w2", c.now_ms())
         .map_err(|err| violation(format!("claim failed: {err}")))?;
-    if let Claim::Claimed(_) = second {
-    } else {
+    let Claim::Claimed(second_claim) = second else {
         return Err(violation("expected to claim the second task"));
-    }
+    };
     e.complete(
         &t2id,
         "w2",
+        second_claim.claim_generation,
         c.now_ms(),
         TaskState::NeedsVerification,
         true,

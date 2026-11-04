@@ -110,7 +110,9 @@ fn open_engine(path: &Path) -> DurableEngine {
     let conn = Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -372,6 +374,7 @@ fn approved_waiting_task(path: &Path, id: &str, digest_hex: &str) {
         .claim_task("preparer", NOW)
         .expect("claim")
         .expect("a task to claim")
+        .row
         .attempts;
 
     let mut repo = TaskRepository::new(e.conn_mut());
@@ -394,6 +397,7 @@ fn approved_waiting_task(path: &Path, id: &str, digest_hex: &str) {
             "proposal-under-test",
             &tid(id),
             "preparer",
+            1,
             "filesystem/write-text",
             Some("out.txt"),
             r#"{"path":"out.txt","contents":"x"}"#,
@@ -525,6 +529,7 @@ fn a_competing_state_change_is_a_classified_refusal_on_the_proposal_path() {
                     "second-proposal",
                     &tid("t"),
                     "w-a",
+                    1,
                     "filesystem/write-text",
                     Some("out.txt"),
                     r#"{"path":"out.txt","contents":"x"}"#,
@@ -569,6 +574,7 @@ fn a_competing_cancellation_makes_the_contender_wait_and_then_see_the_new_state(
             e.claim_task("w1", NOW)
                 .expect("claim")
                 .expect("claimed")
+                .row
                 .state,
             TaskState::Running
         );
@@ -811,6 +817,7 @@ fn two_recoveries_racing_settle_each_orphan_exactly_once() {
             e.claim_task("doomed", NOW)
                 .expect("claim")
                 .expect("claimed")
+                .row
                 .state,
             TaskState::Running
         );
@@ -876,6 +883,7 @@ fn four_recoveries_racing_still_settle_each_orphan_exactly_once() {
             e.claim_task("doomed", NOW)
                 .expect("claim")
                 .expect("claimed")
+                .row
                 .state,
             TaskState::Running
         );
@@ -944,6 +952,7 @@ fn recovery_racing_a_claim_leaves_exactly_one_owner() {
             e.claim_task("doomed", NOW)
                 .expect("claim")
                 .expect("claimed")
+                .row
                 .state,
             TaskState::Running
         );
@@ -968,7 +977,7 @@ fn recovery_racing_a_claim_leaves_exactly_one_owner() {
     let claim = claimant
         .claim_task("late-claimer", NOW)
         .expect("claim")
-        .map(|c| c.id);
+        .map(|c| c.row.id);
 
     let check = open_engine(&db);
     let row = check

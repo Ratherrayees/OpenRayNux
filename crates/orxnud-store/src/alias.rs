@@ -50,7 +50,8 @@
 use std::path::{Path, PathBuf};
 
 use orxnud_domain::platform::{
-    FileFacts, FileId, FilesystemIdentity, SqliteMainDatabase, SqliteMainFacts,
+    FileFacts, FileId, FilesystemIdentity, PrivacyError, PrivacyOutcome, SqliteMainDatabase,
+    SqliteMainFacts,
 };
 
 use crate::ownership::{ExclusiveOwnership, OwnershipError, SharedOwnership};
@@ -183,9 +184,10 @@ impl std::fmt::Display for AliasRefusal {
 
 /// Why a database open did not produce a usable connection.
 ///
-/// Three causes, kept apart because they demand opposite responses: the ownership
+/// Four causes, kept apart because they demand opposite responses: the ownership
 /// lease could not be taken, the file was refused on its own terms (alias
-/// safety), or SQLite refused to open it.
+/// safety), the file could not be made private to its owner, or SQLite refused
+/// to open it.
 #[derive(Debug)]
 pub enum OpenFailure {
     /// The ownership lease could not be established.
@@ -199,6 +201,24 @@ pub enum OpenFailure {
         path: std::path::PathBuf,
         /// Why it could not be shown to be safe.
         reason: AliasRefusal,
+    },
+    /// The database could not be restricted to its owner.
+    ///
+    /// The platform creates the database with the process's umask applied, which
+    /// under the common `022` is world-readable. A store that opened it anyway
+    /// would hold the user's task text, the parameters a model proposed to act
+    /// on, the approval ledger and the audit journal in a file every other
+    /// account on the machine can read. So the open is refused instead.
+    ///
+    /// Distinct from [`OpenFailure::Alias`]: an alias refusal says the file may
+    /// be reached through a second name, and a privacy refusal says the file is
+    /// reachable by *everyone*. The second is the worse of the two, and it is
+    /// the one that is easiest to miss.
+    Privacy {
+        /// The database path.
+        path: std::path::PathBuf,
+        /// Why it could not be restricted.
+        reason: PrivacyError,
     },
     /// SQLite refused the open.
     Sqlite {
@@ -216,6 +236,9 @@ impl std::fmt::Display for OpenFailure {
             Self::Alias { path, reason } => {
                 write!(f, "refusing to open {}: {reason}", path.display())
             }
+            Self::Privacy { path, reason } => {
+                write!(f, "refusing to open {}: {reason}", path.display())
+            }
             Self::Sqlite { path, source } => {
                 write!(f, "cannot open {}: sqlite error: {source}", path.display())
             }
@@ -228,6 +251,7 @@ impl std::error::Error for OpenFailure {
         match self {
             Self::Ownership(e) => Some(e),
             Self::Alias { .. } => None,
+            Self::Privacy { .. } => None,
             Self::Sqlite { source, .. } => Some(source),
         }
     }
@@ -331,6 +355,51 @@ impl SidecarGuard {
             }
         }
         Ok(Self { paths: observed })
+    }
+
+    /// Restrict the sidecars that exist to their owner (`0600`).
+    ///
+    /// # When it runs
+    ///
+    /// After WAL mode has been applied, because that is when SQLite materialises
+    /// `-wal` and `-shm` — and it creates them with the same umask-derived mode
+    /// as the database, so a database restricted to `0600` beside
+    /// world-readable sidecars would leak the same rows the sidecar holds.
+    ///
+    /// It runs **after** [`Self::verify_after_open`] rather than before, so a
+    /// sidecar this module has just refused to touch is never modified.
+    ///
+    /// # Errors
+    ///
+    /// An [`OpenFailure::Privacy`] when a sidecar that exists cannot be
+    /// restricted, and a [`OpenFailure::Alias`] when a sidecar that exists
+    /// cannot be shown to be safe.
+    pub(crate) fn restrict_to_owner(
+        &self,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<(), OpenFailure> {
+        for path in &self.paths {
+            match identity.observe(path) {
+                // Gone. SQLite removes a sidecar when the last connection
+                // closes, so its absence is not an anomaly.
+                FileFacts::Absent => continue,
+                FileFacts::Known { .. } => {
+                    identity.restrict_file_to_owner(path).map_err(|reason| {
+                        OpenFailure::Privacy {
+                            path: path.clone(),
+                            reason,
+                        }
+                    })?;
+                }
+                FileFacts::Unknown { platform } => {
+                    return Err(OpenFailure::Alias {
+                        path: path.clone(),
+                        reason: AliasRefusal::Unknown { platform },
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Verify the sidecars after the database has been opened, and — for an
@@ -564,7 +633,15 @@ pub(crate) fn observe_after_open(
 pub(crate) fn open_shared(
     db_path: &Path,
     identity: &dyn FilesystemIdentity,
-) -> Result<(rusqlite::Connection, SharedOwnership, SidecarGuard), OpenFailure> {
+) -> Result<
+    (
+        rusqlite::Connection,
+        SharedOwnership,
+        SidecarGuard,
+        PrivacyOutcome,
+    ),
+    OpenFailure,
+> {
     // The sidecars are observed **before** the lease is taken, and therefore
     // before any roll-forward install the lease acquisition may perform. An
     // aliased sidecar must be refused before *any* destructive work, not only
@@ -586,7 +663,36 @@ pub(crate) fn open_shared(
     let main = identity.observe_sqlite_main(SqliteMainDatabase::new(&conn));
     let post = post_check(db_path, identity, pre)?;
     main_check(db_path, main, pre, post)?;
-    Ok((conn, ownership, sidecars))
+    // The database is made private to its owner as part of the open, and the
+    // open is **refused** if it cannot be.
+    //
+    // It happens here, after the alias checks and before any `PRAGMA` or WAL
+    // work, for two reasons. It is after, so a file this module has just
+    // refused to touch is never modified — the alias refusal is a statement
+    // about the file, and changing a file you just called unsafe is not
+    // something a reader of this module would expect. It is before, because
+    // the WAL sidecars this connection is about to materialise are created with
+    // the same umask-derived mode, and a database that is private beside
+    // world-readable sidecars is only half private.
+    //
+    // The platform creates the file; the store cannot change that with a
+    // portable call, so the store asks the platform through the capability it
+    // was already handed. See `FilesystemPrivacy`.
+    //
+    // **The decision, stated here so it is stated once.** `Restricted` and
+    // `NotApplicable` both let the open proceed, and they are not the same
+    // answer: `NotApplicable` means the platform has **no** owner-only mechanism
+    // to apply, so the open proceeds and the outcome is **carried out of the
+    // open and recorded**, rather than the store implying a restriction it did
+    // not make. An error is a refusal and never reaches this line.
+    let privacy =
+        identity
+            .restrict_file_to_owner(db_path)
+            .map_err(|reason| OpenFailure::Privacy {
+                path: db_path.to_path_buf(),
+                reason,
+            })?;
+    Ok((conn, ownership, sidecars, privacy))
 }
 
 /// Opens `db_path` under the alias-safety contract, holding an **exclusive**
@@ -607,7 +713,15 @@ pub(crate) fn open_exclusive(
     db_path: &Path,
     held: Option<ExclusiveOwnership>,
     identity: &dyn FilesystemIdentity,
-) -> Result<(rusqlite::Connection, ExclusiveOwnership, SidecarGuard), OpenFailure> {
+) -> Result<
+    (
+        rusqlite::Connection,
+        ExclusiveOwnership,
+        SidecarGuard,
+        PrivacyOutcome,
+    ),
+    OpenFailure,
+> {
     // As in `open_shared`: the sidecars are observed before the lease, so an
     // aliased one is refused before the restore's checkpoint or its install.
     let sidecars =
@@ -627,7 +741,16 @@ pub(crate) fn open_exclusive(
     let main = identity.observe_sqlite_main(SqliteMainDatabase::new(&conn));
     let post = post_check(db_path, identity, pre)?;
     main_check(db_path, main, pre, post)?;
-    Ok((conn, ownership, sidecars))
+    // As in `open_shared`: the database is made private to its owner as part of
+    // the open, and the open is refused if it cannot be.
+    let privacy =
+        identity
+            .restrict_file_to_owner(db_path)
+            .map_err(|reason| OpenFailure::Privacy {
+                path: db_path.to_path_buf(),
+                reason,
+            })?;
+    Ok((conn, ownership, sidecars, privacy))
 }
 
 /// The pre-open observation, reported as an open failure.

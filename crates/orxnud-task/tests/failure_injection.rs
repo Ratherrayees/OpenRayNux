@@ -138,7 +138,9 @@ fn open_engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -233,7 +235,17 @@ fn child_main() -> ! {
     // An external effect is reserved *before* it is dispatched, so a crash here
     // leaves an unresolved ledger row -- TP-12's "outcome unknown".
     let key = DurableEngine::idempotency_key(&t, "external-call", "initial");
-    let reserved = e.reserve_effect(&key, &t, 1, claimed.attempts, "external-call", false, NOW);
+    let reserved = e.reserve_effect(
+        &key,
+        &t,
+        "victim",
+        claimed.claim_generation,
+        1,
+        claimed.attempts,
+        "external-call",
+        false,
+        NOW,
+    );
     assert!(
         reserved.expect("reserve"),
         "the first reservation must succeed"
@@ -249,8 +261,16 @@ fn child_main() -> ! {
         park();
     }
 
-    e.complete(&t, "victim", NOW, TaskState::Completed, true, None)
-        .expect("complete");
+    e.complete(
+        &t,
+        "victim",
+        claimed.claim_generation,
+        NOW,
+        TaskState::Completed,
+        true,
+        None,
+    )
+    .expect("complete");
 
     if stop_here("after-complete-before-ack") {
         // The task is terminal and the effect happened. The process that was about
@@ -598,8 +618,21 @@ fn a_crash_never_produces_a_duplicate_side_effect() {
     {
         let mut e = open_engine(&db);
         assert!(
-            !e.reserve_effect(&key, &tid("fault-task"), 1, 2, "external-call", false, NOW)
-                .expect("reserve"),
+            !e.reserve_effect(
+                &key,
+                &tid("fault-task"),
+                "victim",
+                e.task(&tid("fault-task"))
+                    .expect("read")
+                    .expect("present")
+                    .claim_generation,
+                1,
+                2,
+                "external-call",
+                false,
+                NOW
+            )
+            .expect("reserve"),
             "the reservation from the killed process must still block a re-dispatch"
         );
         // Which is why the retry must go to verification rather than retrying.

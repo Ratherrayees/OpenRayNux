@@ -307,6 +307,156 @@ impl<'a> SqliteMainDatabase<'a> {
     }
 }
 
+/// What the platform did about owner-only access.
+///
+/// # Why this is an answer and not a boolean
+///
+/// "The path is private" and "this platform has no way to make a path private" are
+/// different facts, and a caller that cannot tell them apart is a caller that will
+/// report a guarantee it does not have. The repository already draws this distinction
+/// for the filesystem-identity capability: [`SqliteMainFacts::NotApplicable`] ("this
+/// platform has no API for the question") is kept apart from
+/// [`SqliteMainFacts::Unknown`] ("the platform supports the check but could not
+/// establish the facts"), precisely so that "no evidence available" never reads as
+/// "checked and fine".
+///
+/// The same distinction is needed here, and for a stronger reason: the store **refuses**
+/// to open a database it cannot make private. A boolean would have to mean either
+/// "private" or "not private", and the second reading would make every Windows open a
+/// refusal — which is not the contract this product has, and which would break the
+/// Windows portability lane for a protection the platform does not offer anyway.
+/// So the answer names what happened, and the caller decides.
+///
+/// # What `NotApplicable` does and does not mean
+///
+/// It means **the platform offers no owner-only mechanism**, not "the path is private
+/// by another means" and not "the check was skipped". On Windows the state root
+/// inherits the ACL of the per-user state root it lives under, which is a different
+/// mechanism with a different threat model and is **not** owner-only. A caller
+/// receiving `NotApplicable` must say so rather than record a restriction it did not
+/// apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyOutcome {
+    /// Owner-only access was established, and the caller may rely on it.
+    Restricted,
+    /// This platform has no owner-only access mechanism to establish.
+    ///
+    /// Not an error: the platform is not failing, it is answering a different
+    /// question. It is also not a pass — nothing was restricted.
+    NotApplicable,
+}
+
+impl PrivacyOutcome {
+    /// Whether owner-only access was actually established.
+    ///
+    /// The one question a caller must not skip. `NotApplicable` is **not** a pass, and
+    /// a caller that treats it as one is the exact failure this type exists to
+    /// prevent.
+    #[must_use]
+    pub fn is_restricted(self) -> bool {
+        matches!(self, Self::Restricted)
+    }
+}
+
+/// Why a path could not be restricted to its owner.
+///
+/// Every variant is a **refusal**, and none of them is ever converted into a
+/// successful restriction. ADR-0046's rule applies here exactly as it applies
+/// to a sandbox guarantee: a missing guarantee is a refusal to assert, not a
+/// test to skip. A platform that cannot express owner-only access does not
+/// fall back to a weaker-looking success — "the mode was not changed" is not
+/// the same answer as "the path is private", and a caller that cannot tell
+/// them apart is the caller that opens a world-readable database.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrivacyError {
+    /// The platform could not perform the restriction.
+    #[error("cannot restrict {path} to its owner: {reason}")]
+    Unavailable {
+        /// The path involved.
+        path: String,
+        /// Why the platform could not do it.
+        reason: String,
+    },
+    /// The path is not a regular file, so owner-only *file* access does not apply.
+    ///
+    /// A separate variant from [`PrivacyError::Unavailable`] because the remedy
+    /// differs: this path is the wrong kind of object, not a path the platform
+    /// could not handle.
+    #[error("{path} is not a regular file, so it cannot be restricted as one")]
+    NotAFile {
+        /// The path involved.
+        path: String,
+    },
+    /// The path is not a directory, so owner-only *directory* access does not apply.
+    #[error("{path} is not a directory, so it cannot be restricted as one")]
+    NotADirectory {
+        /// The path involved.
+        path: String,
+    },
+}
+
+/// The filesystem-privacy capability: restricting a path to its owner.
+///
+/// # Why the store needs it
+///
+/// A database holds the user's task text, the parameters a model proposed to
+/// act on, the approval ledger and the audit journal. The platform creates that
+/// file, and it creates it with the process's umask applied — `0644` under the
+/// common `022`, which is **world-readable**. The store cannot change that
+/// with a portable call of its own: the mode bits are an operating-system
+/// opinion, and gate **G3** exists precisely so that a portable crate does not
+/// express one. So the store asks the platform, through the capability it is
+/// already given, and **refuses the open** if the answer is that the file
+/// cannot be made private.
+///
+/// # Why refusing is the right answer
+///
+/// A store that opened a world-readable database and carried on would be
+/// exactly the failure this capability exists to prevent, one layer up: the
+/// file would be private in every record the store writes and readable by
+/// every other account on the machine. The alternative — opening it anyway and
+/// recording that the mode was not what was wanted — trades a refusal for a
+/// disclosure.
+///
+/// # The two operations, and why they are separate
+///
+/// A *file* is restricted to `0600` and a *directory* to `0700`, and the two are
+/// not interchangeable: `0600` on a directory removes the owner's own ability
+/// to traverse it, and `0700` on a file is a different thing entirely. Two
+/// methods say which is meant, so a caller cannot ask for the wrong one and get
+/// it.
+///
+/// # What the answer means
+///
+/// The return value is a [`PrivacyOutcome`], not a unit. `Restricted` means the
+/// protection was established and the caller may rely on it. `NotApplicable` means
+/// the platform has no such mechanism — which is **not** a pass, and which the
+/// caller must not record as one. An error means the platform could have done it
+/// and did not, which the store treats as a refusal to open.
+pub trait FilesystemPrivacy {
+    /// Restricts the regular file at `path` so that only its owner may read or
+    /// write it.
+    ///
+    /// # Errors
+    ///
+    /// [`PrivacyError`] when the platform could not do it, or when the path is
+    /// not a regular file.
+    fn restrict_file_to_owner(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<PrivacyOutcome, PrivacyError>;
+
+    /// Restricts the directory at `path` so that only its owner may enter it or
+    /// list it.
+    ///
+    /// # Errors
+    ///
+    /// [`PrivacyError`] when the platform could not do it, or when the path is
+    /// not a directory.
+    fn restrict_dir_to_owner(&self, path: &std::path::Path)
+    -> Result<PrivacyOutcome, PrivacyError>;
+}
+
 /// The filesystem-identity capability ADR-0058 requires.
 ///
 /// # The direction
@@ -324,7 +474,19 @@ impl<'a> SqliteMainDatabase<'a> {
 /// pair would then describe two different files while looking like one
 /// observation. One call is one resolution, so what it reports is internally
 /// consistent.
-pub trait FilesystemIdentity {
+///
+/// # Why it extends [`FilesystemPrivacy`]
+///
+/// Because the store must be able to *keep* what it opens private, and because
+/// the capability it is handed is the one place a platform opinion may live. A
+/// store that could observe a file but not restrict it would have to choose
+/// between opening a world-readable database and refusing to open it at all —
+/// and the store's own answer to that question is the same one the project
+/// already gives everywhere else: **refuse**. Making privacy a supertrait
+/// rather than a second parameter means the store's existing capability is the
+/// one that has to answer it, so a caller cannot hand the store an
+/// identity-only implementation and get a permissive default.
+pub trait FilesystemIdentity: FilesystemPrivacy {
     /// What the platform can establish about `path`.
     ///
     /// Implementations must not invent a safe-looking answer. A metadata error,
@@ -448,6 +610,31 @@ pub trait NotifyContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`NotApplicable` is not a restriction.**
+    ///
+    /// The whole point of [`PrivacyOutcome`] is that a caller can tell "the
+    /// protection was established" from "this platform has no such mechanism".
+    /// If `is_restricted` ever answered `true` for `NotApplicable`, a caller
+    /// that skipped the question would report a guarantee it does not have — and
+    /// that is the exact failure the type exists to prevent. So it is pinned
+    /// here, on every platform, rather than only where the Windows arm runs.
+    #[test]
+    fn not_applicable_is_not_a_restriction() {
+        assert!(
+            PrivacyOutcome::Restricted.is_restricted(),
+            "a restriction that was applied must report as one"
+        );
+        assert!(
+            !PrivacyOutcome::NotApplicable.is_restricted(),
+            "a platform with no owner-only mechanism must not report as if it had one"
+        );
+        assert_ne!(
+            PrivacyOutcome::Restricted,
+            PrivacyOutcome::NotApplicable,
+            "the two answers must be distinguishable at all"
+        );
+    }
 
     #[test]
     fn secret_ref_uses_the_uniform_service_name() {

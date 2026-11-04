@@ -721,7 +721,7 @@ fn engine(path: &Path) -> DurableEngine {
     let store = orxnud_store::sqlite::Store::open(path, true, &orxnud_platform_fs::OsIdentity)
         .expect("open the store");
     orxnud_store::migration::MigrationRunner::new(store.conn())
-        .migrate(path)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
         .expect("migrate");
     DurableEngine::new(store.into_connection(), EngineLimits::documented()).expect("engine")
 }
@@ -765,7 +765,11 @@ fn durable_task_transitions_cost_what_they_should() {
         create.push(t0.elapsed());
 
         let t0 = Instant::now();
-        e.claim_task_id(&id, "w1", NOW).expect("claim");
+        let claimed = e.claim_task_id(&id, "w1", NOW).expect("claim");
+        let claim_generation = match claimed {
+            orxnud_task::engine::ClaimAttempt::Claimed(c) => c.claim_generation,
+            _ => 0,
+        };
         claim.push(t0.elapsed());
 
         let t0 = Instant::now();
@@ -773,6 +777,7 @@ fn durable_task_transitions_cost_what_they_should() {
             &format!("p-{i}"),
             &id,
             "w1",
+            claim_generation,
             &orxnud_domain::ids::CapabilityId::new("filesystem/write-text"),
             Some("out.txt"),
             r#"{"contents":"x","path":"out.txt"}"#,
@@ -785,8 +790,16 @@ fn durable_task_transitions_cost_what_they_should() {
         propose.push(t0.elapsed());
 
         let t0 = Instant::now();
-        e.complete_task(&id, "w1", NOW, TaskState::Completed, true, None)
-            .expect("complete");
+        e.complete_task(
+            &id,
+            "w1",
+            claim_generation,
+            NOW,
+            TaskState::Completed,
+            true,
+            None,
+        )
+        .expect("complete");
         complete.push(t0.elapsed());
     }
 
@@ -915,7 +928,7 @@ fn tier1_sandbox_overhead_is_measured_or_declined() {
             .as_bytes(),
         )
         .expect("create");
-        send_raw(
+        let claimed = send_raw(
             &endpoint,
             format!(
                 r#"{{"jsonrpc":"2.0","id":"cl","method":"task/claim","params":{{"id":"{id}","worker":"w1"}}}}"#
@@ -923,10 +936,13 @@ fn tier1_sandbox_overhead_is_measured_or_declined() {
             .as_bytes(),
         )
         .expect("claim");
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let p = send_raw(
             &endpoint,
             format!(
-                r#"{{"jsonrpc":"2.0","id":"p","method":"task/propose","params":{{"task":"{id}","worker":"w1","capability":"filesystem/write-text","target":"out.txt","params":{{"path":"out.txt","contents":"x"}}}}}}"#
+                r#"{{"jsonrpc":"2.0","id":"p","method":"task/propose","params":{{"task":"{id}","worker":"w1","capability":"filesystem/write-text","target":"out.txt","claim_generation":{claim_generation},"params":{{"path":"out.txt","contents":"x"}}}}}}"#
             )
             .as_bytes(),
         )

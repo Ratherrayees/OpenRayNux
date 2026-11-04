@@ -32,14 +32,70 @@
 //! that path, because no behavioural test can observe which function a caller
 //! chose.
 
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use orxnud_domain::platform::FilesystemIdentity;
+use orxnud_domain::platform::{FileFacts, FilesystemIdentity, PrivacyError};
 
-use crate::backup::{Backup, BackupError};
+use crate::alias::{AliasRefusal, PreObservation};
+use crate::backup::{Backup, BackupError, VerifiedSnapshot};
 use crate::sqlite::StoreError;
+
+/// What securing an adopted snapshot produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Secured {
+    /// The file is private to its owner, and it is still the file that was
+    /// verified. The adoption may proceed.
+    Ready,
+    /// The file is **gone**.
+    ///
+    /// A competing migrator finished first and discarded the snapshot it took.
+    /// There is nothing left to make private, nothing to protect and nothing to
+    /// adopt, so the caller takes a fresh snapshot instead.
+    Gone,
+}
+
+/// Serialises the snapshot decision, publication, migration and discard for one database.
+///
+/// The database lease is **shared** on the migration path, so it does not exclude a
+/// second migrator. The snapshot pathname is not covered by any SQLite transaction, and
+/// publication replaces that pathname atomically. Two migrators can therefore overwrite
+/// or discard each other's recovery point. This lock is taken only when a migration is
+/// pending, held until the result (including any recovery obligation) is returned, and
+/// released by the operating system if the process dies.
+///
+/// It is a separate zero-byte sidecar beside the canonical snapshot path. It holds no
+/// user data; its only purpose is mutual exclusion.
+struct SnapshotLock {
+    _file: std::fs::File,
+}
+
+impl SnapshotLock {
+    fn path_for(db_path: &Path) -> PathBuf {
+        let mut path = Backup::path_for(db_path).into_os_string();
+        path.push(".lock");
+        PathBuf::from(path)
+    }
+
+    fn acquire(db_path: &Path) -> Result<Self, MigrationError> {
+        let path = Self::path_for(db_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| MigrationError::SnapshotLock {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock()
+            .map_err(|source| MigrationError::SnapshotLock { path, source })?;
+        Ok(Self { _file: file })
+    }
+}
 
 /// A migration failure.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +108,34 @@ pub enum MigrationError {
         /// The underlying error.
         #[source]
         source: rusqlite::Error,
+    },
+
+    /// The recorded schema history is not a contiguous sequence starting at 1.
+    ///
+    /// `applied_version` used to return the **maximum** recorded version, which made a
+    /// history like `1, 2, 14` indistinguishable from an intact `1..=14`: the runner
+    /// saw "current" and did nothing, leaving the database without the tables that
+    /// versions 3..13 were supposed to create. A gap is corruption or tampering, not a
+    /// migration state, and there is no safe version at which to start forward work.
+    #[error("database schema history is incomplete: {detail}")]
+    IncompleteHistory {
+        /// What was actually recorded.
+        detail: String,
+    },
+
+    /// The database was written by a newer schema than this binary knows.
+    ///
+    /// Treating the unknown maximum as "already current" silently opens a database
+    /// whose tables and constraints this build does not understand. The refusal is
+    /// deliberate and happens before a snapshot is taken or a statement is run.
+    #[error(
+        "database schema version {found} is newer than this binary supports (maximum {supported})"
+    )]
+    UnsupportedVersion {
+        /// The version found on disk.
+        found: u32,
+        /// The highest version this binary implements.
+        supported: u32,
     },
 
     /// The migration failed and a snapshot is waiting to be restored (S-31).
@@ -82,6 +166,123 @@ pub enum MigrationError {
     /// Taking or verifying the pre-migration snapshot failed.
     #[error("snapshot protection failed: {0}")]
     Snapshot(#[from] BackupError),
+
+    /// The exclusive snapshot-path lock could not be acquired.
+    ///
+    /// Migrations of one database are serialised from the snapshot decision through
+    /// publication and discard. Without that lock, one migrator's successful `discard`
+    /// could remove a competing migrator's recovery point, because the snapshot pathname
+    /// is shared while the database lease is only shared. A lock failure means the
+    /// migration did not run and no snapshot was disturbed.
+    #[error("could not lock the pre-migration snapshot path at {path}: {source}")]
+    SnapshotLock {
+        /// The lock path.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// An existing snapshot could not be **made private** to its owner, so it was
+    /// **not** adopted as the recovery point and the migration did not proceed.
+    ///
+    /// A distinct variant rather than a `Snapshot` failure because the two demand
+    /// opposite responses. A `Snapshot` failure means "no usable copy exists" and
+    /// the remedy is to take a new one. This one means **a usable copy exists and
+    /// was left exactly where it was**: overwriting it to work around a permission
+    /// failure would destroy the only good copy of the database, so the file is
+    /// preserved and the migration refuses.
+    ///
+    /// It is also deliberately **not** an ownership failure. Nobody else holds this
+    /// snapshot; the platform simply could not make it private, and an operator
+    /// sent to look for a competing process is being sent to the wrong place.
+    #[error("snapshot at {path} could not be made private to its owner: {reason}")]
+    SnapshotPrivacy {
+        /// The snapshot that was left in place.
+        path: std::path::PathBuf,
+        /// Why it could not be made private.
+        reason: PrivacyError,
+    },
+    /// An existing snapshot could not be **shown to be safe** — it was reachable
+    /// through more than one name, or the path was replaced while it was being
+    /// secured — so it was **not** adopted and the migration did not proceed.
+    ///
+    /// The snapshot is left exactly where it was, for the same reason as
+    /// [`Self::SnapshotPrivacy`]: it may be the only good copy of the database.
+    #[error("snapshot at {path} could not be shown to be safe: {reason}")]
+    SnapshotAliasUnsafe {
+        /// The snapshot that was left in place.
+        path: std::path::PathBuf,
+        /// Why it could not be shown to be safe.
+        reason: AliasRefusal,
+    },
+
+    /// An existing snapshot carries **no provenance**, so it cannot be shown to
+    /// be a snapshot of *this* database, and it was **not** adopted.
+    ///
+    /// A distinct variant rather than a `Snapshot` failure because the two
+    /// demand opposite responses. A `Snapshot` failure means "no usable copy
+    /// exists" and the remedy is to take a new one. This one means **a file that
+    /// verifies sits at the canonical path and cannot be tied to this database**:
+    /// it was left by a build that predates the provenance table, or it is a
+    /// database that belongs to something else, and there is no way to tell those
+    /// apart from the file alone.
+    ///
+    /// The file is **left exactly where it was**. Overwriting it to work around
+    /// the missing provenance would destroy the only good copy of the database —
+    /// and the replacement would be a snapshot of the database as it is *now*,
+    /// which is not the pre-migration state the recovery point is for.
+    #[error(
+        "the snapshot at {path} carries no database identity, so it cannot be shown to be a \
+         snapshot of this database; it was left in place. Move it aside and retry"
+    )]
+    SnapshotProvenanceMissing {
+        /// The snapshot that was left in place.
+        path: std::path::PathBuf,
+    },
+
+    /// An existing snapshot carries **another database's** identity, so it is
+    /// not a snapshot of this one, and it was **not** adopted.
+    ///
+    /// This is the cross-database case: the file at the canonical path is a
+    /// complete, healthy database that belongs to a different installation — a
+    /// state directory copied from another machine, a template, a database
+    /// restored from elsewhere. Every structural check it passes; the one check
+    /// it fails is the one that matters.
+    ///
+    /// Adopting it would make the recovery obligation point at the other
+    /// installation's data, and the restore that follows would install that data
+    /// over this database — this database's rows replaced by another
+    /// installation's, with the store reporting success throughout.
+    #[error(
+        "the snapshot at {path} was taken from a different database (its identity is {found}, \
+         this database's is {expected}); it was left in place. Move it aside and retry"
+    )]
+    SnapshotProvenanceMismatch {
+        /// The snapshot that was left in place.
+        path: std::path::PathBuf,
+        /// The identity of the database being migrated.
+        expected: String,
+        /// The identity the snapshot carries.
+        found: String,
+    },
+
+    /// The database could not be given a **provenance identity**, so the
+    /// migration did not proceed.
+    ///
+    /// The identity is what binds a pre-migration snapshot to the database it
+    /// protects. Without it a snapshot cannot be shown to belong to this
+    /// database, so the migration refuses rather than adopt one it cannot vouch
+    /// for — and the refusal here is *earlier* than that: the identity could not
+    /// be written at all.
+    ///
+    /// Nothing was migrated and no snapshot was taken. The database is otherwise
+    /// unchanged.
+    #[error("the database could not be given a provenance identity: {source}")]
+    ProvenanceUnavailable {
+        /// The underlying error.
+        #[source]
+        source: rusqlite::Error,
+    },
 
     /// A migration failed **and the snapshot could not be restored**.
     ///
@@ -295,10 +496,18 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "task_proposal_identity",
         sql: crate::schema::MIGRATION_PROPOSAL_IDENTITY,
     },
+    Migration {
+        // CONC-002. `attempts` is deliberately per-step and is reset at a completed
+        // boundary, so it cannot distinguish every lease acquisition. This separate,
+        // durable counter is incremented in the same UPDATE that grants a claim.
+        version: 15,
+        name: "task_claim_generation",
+        sql: crate::schema::MIGRATION_CLAIM_GENERATION,
+    },
 ];
 
 /// The schema version a fully migrated Phase 2 database reports.
-pub const CURRENT_VERSION: u32 = 14;
+pub const CURRENT_VERSION: u32 = 15;
 
 /// Applies pending migrations.
 #[derive(Debug)]
@@ -317,7 +526,10 @@ impl<'a> MigrationRunner<'a> {
     ///
     /// # Errors
     ///
-    /// [`MigrationError::Failed`] if `schema_meta` is absent or unreadable.
+    /// [`MigrationError::Failed`] if `schema_meta` is absent or unreadable,
+    /// [`MigrationError::IncompleteHistory`] if its versions are not contiguous
+    /// `1..=max`, or [`MigrationError::UnsupportedVersion`] if the maximum is newer
+    /// than [`CURRENT_VERSION`].
     pub fn applied_version(&self) -> Result<u32, MigrationError> {
         Self::applied_version_on(self.conn)
     }
@@ -339,12 +551,40 @@ impl<'a> MigrationRunner<'a> {
         if table_count == 0 {
             return Ok(0);
         }
-        conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_meta;",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|source| MigrationError::Failed { version: 0, source })
+        let (recorded, lowest, highest): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MIN(version), 0), COALESCE(MAX(version), 0) \
+                 FROM schema_meta;",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|source| MigrationError::Failed { version: 0, source })?;
+        if recorded == 0 {
+            return Ok(0);
+        }
+        // A history is only trustworthy if it is exactly `1..=highest`. Counting
+        // rows rather than trusting `MAX` is what makes the `1, 2, 14` case visible:
+        // three recorded versions cannot describe the fourteen-step history the
+        // maximum claims. A negative or zero version is equally not a history this
+        // runner wrote.
+        if lowest != 1 || recorded != highest || highest < 1 {
+            return Err(MigrationError::IncompleteHistory {
+                detail: format!(
+                    "schema_meta records {recorded} versions from {lowest} to {highest}; \
+                     expected the contiguous sequence 1..={highest}"
+                ),
+            });
+        }
+        let highest = u32::try_from(highest).map_err(|_| MigrationError::IncompleteHistory {
+            detail: format!("schema_meta records an out-of-range version {highest}"),
+        })?;
+        if highest > CURRENT_VERSION {
+            return Err(MigrationError::UnsupportedVersion {
+                found: highest,
+                supported: CURRENT_VERSION,
+            });
+        }
+        Ok(highest)
     }
 
     /// Applies every pending migration to a database with **no durable copy**.
@@ -392,6 +632,24 @@ impl<'a> MigrationRunner<'a> {
     /// variant named for a refusal that can no longer happen advertises a guarantee the
     /// type no longer has.
     pub fn migrate_ephemeral(&self) -> Result<Vec<u32>, MigrationError> {
+        // Refuse a corrupt or newer history before writing anything, including the
+        // provenance identity. The per-migration check below runs inside a transaction,
+        // but by then the identity has already been written; a history that cannot be
+        // trusted is not a reason to mutate the database first.
+        self.applied_version()?;
+
+        // The provenance identity is part of the shape of a database this store
+        // owns, so it is created here as well as on the snapshotting path.
+        //
+        // The reason is convergence: an ephemeral database and a migrated one
+        // must have the **same tables**, or "the schema contains exactly the
+        // declared tables" would be true of one and false of the other, and the
+        // test that says so would be describing a schema that does not ship.
+        //
+        // On the snapshotting path the identity is created *earlier* — before the
+        // snapshot is taken, so that the snapshot carries it — and this call
+        // finds it already there.
+        Self::ensure_database_identity(self.conn)?;
         let mut applied = Vec::new();
         for m in MIGRATIONS {
             // Re-checked **inside** the transaction, per migration, rather than filtered
@@ -485,12 +743,46 @@ impl<'a> MigrationRunner<'a> {
     /// verified, [`MigrationError::Failed`] if a migration failed (snapshot
     /// restored), or [`MigrationError::RestoreFailed`] if a migration failed
     /// *and* the restore failed.
-    pub fn migrate(&self, db_path: &Path) -> Result<Vec<u32>, MigrationError> {
+    ///
+    /// # The snapshot is private to its owner
+    ///
+    /// The pre-migration snapshot is a full copy of the database, and the platform
+    /// creates it with the process's umask applied. `identity` is therefore
+    /// **required**: it is how the snapshot is made owner-only before it is
+    /// published, and a migration that cannot take a private snapshot refuses.
+    pub fn migrate(
+        &self,
+        db_path: &Path,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Vec<u32>, MigrationError> {
         let current = self.applied_version()?;
-        let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > current).collect();
-        if pending.is_empty() {
+        if MIGRATIONS.iter().all(|m| m.version <= current) {
             return Ok(Vec::new());
         }
+
+        // From here through the recovery obligation, no other migrator of this database
+        // may publish or discard the shared snapshot pathname. The version is re-read
+        // under the lock: another migrator may have completed between the check above
+        // and this acquisition.
+        let _snapshot_lock = SnapshotLock::acquire(db_path)?;
+        let current = self.applied_version()?;
+        if MIGRATIONS.iter().all(|m| m.version <= current) {
+            return Ok(Vec::new());
+        }
+
+        // The database is given its **provenance identity** before anything else
+        // happens, and that order is the whole of the mechanism.
+        //
+        // The identity is what a pre-migration snapshot carries, and a snapshot
+        // can only carry it if the identity is already in the database when the
+        // copy is taken. So the identity is written first, and the snapshot —
+        // taken or adopted — is bound to it.
+        //
+        // It is written even though the migration may then refuse: the refusal
+        // is about the file at the canonical path, and this database is not that
+        // file. What it does *not* do is touch the file at the canonical path,
+        // which is the one thing the refusal is protecting.
+        let live_identity = Self::ensure_database_identity(self.conn)?;
 
         // The snapshot decision is made here, and there is no longer a parameter for a
         // caller to get wrong. The previous shape took
@@ -504,9 +796,43 @@ impl<'a> MigrationRunner<'a> {
         // A pre-existing snapshot file at the conventional path is still reused rather
         // than overwritten, because it may be the only good copy of a database whose last
         // migration failed. It is used only if it verifies against this database.
-        let snapshot = match Backup::verify(&Backup::path_for(db_path)) {
-            Ok(_) => Some(Backup::existing(Backup::path_for(db_path))),
-            Err(_) => Some(Backup::take(self.conn, db_path)?),
+        let canonical = Backup::path_for(db_path);
+        // The path is observed **before** the verification, so the identity the
+        // verification saw is the identity that is confirmed afterwards. An
+        // observation error is not fatal here: it only matters in the adoption
+        // branch below, and the take branch replaces the file at this name anyway.
+        let pre = crate::alias::observe_before_open(&canonical, identity);
+        let snapshot = match Backup::verify(&canonical) {
+            Ok(verified) => {
+                // The file exists and verified, so it is about to be **adopted** as
+                // the recovery point. A snapshot left behind by a build that did
+                // not restrict it is a world-readable copy of the user's entire
+                // durable state, and adopting it unchanged keeps it that way — so it
+                // is made private **first**, and the migration does not proceed if
+                // that cannot be done.
+                //
+                // The **provenance** check comes before that, and before anything
+                // else touches the file. "Verifies" says the file is a database;
+                // it does not say the file is a snapshot *of this database*, and a
+                // database belonging to something else verifies just as well. A
+                // file that cannot be shown to be ours is not modified, is not
+                // adopted, and is left where it is.
+                Self::require_snapshot_of_this_database(&canonical, &verified, &live_identity)?;
+                let pre = pre.map_err(|reason| MigrationError::SnapshotAliasUnsafe {
+                    path: canonical.clone(),
+                    reason,
+                })?;
+                match Self::secure_adopted_snapshot(&canonical, pre, identity)? {
+                    Secured::Ready => Some(Backup::existing(canonical)),
+                    // The snapshot was removed under us — most likely by a
+                    // competing migrator that finished and discarded the one it
+                    // took. There is nothing to adopt and nothing to protect, so
+                    // a fresh snapshot is taken rather than the open failing
+                    // over a file that is no longer there.
+                    Secured::Gone => Some(Backup::take(self.conn, db_path, identity)?),
+                }
+            }
+            Err(_) => Some(Backup::take(self.conn, db_path, identity)?),
         };
 
         match self.migrate_ephemeral() {
@@ -542,6 +868,275 @@ impl<'a> MigrationRunner<'a> {
             }
         }
     }
+
+    /// Makes an existing, verified snapshot private to its owner before it is adopted.
+    ///
+    /// # Why an adopted snapshot needs this
+    ///
+    /// A snapshot taken by this code is restricted before it is published, so it is
+    /// born `0600`. A snapshot left behind by an **earlier** build is not: it is
+    /// whatever the platform created, which under the common `022` is `0644` —
+    /// world-readable. Adopting it unchanged would keep a world-readable copy of
+    /// every task, every proposed action, the approval ledger and the audit journal
+    /// in the one place the operator is told to keep as their recovery point.
+    ///
+    /// # The order, and why each step is there
+    ///
+    /// 1. **The path must name a file with exactly one name.** The restriction
+    ///    changes the mode of an *inode*, so an inode reachable through a second
+    ///    name would have that other name's object changed as well. The store's own
+    ///    link-count rule refuses that, and reusing it here is the point: the same
+    ///    check that protects the database protects the copy of it.
+    /// 2. **The restriction goes through a descriptor.** `restrict_file_to_owner`
+    ///    opens the file once and `fchmod`s that descriptor, so the object whose mode
+    ///    changes is the object that was opened.
+    /// 3. **The path must still name the same file afterwards.** A path replaced
+    ///    between the observation and the restriction would otherwise be adopted
+    ///    without ever having been checked.
+    ///
+    /// # What it refuses, and what it preserves
+    ///
+    /// A refusal **leaves the snapshot exactly where it was**. It may be the only
+    /// good copy of a database whose last migration failed, and overwriting it to
+    /// work around a permission failure would destroy the recovery point the
+    /// refusal is protecting.
+    ///
+    /// # The platform without a mechanism
+    ///
+    /// A platform with no owner-only mechanism answers
+    /// [`orxnud_domain::platform::PrivacyOutcome::NotApplicable`], and the adoption
+    /// **proceeds** — there is no restriction to make, and refusing would break a
+    /// platform the product supports for storage. `NotApplicable` is never converted
+    /// into `Restricted`: the file is not private, and nothing here says that it is.
+    ///
+    /// # The file that is **gone**
+    ///
+    /// Two things can remove the file between the verification and here: a
+    /// competing migrator that finished and discarded the snapshot it took, and
+    /// an operator. There is then nothing to make private, nothing to protect and
+    /// nothing to adopt — and reporting that as a *privacy* failure would fail an
+    /// open that has lost nothing. So it is reported as what it is, and the
+    /// caller takes a fresh snapshot instead.
+    ///
+    /// This is not a rare interleaving. The canonical snapshot path is shared by
+    /// every process migrating the same database, and one of them finishing
+    /// successfully removes the file the others are looking at.
+    fn secure_adopted_snapshot(
+        path: &Path,
+        pre: PreObservation,
+        identity: &dyn FilesystemIdentity,
+    ) -> Result<Secured, MigrationError> {
+        if let Err(reason) = identity.restrict_file_to_owner(path) {
+            if Self::is_gone(path, identity) {
+                return Ok(Secured::Gone);
+            }
+            return Err(MigrationError::SnapshotPrivacy {
+                path: path.to_path_buf(),
+                reason,
+            });
+        }
+        // The identity must be unchanged: a path replaced while it was being secured
+        // is not the file that was verified.
+        if let Err(reason) = crate::alias::observe_after_open(path, identity, pre) {
+            if matches!(reason, AliasRefusal::Disappeared) {
+                return Ok(Secured::Gone);
+            }
+            return Err(MigrationError::SnapshotAliasUnsafe {
+                path: path.to_path_buf(),
+                reason,
+            });
+        }
+        Ok(Secured::Ready)
+    }
+
+    /// Whether `path` no longer names a file at all.
+    ///
+    /// The platform is asked rather than the filesystem being probed, because the
+    /// platform's answer is the one the rest of this module trusts: it is the
+    /// same observation that establishes the link count and the identity. A
+    /// platform that cannot answer says so, and a file that is still there is
+    /// treated as still there.
+    fn is_gone(path: &Path, identity: &dyn FilesystemIdentity) -> bool {
+        matches!(identity.observe(path), FileFacts::Absent)
+    }
+
+    /// Gives the database its provenance identity, if it does not have one yet, and
+    /// returns it.
+    ///
+    /// # Why this happens **before** the snapshot
+    ///
+    /// The identity is what binds a snapshot to the database it protects, and a
+    /// snapshot can only carry it if the identity is already in the database when
+    /// the copy is taken. So it is written first, and every snapshot this build
+    /// takes afterwards carries it.
+    ///
+    /// # Why it is written even when the migration may then refuse
+    ///
+    /// Because the refusal is about the file at the canonical path, and this
+    /// database is not that file. The identity is written to *this* database; the
+    /// refused file is not touched at all.
+    ///
+    /// # The race
+    ///
+    /// Two processes can open the same database and both reach this. The write
+    /// lock is taken up front (`IMMEDIATE`), the row is keyed by a constant, and
+    /// the insert is `ON CONFLICT DO NOTHING` — so the second process waits, then
+    /// finds the row the first one wrote, and reads *that* value back. The
+    /// identity is therefore the same for both, and there is exactly one.
+    ///
+    /// # Why there is no "it already has one" shortcut
+    ///
+    /// There was one, and it made the property untestable: it read the identity
+    /// and returned it without touching the row, so the insert's own semantics —
+    /// which are what decide whether an existing identity is *kept* — were never
+    /// exercised on a database that already had one. Replacing the insert with
+    /// one that overwrites was then a mutation no test could see.
+    ///
+    /// The shortcut saved one small write transaction on a path that only runs
+    /// when there is a migration to apply, and it cost the only thing that
+    /// matters here: the evidence that the identity is stable.
+    ///
+    /// # Errors
+    ///
+    /// [`MigrationError::ProvenanceUnavailable`] if the identity cannot be
+    /// written or read back.
+    fn ensure_database_identity(conn: &Connection) -> Result<String, MigrationError> {
+        let unavailable = |source| MigrationError::ProvenanceUnavailable { source };
+        let tx = crate::tx::authority_transaction(conn).map_err(unavailable)?;
+        tx.execute_batch(crate::schema::DATABASE_IDENTITY_DDL)
+            .map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO database_identity (singleton, id, created_at_ms) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO NOTHING;",
+            rusqlite::params![new_database_identity(), now_ms()],
+        )
+        .map_err(unavailable)?;
+        let id: String = tx
+            .query_row(
+                "SELECT id FROM database_identity WHERE singleton = 1;",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(id)
+    }
+
+    /// Requires that `verified` is a snapshot of the database whose identity is
+    /// `live_identity`.
+    ///
+    /// # What "verifies" does and does not say
+    ///
+    /// [`Backup::verify`] establishes that the file is a **database**: it opens,
+    /// it passes `integrity_check`, it has a `schema_meta` and that table has
+    /// rows. Every one of those is a statement about the file's *shape*. None of
+    /// them is a statement about *whose* it is, and a complete, healthy database
+    /// belonging to another installation passes all of them.
+    ///
+    /// That is not a hypothetical. The file at the canonical path is adopted
+    /// rather than replaced precisely because it may be the only good copy of a
+    /// database whose last migration failed — so it is also the file most likely
+    /// to be *stale*, and a state directory copied from another machine brings
+    /// its own `.pre-migration.bak` with it.
+    ///
+    /// # The two refusals
+    ///
+    /// * **No provenance at all** (`SnapshotProvenanceMissing`): the file was
+    ///   written by a build that predates the identity, or it is a foreign
+    ///   database. The file alone cannot tell those apart, and neither can this
+    ///   code, so the file is refused.
+    /// * **Another database's identity** (`SnapshotProvenanceMismatch`): the file
+    ///   says what it is, and it is not this.
+    ///
+    /// Both **leave the file exactly where it was**. It is not this store's to
+    /// delete, and it may be the only good copy of something.
+    fn require_snapshot_of_this_database(
+        path: &Path,
+        verified: &VerifiedSnapshot,
+        live_identity: &str,
+    ) -> Result<(), MigrationError> {
+        match &verified.identity {
+            None => Err(MigrationError::SnapshotProvenanceMissing {
+                path: path.to_path_buf(),
+            }),
+            Some(found) if found != live_identity => {
+                Err(MigrationError::SnapshotProvenanceMismatch {
+                    path: path.to_path_buf(),
+                    expected: live_identity.to_owned(),
+                    found: found.clone(),
+                })
+            }
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// The identity of the database `conn` is connected to, if it has one.
+///
+/// `None` for a database that has never been given one: one written by a build
+/// that did not have the provenance table, or one this store has never migrated.
+///
+/// The absence is reported as an absence rather than as an error, because "this
+/// database has no identity" and "this database is not a database" are different
+/// facts and only one of them is a failure.
+pub(crate) fn read_database_identity(conn: &Connection) -> Result<Option<String>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+
+    let has_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'database_identity';",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let id = conn
+        .query_row(
+            "SELECT id FROM database_identity WHERE singleton = 1;",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// A fresh identity for a database.
+///
+/// 128 bits, hex.
+///
+/// # Where the entropy comes from
+///
+/// `RandomState`'s keys are seeded by the operating system and incremented per
+/// instance, so two databases in one process get different values and neither
+/// is derivable from the other. Nothing in this crate needed a randomness
+/// dependency for it, and adding one for a discriminator would be a poor trade.
+///
+/// # What it is and is not
+///
+/// It is a **discriminator**, not a secret: it is stored in the database in the
+/// clear, and anyone who can read the database can read it. What it has to be
+/// is **unique per database instance** and **stable for the life of that
+/// instance**, because it is what says "this snapshot is a snapshot of that
+/// database".
+fn new_database_identity() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut first = RandomState::new().build_hasher();
+    let second = RandomState::new().build_hasher();
+    let entropy = second.finish();
+    first.write_u64(entropy);
+    first.write_u64(now_nanos());
+    first.write_u32(std::process::id());
+    format!("{:016x}{:016x}", first.finish(), entropy)
+}
+
+fn now_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn now_ms() -> i64 {
@@ -572,7 +1167,7 @@ pub fn open_and_migrate(
     // inherit. See `discard_failed_initialisation`.
     let pre_existing = path.exists();
     let store = crate::sqlite::Store::open(path, true, identity)?;
-    match MigrationRunner::new(store.conn()).migrate(path) {
+    match MigrationRunner::new(store.conn()).migrate(path, identity) {
         Ok(_) => Ok(store),
         Err(MigrationError::RecoveryRequired { source, snapshot }) => {
             // S-31: the store holds shared ownership for as long as it lives, so a restore
@@ -652,6 +1247,60 @@ pub fn recover_from_snapshot(
 /// file, or one whose first migration failed under an older build — and deleting that would
 /// destroy a user's data on the strength of a version check. Absence of `schema_meta` is not
 /// evidence of emptiness.
+///
+/// # The canonical snapshot, and why it is never removed here
+///
+/// The snapshot path (`<db>.pre-migration.bak`) is **not** removed by this cleanup,
+/// whatever is at it.
+///
+/// The reason is the rule the whole cleanup is built on: **it removes what this call
+/// created.** The file at the snapshot path is not this call's. This call publishes a
+/// snapshot there only on the paths that end in a recovery obligation — the paths where
+/// the caller restores it — so on every path that reaches this cleanup the file there is
+/// one that was **already** on disk before the call.
+///
+/// That file is not this store's to delete. It may be the only good copy of a pre-migration
+/// state, and it may be the file a refusal has just declined to adopt: a snapshot whose
+/// provenance is missing or belongs to another database is **refused** and **left in
+/// place**, and the refusal's message tells the operator to move it aside. A cleanup that
+/// then deletes it makes that message false and destroys the only recovery copy.
+///
+/// # Why there is no "it is only debris" exception
+///
+/// There was one, and it was wrong in a way no amount of care in the classification
+/// could fix. The exception classified the file at the path — by reading its first
+/// sixteen bytes — and then removed **the path**. Between those two steps the file at
+/// the path can change: another process migrating the same database publishes its own
+/// snapshot there, and the removal then deletes *that* snapshot, which is a valid
+/// recovery point of the same database.
+///
+/// Nothing prevents that interleaving. The lease is keyed on the **database** path, not
+/// the snapshot path; the migration path holds only a **shared** lease, which does not
+/// exclude another migrator; and this cleanup runs after the connection and the lease
+/// have been dropped, so it holds no ownership lock at all. Publication is a
+/// `rename` over the canonical path, which is atomic as a replacement and takes no lock
+/// this cleanup honours. SQLite's own locking covers the database file, not the
+/// snapshot path.
+///
+/// A `dev`/`inode` comparison immediately before the unlink does not close the window
+/// either — it narrows it to the instructions between the comparison and the unlink —
+/// and a same-directory rename would move whatever occupies the path at that instant,
+/// which is the same harm under a different name. On POSIX there is no unlink-by-descriptor,
+/// so the only way to remove *that* file is to unlink a name that is known to refer to it,
+/// and the canonical path is not such a name.
+///
+/// So the cleanup does not touch the canonical path at all, and the check-then-remove
+/// sequence is gone rather than narrowed.
+///
+/// # What is left at the canonical path, and who replaces it
+///
+/// A stale **non-database** file may sit at the canonical path until the next
+/// successful migration publishes a fresh snapshot over it. That is safe, and it needs
+/// no special handling: `Backup::verify` refuses a file that is not a database, so the
+/// next migration takes the **take** branch, and `Backup::publish` renames the staged
+/// copy over the canonical path — an atomic replacement, staged, verified, restricted and
+/// alias-checked exactly as any other published snapshot is. The stale file is replaced
+/// by that publication, not by the cleanup.
 pub(crate) fn discard_failed_initialisation(db_path: &Path, pre_existing: bool) {
     if pre_existing {
         return;
@@ -659,16 +1308,14 @@ pub(crate) fn discard_failed_initialisation(db_path: &Path, pre_existing: bool) 
     // The sidecars too. A `-wal` without its database is not inert: SQLite may recreate
     // the database from it on the next open, which is precisely the stale-data problem
     // S-30 exists to prevent, one step removed.
-    // The snapshot goes too. `Backup::take` does not clean up after itself: if the copy or
-    // the verification fails partway, the file it created stays on disk. On this path there
-    // is nothing to recover from, so that file is debris -- and debris with a snapshot's
-    // name is worse than none, because the *next* start's `migrate` adopts any existing
-    // file at this path that verifies, and an empty database's snapshot can verify.
+    //
+    // The canonical snapshot path is deliberately **not** in this list. See above: it is
+    // not this call's file, and no pathname-based classification can bind a removal to
+    // the file it classified.
     for path in [
         db_path.to_path_buf(),
         wal_sidecar(db_path),
         shm_sidecar(db_path),
-        Backup::path_for(db_path),
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -727,6 +1374,78 @@ mod tests {
             .apply(&c)
             .expect("apply pragmas");
         c
+    }
+
+    /// A history like `1, 2, 14` used to look "current" because only `MAX(version)`
+    /// was read, so the runner skipped versions 3..13 and opened a database with none
+    /// of their tables. The maximum is not a history; the gap is a refusal.
+    #[test]
+    fn a_gapped_schema_history_is_refused_rather_than_treated_as_current() {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE schema_meta (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_meta VALUES (1, 'schema_meta', 0);
+             INSERT INTO schema_meta VALUES (2, 'tasks', 0);
+             INSERT INTO schema_meta VALUES (14, 'task_proposal_identity', 0);",
+        )
+        .expect("stage a gapped history");
+
+        let err = MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect_err("a gap must not be treated as a current schema");
+        assert!(
+            err.to_string().contains("schema history"),
+            "the refusal must name the history, not a generic SQL failure: {err}"
+        );
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_meta;", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(
+            recorded, 3,
+            "a refused migration must not rewrite the history"
+        );
+    }
+
+    /// A newer database is not "already current"; it is a schema this binary cannot
+    /// understand. The old maximum-only read returned `Ok([])` and opened it.
+    #[test]
+    fn a_newer_schema_version_is_refused_rather_than_silently_accepted() {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE schema_meta (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );",
+        )
+        .expect("stage schema_meta");
+        for version in 1..=CURRENT_VERSION + 1 {
+            conn.execute(
+                "INSERT INTO schema_meta VALUES (?1, 'future', 0);",
+                [i64::from(version)],
+            )
+            .expect("record");
+        }
+
+        let err = MigrationRunner::new(&conn)
+            .migrate_ephemeral()
+            .expect_err("a newer schema must not be accepted");
+        assert!(
+            err.to_string().contains("newer than this binary"),
+            "the refusal must say the database is newer: {err}"
+        );
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_meta;", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(
+            recorded,
+            i64::from(CURRENT_VERSION) + 1,
+            "a refused migration must not rewrite the future history"
+        );
     }
 
     #[test]
@@ -1162,16 +1881,11 @@ mod tests {
                 conn.busy_timeout(std::time::Duration::from_secs(10))
                     .expect("busy timeout");
                 // Either this thread applied the migrations or found them already applied;
-                // both are success. What must never happen is a hard failure.
-                //
-                // Ephemeral on purpose. All four threads share one database path, so
-                // `migrate` would have them race for the single snapshot at
-                // `Backup::path_for`, and the test would fail on snapshot contention
-                // instead of on the lock behaviour it exists to pin. The snapshot path has
-                // its own coverage (`migrate` takes and verifies one before touching a
-                // file); this test is about `IMMEDIATE` transactions.
+                // both are success. What must never happen is a hard failure. This now
+                // drives the production `migrate` path, so the snapshot lock is part of
+                // what the four concurrent callers exercise.
                 MigrationRunner::new(&conn)
-                    .migrate_ephemeral()
+                    .migrate(&p, &orxnud_platform_fs::OsIdentity)
                     .map(|_| ())
                     .unwrap_or_else(|e| {
                         // A `SQLITE_BUSY` that outlives the busy timeout is a lock
@@ -1188,12 +1902,78 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).expect("reopen");
         assert_eq!(
             MigrationRunner::new(&conn)
-                .migrate(&path)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
                 .expect("read version"),
             Vec::<u32>::new(),
             "everything is applied exactly once"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The snapshot lock is genuinely exclusive, not an advisory name.
+    ///
+    /// The concurrent migration test above exercises the production path, but its
+    /// success alone would not distinguish a working lock from a fast race. This
+    /// observes the exclusion directly: a second open file description cannot take
+    /// the lock while the guard is alive, and can take it as soon as the guard drops.
+    #[test]
+    fn the_snapshot_lock_excludes_a_second_holder() {
+        let path = tmp_db("snapshot-lock");
+        let held = SnapshotLock::acquire(&path).expect("first holder");
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(SnapshotLock::path_for(&path))
+            .expect("open the lock path");
+        assert!(
+            other.try_lock().is_err(),
+            "a second holder must not acquire the snapshot lock while the first is alive"
+        );
+        drop(held);
+        other
+            .try_lock()
+            .expect("the lock must be released when the guard drops");
+        drop(other);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temp dir"));
+    }
+
+    /// A final-component symlink is one database with two path spellings, but two
+    /// **snapshot** paths.
+    ///
+    /// V-101's lost-recovery interleaving needs two migrators to publish and discard the
+    /// same snapshot pathname. A final-component alias cannot produce that: its snapshot
+    /// is a sibling of the alias (`alias.db.pre-migration.bak`), not of the target
+    /// (`state.db.pre-migration.bak`), so `discard` by one spelling cannot remove the
+    /// other's recovery point. The lock is deliberately keyed by the snapshot pathname it
+    /// protects, so each of those paths is serialised independently. Directory-level
+    /// aliases are different: they resolve to the same snapshot file and therefore the
+    /// same lock file, which is the case the OS lock covers.
+    #[cfg(unix)]
+    #[test]
+    fn a_final_component_symlink_spelling_gets_its_own_snapshot_path() {
+        let db = tmp_db("snapshot-alias");
+        std::fs::write(&db, b"database bytes").expect("write the target");
+        let alias = db.with_file_name("alias.db");
+        std::os::unix::fs::symlink(&db, &alias).expect("symlink the target");
+
+        assert_eq!(
+            std::fs::canonicalize(&alias).expect("canonicalize the alias"),
+            std::fs::canonicalize(&db).expect("canonicalize the target"),
+            "the two spellings must name one database"
+        );
+        assert_ne!(
+            Backup::path_for(&db),
+            Backup::path_for(&alias),
+            "two spellings must not share a snapshot path, or one discard could remove \
+             the other's recovery point"
+        );
+        assert_ne!(
+            SnapshotLock::path_for(&db),
+            SnapshotLock::path_for(&alias),
+            "the snapshot lock is keyed by the pathname it protects"
+        );
+
+        let _ = std::fs::remove_dir_all(db.parent().expect("temp dir"));
     }
 
     #[test]
@@ -1220,6 +2000,7 @@ mod tests {
             names,
             vec![
                 "audit_log",
+                "database_identity",
                 "schedule_fires",
                 "schedules",
                 "schema_meta",
@@ -1327,7 +2108,7 @@ mod tests {
 
         let c = Connection::open(&path).expect("reopen");
         let err = MigrationRunner::new(&c)
-            .migrate(&path)
+            .migrate(&path, &orxnud_platform_fs::OsIdentity)
             .expect_err("migration 2 must fail against the colliding table");
 
         // The obligation, not a warning: this is the only copy of the old state, and the
@@ -1410,7 +2191,7 @@ mod tests {
 
         let c = Connection::open(&path).expect("reopen");
         let err = MigrationRunner::new(&c)
-            .migrate(&path)
+            .migrate(&path, &orxnud_platform_fs::OsIdentity)
             .expect_err("migration 2 must still fail against the colliding table");
         drop(c);
 
@@ -1488,19 +2269,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
-    /// The sidecars, tested where they can actually exist.
+    /// **A failed initialisation removes the database it created and its sidecars —
+    /// and nothing else.**
     ///
-    /// An earlier version of the test above asserted that no `-wal`/`-shm` survived, and
-    /// **passed with the sidecar removal deleted**. Nothing wrote to the database before
-    /// the snapshot was attempted, so SQLite had not created them and the assertion could
-    /// not fail. That is the failure mode AGENTS.md §3 warns about: a green test reading as
-    /// coverage of something it never touched.
+    /// The sidecars are tested where they can actually exist. An earlier version of this
+    /// test asserted that no `-wal`/`-shm` survived, and **passed with the sidecar removal
+    /// deleted**: nothing wrote to the database before the snapshot was attempted, so
+    /// SQLite had not created them and the assertion could not fail. That is the failure
+    /// mode AGENTS.md §3 warns about — a green test reading as coverage of something it
+    /// never touched — so the sidecars are created here by hand.
     ///
-    /// So the claim is tested directly, against a directory that really does contain the
-    /// sidecars. It is still the same guarantee — a `-wal` whose database has been deleted
-    /// is not inert, because SQLite may rebuild the database from it on the next open.
+    /// The cleanup removes what *this call* created. The file at the canonical
+    /// snapshot path is not this call's: this call publishes a snapshot there only on
+    /// the paths that end in a recovery obligation, which the caller restores instead
+    /// of cleaning up. So on every path that reaches this cleanup, the file there was
+    /// already on disk before the call — and it is not the store's to delete.
+    ///
+    /// The file here is deliberately **not** a database: it is what a stale
+    /// non-database file at that path looks like. It is left where it is, and the
+    /// next successful migration replaces it by publishing a fresh snapshot over it
+    /// (see `a_successful_migration_replaces_stale_non_database_debris`).
+    ///
+    /// # Why the snapshot is not removed here at all
+    ///
+    /// A version of this test required the snapshot to be removed with the database.
+    /// That was the rule that made the cleanup a **check-then-delete** sequence: the
+    /// file at the path was classified (a header read), and then the *path* was
+    /// deleted — and between the two, another process migrating the same database
+    /// could publish its own snapshot there. The removal then deleted a valid
+    /// recovery point of the same database.
+    ///
+    /// Nothing prevents that interleaving: the lease is keyed on the database path,
+    /// the migration path holds only a shared lease, and this cleanup runs with no
+    /// lease at all. So the rule is now the simpler one — the cleanup does not touch
+    /// the canonical path — and the check-then-delete sequence is gone rather than
+    /// narrowed.
     #[test]
-    fn discarding_a_failed_initialisation_removes_the_sidecars_and_the_snapshot() {
+    fn discarding_a_failed_initialisation_removes_the_database_and_its_sidecars() {
         let path = tmp_db("sidecars");
         // Built by hand, because nothing on this path writes before the failure.
         std::fs::write(&path, b"sqlite-format-3\0").expect("db");
@@ -1518,18 +2323,19 @@ mod tests {
 
         discard_failed_initialisation(&path, false);
 
-        for p in [
-            path.clone(),
-            wal_sidecar(&path),
-            shm_sidecar(&path),
-            Backup::path_for(&path),
-        ] {
+        for p in [path.clone(), wal_sidecar(&path), shm_sidecar(&path)] {
             assert!(
                 !p.exists(),
                 "{} must be removed with the database it belonged to",
                 p.display()
             );
         }
+        assert!(
+            Backup::path_for(&path).exists(),
+            "the file at the canonical snapshot path is not this call's: it must survive the \
+             cleanup, whatever it is. It may be the only good copy of a pre-migration state, \
+             and it may be the file a refusal has just declined to adopt."
+        );
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
@@ -1676,6 +2482,331 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
+    /// **A candidate recovery snapshot at the canonical path survives the cleanup.**
+    ///
+    /// The cleanup removes what *this call* created. The file at the snapshot path is
+    /// not this call's: this call publishes a snapshot there only on the paths that end
+    /// in a recovery obligation, which the caller restores instead of cleaning up. So a
+    /// database sitting at that path may be the only good copy of a pre-migration state,
+    /// and it is not the store's to delete.
+    ///
+    /// This is the complement of the test above. There, the *database* predated the call
+    /// and everything survived; here the database was created by the call and is removed,
+    /// while the candidate beside it is not.
+    #[test]
+    fn a_candidate_recovery_snapshot_survives_the_failed_initialisation_cleanup() {
+        let path = tmp_db("candidate-kept");
+        let canonical = Backup::path_for(&path);
+        {
+            let c = Connection::open(&canonical).expect("open the candidate");
+            c.execute_batch("CREATE TABLE somebody_elses (id TEXT PRIMARY KEY);")
+                .expect("seed the candidate");
+        }
+        let before = std::fs::read(&canonical).expect("read the candidate");
+
+        discard_failed_initialisation(&path, false);
+
+        assert!(
+            canonical.exists(),
+            "a candidate recovery snapshot must survive the cleanup: it is not this call's \
+             file, and it may be the only good copy of a pre-migration state"
+        );
+        assert_eq!(
+            std::fs::read(&canonical).expect("re-read the candidate"),
+            before,
+            "the candidate must be byte-identical after the cleanup"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// A **version-1** database, written before the provenance table existed, so it
+    /// carries no identity at all.
+    ///
+    /// This is the shape a build that predates the provenance table leaves behind — and
+    /// the shape the refusal tells the operator to move aside. It is also the shape
+    /// whose next migration **fails** (migration 2 creates the `tasks` table, and it is
+    /// already there), which is what keeps a snapshot of it retained as a recovery
+    /// obligation.
+    fn write_a_version_1_database(path: &std::path::Path) {
+        let c = Connection::open(path).expect("open the version-1 database");
+        c.execute_batch(
+            "CREATE TABLE schema_meta (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL);
+             INSERT INTO schema_meta (version, name, applied_at) VALUES (1, 'schema_meta', 0);
+             CREATE TABLE tasks (id TEXT PRIMARY KEY);
+             INSERT INTO tasks (id) VALUES ('legacy-1');",
+        )
+        .expect("seed the version-1 database");
+    }
+
+    /// A **legacy** candidate at the canonical path: a version-1 database, written
+    /// before the provenance table existed, so it carries no identity at all.
+    ///
+    /// This is the shape a build that predates the provenance table leaves behind — and
+    /// the shape the refusal tells the operator to move aside.
+    fn plant_a_legacy_candidate(canonical: &std::path::Path) {
+        write_a_version_1_database(canonical);
+    }
+
+    /// **A successful migration replaces stale non-database debris at the canonical
+    /// snapshot path.**
+    ///
+    /// The cleanup does not remove the canonical path, so a file that is not a database
+    /// can sit there after a failed initialisation. The next migration must replace it —
+    /// and must replace it *safely*: the published snapshot is staged, verified,
+    /// restricted and alias-checked like any other, and it reaches the canonical path by
+    /// an atomic rename.
+    ///
+    /// The migration here **fails** on purpose, after the snapshot is published: a
+    /// successful migration discards the snapshot it took, so the canonical path would be
+    /// empty again and the replacement would not be observable. A failed migration keeps
+    /// the published snapshot as the recovery obligation, which is what makes the
+    /// replacement visible.
+    #[test]
+    fn a_successful_migration_replaces_stale_non_database_debris() {
+        let path = tmp_db("debris-replaced");
+        // A version-1 database whose next migration fails, so the published snapshot is
+        // retained rather than discarded.
+        write_a_version_1_database(&path);
+
+        // The debris: a file at the canonical path that is not a database at all.
+        let canonical = Backup::path_for(&path);
+        std::fs::write(&canonical, b"not a database at all").expect("debris");
+        let before = std::fs::read(&canonical).expect("read the debris");
+
+        let c = Connection::open(&path).expect("open");
+        let err = MigrationRunner::new(&c)
+            .migrate(&path, &orxnud_platform_fs::OsIdentity)
+            .expect_err("migration 2 must fail against the colliding table");
+        drop(c);
+        assert!(
+            matches!(err, MigrationError::RecoveryRequired { .. }),
+            "precondition: the migration must fail and hand back a recovery obligation, \
+             got {err:?}"
+        );
+
+        // The path now holds the published snapshot, not the debris.
+        let after = std::fs::read(&canonical).expect("read the published snapshot");
+        assert_ne!(
+            after, before,
+            "the stale file must have been replaced by the published snapshot, not left in \
+             place and not deleted by the cleanup"
+        );
+        assert!(
+            Backup::verify(&canonical).is_ok(),
+            "the published snapshot must verify: the replacement is a real snapshot, not a \
+             file that merely occupies the path"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// A **foreign** candidate at the canonical path: a complete, healthy database
+    /// belonging to another database, so it carries an identity that is not ours.
+    ///
+    /// Taken through the production snapshot path, so the planted file is a real,
+    /// transactionally consistent copy.
+    fn plant_a_foreign_candidate(canonical: &std::path::Path, other: &std::path::Path) {
+        {
+            let c = Connection::open(other).expect("open the other database");
+            MigrationRunner::new(&c)
+                .migrate(other, &orxnud_platform_fs::OsIdentity)
+                .expect("migrate the other database");
+        }
+        let c = Connection::open(other).expect("reopen the other database");
+        let snapshot = Backup::take(&c, other, &orxnud_platform_fs::OsIdentity)
+            .expect("snapshot the other database");
+        std::fs::copy(snapshot.path(), canonical).expect("plant the foreign candidate");
+    }
+
+    /// The assertions every refused-snapshot case shares.
+    ///
+    /// The file must still be there and byte-identical; and the live database must be
+    /// in the state the caller intended — the half-built file this call created is
+    /// removed, so the next start begins clean and the refused snapshot's content is
+    /// nowhere in it.
+    fn assert_a_refused_snapshot_survived(
+        canonical: &std::path::Path,
+        live: &std::path::Path,
+        before: &[u8],
+        context: &str,
+    ) {
+        assert!(
+            canonical.exists(),
+            "the refused snapshot must still be there: the refusal tells the operator to move \
+             it aside, so the store may not have deleted it ({context})"
+        );
+        assert_eq!(
+            std::fs::read(canonical).expect("re-read the refused snapshot"),
+            before,
+            "the refused snapshot must be byte-identical after the refusal ({context})"
+        );
+        assert!(
+            !live.exists(),
+            "the half-built database this call created must still be removed, so the next \
+             start begins clean ({context})"
+        );
+    }
+
+    /// **A refused snapshot survives the audit journal's constructor.**
+    ///
+    /// The journal is opened by the daemon at startup, so this is a path an operator
+    /// meets: the daemon refuses to start, and the file the refusal names must still be
+    /// there to be moved aside.
+    #[test]
+    fn the_audit_journal_preserves_a_refused_snapshot_with_no_provenance() {
+        let path = tmp_db("journal-legacy");
+        let canonical = Backup::path_for(&path);
+        plant_a_legacy_candidate(&canonical);
+        let before = std::fs::read(&canonical).expect("read the candidate");
+        assert!(
+            !path.exists(),
+            "precondition: the journal database is absent"
+        );
+
+        let err = match crate::security_state::SqliteAuditJournal::open(
+            &path,
+            &orxnud_platform_fs::OsIdentity,
+        ) {
+            Ok(_) => panic!("the journal must refuse the candidate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("carries no database identity"),
+            "the refusal must be the provenance refusal, got: {err}"
+        );
+        assert!(
+            !err.contains("could not be made private"),
+            "a provenance refusal must not be reported as a privacy failure: {err}"
+        );
+        assert!(
+            !err.contains("could not be shown to be safe"),
+            "a provenance refusal must not be reported as an alias failure: {err}"
+        );
+        assert_a_refused_snapshot_survived(
+            &canonical,
+            &path,
+            &before,
+            "the snapshot carries no database identity",
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// **A refused snapshot survives the approval ledger's constructor.**
+    ///
+    /// The ledger is opened by the daemon at startup too, and it is the store of which
+    /// approvals were spent — so its pre-migration copy is evidence, not debris.
+    #[test]
+    fn the_approval_ledger_preserves_a_refused_snapshot_with_no_provenance() {
+        let path = tmp_db("ledger-legacy");
+        let canonical = Backup::path_for(&path);
+        plant_a_legacy_candidate(&canonical);
+        let before = std::fs::read(&canonical).expect("read the candidate");
+        assert!(
+            !path.exists(),
+            "precondition: the ledger database is absent"
+        );
+
+        let err = match crate::security_state::SqliteApprovalLedger::open(
+            &path,
+            &orxnud_platform_fs::OsIdentity,
+        ) {
+            Ok(_) => panic!("the ledger must refuse the candidate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("carries no database identity"),
+            "the refusal must be the provenance refusal, got: {err}"
+        );
+        assert!(
+            !err.contains("could not be made private"),
+            "a provenance refusal must not be reported as a privacy failure: {err}"
+        );
+        assert!(
+            !err.contains("could not be shown to be safe"),
+            "a provenance refusal must not be reported as an alias failure: {err}"
+        );
+        assert_a_refused_snapshot_survived(
+            &canonical,
+            &path,
+            &before,
+            "the snapshot carries no database identity",
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// **A refused snapshot with no provenance survives `open_and_migrate`.**
+    ///
+    /// The refusal says the file is left in place and tells the operator to move it
+    /// aside. Before this correction the caller's cleanup deleted it: the guard was on
+    /// whether the *live database* existed before the call, and a file at the snapshot
+    /// path that was already there is not that call's to delete.
+    ///
+    /// The case is the first-start one, and it is the one that loses data: the database
+    /// does not exist, so the cleanup removes it — and used to remove the snapshot
+    /// beside it, which may have been the only good copy of a pre-migration state.
+    #[test]
+    fn open_and_migrate_preserves_a_refused_snapshot_with_no_provenance() {
+        let path = tmp_db("open-and-migrate-legacy");
+        let canonical = Backup::path_for(&path);
+        plant_a_legacy_candidate(&canonical);
+        let before = std::fs::read(&canonical).expect("read the candidate");
+        assert!(!path.exists(), "precondition: the live database is absent");
+
+        let err = open_and_migrate(&path, &orxnud_platform_fs::OsIdentity)
+            .expect_err("the migration must refuse the candidate");
+
+        match err {
+            StoreError::Migration(inner) => assert!(
+                matches!(*inner, MigrationError::SnapshotProvenanceMissing { .. }),
+                "the caller must receive a missing-provenance refusal, got {inner:?}"
+            ),
+            other => panic!("expected a migration refusal, got {other:?}"),
+        }
+        assert_a_refused_snapshot_survived(
+            &canonical,
+            &path,
+            &before,
+            "the snapshot carries no database identity",
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// **A refused snapshot with another database's provenance survives
+    /// `open_and_migrate`.**
+    ///
+    /// The same case with the other refusal: the candidate is a complete, healthy
+    /// database that belongs to somebody else, so it verifies and is refused on its
+    /// provenance rather than on its shape.
+    #[test]
+    fn open_and_migrate_preserves_a_refused_snapshot_with_another_identity() {
+        let path = tmp_db("open-and-migrate-foreign");
+        let canonical = Backup::path_for(&path);
+        let other = path.with_file_name("other.db");
+        plant_a_foreign_candidate(&canonical, &other);
+        let before = std::fs::read(&canonical).expect("read the candidate");
+        assert!(!path.exists(), "precondition: the live database is absent");
+
+        let err = open_and_migrate(&path, &orxnud_platform_fs::OsIdentity)
+            .expect_err("the migration must refuse the candidate");
+
+        match err {
+            StoreError::Migration(inner) => assert!(
+                matches!(*inner, MigrationError::SnapshotProvenanceMismatch { .. }),
+                "the caller must receive a provenance-mismatch refusal, got {inner:?}"
+            ),
+            other => panic!("expected a migration refusal, got {other:?}"),
+        }
+        assert_a_refused_snapshot_survived(
+            &canonical,
+            &path,
+            &before,
+            "the snapshot was taken from a different database",
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
     /// **The guard on that deletion, in both directions.**
     ///
     /// Deleting a database because its first migration failed is only safe when this call
@@ -1749,7 +2880,7 @@ mod tests {
 
         let c = Connection::open(&path).expect("reopen");
         let err = MigrationRunner::new(&c)
-            .migrate(&path)
+            .migrate(&path, &orxnud_platform_fs::OsIdentity)
             .expect_err("migration 2 must fail against the colliding table");
         drop(c);
 
@@ -1815,7 +2946,7 @@ mod tests {
         let store2 = open_and_migrate(&path, &orxnud_platform_fs::OsIdentity).expect("reopen");
         assert_eq!(
             MigrationRunner::new(store2.conn())
-                .migrate(&path)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
                 .expect("rerun"),
             Vec::<u32>::new()
         );
@@ -1847,7 +2978,7 @@ mod tests {
         let store =
             crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity).expect("open");
         let applied = MigrationRunner::new(store.conn())
-            .migrate(&path)
+            .migrate(&path, &orxnud_platform_fs::OsIdentity)
             .expect("a fresh database must migrate");
         assert_eq!(applied.len(), MIGRATIONS.len(), "every migration applies");
         assert_eq!(
@@ -1877,10 +3008,15 @@ mod tests {
             let store = crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity)
                 .expect("open");
             MigrationRunner::new(store.conn())
-                .migrate(&path)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
                 .expect("run");
         }
-        let backup = Backup::take(&Connection::open(&path).expect("reopen"), &path).expect("take");
+        let backup = Backup::take(
+            &Connection::open(&path).expect("reopen"),
+            &path,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("take");
         {
             let b = Connection::open(backup.path()).expect("open snapshot");
             b.execute_batch("DROP TABLE schema_meta;").expect("drop");
@@ -1893,10 +3029,15 @@ mod tests {
             let store = crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity)
                 .expect("open");
             MigrationRunner::new(store.conn())
-                .migrate(&path)
+                .migrate(&path, &orxnud_platform_fs::OsIdentity)
                 .expect("run");
         }
-        let backup = Backup::take(&Connection::open(&path).expect("reopen"), &path).expect("take");
+        let backup = Backup::take(
+            &Connection::open(&path).expect("reopen"),
+            &path,
+            &orxnud_platform_fs::OsIdentity,
+        )
+        .expect("take");
         {
             let b = Connection::open(backup.path()).expect("open snapshot");
             b.execute_batch("DELETE FROM schema_meta;").expect("delete");
@@ -1910,8 +3051,8 @@ mod tests {
         let path = tmp_db("fresh-verify");
         let store =
             crate::sqlite::Store::open(&path, true, &orxnud_platform_fs::OsIdentity).expect("open");
-        let backup =
-            Backup::take(store.conn(), &path).expect("a fresh database can be snapshotted");
+        let backup = Backup::take(store.conn(), &path, &orxnud_platform_fs::OsIdentity)
+            .expect("a fresh database can be snapshotted");
 
         // Relative to a source with no schema_meta: accepted. The answer is passed in,
         // read before the copy; see `Backup::verify_against_source`.

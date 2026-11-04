@@ -48,7 +48,9 @@ fn engine(path: &Path) -> DurableEngine {
     let conn = rusqlite::Connection::open(path).expect("open");
     Pragma::critical().apply(&conn).expect("pragmas");
     Pragma::critical().verify(&conn).expect("verify pragmas");
-    MigrationRunner::new(&conn).migrate(path).expect("migrate");
+    MigrationRunner::new(&conn)
+        .migrate(path, &orxnud_platform_fs::OsIdentity)
+        .expect("migrate");
     DurableEngine::new(conn, EngineLimits::documented()).expect("engine")
 }
 
@@ -59,6 +61,7 @@ fn claimed_task(e: &mut DurableEngine, id: &str) -> u32 {
     e.claim_task("w1", NOW)
         .expect("claim")
         .expect("claimed")
+        .row
         .attempts
 }
 
@@ -98,6 +101,7 @@ fn propose(e: &mut DurableEngine, task: &str, id: &str) -> String {
         id,
         &tid(task),
         "w1",
+        1,
         "filesystem/write-text",
         Some("out.txt"),
         r#"{"path":"out.txt","contents":"x"}"#,
@@ -358,6 +362,7 @@ fn p1_16_propose_action_does_not_report_success_for_a_zero_row_update() {
         "p-ghost",
         &tid("t"),
         "w1",
+        1,
         "filesystem/write-text",
         Some("out.txt"),
         r#"{"path":"out.txt","contents":"x"}"#,
@@ -431,18 +436,44 @@ fn p1_17_reserve_effect_distinguishes_a_duplicate_from_an_invalid_insert() {
     claimed_task(&mut e, "t");
 
     assert!(
-        e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW)
-            .expect("first"),
+        e.reserve_effect(
+            "k",
+            &tid("t"),
+            "w1",
+            e.task(&tid("t"))
+                .expect("read")
+                .expect("present")
+                .claim_generation,
+            1,
+            1,
+            "step",
+            false,
+            NOW
+        )
+        .expect("first"),
         "the first reservation must succeed"
     );
     assert!(
-        !e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW)
-            .expect("duplicate"),
+        !e.reserve_effect(
+            "k",
+            &tid("t"),
+            "w1",
+            e.task(&tid("t"))
+                .expect("read")
+                .expect("present")
+                .claim_generation,
+            1,
+            1,
+            "step",
+            false,
+            NOW
+        )
+        .expect("duplicate"),
         "a genuine duplicate is `false`, and that is the documented meaning"
     );
 
     // An effect for a task that does not exist: an invalid insert, not a duplicate.
-    let ghost = e.reserve_effect("other", &tid("ghost"), 1, 1, "step", false, NOW);
+    let ghost = e.reserve_effect("other", &tid("ghost"), "w", 0, 1, 1, "step", false, NOW);
     assert!(
         ghost.is_err(),
         "an effect for a non-existent task is invalid, not a duplicate: {ghost:?}"
@@ -498,7 +529,9 @@ fn p1_17_a_rejected_fire_is_not_reported_as_an_already_present_fire() {
     {
         let conn = rusqlite::Connection::open(&path).expect("open");
         Pragma::critical().apply(&conn).expect("pragmas");
-        MigrationRunner::new(&conn).migrate(&path).expect("migrate");
+        MigrationRunner::new(&conn)
+            .migrate(&path, &orxnud_platform_fs::OsIdentity)
+            .expect("migrate");
     }
     let mut e = engine(&path);
     {
@@ -712,6 +745,7 @@ fn absence_of_a_task_is_a_refusal_not_an_empty_proposal() {
         "p",
         &tid("ghost"),
         "w1",
+        1,
         "filesystem/write-text",
         Some("out.txt"),
         "{}",
@@ -791,8 +825,34 @@ fn the_reservation_outcomes_are_exactly_two_and_neither_is_an_error() {
     // `DurableEngine::reserve_effect` collapses the row to a bool; this asserts the two
     // answers it is allowed to give are "reserved" and "already reserved", and that the
     // second is not an error.
-    let first = e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW);
-    let second = e.reserve_effect("k", &tid("t"), 1, 1, "step", false, NOW);
+    let first = e.reserve_effect(
+        "k",
+        &tid("t"),
+        "w1",
+        e.task(&tid("t"))
+            .expect("read")
+            .expect("present")
+            .claim_generation,
+        1,
+        1,
+        "step",
+        false,
+        NOW,
+    );
+    let second = e.reserve_effect(
+        "k",
+        &tid("t"),
+        "w1",
+        e.task(&tid("t"))
+            .expect("read")
+            .expect("present")
+            .claim_generation,
+        1,
+        1,
+        "step",
+        false,
+        NOW,
+    );
     assert!(first.expect("the first reservation is not an error"));
     assert!(
         !second.expect("a duplicate is an answer, not an error"),

@@ -250,17 +250,20 @@ fn propose_the_read(s: &Serving) -> String {
         "task/create",
         json!({"id": "t1", "max_steps": 2, "content": "read a.txt then write final.txt"}),
     );
-    send(
+    let claimed = send(
         &s.endpoint,
         "c",
         "task/claim",
         json!({"id": "t1", "worker": "w1"}),
     );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let p = send(
         &s.endpoint,
         "p",
         "task/ai-propose",
-        json!({"task": "t1", "worker": "w1"}),
+        json!({"task": "t1", "worker": "w1", "claim_generation": claim_generation}),
     );
     assert_eq!(
         p["result"]["proposal"]["capability"], "filesystem/read-text",
@@ -787,12 +790,15 @@ fn a_human_proposed_read_produces_no_observation() {
             "task/create",
             json!({"id": "t1", "max_steps": 2, "content": "read a.txt then write final.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "c",
             "task/claim",
             json!({"id": "t1", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         // `task/propose` is the human route: the proposer is not an `Actor::Ai`.
         let p = send(
             &s.endpoint,
@@ -800,6 +806,7 @@ fn a_human_proposed_read_produces_no_observation() {
             "task/propose",
             json!({
                 "task": "t1", "worker": "w1", "capability": "filesystem/read-text",
+                "claim_generation": claim_generation,
                 "target": "a.txt", "params": {"path": "a.txt"}
             }),
         );
@@ -875,17 +882,20 @@ fn an_observation_never_crosses_a_task_boundary() {
             "task/create",
             json!({"id": "t2", "max_steps": 2, "content": "write final.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "k2",
             "task/claim",
             json!({"id": "t2", "worker": "w2"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let t2_first = send(
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "t2", "worker": "w2"}),
+            json!({"task": "t2", "worker": "w2", "claim_generation": claim_generation}),
         );
         assert_eq!(
             t2_first["result"]["disclosed"]

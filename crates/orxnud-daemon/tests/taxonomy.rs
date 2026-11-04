@@ -210,33 +210,41 @@ fn reason_of(reply: &Value) -> String {
     reason
 }
 
-/// Creates a claimed task with one pending write proposal. Returns the proposal id.
-fn task_with_pending_proposal(s: &Serving, id: &str) -> String {
+/// Creates a claimed task with one pending write proposal.
+///
+/// Returns the proposal id and the generation the claim held, so a later proposal that
+/// must be refused for the *lease* rather than for a missing field can name its claim.
+fn task_with_pending_proposal(s: &Serving, id: &str) -> (String, i64) {
     send(
         &s.endpoint,
         "c",
         "task/create",
         json!({"id": id, "content": "governed"}),
     );
-    send(
+    let claimed = send(
         &s.endpoint,
         "cl",
         "task/claim",
         json!({"id": id, "worker": "w1"}),
     );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let p = send(
         &s.endpoint,
         "p",
         "task/propose",
         json!({
             "task": id, "worker": "w1", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}
         }),
     );
-    p["result"]["proposal"]["proposal_id"]
+    let pid = p["result"]["proposal"]["proposal_id"]
         .as_str()
         .expect("a proposal id")
-        .to_owned()
+        .to_owned();
+    (pid, claim_generation)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,8 +278,14 @@ fn a_missing_resource_is_not_found_and_not_an_invalid_request() {
                 json!({"proposal": "p-ghost", "worker": "w"}),
             ),
             ("capability/approve", json!({"proposal": "p-ghost"})),
-            ("task/complete", json!({"id": "ghost", "worker": "w"})),
-            ("task/continue", json!({"task": "ghost", "worker": "w"})),
+            (
+                "task/complete",
+                json!({"id": "ghost", "worker": "w", "claim_generation": 0}),
+            ),
+            (
+                "task/continue",
+                json!({"task": "ghost", "worker": "w", "claim_generation": 0}),
+            ),
         ] {
             let reply = send(&s.endpoint, "n", method, params);
             assert_eq!(
@@ -312,7 +326,7 @@ fn a_wrong_state_is_a_conflict_across_every_shape_of_it() {
         let s = Serving::start(d.clone()).await;
 
         // A name already taken.
-        let pid = task_with_pending_proposal(&s, "dup");
+        let (pid, claim_generation) = task_with_pending_proposal(&s, "dup");
         let dup = send(
             &s.endpoint,
             "d",
@@ -330,6 +344,7 @@ fn a_wrong_state_is_a_conflict_across_every_shape_of_it() {
             "task/propose",
             json!({
             "task": "dup", "worker": "somebody-else", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": "out.txt", "params": {"path": "out.txt", "contents": "y"}}),
         );
         assert_eq!(code_of(&other), RpcErrorCode::CONFLICT.code(), "{other}");
@@ -386,7 +401,7 @@ fn a_lost_race_and_a_duplicate_name_are_both_conflicts_but_not_the_same_reason()
         let d = dir("race-reasons");
         let s = Serving::start(d.clone()).await;
 
-        task_with_pending_proposal(&s, "race");
+        let _ = task_with_pending_proposal(&s, "race");
         let dup = send(
             &s.endpoint,
             "d",
@@ -437,7 +452,7 @@ fn every_approval_refusal_is_forbidden_and_says_which_one() {
     rt().block_on(async {
         let d = dir("forbidden");
         let s = Serving::start(d.clone()).await;
-        let pid = task_with_pending_proposal(&s, "appr");
+        let (pid, _) = task_with_pending_proposal(&s, "appr");
 
         // No approval at all.
         let none = send(
@@ -473,7 +488,7 @@ fn every_approval_refusal_is_forbidden_and_says_which_one() {
         assert_eq!(reason_of(&again), "approval-already-valid");
 
         // A TTL that leaves the approval already expired.
-        let pid2 = task_with_pending_proposal(&s, "appr2");
+        let (pid2, _) = task_with_pending_proposal(&s, "appr2");
         let expired = send(
             &s.endpoint,
             "a3",
@@ -583,18 +598,21 @@ fn a_missing_provider_is_an_environment_refusal() {
             "task/create",
             json!({"id": "n1", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "cl",
             "task/claim",
             json!({"id": "n1", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
 
         let reply = send(
             &s.endpoint,
             "p",
             "task/ai-propose",
-            json!({"task": "n1", "worker": "w1"}),
+            json!({"task": "n1", "worker": "w1", "claim_generation": claim_generation}),
         );
         assert_eq!(
             code_of(&reply),
@@ -683,18 +701,22 @@ fn no_refusal_carries_content_a_host_path_or_a_credential() {
             "task/create",
             json!({"id": "h1", "max_steps": 2, "content": "read a.txt"}),
         );
-        send(
+        let claimed = send(
             &s.endpoint,
             "cl",
             "task/claim",
             json!({"id": "h1", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let p = send(
             &s.endpoint,
             "p",
             "task/propose",
             json!({
             "task": "h1", "worker": "w1", "capability": "filesystem/read-text",
+            "claim_generation": claim_generation,
             "target": "a.txt", "params": {"path": "a.txt"}}),
         );
         let pid = p["result"]["proposal"]["proposal_id"]
@@ -843,7 +865,7 @@ fn an_approval_race_is_one_winner_and_one_forbidden() {
     rt().block_on(async {
         let d = dir("approverace");
         let s = Serving::start(d.clone()).await;
-        let pid = task_with_pending_proposal(&s, "ar1");
+        let (pid, _) = task_with_pending_proposal(&s, "ar1");
 
         let a = {
             let (endpoint, pid) = (s.endpoint.clone(), pid.clone());
@@ -920,18 +942,22 @@ fn task_with_proposal(s: &Serving, id: &str) -> String {
         "task/create",
         json!({"id": id, "content": "x"}),
     );
-    send(
+    let claimed = send(
         &s.endpoint,
         "cl",
         "task/claim",
         json!({"id": id, "worker": "w1"}),
     );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let p = send(
         &s.endpoint,
         "p",
         "task/propose",
         json!({
             "task": id, "worker": "w1", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
             "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}}),
     );
     p["result"]["proposal"]["proposal_id"]
@@ -1061,17 +1087,20 @@ fn each_taxonomy_class_is_reachable_for_its_own_reason() {
             "task/create",
             json!({"id": "vp", "content": "x"}),
         );
-        send(
+        let claimed = send(
             &providerless.endpoint,
             "cl",
             "task/claim",
             json!({"id": "vp", "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let no_provider = send(
             &providerless.endpoint,
             "8",
             "task/ai-propose",
-            json!({"task": "vp", "worker": "w1"}),
+            json!({"task": "vp", "worker": "w1", "claim_generation": claim_generation}),
         );
         assert_eq!(
             code_of(&no_provider),
