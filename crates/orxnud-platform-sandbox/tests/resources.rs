@@ -31,6 +31,10 @@ use orxnud_platform_sandbox::cgroup::{
     CgroupV2, ResourceControl, ResourceMiss, enforcement_environment,
 };
 
+mod support;
+
+use support::coverage;
+
 #[test]
 fn the_environment_is_reported_explicitly() {
     // Always runs, on any host. A reviewer reading CI output sees the standing of
@@ -116,25 +120,35 @@ fn a_missing_control_is_refused_rather_than_partially_configured() {
 
 #[test]
 fn pids_max_and_cpu_max_are_separate_capabilities() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::resources");
     // A bundled knob would let a caller ask for memory and silently get throttling.
     let cg = CgroupV2::discover();
-    if let Ok(cgroup) = cg.create("separate-test", &[ResourceControl::Processes { max: 32 }]) {
-        let pids = std::fs::read_to_string(cgroup.path.join("pids.max")).expect("pids.max");
-        assert_eq!(pids.trim(), "32");
-        // cpu.max must be untouched: asking for a PID ceiling says nothing about CPU.
-        assert!(
-            !cgroup.path.join("cpu.max").exists()
-                || std::fs::read_to_string(cgroup.path.join("cpu.max"))
-                    .map(|v| v.trim().is_empty() || v.trim() == "max 100000")
-                    .unwrap_or(true),
-            "a PID ceiling must not have written a CPU limit"
+    let Ok(cgroup) = cg.create("separate-test", &[ResourceControl::Processes { max: 32 }]) else {
+        coverage::reduced(
+            "orxnud-platform-sandbox::resources::pids_max_and_cpu_max_are_separate_capabilities",
+            "host has no creatable cgroup base; PID/CPU separation was not exercised",
         );
-        cgroup.remove();
-    }
+        return;
+    };
+    let pids = std::fs::read_to_string(cgroup.path.join("pids.max")).expect("pids.max");
+    assert_eq!(pids.trim(), "32");
+    // cpu.max must be untouched: asking for a PID ceiling says nothing about CPU.
+    assert!(
+        !cgroup.path.join("cpu.max").exists()
+            || std::fs::read_to_string(cgroup.path.join("cpu.max"))
+                .map(|v| v.trim().is_empty() || v.trim() == "max 100000")
+                .unwrap_or(true),
+        "a PID ceiling must not have written a CPU limit"
+    );
+    cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::resources::pids_max_and_cpu_max_are_separate_capabilities",
+    );
 }
 
 #[test]
 fn cgroup_kill_terminates_a_member_that_forked_a_descendant() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::resources");
     // The property a signal cannot offer, and the reason ADR-0035 prefers a cgroup
     // for lifetime once a host delegates one.
     let cg = CgroupV2::discover();
@@ -142,10 +156,18 @@ fn cgroup_kill_terminates_a_member_that_forked_a_descendant() {
         // Undelegated: group kill is not available and the refusal is the correct
         // outcome rather than a silent pass.
         assert!(!cg.availability.group_kill);
+        coverage::reduced(
+            "orxnud-platform-sandbox::resources::cgroup_kill_terminates_a_member_that_forked_a_descendant",
+            "host has no creatable cgroup base; group kill was not exercised",
+        );
         return;
     };
     if !cg.availability.group_kill {
         cgroup.remove();
+        coverage::reduced(
+            "orxnud-platform-sandbox::resources::cgroup_kill_terminates_a_member_that_forked_a_descendant",
+            "host does not delegate cgroup.kill; group kill was not exercised",
+        );
         return;
     }
 
@@ -170,6 +192,9 @@ fn cgroup_kill_terminates_a_member_that_forked_a_descendant() {
     );
     let _ = child.wait();
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::resources::cgroup_kill_terminates_a_member_that_forked_a_descendant",
+    );
 }
 
 #[test]
@@ -195,6 +220,7 @@ fn a_capability_requiring_ceilings_is_refused_on_an_undelegated_host() {
 
 #[test]
 fn an_execution_lands_in_a_dedicated_child_cgroup() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::resources");
     // The safety property behind "falls back to the hierarchy root".
     //
     // The phrase is only safe because the base is a *parent*: limits are written to a
@@ -205,6 +231,10 @@ fn an_execution_lands_in_a_dedicated_child_cgroup() {
     let cg = CgroupV2::discover();
     let Ok(handle) = cg.create("dedicated-child-test", &[]) else {
         // No delegation here, so no cgroup exists and nothing could be misplaced.
+        coverage::reduced(
+            "orxnud-platform-sandbox::resources::an_execution_lands_in_a_dedicated_child_cgroup",
+            "host has no creatable cgroup base; child-cgroup placement was not exercised",
+        );
         return;
     };
     assert!(
@@ -233,6 +263,9 @@ fn an_execution_lands_in_a_dedicated_child_cgroup() {
         );
     }
     handle.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::resources::an_execution_lands_in_a_dedicated_child_cgroup",
+    );
 }
 
 /// Whether bubblewrap is on `PATH`.
@@ -249,15 +282,21 @@ fn which_bwrap() -> bool {
 /// Guards the fixture: a suite that cannot see the environment would pass vacuously.
 #[test]
 fn the_cgroup_probe_reports_something_either_way() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::resources");
     let a = CgroupV2::discover().availability;
     // On Linux the probe either creates a cgroup or reports it cannot. Both are real
-    // answers; a panic here would be the failure.
-    assert!(
-        a.can_create || !a.can_create,
-        "the probe must return, not diverge"
+    // answers; a panic here would be the failure. Discovery must also be stable: a
+    // probe that answers differently on a second call cannot be evidence.
+    let again = CgroupV2::discover().availability;
+    assert_eq!(
+        a, again,
+        "the cgroup probe must give the same answer on a second call"
     );
     let env = enforcement_environment();
     assert_eq!(env.can_enforce(), a.memory && a.processes && a.cpu);
+    coverage::verified(
+        "orxnud-platform-sandbox::resources::the_cgroup_probe_reports_something_either_way",
+    );
 }
 
 /// The runner's own resource reporting, so a caller can see what was not enforced.
@@ -292,10 +331,14 @@ fn the_sandbox_runner_reports_resource_availability() {
     // ground truth rather than a hardcoded value: claiming enforcement the host cannot
     // provide would be the defect, and so would denying it when it can.
     let av = CgroupV2::discover().availability;
+    // Resource enforcement also requires a usable sandbox: the runner creates the
+    // cgroup inside a sandboxed execution, so a host with delegation but no bwrap
+    // cannot enforce anything through this runner. The previous assertion omitted
+    // `have.visibility`, which made the resource-test container fail on a true fact.
     assert_eq!(
         have.resources,
-        av.memory || av.processes || av.cpu,
-        "the runner must report exactly the resource enforcement the host permits"
+        have.visibility && (av.memory || av.processes || av.cpu),
+        "the runner must report exactly the resource enforcement it can apply"
     );
     println!(
         "  runner applies resources: {} | host can enforce: {}",

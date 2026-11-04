@@ -73,7 +73,7 @@ env:
 
 jobs:
   linux-gates:
-    name: Linux gates (G1-G11)
+    name: Linux gates (G1-G17 + G2d)
     runs-on: ubuntu-24.04
     # Headroom, not the fix. The four gate tools now install from prebuilt binaries
     # instead of compiling from source, which is what actually made 15 minutes
@@ -409,6 +409,34 @@ jobs:
       # which `scripts/run-sandbox-tests.sh` declines in more words.
       - name: Measure the environment and run the Tier-1 suites if it can isolate
         run: ./scripts/run-sandbox-tests.sh
+
+  # cgroup resource enforcement, in a deliberately different environment from the
+  # sandbox lane. `enforcement` and `resources` assert that `memory.max`, `pids.max`,
+  # `cpu.max` and `cgroup.kill` actually bite, which requires controller delegation and
+  # therefore CAP_SYS_ADMIN. That is not evidence about the unprivileged Tier-1 sandbox;
+  # it is the only environment in which the cgroup claim can be observed at all. The
+  # script pins the image by registry manifest digest and runs `--privileged
+  # --cgroupns=host`; it is not a weaker sandbox lane, it is a different claim.
+  #
+  # TEST-001: this lane is why the resource tests are no longer excluded from G9. On a
+  # runner with no delegation the suites run, record `reduced` coverage with the missing
+  # controls, and do not claim enforcement. Here they must record `verified`.
+  resource-enforcement:
+    name: cgroup resource enforcement (delegated)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: resource-enforcement
+
+      - name: Run the delegated cgroup enforcement suite
+        run: ./scripts/run-resource-tests.sh
 
   # A dedicated lane for the portable-core claim, because it is the one gate whose
   # failure would invalidate an architectural claim rather than just a build.

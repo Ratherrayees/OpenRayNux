@@ -23,7 +23,7 @@ use orxnud_platform_sandbox::contract::{
 };
 use orxnud_platform_sandbox::linux::BwrapRunner;
 
-use support::{Failure, harness_argv, helper_path, run_helper};
+use support::{Failure, coverage, harness_argv, helper_path, run_helper};
 
 fn runner() -> BwrapRunner {
     BwrapRunner::new()
@@ -354,13 +354,24 @@ fn a_child_cannot_reach_the_host_network_even_though_it_may_bind_a_socket() {
 
 #[test]
 fn a_socket_bound_in_the_namespace_is_unreachable_from_the_host() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::isolation");
     // The property that actually matters, tested directly: bind inside the sandbox,
     // then try to connect from the host.
     let spec = closed_spec("net-listen");
     let result = run_helper(&spec);
     let stdout = String::from_utf8_lossy(&result.stdout.bytes);
-    if stdout.contains("RESULT FAIL") {
-        // Binding failed, which is strictly better. Unreachability is then trivial.
+    assert!(
+        stdout.contains("RESULT"),
+        "the helper produced no result: {stdout} status={:?}",
+        result.status
+    );
+    if !stdout.contains("RESULT FAIL") {
+        // The helper refused to bind. That is not the property under test: there is no
+        // namespace socket whose unreachability could be measured.
+        coverage::reduced(
+            "orxnud-platform-sandbox::isolation::a_socket_bound_in_the_namespace_is_unreachable_from_the_host",
+            "the helper could not bind inside the namespace; unreachability was not exercised",
+        );
         return;
     }
     let port: u16 = stdout
@@ -371,13 +382,13 @@ fn a_socket_bound_in_the_namespace_is_unreachable_from_the_host() {
         .expect("a bound socket must report its port");
     // A short timeout, because on a *reachable* socket the connect would otherwise
     // succeed immediately and on some stacks hang.
+    let addr = format!("127.0.0.1:{port}").parse().expect("socket address");
     assert!(
-        std::net::TcpStream::connect_timeout(
-            &"127.0.0.1".parse().expect("addr"),
-            Duration::from_millis(200),
-        )
-        .is_err(),
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(),
         "the host reached a socket bound inside the sandbox: port {port}"
+    );
+    coverage::verified(
+        "orxnud-platform-sandbox::isolation::a_socket_bound_in_the_namespace_is_unreachable_from_the_host",
     );
 }
 

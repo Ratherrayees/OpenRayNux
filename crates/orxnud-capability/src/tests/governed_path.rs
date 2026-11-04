@@ -17,7 +17,7 @@
 
 // Declared once in `tests/mod.rs`, since a module path inside
 // `tests/` would otherwise resolve per-file.
-use super::{Registry, support};
+use super::{Registry, coverage, support};
 use crate::dispatch::{ArgvPayload, ArgvPayloadExposure, DisabledReason};
 
 use std::collections::BTreeMap;
@@ -1258,9 +1258,16 @@ mod v46 {
         (handle, stop, base)
     }
 
-    fn available() -> bool {
+    fn available(test: &str) -> bool {
         let av = CgroupV2::discover().availability;
-        av.memory && av.processes && av.cpu
+        let ready = av.memory && av.processes && av.cpu;
+        if !ready {
+            coverage::reduced(
+                &format!("orxnud-capability::suites::governed_path::{test}"),
+                "host does not delegate memory+pids+cpu; resource enforcement was not exercised",
+            );
+        }
+        ready
     }
 
     fn bundle(resources: ResourcePolicy) -> Arc<dyn AdapterBundle + Send + Sync> {
@@ -1326,7 +1333,8 @@ mod v46 {
     /// dedicated cgroup whose `memory.max` is the ceiling the contract asked for.
     #[test]
     fn a_required_memory_ceiling_is_applied_by_the_governed_path() {
-        if !available() {
+        let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+        if !available("a_required_memory_ceiling_is_applied_by_the_governed_path") {
             println!("  host does not delegate memory+pids+cpu; reported, not skipped");
             return;
         }
@@ -1400,6 +1408,9 @@ mod v46 {
         assert_eq!(
             o.leftover, 0,
             "the dedicated cgroup was not cleaned up after execution"
+        );
+        coverage::verified(
+            "orxnud-capability::suites::governed_path::a_required_memory_ceiling_is_applied_by_the_governed_path",
         );
     }
 
@@ -1603,7 +1614,8 @@ mod v46 {
     /// marker was never written. It "passed" on a sentinel value.
     #[test]
     fn a_governed_timeout_terminates_a_detached_descendant_and_reaps_its_cgroup() {
-        if !available() {
+        let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+        if !available("a_governed_timeout_terminates_a_detached_descendant_and_reaps_its_cgroup") {
             println!("  host does not delegate cgroup.kill; reported, not skipped");
             return;
         }
@@ -1707,6 +1719,9 @@ mod v46 {
             base.base
         );
         let _ = std::fs::remove_dir_all(&dir);
+        coverage::verified(
+            "orxnud-capability::suites::governed_path::a_governed_timeout_terminates_a_detached_descendant_and_reaps_its_cgroup",
+        );
     }
 
     /// The ceiling must be *enforced by the kernel*, not merely written to a file.
@@ -1722,7 +1737,8 @@ mod v46 {
     /// killed cannot report and the workload had to be unbounded to provoke the kill.
     #[test]
     fn a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written() {
-        if !available() {
+        let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+        if !available("a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written") {
             println!("  host does not delegate memory control; reported, not skipped");
             return;
         }
@@ -1821,6 +1837,9 @@ mod v46 {
             "the cgroup held {} bytes against a {CEILING}-byte ceiling",
             o.peak_memory_current
         );
+        coverage::verified(
+            "orxnud-capability::suites::governed_path::a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written",
+        );
     }
 
     // ------------------------------------------- V-46: placement precedes execution
@@ -1876,7 +1895,8 @@ mod v46 {
     /// neighbouring test above reports its counters instead of requiring them.
     #[test]
     fn the_payload_is_constrained_before_it_executes_work() {
-        if !available() {
+        let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+        if !available("the_payload_is_constrained_before_it_executes_work") {
             println!("  host does not delegate memory control; reported, not skipped");
             return;
         }
@@ -1954,6 +1974,9 @@ mod v46 {
         } else {
             println!("  intervention counters not sampled (window too short); outcome used");
         }
+        coverage::verified(
+            "orxnud-capability::suites::governed_path::the_payload_is_constrained_before_it_executes_work",
+        );
     }
 
     // ------------------------------------------- V-46: limit validation end to end
@@ -2373,4 +2396,133 @@ fn the_exposure_surface_reports_exposed_and_permitted_capabilities() {
         d.argv_payload_exposure().is_empty(),
         "a bundle that exposes nothing must not appear on the disclosure surface"
     );
+}
+
+/// A test that actually runs cannot borrow another test's coverage identity.
+///
+/// This is deliberately a `should_panic` test: the producer panics before it appends
+/// anything, so it cannot create a stray record. The claimed ID is a real expected path
+/// from this suite; only the executing test's harness-assigned name differs.
+#[test]
+#[should_panic(expected = "coverage producer identity mismatch")]
+fn a_verified_record_cannot_claim_another_tests_identity() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    coverage::verified(
+        "orxnud-capability::suites::governed_path::a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written",
+    );
+}
+
+/// The reduced producer has the same identity guard as the verified one.
+#[test]
+#[should_panic(expected = "coverage producer identity mismatch")]
+fn a_reduced_record_cannot_claim_another_tests_identity() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    coverage::reduced(
+        "orxnud-capability::suites::governed_path::the_payload_is_constrained_before_it_executes_work",
+        "deliberate identity-attribution test",
+    );
+}
+
+/// A suite outside this test binary cannot be claimed even if the function name is known.
+#[test]
+#[should_panic(expected = "coverage producer suite is not allowed")]
+fn a_record_cannot_claim_a_suite_outside_this_binary() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs",
+    );
+}
+
+/// A malformed claimed ID is refused before it can reach the artifact.
+#[test]
+#[should_panic(expected = "coverage producer identity is malformed")]
+fn a_record_cannot_use_a_malformed_identity() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    coverage::verified("not-a-full-id");
+}
+
+/// A worker that names itself after another test still has no producer scope.
+#[test]
+#[should_panic(expected = "coverage producer has no test provenance")]
+fn a_named_worker_thread_cannot_emit_another_tests_record() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    let target = "orxnud-capability::suites::governed_path::the_payload_is_constrained_before_it_executes_work";
+    let worker = std::thread::Builder::new()
+        .name(target.to_owned())
+        .spawn(|| coverage::verified(target))
+        .expect("the named worker must spawn");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// An unnamed worker has the same lack of provenance, even with the right claim.
+#[test]
+#[should_panic(expected = "coverage producer has no test provenance")]
+fn an_unnamed_worker_thread_cannot_emit_coverage() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    let target = "orxnud-capability::suites::governed_path::the_payload_is_constrained_before_it_executes_work";
+    let worker = std::thread::spawn(|| coverage::verified(target));
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// A worker that calls `scope` still carries this test's harness identity.
+///
+/// The worker's thread name is deliberately another tracked test's name. Nextest assigns
+/// identity per test process, not per thread, so entering a second scope on the worker
+/// cannot change the process identity to the thread name.
+#[test]
+fn a_named_worker_with_a_scope_cannot_emit_another_tests_record() {
+    let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    let target = "orxnud-capability::suites::governed_path::the_payload_is_constrained_before_it_executes_work";
+    let worker_name =
+        "suites::governed_path::v46::the_payload_is_constrained_before_it_executes_work";
+    let worker = std::thread::Builder::new()
+        .name(worker_name.to_owned())
+        .spawn(|| {
+            let _scope = coverage::scope("orxnud-capability::suites::governed_path");
+            coverage::verified(target);
+        })
+        .expect("the named worker must spawn");
+    let Err(payload) = worker.join() else {
+        panic!("a named worker with its own scope minted the other test's record");
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    assert!(
+        message.contains("coverage producer identity mismatch"),
+        "the worker was rejected for the wrong reason: {message}"
+    );
+}
+
+/// Two real tests with the same final `::` component are distinct identities.
+///
+/// `identity_collision_a` tries to claim the record of `identity_collision_b`; the
+/// final component matches, but the full module path does not, and the producer
+/// refuses. Neither test writes a record.
+mod identity_collision_a {
+    use super::coverage;
+
+    #[test]
+    #[should_panic(expected = "coverage producer identity mismatch")]
+    fn same_final_component() {
+        let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+        coverage::verified(
+            "orxnud-capability::suites::governed_path::identity_collision_b::same_final_component",
+        );
+    }
+}
+
+mod identity_collision_b {
+    use super::coverage;
+
+    #[test]
+    fn same_final_component() {
+        let _coverage = coverage::scope("orxnud-capability::suites::governed_path");
+    }
 }

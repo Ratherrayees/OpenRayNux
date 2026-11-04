@@ -28,6 +28,10 @@ use orxnud_platform_sandbox::cgroup::{
 };
 use std::path::{Path, PathBuf};
 
+mod support;
+
+use support::coverage;
+
 /// A workload that parks until the parent says go.
 ///
 /// # Why not just `spawn` then `adopt`
@@ -117,9 +121,15 @@ fn env() -> orxnud_platform_sandbox::cgroup::EnforcementEnvironment {
 
 /// Skips the body with an explicit, printed reason — never silently.
 macro_rules! requires_delegation {
-    ($what:expr) => {
+    ($test:literal, $what:expr) => {
+        let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
         if !env().can_enforce() {
-            println!("{}: {}", $what, env().describe());
+            let env = env();
+            println!("{}: {}", $what, env.describe());
+            coverage::reduced(
+                concat!("orxnud-platform-sandbox::enforcement::", $test),
+                &format!("{}: {}", $what, env.describe()),
+            );
             return;
         }
     };
@@ -141,7 +151,10 @@ fn read_text(path: &std::path::Path, file: &str) -> String {
 
 #[test]
 fn memory_max_is_kernel_enforced_inside_a_real_cgroup() {
-    requires_delegation!("memory.max");
+    requires_delegation!(
+        "memory_max_is_kernel_enforced_inside_a_real_cgroup",
+        "memory.max"
+    );
 
     let cg = CgroupV2::discover();
     let cgroup = cg
@@ -230,11 +243,14 @@ print('ALLOCATED_ALL'); raise SystemExit(0)" 2>&1"#
     );
     let _ = code;
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::memory_max_is_kernel_enforced_inside_a_real_cgroup",
+    );
 }
 
 #[test]
 fn memory_events_record_the_limit_being_hit() {
-    requires_delegation!("memory.events");
+    requires_delegation!("memory_events_record_the_limit_being_hit", "memory.events");
     // `memory.events` is the kernel's own accounting of `max` hits and OOM kills.
     // Its presence with a non-zero `max` is corroboration, not proof on its own: the
     // enforcement proof is the workload's outcome in the test above.
@@ -256,13 +272,16 @@ fn memory_events_record_the_limit_being_hit() {
         "a delegated memory controller must expose memory.events"
     );
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::memory_events_record_the_limit_being_hit",
+    );
 }
 
 // ------------------------------------------------------------------- pids.max
 
 #[test]
 fn pids_max_prevents_unbounded_process_creation() {
-    requires_delegation!("pids.max");
+    requires_delegation!("pids_max_prevents_unbounded_process_creation", "pids.max");
 
     let cg = CgroupV2::discover();
     let cgroup = cg
@@ -320,13 +339,16 @@ fn pids_max_prevents_unbounded_process_creation() {
          so nothing was enforced"
     );
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::pids_max_prevents_unbounded_process_creation",
+    );
 }
 
 // --------------------------------------------------------------------- cpu.max
 
 #[test]
 fn cpu_max_throttles_rather_than_terminating() {
-    requires_delegation!("cpu.max");
+    requires_delegation!("cpu_max_throttles_rather_than_terminating", "cpu.max");
 
     let cg = CgroupV2::discover();
     let cgroup = cg
@@ -392,13 +414,19 @@ print('BURNT', x)\"";
         "the CPU ceiling had no observable effect: cpu.stat={stat:?} wall={wall:?}"
     );
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::cpu_max_throttles_rather_than_terminating",
+    );
 }
 
 // --------------------------------------------------------------- cgroup.kill
 
 #[test]
 fn cgroup_kill_terminates_a_three_level_subtree() {
-    requires_delegation!("cgroup.kill");
+    requires_delegation!(
+        "cgroup_kill_terminates_a_three_level_subtree",
+        "cgroup.kill"
+    );
 
     let cg = CgroupV2::discover();
     assert!(
@@ -449,11 +477,14 @@ sleep 300"#,
     );
     let _ = parent.wait();
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::cgroup_kill_terminates_a_three_level_subtree",
+    );
 }
 
 #[test]
 fn a_repeated_kill_stays_deterministic() {
-    requires_delegation!("cgroup.kill");
+    requires_delegation!("a_repeated_kill_stays_deterministic", "cgroup.kill");
     let cg = CgroupV2::discover();
     let cgroup = cg.create("kill-twice", &[]).expect("create");
     let child = Child(
@@ -487,11 +518,15 @@ fn a_repeated_kill_stays_deterministic() {
     cgroup.kill_all().expect("second kill on an empty cgroup");
     let _ = child.wait();
     cgroup.remove();
+    coverage::verified("orxnud-platform-sandbox::enforcement::a_repeated_kill_stays_deterministic");
 }
 
 #[test]
 fn a_process_that_exits_before_adoption_is_handled_deterministically() {
-    requires_delegation!("race");
+    requires_delegation!(
+        "a_process_that_exits_before_adoption_is_handled_deterministically",
+        "race"
+    );
     // The race the brief asks about: adoption after the process has gone must fail
     // cleanly rather than hang or corrupt state.
     let cg = CgroupV2::discover();
@@ -519,13 +554,19 @@ fn a_process_that_exits_before_adoption_is_handled_deterministically() {
         "a dead process must not appear in the cgroup"
     );
     cgroup.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::a_process_that_exits_before_adoption_is_handled_deterministically",
+    );
 }
 
 // ------------------------------------------------------------------ V-55 again
 
 #[test]
 fn the_base_is_a_parent_and_never_the_execution_cgroup() {
-    requires_delegation!("V-55");
+    requires_delegation!(
+        "the_base_is_a_parent_and_never_the_execution_cgroup",
+        "V-55"
+    );
     let cg = CgroupV2::discover();
     let handle = cg.create("dedicated-child", &[]).expect("create");
     assert!(
@@ -545,6 +586,9 @@ fn the_base_is_a_parent_and_never_the_execution_cgroup() {
         handle.path
     );
     handle.remove();
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::the_base_is_a_parent_and_never_the_execution_cgroup",
+    );
 }
 
 // ------------------------------------------------------------ discovery determinism
@@ -562,10 +606,15 @@ fn the_base_is_a_parent_and_never_the_execution_cgroup() {
 /// must see the same truth, and no caller may lose a controller to another caller.
 #[test]
 fn concurrent_discovery_never_reports_a_false_negative() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
     let a = CgroupV2::discover().availability;
     if !(a.memory && a.processes && a.cpu) {
         println!("  host does not delegate memory+pids+cpu, so there is no");
         println!("  ground truth to compare concurrent callers against");
+        coverage::reduced(
+            "orxnud-platform-sandbox::enforcement::concurrent_discovery_never_reports_a_false_negative",
+            "host does not delegate memory+pids+cpu; concurrent discovery has no ground truth",
+        );
         return;
     }
 
@@ -631,6 +680,9 @@ fn concurrent_discovery_never_reports_a_false_negative() {
         leftovers, 0,
         "{leftovers} of our probe cgroups were left behind"
     );
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::concurrent_discovery_never_reports_a_false_negative",
+    );
 }
 
 /// The base discovery settled on, for inspection.
@@ -655,9 +707,14 @@ fn expected_base() -> std::path::PathBuf {
 /// quietly if paths are ever derived from a shared name.
 #[test]
 fn concurrent_executions_never_share_a_cgroup() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
     let cg = CgroupV2::discover();
     if !cg.availability.can_create {
         println!("  no creatable base here; nothing to share or not");
+        coverage::reduced(
+            "orxnud-platform-sandbox::enforcement::concurrent_executions_never_share_a_cgroup",
+            "host has no creatable cgroup base; cgroup sharing was not exercised",
+        );
         return;
     }
 
@@ -731,5 +788,89 @@ fn concurrent_executions_never_share_a_cgroup() {
     }
     for p in &paths {
         assert!(!p.exists(), "{p:?} must be gone after its owner's removal");
+    }
+    coverage::verified(
+        "orxnud-platform-sandbox::enforcement::concurrent_executions_never_share_a_cgroup",
+    );
+}
+
+/// The sandbox producer is bound to this test process's harness identity too.
+#[test]
+#[should_panic(expected = "coverage producer identity mismatch")]
+fn a_verified_record_cannot_claim_another_tests_identity() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
+    coverage::verified(
+        "orxnud-platform-sandbox::resources::the_cgroup_probe_reports_something_either_way",
+    );
+}
+
+/// A worker that names itself after another test still has no producer scope.
+#[test]
+#[should_panic(expected = "coverage producer has no test provenance")]
+fn a_named_worker_thread_cannot_emit_another_tests_record() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
+    let target =
+        "orxnud-platform-sandbox::resources::the_cgroup_probe_reports_something_either_way";
+    let worker = std::thread::Builder::new()
+        .name(target.to_owned())
+        .spawn(|| coverage::verified(target))
+        .expect("the named worker must spawn");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// A worker that calls `scope` still carries this test's harness identity.
+///
+/// The worker's thread name is deliberately another tracked test's name. Nextest assigns
+/// identity per test process, not per thread, so entering a second scope on the worker
+/// cannot change the process identity to the thread name.
+#[test]
+fn a_named_worker_with_a_scope_cannot_emit_another_tests_record() {
+    let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
+    let target =
+        "orxnud-platform-sandbox::resources::the_cgroup_probe_reports_something_either_way";
+    let worker_name = "the_cgroup_probe_reports_something_either_way";
+    let worker = std::thread::Builder::new()
+        .name(worker_name.to_owned())
+        .spawn(|| {
+            let _scope = coverage::scope("orxnud-platform-sandbox::enforcement");
+            coverage::verified(target);
+        })
+        .expect("the named worker must spawn");
+    let Err(payload) = worker.join() else {
+        panic!("a named worker with its own scope minted the other test's record");
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    assert!(
+        message.contains("coverage producer identity mismatch"),
+        "the worker was rejected for the wrong reason: {message}"
+    );
+}
+
+/// Two real tests with the same final `::` component are distinct identities.
+mod identity_collision_a {
+    use super::coverage;
+
+    #[test]
+    #[should_panic(expected = "coverage producer identity mismatch")]
+    fn same_final_component() {
+        let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
+        coverage::verified(
+            "orxnud-platform-sandbox::enforcement::identity_collision_b::same_final_component",
+        );
+    }
+}
+
+mod identity_collision_b {
+    use super::coverage;
+
+    #[test]
+    fn same_final_component() {
+        let _coverage = coverage::scope("orxnud-platform-sandbox::enforcement");
     }
 }

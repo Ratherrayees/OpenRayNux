@@ -93,10 +93,14 @@ if [ "${1:-}" = "--host" ]; then
   echo "   a host that cannot isolate refuses every Tier-1 capability, and the suites"
   echo "   assert that refusal instead of a successful execution."
   ./scripts/preflight.sh
+  # The three capability suites are modules inside `orxnud-capability/src/tests/`,
+  # not integration binaries. `--test governed_path` fails before a single test runs
+  # with "no test target named ..."; these are nextest path filters instead. The same
+  # stale spelling was already corrected in `run-sandbox-tests-inner.sh`.
   for suite in \
-    "-p orxnud-capability --test governed_path" \
-    "-p orxnud-capability --test read_text_real" \
-    "-p orxnud-capability --test write_text" \
+    "-p orxnud-capability -E test(suites::governed_path)" \
+    "-p orxnud-capability -E test(suites::read_text_real)" \
+    "-p orxnud-capability -E test(suites::write_text)" \
     "-p orxnud-platform-sandbox --test isolation" \
     "-p orxnuctl --test cli_e2e" \
     "-p orxnud-daemon --test continuation" \

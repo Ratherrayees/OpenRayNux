@@ -24,6 +24,7 @@ pub(crate) type Registry = crate::dispatch::AdapterRegistry;
 mod bypass;
 mod concurrency;
 mod contract;
+mod coverage;
 mod dispatch_path;
 mod durable_state;
 mod governed_path;

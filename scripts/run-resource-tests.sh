@@ -113,12 +113,59 @@ docker run --rm \
   -v orxnud-target:/src/target \
   "$IMAGE" \
   bash -lc '
-    set -e
+    set -euo pipefail
     export PATH="/usr/local/cargo/bin:$PATH"
     echo "cargo: $(command -v cargo || echo MISSING)"
+
+    # The resource tests must execute inside this privileged container: that is the
+    # only place the delegated cgroup controls are writable. They also need nextest,
+    # because the coverage producer binds each record to the nextest per-test process
+    # identity; ordinary `cargo test` cannot supply it. Install the same pinned,
+    # checksum-verified nextest the sandbox and gate lanes use, into a throwaway
+    # directory in this container. The resource lane runs as root for cgroup access,
+    # so this is a root-owned path, but it is job-local, never a system path, and it
+    # carries the same literal checksum pin.
+    nextest_bin="$(mktemp -d /tmp/orxnud-nextest.XXXXXX)"
+    coverage_file=/src/target/resource-coverage-$$.jsonl
+    cleanup() {
+      rm -f "$coverage_file"
+      rm -rf "$nextest_bin"
+    }
+    trap cleanup EXIT
+    bash scripts/install-nextest-verified.sh "$nextest_bin"
+    export PATH="$nextest_bin:$PATH"
+    command -v cargo-nextest >/dev/null || {
+      echo "resource lane: cargo-nextest is not available after verified install" >&2
+      exit 1
+    }
+    cargo nextest --version
+
     echo "--- environment ---"
     stat -fc "cgroup fs type: %T" /sys/fs/cgroup
     echo "controllers: $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null | tr "\n" " ")"
-    cargo test -p orxnud-platform-sandbox --test resources -- --nocapture --test-threads=1
-    cargo test -p orxnud-capability --test governed_path -- --test-threads=1
+    echo "nextest tests:"
+    cargo nextest list -p orxnud-platform-sandbox --test resources --message-format oneline
+    cargo nextest list -p orxnud-platform-sandbox --test resources --message-format oneline \
+      | grep -q "^orxnud-platform-sandbox::resources " || {
+        echo "resource lane: the resources test target is missing" >&2
+        exit 1
+      }
+
+    rm -f "$coverage_file"
+    export ORXNUD_TEST_COVERAGE="$coverage_file"
+    export ORXNUD_COVERAGE_RUN="resource-$$"
+    # The old invocation also named `--test governed_path`. That target does not
+    # exist: the suite moved inside `orxnud-capability`, and it needs `bwrap` and the
+    # hostile-helper test binary, which this resource image does not provide. It is
+    # run by G9 and by the sandbox lane, not here. The resource target is this
+    # container lane scope; the coverage checker below names exactly that suite.
+    cargo nextest run -p orxnud-platform-sandbox --test resources --no-capture
+    # This lane exists to prove enforcement, not to go green when the host cannot
+    # provide it. The checker accepts `reduced` elsewhere; here every tracked resource
+    # path must have reached its assertions. Missing records, duplicate records, a
+    # mismatched run token, and a zero-record artifact all fail.
+    python3 scripts/test-coverage.py check \
+      --artifact "$coverage_file" --run "$ORXNUD_COVERAGE_RUN" \
+      --suite orxnud-platform-sandbox::resources --require-verified
+    rm -f "$coverage_file"
   '

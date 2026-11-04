@@ -605,6 +605,49 @@ gate_G8() {
 
 gate_G9() {
   banner G9
+
+  # The JSONL artifact proves that an ID appeared; it does not prove which test wrote it.
+  # Run the bounded producer-provenance regression first: it executes the real nextest
+  # harness for the payload test alone, verifies the enforced-memory ID is absent and the
+  # checker reports it missing, then runs both tests and verifies each records only itself.
+  if ! scripts/test-coverage-provenance.sh; then
+    fail_gate "coverage producer provenance regression failed"
+    return
+  fi
+
+  # TEST-002: a lane whose selector names no target, or whose nextest filter selects
+  # nothing, fails before its first test or reports an empty green. Both are invisible
+  # in a developer-facing lane that CI does not run.
+  if ! scripts/check-test-selectors.sh; then
+    fail_gate "a sandbox/resource lane selector names no target or selects no tests"
+    return
+  fi
+
+  # TEST-001: a passing test process is not evidence that a guarded body ran. Tests
+  # append a record only when they exercise (or deliberately reduce) their path; the
+  # gate validates those records against a fixed expected set. The scanner rejects the
+  # two shapes that already produced false green here: a successful early return with no
+  # decision, and a tautology such as `a.can_create || !a.can_create`.
+  local coverage_file="$PWD/target/test-coverage-$$.jsonl"
+  local coverage_run
+  coverage_run="$(date +%s%N)-$$-${RANDOM}"
+  rm -f "$coverage_file"
+
+  if ! python3 scripts/test-coverage.py scan \
+      --file crates/orxnud-capability/src/tests/write_text.rs \
+      --file crates/orxnud-capability/src/tests/governed_path.rs \
+      --file crates/orxnud-daemon/tests/uncertain_outcome.rs \
+      --file crates/orxnud-platform-sandbox/tests/enforcement.rs \
+      --file crates/orxnud-platform-sandbox/tests/resources.rs \
+      --file crates/orxnud-platform-sandbox/tests/isolation.rs; then
+    fail_gate "a test source contains a shape that can pass without exercising its assertions"
+    return
+  fi
+
+  # Set by the caller so a fallback path and the checker see the same fresh artifact.
+  export ORXNUD_TEST_COVERAGE="$coverage_file"
+  export ORXNUD_COVERAGE_RUN="$coverage_run"
+
   if have cargo-nextest; then
     # `nextest` rather than `cargo test` for one concrete reason: it runs each
     # test in its own process. TP-7 spawns and SIGKILLs a child, and a test that
@@ -625,6 +668,11 @@ gate_G9() {
     #   * cannot       -> the sandbox-evidence binaries are excluded, each with a
     #                     stated reason, and the reason is printed.
     #
+    # Enforcement and resource tests are deliberately NOT excluded now: their guarded
+    # bodies run on an undelegated host and record `reduced` with the missing controls,
+    # which is the honest answer. Hiding them behind an exclusion was the false-green
+    # half of TEST-001.
+    #
     # This is not a silent skip. The exclusion is narrower than "the sandbox
     # tests": the refusal-path tests inside those same binaries DO run, because
     # they assert the property that is true on an incapable host. And the positive
@@ -635,6 +683,7 @@ gate_G9() {
     # host and knows the suites apply -- `scripts/run-sandbox-tests.sh` uses it inside the
     # container, where the point is to run them unconditionally.
     local filter=()
+    local excluded=()
     if [ -z "${ORXNUD_TIER1_ASSUMED:-}" ] && ! scripts/preflight.sh --check >/dev/null 2>&1; then
       # The sentinel a Tier-1 suite fails with when it cannot run here. Checked below, so
       # a suite added to this repository later and forgotten in this list fails the gate
@@ -673,7 +722,7 @@ gate_G9() {
       # here for that reason; the three that do not execute a capability are NOT excluded
       # and run everywhere.
       filter=(
-        -E 'not ((binary(isolation) or binary(enforcement) or binary(resources) or binary(hostile_helper) or binary(disclosure))
+        -E 'not ((binary(isolation) or binary(hostile_helper) or binary(disclosure))
               or test(suites::governed_path::) or test(suites::read_text_real::) or test(suites::write_text::)
               or test(linux::tests::)
               or test(the_host_backend_is_selected_at_compile_time_and_reports_honestly)
@@ -694,9 +743,16 @@ gate_G9() {
               or test(a_crash_does_not_resurrect_an_expired_approval)
               or test(a_crash_after_expiry_and_before_reapproval_still_recovers))'
       )
+      excluded=(
+        orxnud-capability::suites::write_text
+        orxnud-capability::suites::governed_path
+        orxnud-platform-sandbox::isolation
+      )
       note "host cannot isolate: excluding the Tier-1 sandbox-evidence tests."
-      note "  governed_path, read_text_real, write_text, isolation, enforcement,"
-      note "  resources, hostile_helper  -- binaries whose subject is a real sandbox."
+      note "  governed_path, read_text_real, write_text, isolation, hostile_helper"
+      note "  -- binaries whose subject is a real sandbox."
+      note "  enforcement and resources RUN here and record reduced coverage rather"
+      note "  than disappearing behind the exclusion."
       note "  linux::tests::              -- the Linux backend's own suite."
       note "  6 named tests               -- sandbox-evidence tests inside tasks.rs."
       note "  6 named tests               -- continuation.rs, which cannot reach a step"
@@ -708,7 +764,8 @@ gate_G9() {
 
       local out rc=0
       # shellcheck disable=SC2086 # the filter is intentionally several words
-      out="$(cargo nextest run --workspace --no-fail-fast "${filter[@]}" 2>&1)" || rc=$?
+      out="$(ORXNUD_TEST_COVERAGE="$coverage_file" ORXNUD_COVERAGE_RUN="$coverage_run" \
+        cargo nextest run --workspace --no-fail-fast "${filter[@]}" 2>&1)" || rc=$?
       echo "$out"
       if printf '%s' "$out" | grep -q "$refusal"; then
         fail_gate "a suite outside the exclusion list needs a real sandbox: it failed with \"$refusal\" on a host that cannot isolate, so it was never excluded. Add its binary to the G9 filter above, or run it in scripts/run-sandbox-tests.sh"
@@ -718,26 +775,56 @@ gate_G9() {
         fail_gate "tests failed"
         return
       fi
-      ok "cargo nextest run (all host-applicable tests)"
+      local coverage_args=(check --artifact "$coverage_file" --run "$coverage_run")
+      local suite
+      for suite in "${excluded[@]}"; do
+        coverage_args+=(--excluded-suite "$suite")
+      done
+      local coverage_summary
+      if ! coverage_summary="$(python3 scripts/test-coverage.py "${coverage_args[@]}")"; then
+        fail_gate "test coverage records are incomplete or dishonest"
+        return
+      fi
+      printf '%s\n' "$coverage_summary" | sed 's/^/     /'
+      if printf '%s' "$coverage_summary" | grep -q 'verified=.* reduced=0 not-exercised=0 missing=0'; then
+        ok "cargo nextest run (all expected paths verified)"
+      else
+        ok "cargo nextest run (reduced coverage; see the summary above)"
+      fi
+      rm -f "$coverage_file"
       return
     fi
-    if cargo nextest run --workspace; then
-      ok "cargo nextest run (all tests)"
+    if ORXNUD_TEST_COVERAGE="$coverage_file" ORXNUD_COVERAGE_RUN="$coverage_run" \
+        cargo nextest run --workspace; then
+      local coverage_summary
+      if ! coverage_summary="$(python3 scripts/test-coverage.py check \
+          --artifact "$coverage_file" --run "$coverage_run")"; then
+        fail_gate "test coverage records are incomplete or dishonest"
+        return
+      fi
+      printf '%s\n' "$coverage_summary" | sed 's/^/     /'
+      if printf '%s' "$coverage_summary" | grep -q 'verified=.* reduced=0 not-exercised=0 missing=0'; then
+        ok "cargo nextest run (all expected paths verified)"
+      else
+        ok "cargo nextest run (reduced coverage; see the summary above)"
+      fi
     else
       fail_gate "tests failed"
     fi
+    rm -f "$coverage_file"
     return
   fi
   if is_strict; then
     fail_gate "cargo-nextest is not installed"
+    rm -f "$coverage_file"
     return
   fi
-  note_skip "cargo-nextest not installed; using cargo test (process isolation is lost)"
-  if cargo test --workspace; then
-    ok "cargo test --workspace"
-  else
-    fail_gate "tests failed"
-  fi
+  # The helper identities are supplied by nextest per test process. A whole-workspace
+  # `cargo test` run cannot supply a distinct identity for each test, and the old
+  # thread-name fallback is deliberately gone while coverage is being recorded. Fail
+  # clearly rather than run a suite whose producer records cannot be attributed.
+  fail_gate "cargo-nextest is required to establish TEST-001 producer identity; the cargo test fallback cannot provide it"
+  rm -f "$coverage_file"
 }
 
 # G10 — no committed credential.
@@ -831,6 +918,14 @@ gate_G12() {
 # that can agree with the first while both are wrong.
 gate_G13() {
   banner G13
+  # TEST-003: `rustscan.py` is the lexer every G3/G4 result rests on, and its own
+  # self-tests previously ran in no lane. Run them before the gate fixtures, so a
+  # broken classifier is reported as a classifier failure rather than as a gate that
+  # disagrees with its fixtures.
+  if ! python3 scripts/rustscan.py; then
+    fail_gate "the source classifier's own self-tests failed"
+    return
+  fi
   if python3 scripts/gate-selftest.py; then
     ok "G2d and G3 self-tests pass (real gate logic, temporary fixtures)"
   else

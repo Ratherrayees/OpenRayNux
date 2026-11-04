@@ -23,6 +23,7 @@ The exit status is what CI reads. Nothing in this file is a stand-in.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(REPO, "scripts", "ci-gates.sh")
+COVERAGE = os.path.join(REPO, "scripts", "test-coverage.py")
 
 # Minimal but *faithful* copies of the two crates G2d now reads.
 #
@@ -1816,6 +1818,56 @@ def run_g4_case(tmp: str, name: str, gate: str, rel: str, expect_fail: bool) -> 
     )
 
 
+def coverage_expected() -> dict[str, str]:
+    """The checker's own expected set, so the fixture cannot drift from the gate."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("orxnud_test_coverage", COVERAGE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.EXPECTED
+
+
+def write_coverage(path: str, run: str, *, reduced: str | None = None, omit: str | None = None) -> None:
+    expected = coverage_expected()
+    with open(path, "w", encoding="utf-8") as fh:
+        for test in expected:
+            if test == omit:
+                continue
+            record = {"run": run, "test": test, "outcome": "verified"}
+            if test == reduced:
+                record = {
+                    "run": run,
+                    "test": test,
+                    "outcome": "reduced",
+                    "reason": "fixture: required capability unavailable",
+                }
+            fh.write(json.dumps(record) + "\n")
+
+
+def run_coverage_case(tmp: str, name: str, *, expect_ok: bool, args: list[str], output: str | None = None) -> tuple[bool, str]:
+    result = subprocess.run(
+        [sys.executable, COVERAGE] + args,
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        check=False,
+    )
+    ok = (result.returncode == 0) == expect_ok
+    if output is not None and output not in result.stdout:
+        ok = False
+    if ok:
+        return True, ""
+    return (
+        False,
+        f"{name}\n     expected checker to "
+        f"{'ACCEPT' if expect_ok else 'REJECT'}, got exit {result.returncode}\n"
+        f"     stdout:\n{result.stdout}\n     stderr:\n{result.stderr}",
+    )
+
+
 def main() -> int:
     failures: list[str] = []
     total = 0
@@ -1861,6 +1913,186 @@ def main() -> int:
         for name, expect_fail, lib in DOC_CASES:
             total += 1
             ok, detail = run_doc_case(tmp, name, expect_fail, lib)
+            if ok:
+                print(f"  ok    {name}")
+            else:
+                print(f"  FAIL  {name}")
+                failures.append(detail)
+
+        # TEST-001 coverage: the checker and scanner must reject false green and accept
+        # an honest reduced-coverage run. These invoke the same CLI G9 uses.
+        coverage_run = "selftest-run"
+        coverage_all = os.path.join(tmp, "coverage-all.jsonl")
+        write_coverage(coverage_all, coverage_run)
+        coverage_missing = os.path.join(tmp, "coverage-missing.jsonl")
+        first = next(iter(coverage_expected()))
+        write_coverage(coverage_missing, coverage_run, omit=first)
+        coverage_reduced = os.path.join(tmp, "coverage-reduced.jsonl")
+        write_coverage(coverage_reduced, coverage_run, reduced=first)
+
+        # Producer-independent fixtures for the parser's fail-closed cases. These are
+        # deliberately separate from the real-harness provenance regression in
+        # scripts/test-coverage-provenance.sh.
+        covered_enforced = (
+            "orxnud-capability::suites::governed_path::"
+            "a_required_memory_ceiling_is_enforced_by_the_kernel_not_merely_written"
+        )
+        coverage_wrong_run = os.path.join(tmp, "coverage-wrong-run.jsonl")
+        write_coverage(coverage_wrong_run, "another-run")
+        coverage_missing_enforced = os.path.join(tmp, "coverage-missing-enforced.jsonl")
+        write_coverage(coverage_missing_enforced, coverage_run, omit=covered_enforced)
+        coverage_duplicate = os.path.join(tmp, "coverage-duplicate.jsonl")
+        write_coverage(coverage_duplicate, coverage_run)
+        with open(coverage_duplicate, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"run": coverage_run, "test": first, "outcome": "verified"}) + "\n")
+        coverage_unknown = os.path.join(tmp, "coverage-unknown.jsonl")
+        write_coverage(coverage_unknown, coverage_run)
+        with open(coverage_unknown, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"run": coverage_run, "test": "unknown::test", "outcome": "verified"}
+                )
+                + "\n"
+            )
+        coverage_malformed = os.path.join(tmp, "coverage-malformed.jsonl")
+        write_coverage(coverage_malformed, coverage_run)
+        with open(coverage_malformed, "a", encoding="utf-8") as fh:
+            fh.write("{not-json\n")
+        first_suite = coverage_expected()[first]
+
+        early = os.path.join(tmp, "early.rs")
+        with open(early, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#[test]\n"
+                "fn an_approved_write_reaches_the_sandbox_and_verifies_from_the_filesystem() {\n"
+                "    return;\n"
+                "}\n"
+            )
+        tautology = os.path.join(tmp, "tautology.rs")
+        with open(tautology, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#[test]\n"
+                "fn the_cgroup_probe_reports_something_either_way() {\n"
+                "    assert!(a.can_create || !a.can_create);\n"
+                "}\n"
+            )
+
+        coverage_cases = [
+            (
+                "coverage: an early successful return is not fully verified",
+                False,
+                ["scan", "--file", early],
+                None,
+            ),
+            (
+                "coverage: a tautology-shaped assertion is not evidence",
+                False,
+                ["scan", "--file", tautology],
+                None,
+            ),
+            (
+                "coverage: a missing expected record is not complete",
+                False,
+                ["check", "--artifact", coverage_missing, "--run", coverage_run],
+                None,
+            ),
+            (
+                "coverage: a duplicate record fails closed",
+                False,
+                ["check", "--artifact", coverage_duplicate, "--run", coverage_run],
+                None,
+            ),
+            (
+                "coverage: an unknown test cannot satisfy an expected path",
+                False,
+                ["check", "--artifact", coverage_unknown, "--run", coverage_run],
+                None,
+            ),
+            (
+                "coverage: malformed JSON fails closed",
+                False,
+                ["check", "--artifact", coverage_malformed, "--run", coverage_run],
+                None,
+            ),
+            (
+                "coverage: a record from another run is not credited",
+                False,
+                ["check", "--artifact", coverage_wrong_run, "--run", coverage_run],
+                None,
+            ),
+            (
+                "coverage: the payload record does not stand in for the enforced path",
+                False,
+                [
+                    "check",
+                    "--artifact",
+                    coverage_missing_enforced,
+                    "--run",
+                    coverage_run,
+                    "--suite",
+                    "orxnud-capability::suites::governed_path",
+                ],
+                f"MISSING       {covered_enforced}",
+            ),
+            (
+                "coverage: an excluded suite is reported as not exercised",
+                True,
+                [
+                    "check",
+                    "--artifact",
+                    coverage_missing,
+                    "--run",
+                    coverage_run,
+                    "--excluded-suite",
+                    first_suite,
+                ],
+                "not exercised",
+            ),
+            (
+                "coverage: a real test failure cannot be downgraded to reduced coverage",
+                False,
+                [
+                    "check",
+                    "--artifact",
+                    coverage_all,
+                    "--run",
+                    coverage_run,
+                    "--run-status",
+                    "1",
+                ],
+                None,
+            ),
+            (
+                "coverage: an unsupported-host run reports reduced coverage honestly",
+                True,
+                ["check", "--artifact", coverage_reduced, "--run", coverage_run],
+                "reduced coverage",
+            ),
+            (
+                "coverage: a complete verified run is reported as complete",
+                True,
+                ["check", "--artifact", coverage_all, "--run", coverage_run],
+                "all",
+            ),
+            (
+                "coverage: a lane requiring enforcement cannot accept reduced coverage",
+                False,
+                [
+                    "check",
+                    "--artifact",
+                    coverage_reduced,
+                    "--run",
+                    coverage_run,
+                    "--require-verified",
+                ],
+                None,
+            ),
+        ]
+        for name, expect_ok, args, output in coverage_cases:
+            total += 1
+            ok, detail = run_coverage_case(
+                tmp, name, expect_ok=expect_ok, args=args, output=output
+            )
             if ok:
                 print(f"  ok    {name}")
             else:

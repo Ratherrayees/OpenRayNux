@@ -18,7 +18,7 @@
 
 // Declared once in `tests/mod.rs`, since a module path inside
 // `tests/` would otherwise resolve per-file.
-use super::{Registry, support};
+use super::{Registry, coverage, support};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -108,7 +108,7 @@ fn invocation(params: &serde_json::Value) -> orxnud_policy::authority::Capabilit
 // capability, and keeps `governed_path`'s argv-payload tests measuring the gate.
 //
 // This is an exception, not a fix. The underlying exposure is unchanged and remains
-// open; see `docs/18-remediation-plan.md` S-17.
+// open; see `docs/12-verification-register.md` V-67 (R-1).
 fn permitted() -> [CapabilityId; 1] {
     [CapabilityId::new("filesystem/write-text")]
 }
@@ -293,6 +293,10 @@ fn require_sandbox(test: &str) -> bool {
     if sandbox_available() {
         return true;
     }
+    coverage::reduced(
+        &format!("orxnud-capability::suites::write_text::{test}"),
+        "sandbox backend unsupported; the governed Tier-1 path was not exercised",
+    );
     eprintln!(
         "{test}: no sandbox backend on this host; the governed Tier-1 path cannot be exercised"
     );
@@ -305,6 +309,7 @@ fn require_sandbox(test: &str) -> bool {
 
 #[test]
 fn an_approved_write_reaches_the_sandbox_and_verifies_from_the_filesystem() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("an_approved_write_reaches_the_sandbox_and_verifies_from_the_filesystem") {
         return;
     }
@@ -333,6 +338,9 @@ fn an_approved_write_reaches_the_sandbox_and_verifies_from_the_filesystem() {
         "the child must have exited cleanly: {:?}",
         outcome.execution
     );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::an_approved_write_reaches_the_sandbox_and_verifies_from_the_filesystem",
+    );
 }
 
 #[test]
@@ -354,6 +362,7 @@ fn a_write_without_an_approval_is_refused_and_nothing_is_written() {
 
 #[test]
 fn bytes_arrive_exactly_with_nothing_interpreted() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("bytes_arrive_exactly_with_nothing_interpreted") {
         return;
     }
@@ -378,10 +387,14 @@ fn bytes_arrive_exactly_with_nothing_interpreted() {
         awkward.as_bytes(),
         "the bytes must arrive exactly"
     );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::bytes_arrive_exactly_with_nothing_interpreted",
+    );
 }
 
 #[test]
 fn an_empty_file_is_the_requested_effect_not_a_missing_one() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("an_empty_file_is_the_requested_effect_not_a_missing_one") {
         return;
     }
@@ -402,6 +415,9 @@ fn an_empty_file_is_the_requested_effect_not_a_missing_one() {
         "an empty file verifies: {:?}",
         outcome.verification
     );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::an_empty_file_is_the_requested_effect_not_a_missing_one",
+    );
 }
 
 /// The escape test: the boundary is the sandbox, and this proves it.
@@ -413,6 +429,7 @@ fn an_empty_file_is_the_requested_effect_not_a_missing_one() {
 /// stopping the write.
 #[test]
 fn an_escaping_path_cannot_reach_the_host_filesystem() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("an_escaping_path_cannot_reach_the_host_filesystem") {
         return;
     }
@@ -471,6 +488,9 @@ fn an_escaping_path_cannot_reach_the_host_filesystem() {
         "a sandboxed write escaped the workspace: {}",
         outside.display()
     );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::an_escaping_path_cannot_reach_the_host_filesystem",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +499,7 @@ fn an_escaping_path_cannot_reach_the_host_filesystem() {
 
 #[test]
 fn an_approval_for_one_parameter_set_does_not_authorise_another() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("an_approval_for_one_parameter_set_does_not_authorise_another") {
         return;
     }
@@ -509,10 +530,14 @@ fn an_approval_for_one_parameter_set_does_not_authorise_another() {
         "alpha",
         "the refused dispatch must not have modified the file"
     );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::an_approval_for_one_parameter_set_does_not_authorise_another",
+    );
 }
 
 #[test]
 fn object_key_order_does_not_change_what_an_approval_authorises() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("object_key_order_does_not_change_what_an_approval_authorises") {
         return;
     }
@@ -558,6 +583,9 @@ fn object_key_order_does_not_change_what_an_approval_authorises() {
         )
         .expect("a reordered but identical request is the same approved operation");
     assert!(outcome.is_verified(), "{:?}", outcome.verification);
+    coverage::verified(
+        "orxnud-capability::suites::write_text::object_key_order_does_not_change_what_an_approval_authorises",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +594,7 @@ fn object_key_order_does_not_change_what_an_approval_authorises() {
 
 #[test]
 fn an_expired_approval_is_refused_and_nothing_is_written() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("an_expired_approval_is_refused_and_nothing_is_written") {
         return;
     }
@@ -593,6 +622,9 @@ fn an_expired_approval_is_refused_and_nothing_is_written() {
     assert!(
         !fixture.path("late.txt").exists(),
         "an expired approval must not have written anything"
+    );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::an_expired_approval_is_refused_and_nothing_is_written",
     );
 }
 
@@ -628,6 +660,7 @@ fn an_approval_is_valid_right_up_to_its_expiry() {
 
 #[test]
 fn an_approval_succeeds_once_and_is_refused_the_second_time() {
+    let _coverage = coverage::scope("orxnud-capability::suites::write_text");
     if !require_sandbox("an_approval_succeeds_once_and_is_refused_the_second_time") {
         return;
     }
@@ -661,6 +694,9 @@ fn an_approval_succeeds_once_and_is_refused_the_second_time() {
     assert!(
         refusal.to_string().contains("approval-already-used"),
         "the refusal must be the single-use ledger: {refusal}"
+    );
+    coverage::verified(
+        "orxnud-capability::suites::write_text::an_approval_succeeds_once_and_is_refused_the_second_time",
     );
 }
 

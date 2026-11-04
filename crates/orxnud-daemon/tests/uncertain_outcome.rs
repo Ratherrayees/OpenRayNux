@@ -38,6 +38,9 @@ use std::time::Duration;
 use orxnud_protocol::error::RpcErrorCode;
 use serde_json::{Value, json};
 
+#[path = "support/coverage.rs"]
+mod coverage;
+
 // ---------------------------------------------------------------------------
 // harness
 // ---------------------------------------------------------------------------
@@ -110,7 +113,7 @@ impl Daemon {
         // need a capability that actually executes; this is how they get one.
         //
         // It does NOT satisfy R-1 option 2 (owner, bounded period, review date). See the open
-        // owner decision in `docs/18` section 12.
+        // owner decision recorded in `docs/12-verification-register.md` V-67 (R-1).
         cmd.arg("--permit-argv-payload-exposure-for-tests");
         let child = cmd.spawn().expect("spawn orxnud");
         let me = Self { child, ep };
@@ -167,18 +170,22 @@ impl Daemon {
             "task/create",
             json!({"id": id, "content": "write"}),
         );
-        send(
+        let claimed = send(
             self.ep(),
             "cl",
             "task/claim",
             json!({"id": id, "worker": "w1"}),
         );
+        let claim_generation = claimed["result"]["claim_generation"]
+            .as_i64()
+            .expect("claim generation");
         let p = send(
             self.ep(),
             "p",
             "task/propose",
             json!({
                 "task": id, "worker": "w1", "capability": "filesystem/write-text",
+                "claim_generation": claim_generation,
                 "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}}),
         );
         let pid = p["result"]["proposal"]["proposal_id"]
@@ -204,9 +211,16 @@ impl Drop for Daemon {
     }
 }
 
-fn ready_on(host: bool) -> bool {
+fn ready_on(host: bool, test: Option<&str>) -> bool {
     let cap = orxnud_platform_sandbox::host_capability();
-    host && cap.tier1_executable
+    let ready = host && cap.tier1_executable;
+    if !ready && let Some(test) = test {
+        coverage::reduced(
+            &format!("orxnud-daemon::uncertain_outcome::{test}"),
+            "Tier-1 sandbox is not executable on this host (V-87); no positive evidence",
+        );
+    }
+    ready
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +238,11 @@ fn ready_on(host: bool) -> bool {
 )]
 #[test]
 fn an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped"),
+    ) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -314,6 +332,7 @@ fn an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped() {
         "task/propose",
         json!({
             "task": "u1", "worker": "w1", "capability": "filesystem/write-text",
+            "claim_generation": 0,
             "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}}),
     );
     assert!(
@@ -323,6 +342,9 @@ fn an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped() {
 
     drop(s2);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +363,11 @@ fn an_uncertain_non_idempotent_effect_stops_the_task_and_stays_stopped() {
 )]
 #[test]
 fn an_uncertain_task_offers_no_shortcut_back_to_running() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("an_uncertain_task_offers_no_shortcut_back_to_running"),
+    ) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -404,6 +430,7 @@ fn an_uncertain_task_offers_no_shortcut_back_to_running() {
             "task/propose",
             json!({
                 "task": "u2", "worker": "w1", "capability": "filesystem/write-text",
+                "claim_generation": 0,
                 "target": "out.txt", "params": {"path": "out.txt", "contents": "x"}}),
         )
         .get("error")
@@ -416,7 +443,7 @@ fn an_uncertain_task_offers_no_shortcut_back_to_running() {
         s.ep(),
         "5",
         "task/complete",
-        json!({"id": "u2", "worker": "w1"}),
+        json!({"id": "u2", "worker": "w1", "claim_generation": 0}),
     );
     assert!(
         c.get("error").is_some(),
@@ -443,6 +470,9 @@ fn an_uncertain_task_offers_no_shortcut_back_to_running() {
 
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::an_uncertain_task_offers_no_shortcut_back_to_running",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +492,8 @@ fn an_uncertain_task_offers_no_shortcut_back_to_running() {
 )]
 #[test]
 fn a_verified_effect_still_completes_normally() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(true, Some("a_verified_effect_still_completes_normally")) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -499,6 +530,9 @@ fn a_verified_effect_still_completes_normally() {
 
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::a_verified_effect_still_completes_normally",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +551,11 @@ fn a_verified_effect_still_completes_normally() {
 )]
 #[test]
 fn the_audit_records_the_uncertainty_rather_than_a_completion() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("the_audit_records_the_uncertainty_rather_than_a_completion"),
+    ) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -587,6 +625,9 @@ fn the_audit_records_the_uncertainty_rather_than_a_completion() {
 
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::the_audit_records_the_uncertainty_rather_than_a_completion",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +647,11 @@ fn the_audit_records_the_uncertainty_rather_than_a_completion() {
 )]
 #[test]
 fn a_crash_inside_the_uncertainty_transition_leaves_no_retryable_task() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("a_crash_inside_the_uncertainty_transition_leaves_no_retryable_task"),
+    ) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -665,6 +710,9 @@ fn a_crash_inside_the_uncertainty_transition_leaves_no_retryable_task() {
 
     drop(again);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::a_crash_inside_the_uncertainty_transition_leaves_no_retryable_task",
+    );
 }
 
 /// Two of the four rows in the decision table have **no end-to-end producer today**, and
@@ -703,7 +751,7 @@ fn the_table_has_an_end_to_end_producer_for_every_row_that_can_have_one() {
     // should be extended, and the note above should be deleted.
     // A print, not an assertion: on a hosted runner no row has a producer here, and
     // failing the suite for that would report an environment fact as a defect.
-    if !ready_on(true) {
+    if !ready_on(true, None) {
         println!("  this host cannot isolate, so no row is produced end to end here (V-87)");
     }
 }
@@ -721,7 +769,11 @@ fn the_table_has_an_end_to_end_producer_for_every_row_that_can_have_one() {
 )]
 #[test]
 fn the_durable_record_explains_the_uncertainty_without_carrying_content() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("the_durable_record_explains_the_uncertainty_without_carrying_content"),
+    ) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -762,6 +814,9 @@ fn the_durable_record_explains_the_uncertainty_without_carrying_content() {
 
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::the_durable_record_explains_the_uncertainty_without_carrying_content",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +835,11 @@ fn the_durable_record_explains_the_uncertainty_without_carrying_content() {
 )]
 #[test]
 fn a_worker_whose_lease_ended_cannot_settle_the_outcome() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("a_worker_whose_lease_ended_cannot_settle_the_outcome"),
+    ) {
         println!("  this host cannot isolate; no positive evidence (V-87)");
         return;
     }
@@ -817,6 +876,9 @@ fn a_worker_whose_lease_ended_cannot_settle_the_outcome() {
 
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::a_worker_whose_lease_ended_cannot_settle_the_outcome",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +947,11 @@ fn effects(root: &std::path::Path) -> Vec<(String, String, i64)> {
 )]
 #[test]
 fn the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some("the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs"),
+    ) {
         println!(
             "  NOT_PROVEN: this host cannot isolate, so the dispatch cannot be made to run; \
              the ledger evidence is NOT demonstrated here (V-87)"
@@ -934,6 +1000,9 @@ fn the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs()
     assert_eq!(s.task("v93l")["state"], "completed");
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs",
+    );
 }
 
 /// The mirror: an idempotent capability records an effect that *is* safe to repeat, so a
@@ -947,7 +1016,13 @@ fn the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs()
 )]
 #[test]
 fn the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_capability() {
-    if !ready_on(true) {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    if !ready_on(
+        true,
+        Some(
+            "the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_capability",
+        ),
+    ) {
         println!("  NOT_PROVEN: this host cannot isolate (V-87)");
         return;
     }
@@ -967,12 +1042,16 @@ fn the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_ca
         json!({"id": "v93li", "worker": "w1"}),
     );
     assert!(claimed.get("result").is_some(), "claim failed: {claimed}");
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
     let p = send(
         s.ep(),
         "p",
         "task/propose",
         json!({
             "task": "v93li", "worker": "w1", "capability": "text/word-count",
+            "claim_generation": claim_generation,
             "params": {"text": "one two three"}}),
     );
     let pid = p["result"]["proposal"]["proposal_id"]
@@ -1005,6 +1084,9 @@ fn the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_ca
     );
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+    coverage::verified(
+        "orxnud-daemon::uncertain_outcome::the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_capability",
+    );
 }
 
 /// The task's own `idempotent` flag is not what the ledger records, and must not be.
@@ -1033,4 +1115,84 @@ fn the_daemons_default_task_kind_is_idempotent_and_that_is_not_what_is_recorded(
     assert_eq!(t["idempotent"], true, "{t}");
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A reduced record cannot be assigned to another test in this suite.
+#[test]
+#[should_panic(expected = "coverage producer identity mismatch")]
+fn a_reduced_record_cannot_claim_another_tests_identity() {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    coverage::reduced(
+        "orxnud-daemon::uncertain_outcome::the_durable_record_explains_the_uncertainty_without_carrying_content",
+        "deliberate identity-attribution test",
+    );
+}
+
+/// A worker that names itself after another test still has no producer scope.
+#[test]
+#[should_panic(expected = "coverage producer has no test provenance")]
+fn a_named_worker_thread_cannot_emit_another_tests_record() {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    let target = "orxnud-daemon::uncertain_outcome::the_durable_record_explains_the_uncertainty_without_carrying_content";
+    let worker = std::thread::Builder::new()
+        .name(target.to_owned())
+        .spawn(|| coverage::verified(target))
+        .expect("the named worker must spawn");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// A worker that calls `scope` still carries this test's harness identity.
+///
+/// The worker's thread name is deliberately another tracked test's name. Nextest assigns
+/// identity per test process, not per thread, so entering a second scope on the worker
+/// cannot change the process identity to the thread name.
+#[test]
+fn a_named_worker_with_a_scope_cannot_emit_another_tests_record() {
+    let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    let target = "orxnud-daemon::uncertain_outcome::the_durable_record_explains_the_uncertainty_without_carrying_content";
+    let worker_name = "the_durable_record_explains_the_uncertainty_without_carrying_content";
+    let worker = std::thread::Builder::new()
+        .name(worker_name.to_owned())
+        .spawn(|| {
+            let _scope = coverage::scope("orxnud-daemon::uncertain_outcome");
+            coverage::verified(target);
+        })
+        .expect("the named worker must spawn");
+    let Err(payload) = worker.join() else {
+        panic!("a named worker with its own scope minted the other test's record");
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    assert!(
+        message.contains("coverage producer identity mismatch"),
+        "the worker was rejected for the wrong reason: {message}"
+    );
+}
+
+/// Two real tests with the same final `::` component are distinct identities.
+mod identity_collision_a {
+    use super::coverage;
+
+    #[test]
+    #[should_panic(expected = "coverage producer identity mismatch")]
+    fn same_final_component() {
+        let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+        coverage::verified(
+            "orxnud-daemon::uncertain_outcome::identity_collision_b::same_final_component",
+        );
+    }
+}
+
+mod identity_collision_b {
+    use super::coverage;
+
+    #[test]
+    fn same_final_component() {
+        let _coverage = coverage::scope("orxnud-daemon::uncertain_outcome");
+    }
 }
