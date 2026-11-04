@@ -33,7 +33,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/openraynux/openraynux"
+repository = "https://github.com/Ratherrayees/OpenRayNux"
 authors = ["OpenRayNux contributors"]
 publish = false
 
@@ -53,7 +53,7 @@ rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 # `orxnud-store`'s build script, which parses the bundled `sqlite3.h` to
 # assert the linked version at compile time. Never linked into the library.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal", "net", "io-util"] }
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal", "net", "io-util"] }
 # Unix-only peer credentials (`SO_PEERCRED`), used by `orxnud-platform-ipc` to
 # establish who a local caller actually is. Already a transitive dependency of tokio on
 # this platform; named here so the platform crate depends on it directly rather than on

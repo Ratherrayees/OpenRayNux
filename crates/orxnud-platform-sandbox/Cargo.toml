@@ -4,6 +4,7 @@ description = "Subprocess execution boundary: the portable contract and its per-
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # The contract lives here rather than in orxnud-domain because a sandbox is an OS

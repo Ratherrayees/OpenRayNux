@@ -22,6 +22,9 @@ orxnud-domain = { workspace = true }
 # lives here because this crate is one of the three gate G3 permits it in.
 # `rusqlite` is already the store's dependency, so the Windows build adds no new
 # SQLite version to the graph.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 rusqlite = { workspace = true }
 windows-sys = { workspace = true }
