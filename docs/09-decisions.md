@@ -28,7 +28,7 @@ existed while the header still claimed 47 ADRs through ADR-0049:
   (closes V-92).
 * **ADR-0054** — the Tier-1 payload travels on the child's stdin; credential-carrying
   capabilities stay prohibited until a separate design lands. **Decided, not implemented**;
-  `docs/18` §6.3 gates the implementation phase on this record being merged.
+  the implementation phase was gated on this record being merged.
 * **ADR-0055** — the credential channel: an inherited file descriptor carried by
   `bwrap --sync-fd`, opt-in per capability, with the prohibition kept until the evidence exists.
   **Decided, not implemented**; ships no code and enables no capability.
@@ -4836,8 +4836,8 @@ test now says so rather than letting the absence pass unnoticed.
 
 **Status.** **Decided and reviewed; the transport implementation has landed, and the default
 refusal remains in force.** Owner review 2026-10-10 approved the direction and the 1 MiB limit,
-and required the empty-vs-absent framing detail that Decision 4 now specifies. `docs/18` §6.3
-gated S-17's implementation phase on this record being **merged**; that gate has been passed.
+and required the empty-vs-absent framing detail that Decision 4 now specifies. S-17's
+implementation phase was gated on this record being **merged**; that gate has been passed.
 Lifts nothing. F-10 stays open and R-1 stands.
 
 > **AMENDED 2026-10-19 — the transport change has landed; the refusal deliberately has not.**
@@ -5097,8 +5097,7 @@ reason structural rather than advisory.
 
 **Decision 6 — transport compatibility is explicit, and a mismatch is refused.**
 
-`docs/18` §929 requires that an old helper with a new daemon be **refused, not silently
-mismatched**. Removing `--contents` from `argv` would otherwise produce a *refusal by
+An old helper with a new daemon is **refused, not silently mismatched**. Removing `--contents` from `argv` would otherwise produce a *refusal by
 accident*: today's helper errors on a missing `--contents`, which is the right outcome reached
 for the wrong reason, and which a later edit could quietly remove. The daemon and helper
 therefore agree a transport version explicitly, and a helper that does not implement the stdin
@@ -6205,7 +6204,7 @@ nothing is pending, and restores on failure — it is correct. `run(snapshot_ver
 uses `migrate`. So one path is right and five are not, and nothing in the type system, the
 naming, or the tests distinguishes them.
 
-The full specification is §7-S11 in the remediation plan. This record covers only what that
+The full specification (remediation slice S-11) is not reproduced here; this record covers only what that
 specification cannot settle.
 
 **Decision D-S11-a — APPROVED 2026-10-14: remove the public caller-controlled `run(bool)` mode.
@@ -6346,7 +6345,7 @@ safety until both contracts hold.**
 production sequence behaved safely in this experiment. It does not establish safety under
 concurrent access, file replacement, or any ordering in which a sidecar outlives the main file
 it belongs to. The repeatable Case 3/4 results are a **separate failure mode** with their own
-acceptance criteria (§7-S30), not a footnote on the happy path.
+acceptance criteria (slice S-30), not a footnote on the happy path.
 
 **Implementation caution, recorded because it is the obvious wrong first attempt.** Sidecar
 removal **cannot** be an unconditional filesystem cleanup while SQLite connections may still be
@@ -6365,7 +6364,7 @@ that the mechanism prevents stale state from being replayed **and** that it rema
 connections are live or a restore fails partway through.
 
 **S-30's five acceptance criteria.** None is satisfied by the happy path alone, and each is
-carried in §7-S30: (1) stale-sidecar regression, repeated with stale `-wal` and stale `-shm`;
+carried in S-30: (1) stale-sidecar regression, repeated with stale `-wal` and stale `-shm`;
 (2) **unreadable is failure** — an unreadable database must never count as evidence that the
 unwanted row is absent, which is the mistake the first version of this experiment's probe made;
 (3) logical-state verification against the snapshot's expected state, because `integrity_check`,

@@ -1,16 +1,22 @@
 # 12 — Verification Register & Freshness Policy
 
-Status: **Draft v0.5** · Adopted 2026-09-30 · last reconciled **2026-10-10** against
-`HEAD` (`1fa2d0b`); previously reconciled 2026-10-08 against `c5934970`.
+Status: **Draft v0.5** · Adopted 2026-09-30 · last full reconciliation **2026-10-10**
+against `HEAD` (`1fa2d0b`); previously reconciled 2026-10-08 against `c5934970`. The counts
+below were re-measured **2026-10-24** against the current worktree; that re-measurement is
+not a full re-read of every row.
 
-96 V-rows (V-01 … V-97, V-44 deliberately unused) plus one non-V row, `K.1`, so 97 bolded
-table rows in total. **`F-26` was added to §2 on 2026-10-14, taking that total to 98.** (The
-pre-existing discrepancy between "96" and the rows actually present in §2 is left as found; it
-is not this row's business to reconcile, and guessing a corrected total would be a second
-unsourced number in a register whose whole purpose is that its numbers are sourced.) No V-ID appears twice. V-96 was reclassified from `*(undefined)*` to a
-recovered definition on 2026-10-10; see the note below. Every V-ID cited anywhere in `docs/`
-is present here, with the single exception of **V-44**, which is cited in `09-decisions.md`
-and `README.md` *as* the deliberately-unused identifier.
+**Canonical per-ID audit ledger:** the 136-ID ledger from the 2026-10-21 independent audit is
+maintained as a local-only record and is not part of this repository; its two parts record the
+audit-baseline status and the current working-tree dispositions separately.
+
+**Measured 2026-10-24 against this working tree:** **101 V-rows** (V-01 … V-102; V-44
+deliberately unused) plus the non-V rows `K.1` and `F-26` = **103 bolded table rows**.
+No V-ID appears twice. The previous "96 V-rows" and "now 102" figures were stale: `V-98`,
+`V-99`, `V-100`, `V-101` and `V-102` had been added without a full recount. V-96 was
+reclassified from `*(undefined)*` to a recovered definition on 2026-10-10; see the note
+below. Every V-ID cited anywhere in `docs/` is present here, with the single exception of
+**V-44**, which is cited in `09-decisions.md` and `README.md` *as* the deliberately-unused
+identifier.
 
 **Three numbering gaps, all deliberate**, recorded rather than renumbered because
 renumbering would break every existing citation, and because a silent gap is
@@ -109,8 +115,8 @@ phase gate).
 | ID | Claim | Verification source | Cadence / trigger | Last verified | Consequence of silent drift |
 | **F-26** | **Every production schema-changing upgrade holds a verified pre-migration recovery snapshot, and refuses to migrate without one (S-11-INV).** | **NOT VERIFIED. F-26 is OPEN and S-11 is not implemented.** **AMENDED 2026-10-17 (A-009): the trust-me APIs are gone, which removes the specific mechanism this row cited but does not close the finding.** `MigrationRunner::run(bool)`, the `snapshot_verified_by_caller` parameter on `migrate`, the `snapshot_verified` parameter on `open_and_migrate`, `MigrationError::NoSnapshot`, and both `SqliteAuditJournal::migrate(&Connection)` / `SqliteApprovalLedger::migrate(&Connection)` helpers **no longer exist in the source**, so the six entry points this row named are not reachable by those names. The four `security_state.rs` callers now go through `migrate(path)` and recover through `migration::recover_from_snapshot`, with tests driving both production constructors to a genuine mid-migration failure and asserting the restored `schema_meta`, `audit_log` and `spent_approvals` state. Gate **G16** refuses the one remaining unprotected path (`migrate_ephemeral`) in production source and is exercised in 16 directions by G13. **Still open:** F-26b and F-26c (hard-link alias, ADR-0058 — approved 2026-10-14 and implemented in source; the focused Windows identity suites have since run on a hosted Windows runner — A-019 — and the finding remains open on its residual window), and S-11's wider specification. **AMENDED 2026-10-17 (A-011): the public-schema-SQL route described by that residual gap is now closed and G16 also refuses production schema DDL — but F-26 remains OPEN**, because `orxnud-store` still publishes live `Connection` values and G16 is lexical enforcement, not a type-system guarantee. The original 2026-10-14 text follows, retained because it records what was measured.**
 
-The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`,
-§7-S30) owns the restore defect; S-11 (§7-S11) owns the six entry points. **S-11 is blocked on
+The snapshot *mechanism* is implemented and separately covered: `Backup::take` uses SQLite's online backup API (`backup.rs:164`), `verify_impl` runs `PRAGMA integrity_check` and requires `schema_meta` (`backup.rs:258`), `verify_against_source` compares against the source (`backup.rs:229`), `migrate` verifies-or-takes and restores on failure (`migration.rs:396`). **The invariant is not, because `run(snapshot_verified: bool)` trusts the boolean** (`migration.rs:299`) rather than requiring a snapshot to exist, and **six production entry points reach it**: `task_service.rs:170` (`migrate(path, false)`, correct); `security_state.rs:92`, `:116`, `:270`, `:290` (all `.run(true)`); and `migration.rs:468` `open_and_migrate`, which forwards an unverified caller boolean straight into the trusting API. Two of the four (`SecurityState::migrate`, `Ledger::migrate`) take only `&Connection` and therefore **cannot** snapshot as written. `Ledger::open` is reachable in production at `daemon/src/lib.rs:908`. **Existing coverage does not reach any of them**: the single test of the snapshotting path is `migration.rs:1137`, and no test drives a production entry point. **A second, distinct defect was measured on 2026-10-14.** `Backup::restore` rewrites the main file but never neutralises `state.db-wal`/`state.db-shm` (`backup.rs:351`). Measured against the real mechanism: the production path (restore while the runner's connection is open) is **safe**, but replaying a **stale `-wal`** beside a restored main file makes **post-snapshot data resurface — deterministically, 3/3 repeats** — while `PRAGMA integrity_check` returns **`ok`**, `schema_meta` still reads the pre-snapshot version, and `Backup::verify` still passes. SQLite's salt check does not prevent it, and structural post-restore checking is therefore **proven insufficient**. The invariant this forces is **S-11-RESTORE** in ADR-0057: sidecar removal is a *precondition of the restore*, and the post-restore guarantee must be **logical**. **The two halves are now tracked separately and the dependency is hard.** S-30 (`S-11-RESTORE`)
+owns the restore defect; S-11 owns the six entry points. **S-11 is blocked on
 S-30** and must not claim safety until S-30's five acceptance criteria hold — a coordinator whose
 rollback can return `Ok(())` while restoring the wrong state would make its own safety claim
 false. Both are P1; the split is scope and test boundary, not severity. D-S11-a is approved,
@@ -175,9 +181,9 @@ reporting success, but that is not a clean rollback and this row does not claim 
 
 | **V-49** | **A required sandbox guarantee is refused; there is no unsandboxed fallback** | `AvailableGuarantees::check` → `Refused(GuaranteeUnavailable)`; `BwrapRunner::run` refuses before `Command::spawn`; asserted by `a_spec_with_nothing_granted_starts_no_process_for_an_ungranted_capability` and `a_spec_demanding_os_enforced_resources_is_refused_on_this_host` | **milestone:** Phase 4b — the dispatcher integration must preserve this | 2026-09-30 | **Critical.** The invariant: *every Tier-1 execution request is rejected when a required sandbox guarantee cannot be established; there is no "best effort" fallback to unsandboxed execution.* `bwrap` missing yields `MechanismMissing`, not a run without isolation — an unsandboxed capability has no isolation at all, which is worse than no capability. Relaxation exists but is explicit (`accepting_best_effort_containment()`), named in the diff, and recorded in `ExecutionResult::unproven` so an audit record can state the gap rather than imply otherwise. Phase 4a's evidence for this is negative-path only: it proves refusal, not that a *governed* execution path consumes it, because no such path exists yet. |
 | **V-50** | **CLOSED by V-51 -- the sandbox **is** reachable from the dispatcher** | `orxnud-platform-sandbox` has no consumer; `grep -rn SandboxRunner crates/` finds only its own tests | **closed:** superseded by V-51| 2026-10-05 | **High.** Recorded as an explicit gap rather than an omission. The full governed path — `Dispatcher → execution contract → sandbox supervisor → Tier-1 subprocess → result → Verification → Audit` — does not exist, so Phase 4a proves a boundary that nothing yet enforces. A later execution path could bypass it accidentally, which is precisely the failure the Phase 3 exit criteria were written to prevent. Phase 4b must wire it with synthetic adapters only and prove no bypass exists. **Nothing is registered and nothing runs unsandboxed today**, so no capability is currently at risk; the risk is architectural drift, not an active exposure. Re-verified 2026-10-05 and closed. Its stated verification source was `grep -rn SandboxRunner crates/ finds only its own tests`, and that command now returns `crates/orxnud-capability/src/subprocess.rs:37,84,103,299` and `governed_path.rs:984,1342,1346` -- the entry was disproved by its own evidence and had never been re-read, which register rule 2 exists to prevent. V-51 is the closure. |
-| **V-54** | **A Tier-1 `Subprocess` capability cannot fall back to in-process execution — MUTATION-VERIFIED** | `crates/orxnud-capability/src/dispatch.rs:905-977`; the arms' bodies swapped, `Subprocess` left carrying the in-process body. `governed_path`: **10 of 16 FAILED**, restored **16 passed**. Repeated twice (plus a narrow single-test run): identical every time | **release:** any change to the execution arms in `dispatch`, to `CapabilityAdapter::tier`, or to `with_execution` | 2026-09-30 | **High.** Three enforcement layers, now distinguished and all three demonstrated. **(1) STRUCTURALLY ENFORCED** — a `Subprocess` adapter's `invoke` panics by design, so an in-process route surfaces as a loud failure rather than a silent unsandboxed execution. **(2) MECHANICALLY GATE-ENFORCED** — gate G2 rejects `Command::new` anywhere in `orxnud-capability`; verified by injection (exit 1, named message). **(3) MUTATION-VERIFIED** — swapping the two match arms' bodies makes 10 governed-path tests fail, with the primary mechanism reported by the suite itself: `Tier-1 adapter invoked in-process: the sandbox route was bypassed`, and a Tier-1 capability with no sandbox returning a `DispatchOutcome` where `SandboxRefused` was required. The mutation touched production code only — 45 lines, one file, no test, assertion, error text or documentation changed — and compiled cleanly, so it was a behaviour change and not a build break. The two earlier failed attempts (V-54's prior state) had relabelled an arm without swapping bodies; recorded because the fix was to *locate the exact branch and its boundaries first*, not to retry harder. |
-| **V-51** | **Tier-1 execution now runs through the governed path; a sandboxless Tier-1 capability is refused** | `crates/orxnud-capability/tests/governed_path.rs` (16 tests, real subprocesses) | **release:** any change to `dispatch`, `subprocess`, or the sandbox contract; fired 2026-10-05 (`dispatch.rs`, `isolation.rs`, and the daemon `Runtime` all changed)| 2026-10-05 | **Critical.** Closes V-50. `CapabilityAdapter::tier()` returns `InProcess` or `Subprocess`; a `Subprocess` adapter has **no** in-process route, because its `invoke` panics by design -- if the sandbox branch were ever bypassed the suite says so loudly. `with_execution` is the only way to enable subprocess execution; there is deliberately no setter taking a program and arguments, which would be the `dispatcher -> direct subprocess` bypass. Refusals are counted, not inferred from timing: a policy, budget, credential or capability-resolution refusal reaches the backend **zero** times. The `ExecutionContract` carries no credential and no `SecretRef`, because a contract is logged and audited. **Scope:** proved on this host with `bubblewrap`. Windows remains unverified (V-29). Re-verified 2026-10-05. `governed_path` is now 24 tests rather than 16, `read_text_real` adds 12 more against a real sandboxed read, and `cli_e2e` drives the whole loop through the shipped binaries. The claim is unchanged and still true: a `Subprocess` adapter has no in-process route, and a host with no namespace guarantees refuses before a process exists. |
-| **V-52** | **cgroup v2 controls are writable in a delegated container; end-to-end enforcement is NOT yet proven** | `scripts/run-resource-tests.sh`; `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max`, `cgroup.kill` all WRITABLE; `cgroup_kill_terminates_a_member_that_forked_a_descendant` PASSES | **milestone:** directory selection inside the test image | 2026-09-30 | **High.** Partial progress on V-46, and recorded as partial rather than promoted. **Proven:** the controls are writable where cgroups are delegated, and `cgroup.kill` terminates a member's descendants -- the property a signal cannot offer. **Not proven:** memory/pids/cpu *enforcement* end to end, because the cgroup directory the probe selects inside `rust:1-bookworm` is not one it can create children in, so the suite reports NOT_PROVEN there. `alpine` was separately verified to accept a subdirectory at the hierarchy root, so the remainder is directory selection, not a missing kernel capability. Two host facts worth recording: `--cgroupns=host` is required, because Docker's private cgroup namespace makes PID spaces disagree and `cgroup.procs` writes fail with ENOENT on an obviously-correct path; and the own-cgroup path is not always creatable, so discovery falls back to the hierarchy root rather than reporting "no delegation" in an environment that delegates. |
+| **V-54** | **A Tier-1 `Subprocess` capability cannot fall back to in-process execution — MUTATION-VERIFIED** | `crates/orxnud-capability/src/dispatch.rs:905-977`; the arms' bodies swapped, `Subprocess` left carrying the in-process body. `governed_path`: **10 of 16 FAILED**, restored **16 passed**. Repeated twice (plus a narrow single-test run): identical every time | **release:** any change to the execution arms in `dispatch`, to `CapabilityAdapter::tier`, or to `with_execution` | 2026-09-30 | **High.** Three enforcement layers, now distinguished and all three demonstrated. **(1) STRUCTURALLY ENFORCED** — a `Subprocess` adapter has no in-process implementation: the shipped adapters' `invoke` returns an error without performing the effect, and the governed-path test adapter panics, so an in-process route surfaces as a loud failure rather than a silent unsandboxed execution. **(2) MECHANICALLY GATE-ENFORCED** — gate G2 rejects `Command::new` anywhere in `orxnud-capability`; verified by injection (exit 1, named message). **(3) MUTATION-VERIFIED** — swapping the two match arms' bodies makes 10 governed-path tests fail, with the primary mechanism reported by the suite itself: `Tier-1 adapter invoked in-process: the sandbox route was bypassed`, and a Tier-1 capability with no sandbox returning a `DispatchOutcome` where `SandboxRefused` was required. The mutation touched production code only — 45 lines, one file, no test, assertion, error text or documentation changed — and compiled cleanly, so it was a behaviour change and not a build break. The two earlier failed attempts (V-54's prior state) had relabelled an arm without swapping bodies; recorded because the fix was to *locate the exact branch and its boundaries first*, not to retry harder. |
+| **V-51** | **Tier-1 execution now runs through the governed path; a sandboxless Tier-1 capability is refused** | `crates/orxnud-capability/tests/governed_path.rs` (16 tests, real subprocesses) | **release:** any change to `dispatch`, `subprocess`, or the sandbox contract; fired 2026-10-05 (`dispatch.rs`, `isolation.rs`, and the daemon `Runtime` all changed)| 2026-10-05 | **Critical.** Closes V-50. `CapabilityAdapter::tier()` returns `InProcess` or `Subprocess`; a `Subprocess` adapter has **no** in-process route: the shipped adapters' `invoke` returns an error instead of performing the effect, and the governed-path test adapter panics if the sandbox branch is bypassed. `with_execution` is the only way to enable subprocess execution; there is deliberately no setter taking a program and arguments, which would be the `dispatcher -> direct subprocess` bypass. Refusals are counted, not inferred from timing: a policy, budget, credential or capability-resolution refusal reaches the backend **zero** times. The `ExecutionContract` carries no credential and no `SecretRef`, because a contract is logged and audited. **Scope:** proved on this host with `bubblewrap`. Windows remains unverified (V-29). Re-verified 2026-10-05. `governed_path` is now 24 tests rather than 16, `read_text_real` adds 12 more against a real sandboxed read, and `cli_e2e` drives the whole loop through the shipped binaries. The claim is unchanged and still true: a `Subprocess` adapter has no in-process route, and a host with no namespace guarantees refuses before a process exists. |
+| **V-52** | **cgroup v2 controls are writable in a delegated container; end-to-end enforcement is NOT yet proven** | `scripts/run-resource-tests.sh`; `memory.max`, `memory.swap.max`, `pids.max`, `cpu.max`, `cgroup.kill` all WRITABLE; `cgroup_kill_terminates_a_member_that_forked_a_descendant` PASSES | **milestone:** directory selection inside the test image | 2026-09-30 | **High.** Partial progress on V-46, and recorded as partial rather than promoted. **Proven:** the controls are writable where cgroups are delegated, and `cgroup.kill` terminates a member's descendants -- the property a signal cannot offer. **Not proven:** memory/pids/cpu *enforcement* end to end, because the cgroup directory the probe selects inside `rust:1-bookworm` is not one it can create children in, so the suite reports NOT_PROVEN there. `alpine` was separately verified to accept a subdirectory at the hierarchy root, so the remainder is directory selection, not a missing kernel capability. Two host facts worth recording: `--cgroupns=host` is required, because Docker's private cgroup namespace makes PID spaces disagree and `cgroup.procs` writes fail with ENOENT on an obviously-correct path; and the own-cgroup path is not always creatable, so discovery falls back to the hierarchy root rather than reporting "no delegation" in an environment that delegates. **A-034 repaired the lane's nextest/coverage execution and removed its stale selector; this does not change this row's end-to-end verdict.** |
 | **V-53** | **A resource ceiling is required per capability, not by blanket default** | `ExecutionContract::require_resource_ceilings`; `spec_for` maps it to `Resource::Required` or `Resource::Observed` | **release:** any change to the contract's defaults | 2026-09-30 | **Medium.** A blanket `Required` default would refuse every Tier-1 capability on a host without delegated cgroups -- fail-closed in form, but a sandbox that never runs in practice, and pressure to weaken the default later. The distinction is per capability: something that cannot safely exceed a limit sets `true` and is **refused**; something that can sets `false` and receives supervisor-side observation, recorded in `ExecutionResult::unproven`. Fail-closed is preserved where it belongs -- the *host* never silently degrades a limit the caller asked for. |
 
 | **V-55** | **The cgroup base is a parent, never the execution's home** | `CgroupV2::is_dedicated_child`; `resources.rs::an_execution_lands_in_a_dedicated_child_cgroup` | **release:** any change to `own_cgroup` or `CgroupV2::create` | 2026-09-30 | **Critical.** The phrase "falls back to the hierarchy root" was ambiguous and is now a checked property. Discovery may resolve the base to the cgroup hierarchy root (V-52), which is safe **only** because `create` always builds `base/orxnud-<name>`, writes limits to that child, and adopts processes into that child. Nothing ever writes a control to the base. Writing `memory.max` or `pids.max` on the shared base would throttle or kill processes OpenRayNux does not own, so `CgroupV2` now retains its `base` and exposes `is_dedicated_child()`, and a test asserts the execution directory is strictly below it and that the base carries no limit. **Reviewed rather than assumed** — the original wording would have been the basis for a wrong claim. |
@@ -206,7 +212,7 @@ reporting success, but that is not a clean rollback and this row does not claim 
 | **V-64** | **`orxnud-task::clock`'s claim to be the tree's only wall-clock read is already untrue** | `crates/orxnud-task/src/clock.rs:13` states "`SystemClock` is the single place that reads the wall clock, which makes it greppable: one file, one `SystemTime::now()`", but `crates/orxnud-daemon/src/task_service.rs:356` (`fn now_ms`) and `crates/orxnud-store/src/migration.rs:323` both call `SystemTime::now()` directly | **milestone:** before any time-dependent policy or approval expiry is relied upon** | 2026-10-03 | **Low.** Recorded because V-62's fix routes capability dispatch through `SystemClock` on the strength of that claim, and the claim is wrong: there are three direct clock reads, not one. Nothing is broken by it today — `task_service::now_ms` and `SystemClock` agree to the millisecond, and `migration.rs` stamps a one-time bootstrap. The hazard is future and specific: a change that needs the *same* instant in two subsystems can pick two sources, get values differing by a millisecond, and produce an off-by-one in a window comparison (`issued_at <= now < expires_at`) with no error anywhere. Worth collapsing to one source when time starts mattering structurally, and worth correcting the comment now that it is known to be aspirational. Not fixed here because both call sites are load-bearing established behaviour and this slice is about dispatch correctness. |
 | **V-65** | **A `pids.max` of 1 makes every Tier-1 capability fail with an opaque `EAGAIN` from `bwrap`** | `ResourceBudget.processes` bounded the payload, but `pids.max` bounds the whole cgroup — which also holds the sandbox supervisor's own task tree. Measured on this host: `pids.max = 1` fails at namespace creation (`Creating new namespace failed: Resource temporarily unavailable`), `= 2` fails at `Can't fork for pid 1`, `>= 4` runs. The shipped `filesystem/write-text` budget originally requested `Some(1)` and every sandboxed invocation failed | **release:** any change to a Tier-1 capability's resource budget, or to how the supervisor is spawned | 2026-10-03 | **Medium, and fixed by understanding rather than by guessing.** The failure mode is genuinely nasty: it presents as a sandbox failure, is unaffected by anything the capability does, and is fixed by a number that looks arbitrary in the source. Two things are worth keeping from it. First, `processes` means *processes this invocation may use*, where "this invocation" includes the machinery that runs it — the tidier-looking `1` is the one that does not work. Second, the shipped value is `16`, not the measured floor of `4`: a ceiling set exactly at the floor turns a future sandbox that grows a task or two into a capability that fails for a reason nothing in the capability's source mentions. Discovered by probing the backend with the five limit combinations rather than by reading, because no amount of reading `write_text.rs` would have suggested that `1` was the problem. |
 | **V-66** | **Tier-1 invocation parameters cannot reach a sandboxed child: `AdapterBundle::sandbox_plan()` took no invocation** | `crates/orxnud-capability/src/dispatch.rs` — `sandbox_plan(&self)` returned a constant `SandboxPlan`, and for `ExecutionTier::Subprocess` the dispatcher never calls the adapter's `invoke` (it executes the contract built from that plan). The only dynamic channel into the child was `CREDENTIAL_ENV`, injected by the backend for credentials | **milestone:** before any second parameterised Tier-1 capability | 2026-10-03 | **High, and fixed with the smallest change that works.** A parameterised Tier-1 capability was not implementable at all: the adapter is not consulted, so `dispatch` receives the parameters twice — raw in `ActionRequest.params` and normalised as `NormalizedParams` — and nothing could carry the first to the child. The alternatives were both worse than the defect. Passing data through the credential environment variable would put a payload somewhere that is specifically redacted for secrets and audited as credential-shaped. Writing a request file host-side *before* dispatch would create a filesystem side effect *before authorisation*, which is strictly worse than the bug this was found alongside. So `sandbox_plan` now takes `&CapabilityInvocation`: additive (the one Tier-0 bundle returns `None` and ignores it), two dispatcher call sites, one test impl, and the sandbox crate, verifier and stage order are all untouched. Worth stating plainly because it means the capability layer's plan interface was, until now, missing a parameter it structurally needed. |
-| **V-67** | **`SandboxSpec` has no stdin channel, so Tier-1 parameters travel in `argv` and are visible in the host process table — OPEN, P0** | `filesystem/write-text` passes `--path` and `--contents` as arguments; `crates/orxnud-capability/src/subprocess.rs::spec_for` forwards `contract.args` to the sandbox command line; `crates/orxnud-platform-sandbox/src/linux.rs` renders every `spec.env` pair as an `--setenv K V` **argv** pair. **Cross-UID exposure demonstrated 2026-10-10, not inferred from file mode:** on the audit host a container sharing the host PID namespace and running as uid 12345 (`CapEff 0`, same user namespace inode `user:[4026531837]` as the uid-1000 target) **read the target's `/proc/<pid>/cmdline` successfully**, recovering the sentinel argv bytes. Controls in the same run: writing `/proc/<pid>/cmdline` was **denied** (so `0444` is the operative constraint for writes), and reading `/proc/<pid>/environ` was **denied** (`0400`, owner-only) — the credential path is distinguishable from the payload path only because `spec.env` becomes argv. **Condition — this is host-dependent and must be re-measured, not assumed:** `/proc` is mounted `rw,nosuid,nodev,noexec,relatime` with **no `hidepid` option**, i.e. the default `hidepid=0`. `hidepid>=1`, or a `ptrace`-scoped hardened kernel, restricts cross-user process-directory access and would change the answer. `ls -l` mode alone is **not** evidence of a cross-UID read and is recorded here only as supporting context | **release:** any **payload-carrying or credential-carrying** Tier-1 capability; and **governance:** none may ship until the stdin transport is verified — re-read on any change to `SandboxSpec`, `spawn_supervisor`, `write_text.rs`, or the credential-environment path. The prior trigger, *"any Tier-1 capability whose parameters are sensitive"*, was too narrow: it would not have fired for `write-text`, whose contents are a workspace payload rather than a secret | 2026-10-10 | **P0, OPEN — not mitigated.** Reconciled 2026-10-10 against the independent audit (`docs/16` finding F-10) and its validation (`docs/17`), and against the remediation plan (`docs/18` §12 R-1, §7 S-02/S-17). **The earlier characterisation of this row as "Low for this capability" was wrong and is withdrawn.** It judged the exposure by whether the bytes are secret; the actual exposure is that **any local uid can read this user's process table for the life of every `write-text` execution**. **Current exposure:** the shipped `filesystem/write-text` passes its payload as process arguments, so it is readable through `/proc/<pid>/cmdline` for as long as the execution lives. This has **not** been fixed. **Governance restriction, in force now:** no new payload-carrying or credential-carrying Tier-1 capability may ship until the stdin transport (plan slice **S-17**) is verified against its stated acceptance criteria. That is a **governance decision recorded here and in `docs/18` §12 R-1 — it is not enforced by any runtime check, CI gate, or configuration in this repository.** **Verification boundary — recording this restriction does not fix the runtime.** The interim
+| **V-67** | **`SandboxSpec` has no stdin channel, so Tier-1 parameters travel in `argv` and are visible in the host process table — OPEN, P0** | `filesystem/write-text` passes `--path` and `--contents` as arguments; `crates/orxnud-capability/src/subprocess.rs::spec_for` forwards `contract.args` to the sandbox command line; `crates/orxnud-platform-sandbox/src/linux.rs` renders every `spec.env` pair as an `--setenv K V` **argv** pair. **Cross-UID exposure demonstrated 2026-10-10, not inferred from file mode:** on the audit host a container sharing the host PID namespace and running as uid 12345 (`CapEff 0`, same user namespace inode `user:[4026531837]` as the uid-1000 target) **read the target's `/proc/<pid>/cmdline` successfully**, recovering the sentinel argv bytes. Controls in the same run: writing `/proc/<pid>/cmdline` was **denied** (so `0444` is the operative constraint for writes), and reading `/proc/<pid>/environ` was **denied** (`0400`, owner-only) — the credential path is distinguishable from the payload path only because `spec.env` becomes argv. **Condition — this is host-dependent and must be re-measured, not assumed:** `/proc` is mounted `rw,nosuid,nodev,noexec,relatime` with **no `hidepid` option**, i.e. the default `hidepid=0`. `hidepid>=1`, or a `ptrace`-scoped hardened kernel, restricts cross-user process-directory access and would change the answer. `ls -l` mode alone is **not** evidence of a cross-UID read and is recorded here only as supporting context | **release:** any **payload-carrying or credential-carrying** Tier-1 capability; and **governance:** none may ship until the stdin transport is verified — re-read on any change to `SandboxSpec`, `spawn_supervisor`, `write_text.rs`, or the credential-environment path. The prior trigger, *"any Tier-1 capability whose parameters are sensitive"*, was too narrow: it would not have fired for `write-text`, whose contents are a workspace payload rather than a secret | 2026-10-10 | **P0, OPEN — not mitigated.** Reconciled 2026-10-10 against the independent audit (finding F-10) and its validation, and against the remediation plan (R-1, S-02/S-17). **The earlier characterisation of this row as "Low for this capability" was wrong and is withdrawn.** It judged the exposure by whether the bytes are secret; the actual exposure is that **any local uid can read this user's process table for the life of every `write-text` execution**. **Current exposure:** the shipped `filesystem/write-text` passes its payload as process arguments, so it is readable through `/proc/<pid>/cmdline` for as long as the execution lives. This has **not** been fixed. **Governance restriction, in force now:** no new payload-carrying or credential-carrying Tier-1 capability may ship until the stdin transport (plan slice **S-17**) is verified against its stated acceptance criteria. That is a **governance decision recorded here as R-1 — it is not enforced by any runtime check, CI gate, or configuration in this repository.** **Verification boundary — recording this restriction does not fix the runtime.** The interim
 control (plan slice **S-02**) **is implemented and verified as of 2026-10-10**, and it is
 **containment of reachability for the default posture, not a mitigation of the exposure**.
 What was built: `AdapterBundle::argv_payload` has **no default** and returns
@@ -341,7 +347,7 @@ the exception:** the configuration key and environment variable that were briefl
 been removed, and the one remaining route (a flag used by suites that spawn the real binary) is
 compiled out of release builds. Granting it therefore requires a source-level decision, which is
 *not* the plan's bounded owner approval — that mechanism does not exist, and the open owner
-decision is recorded in `docs/18` §12.
+decision is recorded in this register (V-67, R-1).
 
 **Evidence.** `a_fully_approved_write_is_refused_by_default_and_writes_nothing` drives propose →
 **real human approval** → execute against a daemon in the shipped default posture and asserts
@@ -354,7 +360,7 @@ no-payload Tier-1 bundle are unaffected, that the disclosure cannot be a constan
 exposure text carries the `hidepid` condition. **Not claimed:** no mutation testing was run.
 
 **Credential handling is a separate risk, and credential redaction does not mitigate this exposure.** `CREDENTIAL_ENV` remains the only channel carrying anything secret and is redacted throughout; that is a distinct and still-latent concern. It does **not** reduce this row: the payload is not a credential and never passes through the redacted path, and because `spec.env` is rendered as `--setenv K V` **argv pairs**, any bundle that populated `env` would place that value in the same world-readable `cmdline`. The two exposures must not be described as one mitigated problem. Adding a stdin channel means changing `SandboxSpec` and the supervisor; that change is specified but **unbuilt**. |
-| **V-68** | ****`orxnud-task`'s `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` fails intermittently under full-workspace parallel load -- now 4 recorded occurrences, and the cause is still undiagnosed**** | Observed once in `./scripts/ci-gates.sh` while 1004 tests ran concurrently; passed 13/13 in isolation and in 8 consecutive `cargo nextest run -p orxnud-task` runs. This slice changed no file in `orxnud-task` or `orxnud-store` | **milestone:** before relying on a full-workspace green run as evidence -- re-read 2026-10-05| 2026-10-05 | **Low, pre-existing, and not this slice's to fix.** Recorded rather than dismissed because a suite that is intermittently red cannot distinguish a real regression from load, which is exactly the value it is being relied on for. It is a concurrency test over a shared file, so the likely cause is timing under CPU contention rather than a logic error — but "likely" is a guess, and the honest next step is to reproduce it under deliberate contention and read what the failure actually says. Left alone here: this slice changed nothing in `orxnud-task`, and a drive-by fix to a task-engine concurrency test would be a worse change than the flake. Corrected 2026-10-05, because the entry understated its own subject. It said "observed once" with a 13/13 isolation pass rate; the commit that introduced multi-step composition recorded the same test failing **twice more** in full runs while passing **8/8** in isolation, and V-42 records a fourth. So: 4 occurrences across V-42 and V-68, and the isolation pass count fell from 13/13 to 8/8. The cause is still not known -- it is a concurrency test over a shared file, so timing under CPU contention is a *guess*, and this register does not record guesses as findings. What is now measured and stable: the full-workspace suite is green, and has been on every run since, including 1360/1360 locally and 1244/1244 on a hosted runner under the G9 scope ADR-0046 defines. A suite that is intermittently red cannot distinguish a regression from load, so this stays open until someone reproduces it under deliberate contention and reads what it says. |
+| **V-68** | ****`orxnud-task`'s `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` fails intermittently under full-workspace parallel load -- now 5 recorded occurrences, and the cause is still undiagnosed**** | Observed once in `./scripts/ci-gates.sh` while 1004 tests ran concurrently; passed 13/13 in isolation and in 8 consecutive `cargo nextest run -p orxnud-task` runs. This slice changed no file in `orxnud-task` or `orxnud-store` | **milestone:** before relying on a full-workspace green run as evidence -- re-read 2026-10-05| 2026-10-24 | **Low, pre-existing, and not this slice's to fix.** Recorded rather than dismissed because a suite that is intermittently red cannot distinguish a real regression from load, which is exactly the value it is being relied on for. It is a concurrency test over a shared file, so the likely cause is timing under CPU contention rather than a logic error — but "likely" is a guess, and the honest next step is to reproduce it under deliberate contention and read what the failure actually says. Left alone here: this slice changed nothing in `orxnud-task`, and a drive-by fix to a task-engine concurrency test would be a worse change than the flake. Corrected 2026-10-05, because the entry understated its own subject. It said "observed once" with a 13/13 isolation pass rate; the commit that introduced multi-step composition recorded the same test failing **twice more** in full runs while passing **8/8** in isolation, and V-42 records a fourth. So: 4 occurrences across V-42 and V-68, and the isolation pass count fell from 13/13 to 8/8. The cause is still not known -- it is a concurrency test over a shared file, so timing under CPU contention is a *guess*, and this register does not record guesses as findings. What is now measured and stable: the full-workspace suite is green, and has been on every run since, including 1360/1360 locally and 1244/1244 on a hosted runner under the G9 scope ADR-0046 defines. A suite that is intermittently red cannot distinguish a regression from load, so this stays open until someone reproduces it under deliberate contention and reads what it says. **A fifth occurrence was observed on 2026-10-24**, in the first full gate run after the PLAT-007 probe regression test was added: the 1997-test run failed with "every task must be claimed exactly once" (`left: 10`, `right: 12`), then passed 5/5 in isolation, and the next full gate was 1997/1997 green. The cause remains undiagnosed, and this row stays open. |
 | **V-69** | **An approval carries no approver identity anywhere, so it is a bearer token that proves parameters but not consent** | `ApprovalRecord` (`crates/orxnud-domain/src/approval.rs`) has fields `actor_label`, capability, target, params, issued/expires, risk, digest — no approver. `canonical_bytes` (`crates/orxnud-policy/src/digest.rs`) binds `actor.label()`, `actor.authority_root()`, capability, target, params and the time bounds: the *proposer's* identity is inside the digest, the approver's is not. `actor_label` is written to the record and to `task_approvals.actor_label` and is **never read at dispatch** (`grep` finds no comparison outside tests). `Decision::Gate.approver` is *derived* at `engine.rs:396` from the proposer's `authority_root()` — an inference where evidence belongs | **milestone:** before any actor other than `Human` reaches the dispatcher, and **release:** on any change to `canonical_bytes`, `ApprovalRecord`, or the `can_grant` enforcement at `engine.rs:266` | 2026-10-03 | **High, latent, and it becomes live the moment a delegated actor exists.** Not exploitable today: with one local user behind a 0700 socket, minting an approval on request is equivalent to that user consenting. The reason it is High anyway is the *shape* of the failure. `capability/approve` answers any caller, and the runtime hardcodes the approver to the local human, so a pipeline built on this would let an AI-side workflow obtain its own approval through the same endpoint and every stage would report success — a **false demonstration of governance**, which is worse than no delegation because it would be trusted. The load-bearing consequence is that `can_grant()` is currently enforced in exactly one non-test place and only refuses an actor with neither grant capability nor an authority root; it cannot check *who approved* because there is nothing to check. **Now implemented.** ADR-0037 (D1, D2) landed: the record carries an explicit `approver`, `canonical_bytes` binds both parties under a `v2` prefix, `authorise` refuses a non-granting approver and an approver who is not the proposer's authority root, and `issue_approval` refuses to mint without `can_grant()`. Verified by mutation: removing the approver from the digest fails `the_digest_binds_the_approver_so_one_consent_cannot_be_replayed_by_another`. Demonstrated end-to-end on the governed task path, where a proposal delegated by the local human is approved with `actor_label: ai`, `approver: human`, `authority_root: local`. |
 | **V-70** | **An `Actor` arriving over local IPC is an asserted principal, not an authenticated identity, and the type does not say so** | `Actor` derives `Serialize, Deserialize` (`crates/orxnud-domain/src/actor.rs`), so `Actor { user: "H" }` can be sent by any caller. `crates/orxnud-daemon/src/runtime.rs:560` hardcodes `local_actor()` and never reads an actor from the request, so nothing depends on this yet | **release:** any move to multi-user access, any transport beyond the local socket, or any code that starts treating a deserialised `Actor` as proof of identity | 2026-10-03 | **Medium, and it is a hazard rather than a defect.** Nothing is wrong today: the practical boundary is the 0700 Unix socket plus the single-user local model, and the runtime not accepting an actor at all is the strongest possible current posture. The risk is entirely in what comes next — `Actor` being `Deserialize` is easy to later read as "the daemon knows who this is", which is the same class of mistake ADR-0034 caught in `CapabilityInvocation`. Three things must stay distinct in naming, docs and tests: *principal assertion* ≠ *principal authentication* ≠ *principal authorization*. Recorded so that multi-user work starts by naming the boundary rather than inheriting an ambiguity. Settled as a constraint by ADR-0037 (D6); deliberately **not** fixed, because multi-user authentication is out of scope and inventing a half-measure now would be worse than the honest gap. |
 | **V-71** | **Task lease and worker identity must never grant or derive capability authority — currently true only by absence of code** | A lease grants exactly one capability: completion fencing (`complete` requires a live lease from that worker), plus `extend`/heartbeat and the concurrency slot. Verified: **no `Actor::` is constructed from a task or a lease anywhere in `orxnud-task`, `orxnud-daemon` or `orxnud-store`** — the only non-test construction is the hardcoded local human at `runtime.rs:560` | **milestone:** before `task → capability` execution is wired, and **release:** on any change that derives an actor, a grant or an approval from a task id, a lease or a worker identity | 2026-10-03 | **Low now, and the most important thing in this block to preserve.** It is currently guaranteed by nothing but the absence of the code path that would break it, which is exactly the kind of truth that erodes without anyone deciding to erode it. The foreseeable regression is convenient rather than malicious: wiring task-driven execution makes it natural to derive the actor from the claimed task, and that derivation would silently convert *ownership of a workflow* into *authority to perform every capability the workflow represents*. **Now implemented and demonstrated.** The proposal path builds the proposer from the task identity and never from the lease holder, and the `task_proposals` table has no worker column at all, so the escalation is unavailable by schema as well as by code. ADR-0038 (D5) is a regression test: `the_lease_holder_does_not_become_the_proposer` asserts that a worker without the live lease cannot propose and that a legitimate holder's proposal records a delegated actor rather than itself. Verified by mutation: deriving the actor from the worker string fails it. Also worth keeping in view while wiring: `may_use_approval` checks expiry only and never verifies the digest against the action, deferring that to policy — so it must not be read as "this action is authorised". |
@@ -401,12 +407,16 @@ classified `INTERNAL_ERROR` sink. |
 
 | **V-84** | ****A task at a step boundary is advanced only by an explicit `claim_next_step()`, and only `task/continue` calls it: the generic claim still never advances a boundary**** | `claim()` and `take_lease()` select `WHERE state = 'pending'`, and `idx_tasks_claimable` is `WHERE state = 'pending'`. A task in `AwaitingNextStep` is therefore invisible to a polling worker and is advanced only by the targeted `claim_next_step()` added in Stage 3d. This is a deliberate separation, not an oversight: continuation is a distinct operation from first dispatch. **Satisfied 2026-10-06 (ADR-0047):** `task/continue` is the production caller, and `the_generic_claim_does_not_take_a_step_boundary` still pins that the generic claim path stays `Pending`-only and the index was not widened. | **met** | 2026-10-06 | **Orchestration requirement, recorded so it is not rediscovered as a bug:** a production execution loop **must explicitly resume `AwaitingNextStep` via `claim_next_step()` and must never depend on `claim()` polling to discover a boundary.** The intended shape is `execute step -> verified -> AwaitingNextStep -> continuation notices boundary -> claim_next_step() -> propose next step`, and after human approval `approval -> claim_next_step() -> fresh lease -> Running -> execution`. Widening the generic claim was considered and declined: it would assert that *any* polling worker seeing a boundary is entitled to advance it, which is a new scheduling contract broader than the composition work designed so far, and it would additionally require deciding `Pending`/`AwaitingNextStep` coexistence and ordering semantics, changing `idx_tasks_claimable`, and confirming every existing worker implementation understands the new state. The claim index was not widened. (Migration **10** was later added for an unrelated key defect: `task_approvals` was keyed `(task_id, attempt_no)` while `attempt_no` restarts per step, so a second step's approval collided with the first's and was silently discarded by an `INSERT OR IGNORE`. That key is now `(task_id, step_no, attempt_no)`, matching `task_attempts`.) The behaviour is pinned by `the_generic_claim_does_not_take_a_step_boundary`, so a future change to the claim query has to notice and revisit this decision deliberately. Until a continuation loop exists above the repository primitive, multi-step tasks stop at the boundary by design. Re-read 2026-10-05 and the second half of the claim is now stated, because it is the half a reader is most likely to assume the other way. `TaskRepository::claim_next_step()` exists and is tested (`task_repo::advancement_tests` plus `the_generic_claim_does_not_take_a_step_boundary`, which pins that the generic claim path stays `Pending`-only and `idx_tasks_claimable` was not widened). **There was no production caller** when this entry was first written: `grep -rn claim_next_step crates --include=*.rs | grep -v task_repo.rs` returned nothing and `orxnud-daemon` exposed no IPC method that reached it, so the delivered state was a *governed primitive* -- a state, a targeted claim, step-scoped approvals and attempts, a step-bound digest -- with the orchestration deliberately unwritten. ADR-0043 recorded that as a requirement rather than a bug, and this entry was where a reader was to confirm it was still unmet. **Now met:** `orxnud-task`'s engine and `orxnud-daemon`'s `TaskService` each expose exactly one pass-through to it, `task/continue` calls it once per boundary and never widens the generic claim, and `crates/orxnud-daemon/tests/continuation.rs` asserts the exactly-once behaviour under two concurrent continuations. Reaching the boundary also required making `max_steps` settable at `task/create`; without it the schema default of 1 meant no task could ever reach one, so this gap was not only unwired but unreachable. |
 | **V-85** | **A GitHub-hosted Linux runner ships `bwrap` and cannot use it, so `host_backend_name()` reports a backend on a host that can isolate nothing** | `host_backend_name()` is compile-time; `BwrapRunner::probe()` is runtime. Measured: with `bwrap` present, `AvailableGuarantees { visibility: false, tree_lifetime: false }`, so `check()` refuses and `can_fulfil` is false — which is the `the execution backend cannot establish the required sandbox guarantees` refusal two `orxnuctl::cli_e2e` tests were failing on. Root cause is `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04+ with no per-binary AppArmor grant for `bwrap`. The full fingerprint is printed by `scripts/preflight.sh` on every `linux-gates` run | **milestone:** every `linux-gates` run — the step is placed *before* the gates so the reason is in the log on exactly the runs that need explaining | 2026-10-05 | **High, and it was invisible.** Nothing in the tree said the runner could not sandbox: the backend name said `bwrap`, `bwrap --version` succeeded, and the only symptom was a red test whose message named a guarantee without naming the host. Three consequences followed. (1) A host-level `bwrap --version` check would have reported success on a host that can isolate nothing — so presence is not capability, and the probe has to *run* the namespace. (2) CI fail-fasts, so the two visible failures were hiding six more: `--no-fail-fast` on a simulated incapable host found 8 `cli_e2e` tests in total, 14 in `governed_path`, and 25 in the sandbox crate. Any future "only two tests fail" reading of this register should be checked against that. (3) The test's gate was `#[cfg_attr(not(target_os = "linux"), ignore)]`, which asks a platform question rather than a capability one and skips rather than tests, leaving the interesting state untested everywhere. ADR-0046 fixes the surfacing and the assertions; it does not change the contract. |
-| **V-86** | **`--privileged` and `--cap-add=SYS_ADMIN` make the Tier-1 probe pass without creating a user namespace, so a container green run is not evidence for the production configuration** | `BwrapRunner::probe_identity()`, which runs the *same* argv as `namespace_probe` and reads `/proc/self/uid_map` and `CapEff` from inside the result. Measured: production host and the chosen container both give `uid_map 1000 0 1`, `CapEff 0000000000000000` — a single-entry nested map with no capabilities. `--cap-add=SYS_ADMIN` gives `uid_map 0 0 4294967295`, `CapEff 00000000a82425fb` — the full identity map, i.e. no nested user namespace at all | **release:** any change to `scripts/run-sandbox-tests.sh`'s container flags, and on any `sandbox-integration` run, which calls `preflight --require` first and exits non-zero unless the nested shape is observed | 2026-10-05 | **Critical, and the reason the obvious fix was rejected.** Inside a `CAP_SYS_ADMIN` container `bwrap` runs with the caller's pre-existing privilege over the container's own mount namespace, so it never exercises the unprivileged-userns path every real user depends on — a leak contained there may not be contained in production, and a capability that fails to nest there is never tested. A passing Tier-1 suite in that container would be evidence about a configuration OpenRayNux will never ship, which is worse than no evidence because it looks like evidence. The container actually used grants **nothing**: `--security-opt seccomp=unconfined` (Docker's default seccomp returns EPERM for `unshare(CLONE_NEWUSER)`, measured — with seccomp on even `unshare -U` fails) and `--security-opt systempaths=unconfined` (Docker bind-mounts over `/proc/kcore` and `/proc/sys`, so procfs is not "fully visible" and the kernel refuses a nested procfs mount, measured as `bwrap: Can't mount proc on /proc`). The tests then run under `setpriv` as uid 1000 with `--inh-caps=-all --bounding-set=-all`, which forces `bwrap` to nest. The generalisable rule: **a sandbox test is evidence only if it ran in the same privilege configuration as production, and the way to know that is to read the identity from inside the sandbox, not to infer it from how the sandbox was launched.** |
+| **V-86** | **`--privileged` and `--cap-add=SYS_ADMIN` make the Tier-1 probe pass without creating a user namespace, so a container green run is not evidence for the production configuration** | `BwrapRunner::probe_identity()`, which now runs the same product argv as `namespace_probe` (corrected 2026-10-24; it previously did not) and reads `/proc/self/uid_map` and `CapEff` from inside the result. Measured: production host and the chosen container both give `uid_map 1000 0 1`, `CapEff 0000000000000000` — a single-entry nested map with no capabilities. `--cap-add=SYS_ADMIN` gives `uid_map 0 0 4294967295`, `CapEff 00000000a82425fb` — the full identity map, i.e. no nested user namespace at all | **release:** any change to `scripts/run-sandbox-tests.sh`'s container flags, and on any `sandbox-integration` run, which calls `preflight --require` first and exits non-zero unless the nested shape is observed | 2026-10-05 | **Critical, and the reason the obvious fix was rejected.** Inside a `CAP_SYS_ADMIN` container `bwrap` runs with the caller's pre-existing privilege over the container's own mount namespace, so it never exercises the unprivileged-userns path every real user depends on — a leak contained there may not be contained in production, and a capability that fails to nest there is never tested. A passing Tier-1 suite in that container would be evidence about a configuration OpenRayNux will never ship, which is worse than no evidence because it looks like evidence. The container actually used grants **nothing**: `--security-opt seccomp=unconfined` (Docker's default seccomp returns EPERM for `unshare(CLONE_NEWUSER)`, measured — with seccomp on even `unshare -U` fails) and `--security-opt systempaths=unconfined` (Docker bind-mounts over `/proc/kcore` and `/proc/sys`, so procfs is not "fully visible" and the kernel refuses a nested procfs mount, measured as `bwrap: Can't mount proc on /proc`). The tests then run under `setpriv` as uid 1000 with `--inh-caps=-all --bounding-set=-all`, which forces `bwrap` to nest. The generalisable rule: **a sandbox test is evidence only if it ran in the same privilege configuration as production, and the way to know that is to read the identity from inside the sandbox, not to infer it from how the sandbox was launched.** **Corrected 2026-10-24 (PLAT-007):** the earlier claim that `probe_identity` ran the *same* argv as `namespace_probe` was false. `namespace_probe` used `--ro-bind / /` and fewer flags; `probe_identity` had its own argv. Both now go through `probe_command` → `build_command(&SandboxSpec)`, so they share the product argv. The identity measurement above is unchanged, but the probe only became a test of the product argv on 2026-10-24. |
 
 | **V-87** | **A container cannot escape `apparmor_restrict_unprivileged_userns` on a GitHub-hosted runner, so no positive Tier-1 evidence is obtainable in GitHub-hosted CI** | `scripts/run-sandbox-tests.sh`, measured on `ubuntu-latest` inside the container it configures (`seccomp=unconfined`, `systempaths=unconfined`, uid 1000, every capability dropped). Reported on every run of CI job `sandbox-integration`, before any suite: `uid/gid 1000/1000`, `CapEff 0000000000000000`, `guarantees: visibility=false tree_lifetime=false resources=false`, `tier1_executable: no`, `== sandbox identity unavailable ==`. `--security-opt apparmor=unconfined` was tried and does not help: the restriction is a sysctl, not a profile on `bwrap` | **release:** any change to the container flags or to `ubuntu-latest`; re-measure before believing any claim that CI proves the sandbox | 2026-10-05 | **High, and it corrects a conclusion this project would otherwise have drawn wrongly.** The same container **does** reproduce production on a host with no AppArmor loaded -- measured, `uid_map 1000 0 1` and `CapEff 0` inside the sandbox, against the full identity map `0 0 4294967295` a `--cap-add=SYS_ADMIN` container gives. So a local pass was available and would have been a **false assurance**: the difference between the two hosts is the one thing that matters, and only the runner shows it. Recorded consequence: *a sandbox measurement taken on a host whose confinement policy differs from production is not evidence about production*, which is the same shape as V-46's "delegation is per-host" and the reason the preflight prints the identity rather than a boolean. **Deliberately not fixed by weakening the host.** Turning this green needs either `kernel.apparmor_restrict_unprivileged_userns=0` or a per-binary AppArmor profile for `bwrap` loaded on the runner, and both are a host security-policy change made so a test can pass -- the trade `scripts/run-resource-tests.sh` already declines about a desktop session's cgroup delegation. So the lane reports the gap in capitals, produces no positive evidence, and exits successfully; **a green `sandbox-integration` means "the environment was measured", not "the sandbox was proven."** Positive Tier-1 evidence comes from a host that can create an unprivileged user namespace (`run-sandbox-tests.sh --host`), and cgroup enforcement from `run-resource-tests.sh`, which needs delegation and therefore a different container. |
 
 | **V-88** | ****Only the verified output of an approved `filesystem/read-text`, released once, across one step boundary, to the `(endpoint, model)` identity that asked for it, can leave this machine for a provider**** | `Observation::step_no` and `ObservationStore::take_for` (eligibility is `step_no + 1 == requesting step_no`, plus task and `ProviderIdentity::matches`); `ProposalProvider::destination` defaults to `None`; `retain_read_observation` requires `output_is_ephemeral && is_verified()` and an `Actor::Ai` naming the configured model; `DisclosureBatch` has a private field; `release_observations` appends a `DisclosureRecord` before the request and refuses on append failure. Evidence: `crates/orxnud-daemon/tests/disclosure.rs` (10), `runtime.rs::read_retention_gate` (9), `observation.rs` store tests (5), `http_provider::disclosure_rendering_tests` (2), `proposer::tests` destination (1). **Mutation-checked** — breaking the task check, the step check, the identity check, single-use consumption, the size limit, the verification requirement, or the audit append each fails the suite. | **release:** any change to `ObservationStore::take_for`, `ProviderIdentity::matches`, `ProposalProvider::destination`, `retain_read_observation`, `release_observations`, or `render_disclosures`; any capability that declares ephemeral output | 2026-10-06 | **High, because this is the first data-release boundary in the build, and it is the claim ADR-0045 was written to make enforceable.** Scope is deliberately one capability's output, one proposal, one destination. What is **not** claimed: no memory subsystem, no retrieval across proposals, no semantic search, no unrestricted export — an observation informs one explicitly authorised proposal and is then gone. Single-use is enforced by **erasure** rather than by a durable consumed flag, because the store is process memory (ADR-0045 D4); a crash therefore loses content rather than restoring it. Enabling `filesystem/read-text` in `SHIPPED_POLICY` is part of this claim and was a **defect fix**: the capability menu already advertised it and policy refused it as `unknown-capability`, so the whole subsystem was unreachable for a reason unrelated to leaving it unwired. **Evidence boundary:** every test in `disclosure.rs` needs a verified sandboxed read, so it is excluded from the hosted G9 scope and runs in the ADR-0046 container, which per V-87 cannot itself obtain positive Tier-1 evidence on a GitHub runner. The gate-level controls that do not need a sandbox (renderer delimiters, the `destination` default, store eligibility, the retention gates) run everywhere. |
 | **V-98** | **CLOSED — every CI lane installed an unauthenticated, mutable, root-owned executable on every push** | `scripts/run-sandbox-tests.sh:125` ran `curl -LsSf https://get.nexte.st/latest/linux \| tar zxf - -C /usr/local/cargo/bin` inside the container bootstrap, as root, before any build step: a mutable tag, no integrity check, and network content piped into a root-owned system path | **release:** any change to `scripts/install-nextest-verified.sh`, the pins in `scripts/run-sandbox-tests.sh` / `scripts/run-resource-tests.sh`, or the CI toolchain install path — re-read 2026-10-10 | 2026-10-10 | **Closed on verification, and the three defects were independent.** **(1) Mutable:** `/latest/linux` resolved to whatever upstream last published, so the lane's behaviour changed with no diff here. Replaced by an exact release, **cargo-nextest 0.9.146**, `x86_64-unknown-linux-gnu` — the version `.github/workflows/ci.yml` already pins and documents, so the project keeps *one* cargo-nextest and a container pass cannot disagree with a gate pass. **(2) Unauthenticated:** the pin is `sha256` **`682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428`**, read from the `.sha256` asset published *with* release `cargo-nextest-0.9.146`, and then **confirmed against the artifact itself** — downloaded from the release and hashed locally — so the two agreeing is evidence, not an assumption. It is a **literal**: `test-ci-toolchain-pinning.sh` fails if it becomes `${...}`, because an overrideable checksum is a suggestion. A `ORXNUD_NEXTEST_BASE_URL` mirror override **is** allowed and is safe precisely because the pin still governs — the mirror may change where bytes come from, never what they must be. **(3) Root, into a system path, from a pipe:** the download now lands in a file, is verified **before** extraction, and is installed and executed as **uid 1000** into `/home/orxnud/.local/bin`, owned by that uid — demonstrated in the real container (`orxnud 755 /home/orxnud/.local/bin/cargo-nextest`, run under `setpriv --reuid=1000 --bounding-set=-all`). **Images pinned by registry digest**, not tag: `rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6` (OCI **index**, so it stays immutable *and* resolves on arm64 developer hosts), read from the Docker Hub registry API and re-fetched **by digest** to confirm it resolves; the `linux/amd64` manifest it resolves to is `sha256:b36c246742b4d323472588f789601be34eb4af053255e2af53969078ee8dcec7`. **This is a registry manifest digest, not a local `docker images` ID**, which is the confusion the slice names. **Negative-tested, twice.** `scripts/test-ci-toolchain-pinning.sh` drives the **real** installer with a locally-built artifact that does not match the pin and requires nonzero exit **and** no installed binary **and** no execution; mutating the production checksum comparison to `if false` makes it report `rc=0` and *installs the bad artifact*. A second mutation -- reverting the release-asset URL to the form that 404s -- was also caught, and that one existed because the **positive** run found it: an earlier check ("does the URL mention the version?") passed against a 404, so the check now reads the URL the installer **actually requested**. Enforced as **gate G14**. **In the real pinned container**, a refusing install left no binary and the following build step never ran (container exit 1, build marker never printed), which is the ordering the criterion asks for. **Not claimed:** this closes the *supply-chain* defect only. It produces **no** Tier-1 isolation evidence, and `sandbox-integration` still reports that the environment was measured rather than that the sandbox was proven. The unauthenticated path is not merely relabelled — it no longer exists. |
+| **V-99** | **The state root, the database the store opens, its sidecars and every copy of it the store makes — taken *or* adopted — are private to their owner; a database or a snapshot that cannot be made private is not opened** | The platform creates a SQLite database — and the `-wal` / `-shm` sidecars — with the process's umask applied, which under the common `022` is `0644`: **world-readable**. The state root was created by `create_dir_all` with no mode, so it was `0755`. Measured on a fresh daemon state root before this row: `755 state/`, `644 state.db`, `644 state.db-wal`, `644 state.db-shm`, `644 state.db.lock`, `700 workspace`, `600 orxnud.sock` — the socket and the workspace were private and **the database, the audit journal, the approval ledger and the whole task log were not**. Now: `orxnud_platform_fs::create_private_dir` creates the state root and restricts it to `0700` through a **descriptor** (`File::set_permissions` is an `fchmod`, so the mode changes on the object that was opened, not on whatever a name resolves to later), and `FilesystemPrivacy::restrict_file_to_owner` does the same for the database and its sidecars. `orxnud_store::alias::open_shared` / `open_exclusive` restrict the database **as part of the guarded open**, and the open is **refused** (`OpenFailure::Privacy` → `StoreError::Privacy`) when the platform cannot do it. **Both copies of the database are private, and both are private in the two ways they can exist.** (1) *Taken*: the pre-migration snapshot (`state.db.pre-migration.bak` — a full copy of every task, every proposed action, the approval ledger and the audit journal, and the artefact an operator is told to keep) and the restore staging image are restricted to `0600` **before** they are published, so a snapshot is born private rather than tightened after the fact. (2) *Adopted*: a snapshot left behind at the canonical path by an **earlier** build is `0644`, and `MigrationRunner::migrate` reuses such a file because it may be the only good copy of a database whose last migration failed. It is now made private **before** it is accepted as the recovery point: the path is observed first (the store's own link-count rule, so an inode with a second name is refused rather than having that other name's object changed too), the restriction goes through a descriptor, and the identity is re-checked afterwards so a replaced path is refused. A refusal is **fail-closed and distinct** — `MigrationError::SnapshotPrivacy` for a file that could not be made private and `MigrationError::SnapshotAliasUnsafe` for one that could not be shown to be safe — and in both cases **the snapshot is left exactly where it was**, because overwriting it to work around a permission failure would destroy the recovery point the refusal protects. `Backup::take` and `MigrationRunner::migrate` **require** the filesystem capability for all of this: a snapshot-taking API that could not restrict what it takes would be a public way to produce a world-readable copy of the user's entire durable state. **The diagnostic reports what was observed.** `--doctor` used to print `owner-only (0700 directory, 0600 database)` on the strength of a *compile-time capability check* — "this build has Unix mode bits" — which was false about the installation in front of the operator: a state root at `0755` and a database at `0644` were reported as owner-only. It now reads the modes (`orxnud_platform_fs::observe_owner_only`) and distinguishes **owner-only**, **NOT owner-only** (with the mode it saw), **absent**, **unverified** (it could not be inspected) and **not applicable** (the platform has no owner-only mechanism, so nothing was measured). It creates nothing and changes nothing: a diagnostic that repairs what it diagnoses cannot be re-read to check the repair. The **startup** banner is a different thing and still reports the **actual enforcement outcome** (`Runtime::privacy_outcome`, the result of the real `ensure_state_root` call), not a capability check. Under a `umask 0777` the requested `0700` is masked to `0000`, and a directory at `0000` cannot be opened to be restricted, so the daemon **refuses to start** — no database, no endpoint — and leaves a `0000` root the owner can `chmod` back. The full account of that case, of the residual enumeration below, and of the mutation evidence is in **A-020**; this row states the property, A-020 carries the working. Evidence: `crates/orxnud-store/tests/database_privacy.rs` (7), `crates/orxnud-store/tests/backup_privacy.rs` (4), `crates/orxnud-store/tests/snapshot_adoption.rs` (3), `crates/orxnud-daemon/tests/state_privacy.rs` (6), `crates/orxnud-daemon/tests/doctor_privacy.rs` (4), one in-crate test in `crates/orxnud-store/src/backup.rs` for the restore staging image, and one in `crates/orxnud-domain/src/platform.rs` for the `NotApplicable` contract — all driving the production paths against real files | **release:** any change to `orxnud_platform_fs::restrict_file_to_owner`, `orxnud_platform_fs::create_private_dir`, `orxnud_platform_fs::observe_owner_only`, `FilesystemPrivacy`, `PrivacyOutcome`, `alias::open_shared` / `open_exclusive`, `Backup::take`, `Backup::restore`, `MigrationRunner::migrate`, `MigrationRunner::secure_adopted_snapshot`, `Paths::ensure_state_root`, or the `--doctor` privacy report; and **event:** any new platform, or any change to the IPC endpoint's parent directory | 2026-10-21 | **High, and it was a disclosure rather than a defect in the governance model.** Everything the daemon holds about the user — every task, every parameter a model proposed to act on (including the literal text a `filesystem/write-text` proposal would write), the approval ledger, and the hash-chained audit journal — was in a file every other account on the machine could read, inside a directory every other account could list. The socket's `0600` and the workspace's `0700` were private, so the boundary looked correct from the outside while the durable state underneath it was not. Two properties are separate and both now hold: the **directory** is the boundary (the daemon restricts the root to `0700` before anything is created inside it, so the platform's umask-derived mode never matters for reachability), and the **file** is private in its own right (so the file stays private if it is copied, or the directory's mode is later loosened). **Not claimed:** this is a **Unix** guarantee. Windows has no mode bits, so the platform answers `PrivacyOutcome::NotApplicable` — a distinct answer, not a success that reads as a restriction, and the store, the audit journal and the approval ledger all **record** it rather than implying a protection they did not apply. A Windows state root inherits whatever ACL the user's per-user state root carries, and that is **not** the same as owner-only and is **unproven** here (V-29). The daemon itself does not run on Windows — the local IPC transport refuses there — so no Windows user-facing surface exists; the store's Windows use is the portability lane. **The Windows runtime behaviour of this row is NOT verified here**: the MSVC workspace check is blocked on this host by `cc-rs: failed to find tool "lib.exe"` (no MSVC C toolchain for bundled SQLite), so only `cargo check -p orxnud-domain --target x86_64-pc-windows-msvc` was run, and the `NotApplicable` arm is **compile-checked, not executed**. The portable coverage is the `PrivacyOutcome::is_restricted` unit test in `orxnud-domain` and the `NotApplicable` case in `crates/orxnud-store/tests/backup_privacy.rs`, both of which run on every platform. **Remaining, and recorded rather than assumed away.** (1) The lease lock file `<db>.lock` is created by the platform with the umask applied and is **not** restricted — it is a zero-byte `flock` target holding no data, and it is unreachable inside the `0700` root, but its mode does vary with the ambient umask. (2) The SQLite-created **staging** copy is `0644` for the duration of the copy and is restricted only afterwards; it is never published or retained before that, and it is inside the `0700` root, so it is not reachable by another local account. (3) `PrivacyOutcome::NotApplicable` is **overloaded**: `Paths::ensure_workspace` answers it for an *existing* workspace on Unix, where it means "nothing was restricted here" rather than "this platform has no mechanism". No caller reads that value today, but it is a trap for a future one. (4) A standalone `Daemon::start()` — a library consumer, not the runtime — creates the state root at the ambient umask, because `ensure_workspace` creates the root as a *parent* of the workspace; every production path goes through `Runtime::finish`, which establishes the private root first. (5) The `create_dir_all` in `orxnud-platform-ipc` was deliberately **not** changed: that crate is handed an arbitrary endpoint path, and restricting its parent would change the mode of a directory the program does not own — the daemon establishes the boundary for the state root it owns, and the socket's own `0600` remains independently correct. (6) **A symlinked snapshot path is followed, not refused.** Snapshot inspection follows symlinks, so if the canonical pre-migration snapshot path is a symlink it is the **target** that is observed, verified and restricted: the symlink itself is not refused, and the snapshot path is not explicitly required to be a non-symlink. The final acceptance review reproduced a case in which the target was the **live database**, and the restriction changed its mode from `0644` to `0600`. The effect is **tightening-only** and it requires the owner to control the protected state directory, so it is not a disclosure to another account — but the target-object substitution is a **residual**, not something this row claims is fixed. (7) **The restricted descriptor is not directly bound to the observed identity.** The adoption observes the path identity, verifies the content by opening the path, restricts a **separately opened** descriptor, and then checks the path identity again. That final check **detects** a path substitution and refuses the adoption — but the descriptor that was restricted is not directly bound to the identity originally observed and verified, so a substitution inside that window is detected after the fact rather than prevented. The final acceptance review assessed the consequence as **same-privilege and tightening-only**, not a demonstrated cross-user disclosure, and identified binding the descriptor directly to the expected identity as a possible future hardening improvement. Neither (6) nor (7) blocks the Linux MVP: both require the owner to control the protected state directory, and neither can make a path more readable. |
+| **V-100** | **A pre-migration snapshot is adopted as the recovery point only when it can be shown to be a snapshot of *this* database; a snapshot that carries no identity, or another database's, is refused and left exactly where it was** | The adoption branch of `MigrationRunner::migrate` accepted any file at the canonical path (`<db>.pre-migration.bak`) that `Backup::verify` accepted — and `verify` establishes only that the file *is a database*: it opens, it passes `integrity_check`, it has a `schema_meta`, and that table has rows. None of that says *whose* it is. Measured before this row: a complete, healthy database belonging to a **different** installation, planted at the canonical path, was adopted as the recovery point; the migration failed; and the recovery the caller then performed installed the foreign database's rows over the live database — the live database's own row was gone, replaced by the other installation's, with the store reporting success throughout (`crates/orxnud-store/tests/snapshot_provenance.rs`, written so that it compiles and **fails** against the unmodified code: `left: "foreign-1", right: "live-1"`). Now: the database carries its own **provenance identity** — one row in `database_identity` (a `singleton` primary key constrained to `1`, so exactly one row; 128 bits of hex from the OS-seeded keys of `RandomState`, mixed with the time and the pid), created by the store **before the first snapshot is taken** so that every snapshot this build takes carries it, and read back inside the same `IMMEDIATE` transaction that creates it, so a concurrent creator cannot produce a second identity. `Backup::verify` now reports it (`VerifiedSnapshot::identity`), and the adoption compares it with the live database's **before it touches the file**: **no identity at all** is `MigrationError::SnapshotProvenanceMissing`, **another database's identity** is `MigrationError::SnapshotProvenanceMismatch` (both name the file and leave it in place -- including through the callers' failed-initialisation cleanup, which does not delete the canonical snapshot path at all; see A-021 part 6), and the task layer maps them to `EngineErrorKind::Unavailable` — the migration did not proceed, the schema is untouched, the operator can act. Evidence: `crates/orxnud-store/tests/snapshot_provenance.rs` (5), `crates/orxnud-store/tests/snapshot_adoption.rs` (4, one of them new), `crates/orxnud-task/src/error.rs` (1). **Mutation-checked: 6 of 6 caught, 0 unobserved, 0 skipped** — the comparison removed, a missing identity accepted, the insert overwriting an existing identity, the identity created *after* the snapshot instead of before it, the vanished-snapshot fallback removed, and the error classification changed | **release:** any change to `database_identity`, `MigrationRunner::ensure_database_identity`, `MigrationRunner::require_snapshot_of_this_database`, `MigrationRunner::secure_adopted_snapshot`, `Backup::verify`, `VerifiedSnapshot`, `MigrationError::SnapshotProvenanceMissing`, `MigrationError::SnapshotProvenanceMismatch`, `MigrationError::ProvenanceUnavailable`, or the adoption branch of `MigrationRunner::migrate`; and **event:** any change to the canonical snapshot path, or to the order in which the identity and the snapshot are produced | 2026-10-22 | **High, and the failure was silent rather than loud.** The store reported a successful migration and a successful recovery while the user's tasks, proposals, approvals and audit journal were replaced by another database's. Nothing in the running system could notice: the restore's logical verification compares the installed content against the snapshot it was handed, and both were the foreign database's — the check was working, on the wrong pair. The blast radius is the whole durable state of one installation, and the file the operator is told to keep as their recovery point is the very file that caused it. **Not claimed:** that the *restore* primitive is bound (it is not — see A-021), that the identity is a secret (it is not — it is a discriminator, stored in the clear), or that a snapshot written by a build that predates the provenance table is still adopted (it is not — it is refused, and the operator must move it aside; see A-021). |
+| **V-101** | **The pre-migration snapshot path is shared between concurrent migrators of the same database, so a successful migrator's `Backup::discard()` can remove another migrator's published snapshot; that migrator's recovery obligation then names a file that is gone** | **OPEN — narrowed 2026-10-23 (A-022 amendment). The named lost-recovery-point interleaving is fixed on the production path by serialising `MigrationRunner::migrate` and by refusing to discard a snapshot the call adopted; V-101 stays open on the stale-adoption and direct-API residuals recorded in A-022. Original record follows.** `Backup::discard()` (`crates/orxnud-store/src/backup.rs:993`) removes the canonical path **by pathname**; `MigrationRunner::migrate` calls it on the success path (`migration.rs:703`). Two processes migrating the same database hold the shared lease simultaneously (`ownership.rs:530` — `try_lock_shared`; the store's own `security_state::tests::concurrent_opens_of_one_database_all_succeed` opens one database eight times at once), and SQLite's transactions serialise the **database** file, not the separate snapshot pathname. Publication is an atomic `rename` over the canonical path (`backup.rs:377`) with no lock the discard honours. The interleaving, its consequence and the proposed direction are in A-022 | **event:** any change to `Backup::discard`, `Backup::publish`, `Backup::path_for`, the snapshot decision in `MigrationRunner::migrate`, or the lease protocol in `ownership.rs`; and on any change that gives the canonical snapshot path a per-migrator name | 2026-10-22 | **Medium.** It can lose a **recovery point**, and it does so **loudly**: the other migrator's restore finds nothing (`Backup::restore` → `BackupError::Missing` → `MigrationError::RestoreFailed`), so the operator is told rather than misled. It does **not** silently replace the live database with another database's content — the file removed is a snapshot of the **same** database, and the restore fails rather than succeeding on a wrong file. It does not weaken DATA-004, whose provenance comparison runs before any adoption. **Not claimed:** that every concurrent-migrator sequence is safe — the stale-adoption residual remains and direct `Backup` callers are outside the lock (A-022). The named lost-file sequence is fixed on the production path. |
+| **V-102** | **A model call on the `task/continue` route does not hold the daemon's single-writer governed mutex, so a slow model stalls no other durable-state route; and the store's own fencing, not that mutex, is what decides whether the continuation's writes are allowed** | **CLOSED by A-023.** The continuation now runs the same gather/call/persist shape as `task/ai-propose` (`crates/orxnud-daemon/src/runtime.rs`): the read, the boundary crossing and the gathering happen under the governed lock, the **model is asked with no lock held**, and the write takes the lock again. Before it, the continuation held the mutex across the provider's network round trip, so a slow model held the single mutex every durable-state route needs — and the daemon's own scheduler pass (`crates/orxnud-daemon/src/serve.rs`) with it. Evidence: `crates/orxnud-daemon/tests/continuation.rs::a_blocked_continuation_does_not_hold_the_governed_lock` and `::a_cancelled_task_cannot_receive_a_stale_proposal_from_a_blocked_continuation` (both new, deterministic: a latch, not a sleep), plus the pre-existing `::a_boundary_is_claimed_by_exactly_one_worker`, `::a_provider_failure_returns_the_task_to_its_boundary_and_is_retryable` and `crates/orxnud-daemon/tests/serve_lifecycle.rs::a_blocked_provider_does_not_stop_unrelated_requests` (the `task/ai-propose` half of the same property). **Mutation-checked: 2 of 2 caught, 0 unobserved, 0 skipped** in an isolated copy of the working tree (A-023). **Amended later the same day (the A-023 follow-up):** the one limit the correction named was closed — the claim on `task/continue` is now **renewed while the model is being asked**, every third of `EngineLimits::lease_duration_ms`, using the store's existing fenced `heartbeat` with no new authority, mutex or store role; a slow model no longer outlives its own claim, and a claim that *is* lost mid-wait (cancelled, lapsed, or otherwise no longer this worker's) ends the request in `CONFLICT` with `reason: "claim-lost"` rather than a stale write. The mechanism, its fences and its bounds are in A-023's follow-up block, which governs from that amendment on. Evidence added by the amendment: three lease tests in `continuation.rs` (the corrected survival test holds a latched provider for **three** lease durations, reads the live lease from the daemon's own database, and asserts the persisted proposal is stamped at the write rather than at the pre-wait claim; lock released between renewal ticks; cancelled-task reason pin) and **seven** engine-fence tests in `crates/orxnud-task/tests/v102_heartbeat_fencing.rs` (five heartbeat clauses plus two persistence-clock tests). **The persistence boundary is part of the fence:** `propose_action_at_write`, `complete_with_at_write` and `heartbeat_at_write` sample the clock inside the store's `IMMEDIATE` transaction, so a pre-wait timestamp no longer decides whether an expired lease is accepted. **Evidence-record correction:** the follow-up's original mutation count (8 caught, 1 honest miss, 1 equivalent) was historical and its artifacts were not preserved; it is **not** re-verified here. The persistence-boundary correction re-ran five re-runnable mutants and caught all five (0 missed), including *renewal disabled* and *the pre-wait proposal clock restored*; validation counts below are the fresh ones. Details in A-023 | **event:** any change to the lock scope of `continue_task` or `ai_propose`, to `call_provider`, to the provider timeout, to the request deadline, to `EngineLimits::lease_duration_ms`, or to the fencing in `TaskRepository::propose_action` and `TaskRepository::complete_with`; and, per the A-023 follow-up: to `TaskService::heartbeat`, the renewal tick in `continue_task`, the persistence-clock variants `TaskRepository::propose_action_at_write` / `complete_with_at_write` / `heartbeat_at_write`, or the fencing in `TaskRepository::heartbeat` and `DurableEngine::heartbeat` 2026-10-22 | **Medium, and it is a liveness/throughput consequence, not a data-integrity one.** The worst case is a *slow but successful* model holding every other durable-state route for up to the provider's own 60 s timeout (`crates/orxnud-daemon/src/http_provider.rs`: `DEFAULT_TIMEOUT`); the request deadline (120 s, `crates/orxnud-daemon/src/serve.rs`) is above it, so the call itself is not cut. Nothing on this path can install foreign data, bypass an approval, or duplicate an effect: the continuation writes a *proposal* and waits for a human, and the write is fenced by the store. **Not claimed:** (amended by the A-023 follow-up, later the same day) — with the claim renewed every third of the lease, a slow model no longer outlives its claim, so the pre-amendment residual "a model call longer than the lease lapses its own claim and is refused at the write" no longer describes the current code; what remains is that a claim lost mid-wait is reported as a `claim-lost` conflict rather than revived (pinned by `a_cancelled_task_is_not_revived_by_a_renewal`), and that the daemon-head storage-error branch of the renewal tick has no deterministic end-to-end producer (the equivalent engine-level refusal is tested in `crates/orxnud-task/tests/v102_heartbeat_fencing.rs`). The pre-amendment residual was true of the state this row CLOSED, and the A-023 follow-up block is its amendment record. **The persistence boundary is now the clock's:** the proposal, completion and renewal each read time after `BEGIN IMMEDIATE` and before the state-changing write (`propose_action_at_write`, `complete_with_at_write`, `heartbeat_at_write`), and the pre-wait timestamp is used only to claim the step and name the proposal. A test that only asserted `state = running` would not have proved the lease was live; the corrected survival test reads `lease_holder` and `lease_expires_at_ms` from the store and asserts the proposal's `created_at_ms` is at or after the instant the test released the provider. |
 
 Recorded per operating rule 5: wrongness is worth recording, because it is how
 this register improves.
@@ -480,7 +490,7 @@ path passes `Some(0)`; production passes `None`, which uses
 
 **Observed:** 2026-10-10, during the S-17 design pass. A single `scripts/ci-gates.sh` run
 reported `1 failed: G9` (the test gate). The test binaries were **unchanged** by that pass —
-it touched `docs/09-decisions.md`, `docs/12` and `docs/18` only — so the failure is not
+it touched `docs/09-decisions.md`, `docs/12` and the remediation plan only — so the failure is not
 attributable to any edit in it.
 
 **What is known.** Re-running `scripts/ci-gates.sh G9` in isolation gave
@@ -2648,6 +2658,1444 @@ directions can be checked against this row.
 | **event** | any change to `certainty_of`, `effect_status_for_certainty`, `effect_status_for_dispatch_failure`, the audit classifier for `VerificationRefuted`, or the `Certainty` enum |
 | **date** | 2026-10-14 |
 | **severity** | **High.** Silent drift re-opens an automatic repeat of a possibly-performed non-idempotent effect, with no human involved. |
+
+### A-020 — SEC-003: the durable state was world-readable, and is now private to its owner
+
+**What the finding was.** The platform creates a SQLite database — and the `-wal` / `-shm`
+sidecars — with the process's umask applied, which under the common `022` is `0644`. The state
+root was created by `create_dir_all` with no mode, so it was `0755`. Measured on a fresh daemon
+state root:
+
+```
+755  state/            <- the state root
+644  state/state.db    <- tasks, proposals, approvals, the audit journal
+644  state/state.db-wal
+644  state/state.db-shm
+644  state/state.db.lock
+700  state/workspace   <- already private
+600  state/orxnud.sock <- already private
+```
+
+The socket and the workspace were private, so the boundary **looked** correct from the outside
+while the durable state underneath it was readable by every other account on the machine. The
+database holds every task, every parameter a model proposed to act on — including the literal
+text a `filesystem/write-text` proposal would write — the approval ledger, and the
+hash-chained audit journal.
+
+**Resolution, in six parts.**
+
+1. **The directory is the boundary.** `orxnud-daemon::Paths::ensure_state_root` restricts the
+   state root to `0700` *before* anything is created inside it, so the platform's umask-derived
+   mode never matters for reachability. It is called first in `Runtime::finish`, ahead of
+   `attach_durable_security_state`, and a failure is fatal to the start.
+
+2. **The file is private in its own right.** The store restricts the database and its sidecars
+   as part of the guarded open, so the file stays private if it is copied or the directory's mode
+   is later loosened. The store asks the platform through the capability it is already handed:
+   `FilesystemPrivacy` is a supertrait of `FilesystemIdentity`, so the store's existing
+   parameter carries the operation and no caller can hand the store an identity-only
+   implementation and get a permissive default.
+
+3. **A failure to secure is a refusal.** `alias::open_shared` / `open_exclusive` refuse the open
+   with `OpenFailure::Privacy` when the platform cannot restrict the file. A store that opened a
+   world-readable database and carried on would be a disclosure with a note attached, and there
+   is no degraded mode to fall back to. In the restore path the refusal is
+   `BackupError::Privacy`, **not** `BackupError::Ownership`: the two are different facts with
+   different remedies, and an operator sent to look for a competing process is being sent to
+   the wrong place.
+
+4. **The copies are private too — in both the ways they can exist.** The store makes two
+   **complete copies** of the database, and neither was private at first: the
+   **pre-migration snapshot** (`state.db.pre-migration.bak`) and the **restore staging image**.
+   The snapshot is created on *every* migration and is **deliberately kept** when a migration
+   fails, because it may be the only good copy of the database — and it is the artefact an
+   operator is told to keep and back up. Both are now restricted to `0600` **before** they are
+   published, so a snapshot is *born* private rather than tightened after the fact (the
+   publication is a rename, and a rename preserves the mode). `Backup::take` and
+   `MigrationRunner::migrate` therefore **require** the filesystem capability: a
+   snapshot-taking API that could not restrict what it takes would be a public way to produce
+   a world-readable copy of the user's entire durable state.
+
+5. **An *adopted* snapshot is made private before it is accepted.** A snapshot left at the
+   canonical path by an **earlier** build is `0644`, and `migrate` reuses such a file because it
+   may be the only good copy of a database whose last migration failed. It is now made private
+   **before** it is accepted as the recovery point: the path is observed first (the store's own
+   link-count rule, so an inode with a second name is refused rather than having that other
+   name's object changed too), the restriction goes through a descriptor, and the identity is
+   re-checked afterwards so a replaced path is refused. A refusal is **fail-closed and
+   distinct** — `MigrationError::SnapshotPrivacy` for a file that could not be made private and
+   `MigrationError::SnapshotAliasUnsafe` for one that could not be shown to be safe — and in
+   both cases **the snapshot is left exactly where it was**, because overwriting it to work
+   around a permission failure would destroy the recovery point the refusal protects.
+
+6. **The diagnostic reports what was observed, not what the platform could do.** `--doctor`
+   used to print `owner-only (0700 directory, 0600 database)` on the strength of a
+   *compile-time capability check* — "this build has Unix mode bits" — which was false about
+   the installation in front of the operator: a state root at `0755` and a database at `0644`
+   were reported as owner-only. It now reads the modes
+   (`orxnud_platform_fs::observe_owner_only`) and distinguishes **owner-only**, **NOT
+   owner-only** (with the mode it saw), **absent**, **unverified** (it could not be inspected)
+   and **not applicable** (the platform has no owner-only mechanism, so nothing was measured).
+   It creates nothing and changes nothing: a diagnostic that repairs what it diagnoses cannot
+   be re-read to check the repair. The **startup** banner is a different thing and still
+   reports the **actual enforcement outcome** — the result of the real `ensure_state_root` call
+   — not a capability check.
+
+**Why the mode is set through a descriptor.** `restrict_file_to_owner` opens the path once and
+changes the mode through that handle — `File::set_permissions` is an `fchmod(2)`. A
+`chmod(2)` on a path is a different operation: the kernel resolves the name at the moment of the
+syscall, so the object whose mode changes is whatever the name resolves to *then*, and a name
+that is a symbolic link changes the mode of its **target**. The object's kind is checked through
+the same descriptor (`File::metadata` is an `fstat(2)`), so "is it a regular file?" and "change
+its mode" describe one object rather than two resolutions of one name.
+
+**Why the creation mode is set twice.** `mkdir(2)` takes the mode **masked by the umask**, so a
+`0700` request can arrive as `0000` — stricter than asked for, and useless, because the owner
+cannot enter the directory either. `create_private_dir` therefore creates the leaf at `0700`
+(never *more* permissive than owner-only) and then sets the mode exactly. The window between
+the two is a window in which the directory is too strict rather than too open.
+
+**The one umask the implementation cannot satisfy, and what it does about it.** Under
+`umask 0777` the requested `0700` arrives as `0000`, and a directory at `0000` cannot be
+**opened** — so the descriptor-based restriction cannot be performed on the object just
+created. The behaviour is a **secure refusal**: the daemon does not start, no database is
+written, no endpoint is bound, and the state root is left at `0000` — *more* restrictive than
+asked for, so nothing is exposed. The artefact is recoverable, because `chmod` is governed by
+ownership rather than by the mode: the owner may `chmod 700` it and the daemon then starts
+normally. Making it work at any umask would need a pathname-based `chmod` after the fact,
+which is the time-of-check / time-of-use shape the descriptor-based design exists to avoid, so
+it is deliberately not done.
+
+**What was deliberately not changed.** `orxnud-platform-ipc`'s `create_dir_all` was left alone:
+that crate is handed an arbitrary endpoint path, and restricting its parent would change the mode
+of a directory the program does not own. The daemon establishes the boundary for the state root
+it owns, and the socket's own `0600` remains independently correct — which is what that
+crate's comment now says, instead of asserting a `0700` parent that did not exist.
+
+**Evidence.** `crates/orxnud-store/tests/database_privacy.rs` (7),
+`crates/orxnud-store/tests/backup_privacy.rs` (4),
+`crates/orxnud-store/tests/snapshot_adoption.rs` (3),
+`crates/orxnud-daemon/tests/state_privacy.rs` (6),
+`crates/orxnud-daemon/tests/doctor_privacy.rs` (4), one in-crate test in
+`crates/orxnud-store/src/backup.rs` (the restore staging image) and one in
+`crates/orxnud-domain/src/platform.rs` (the `NotApplicable` contract). They drive the
+**production** paths against real files: a newly created database is `0600`; its sidecars are
+`0600`; an existing `0644` database and an existing `0644` sidecar are tightened on the next
+open; a **newly taken** pre-migration snapshot is `0600`; the restore staging image is `0600`;
+an **adopted** `0644` snapshot is made `0600` before it is accepted as the recovery point; a
+privacy failure at the adoption refuses the adoption, is classified as a privacy failure rather
+than an ownership one, and **leaves the snapshot in place**; a snapshot reachable through a
+second name is refused and left unmodified; the restriction holds under `umask 000` and the
+state root is exactly `0700` under it (both proved in a child process, because the umask is
+process-global state); under `umask 0777` the daemon **refuses to start**, writes no database,
+binds no endpoint, and leaves a `0000` root that the owner can `chmod` back; an open that
+cannot restrict the file is refused and the refusal is not reported as an ownership or alias
+refusal; a database reachable through a second name is **still** refused; and `--doctor`
+reports the **observed** modes — a `0755`/`0644` installation is reported as **NOT
+owner-only**, a `0700`/`0600` one as owner-only, and an absent one as absent, with the
+diagnosis changing nothing.
+
+**Mutation validation, and what was actually run.** The repository's own harness,
+`scripts/mutate.sh`, **could not be used against this tree**: it refuses a dirty working tree
+(`mutate.sh:47-51`) and the whole SEC-003 change is uncommitted, because committing is
+forbidden here. The substitute is an in-tree mutation with a proven revert, and the two are
+**not** the same thing and are not presented as such.
+
+* An **earlier** round of this work (before the F-1/F-2 follow-up) reverted three
+  enforcement points and observed **8 of the then-10** privacy tests failing, the two that
+  passed being the alias-preservation test and the workspace test, whose properties the
+  mutation did not touch. **That experiment was not re-run in this follow-up**; it is recorded
+  as history, and the "8 of the 10" wording referred to a suite that has since grown.
+* In **this** follow-up, two mutations were applied and reverted in the working tree, each
+  proved reverted afterwards (no mutation marker remained and the affected suite was re-run
+  green):
+  1. **The adopted-snapshot restriction removed** from
+     `MigrationRunner::secure_adopted_snapshot` — **2 of the 3** `snapshot_adoption` tests
+     failed (`an_adopted_world_readable_snapshot_is_made_private_before_it_is_retained` and
+     `a_privacy_failure_refuses_the_adoption_and_preserves_the_snapshot`). The third, the
+     two-names refusal, still passed, because the link-count refusal precedes the
+     restriction — which is the correct ordering, and is why that test is not a detector for
+     this mutation.
+  2. **The capability-based claim restored** in the `--doctor` report — **2 of the 4**
+     `doctor_privacy` tests failed
+     (`a_world_readable_installation_is_not_reported_as_owner_only` and
+     `the_report_never_claims_owner_only_from_a_capability_check`).
+
+  So the mutation evidence for the two follow-up defects is **2 of 3** and **2 of 4** observed
+  failures, and the full history is **not** a single re-run number. What the tests assert is
+  an **exact mode** (`Some(0o600)`, `Some(0o700)`) rather than "not world-readable", so a
+  regression to `0644` fails them; that specificity is the reason the mutation evidence is
+  considered sufficient for these two defects, and it is not a substitute for running
+  `scripts/mutate.sh` against a clean tree.
+
+**The Windows contract, stated exactly.** Windows has no mode bits, so the platform answers
+**`PrivacyOutcome::NotApplicable`** — a *distinct* answer, not a success that reads as a
+restriction. The store, the audit journal and the approval ledger all **record** that outcome
+(`Store::privacy_outcome()`, `SqliteAuditJournal::privacy_outcome()`,
+`SqliteApprovalLedger::privacy_outcome()`) rather than implying a protection they did not
+apply. The daemon prints the state root's privacy status at startup — the **actual outcome of
+the real `ensure_state_root` call**, not a capability check — and `--doctor` prints the
+**observed** status of the state root and the database, distinguishing owner-only, NOT
+owner-only (with the mode it saw), absent, unverified, and not-applicable. The
+store's decision is explicit: `NotApplicable` **allows the open** (refusing would break a
+platform the product supports for storage, for a protection it does not offer) and **records**
+the fact; an **error** refuses the open. What Windows actually offers is a per-user ACL on the
+state root, inherited from the per-user state root above it — a **different mechanism with a
+different threat model**, not owner-only, and **unproven** here (V-29). The daemon itself does
+not run on Windows: the local IPC transport refuses there.
+
+**Checks executed versus checks not verified.** Executed here: the whole workspace suite, the
+CI gate suite, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -D
+warnings`, and the focused store / platform-fs / platform-ipc / domain / daemon privacy suites.
+**Not verified here:** the Windows **runtime** behaviour of any of this. The MSVC workspace
+check is blocked on this host by `cc-rs: failed to find tool "lib.exe"` — no MSVC C toolchain
+for bundled SQLite — so the `NotApplicable` arm is **compile-checked, not executed**; only
+`cargo check -p orxnud-domain --target x86_64-pc-windows-msvc` was run. The portable coverage
+is the `PrivacyOutcome::is_restricted` unit test and the `NotApplicable` case in
+`backup_privacy.rs`, both of which run on every platform. The three `s31_*` suites' test
+**doubles** were modified — each gained a `FilesystemPrivacy` implementation — so "the Windows
+suites are unchanged" is **not** true of them; their *assertions* are unchanged and their
+coverage of the Windows identity path is unchanged, but the doubles' new trait method is
+compile-checked only.
+
+**Remaining, and accepted — recorded rather than left for a reader to assume otherwise.**
+(1) The lease lock file `<db>.lock` is created by the platform with the umask applied and is
+**not** restricted: it is a zero-byte `flock` target that holds no data and is unreachable
+inside the `0700` root, but its mode does vary with the ambient umask. (2) The
+SQLite-created **staging** copy is `0644` for the duration of the copy and is restricted only
+afterwards; it is never published or retained before that, and it is inside the `0700` root, so
+it is not reachable by another local account. (3) `PrivacyOutcome::NotApplicable` is
+**overloaded**: `Paths::ensure_workspace` answers it for an *existing* workspace on Unix, where
+it means "nothing was restricted here" rather than "this platform has no mechanism". No caller
+reads that value today, but it is a trap for a future one. (4) A standalone `Daemon::start()` —
+a library consumer, not the runtime — creates the state root at the ambient umask, because
+`ensure_workspace` creates the root as a *parent* of the workspace; every production path goes
+through `Runtime::finish`, which establishes the private root first. (5) **A symlinked snapshot path is followed, not refused.** Snapshot inspection follows symlinks, so if the canonical pre-migration snapshot path is a symlink it is the **target** that is observed, verified and restricted: the symlink itself is not refused, and the snapshot path is not explicitly required to be a non-symlink. The final acceptance review reproduced a case in which the target was the **live database**, and the restriction changed its mode from `0644` to `0600`. The effect is **tightening-only** and it requires the owner to control the protected state directory, so it is not a disclosure to another account — but the target-object substitution is a **residual**, not a fixed defect. (6) **The restricted descriptor is not directly bound to the observed identity.** The adoption observes the path identity, verifies the content by opening the path, restricts a **separately opened** descriptor, and then checks the path identity again. That final check **detects** a path substitution and refuses the adoption — but the descriptor that was restricted is not directly bound to the identity originally observed and verified, so a substitution inside that window is detected after the fact rather than prevented. The final acceptance review assessed the consequence as **same-privilege and tightening-only**, not a demonstrated cross-user disclosure, and identified binding the descriptor directly to the expected identity as a possible future hardening improvement. Neither (5) nor (6) is a fixed defect, and neither blocks the Linux MVP: both require the owner to control the protected state directory, and neither can make a path more readable.
+
+| | |
+|---|---|
+| **event** | any change to `orxnud_platform_fs::restrict_file_to_owner`, `orxnud_platform_fs::create_private_dir`, `orxnud_platform_fs::observe_owner_only`, `FilesystemPrivacy`, `PrivacyOutcome`, `alias::open_shared` / `open_exclusive`, `Backup::take`, `Backup::restore`, `MigrationRunner::migrate`, `MigrationRunner::secure_adopted_snapshot`, `Paths::ensure_state_root`, the `--doctor` privacy report, or the IPC endpoint's parent directory |
+| **date** | 2026-10-21 |
+| **severity** | **High.** Silent drift re-opens a world-readable copy of every task, every proposed action and the whole audit journal, on a shared machine, with nothing in the running system able to notice. |
+
+
+### A-021 — DATA-004: a pre-migration snapshot is now bound to the database it protects
+
+**What the finding was.** `MigrationRunner::migrate` reuses a file already at the canonical
+pre-migration path (`<db>.pre-migration.bak`) instead of taking a new one, because it may be the
+only good copy of a database whose last migration failed. The reuse was gated on
+`Backup::verify` alone — and `verify` establishes that the file **is a database**: it opens, it
+passes `PRAGMA integrity_check`, it has a `schema_meta`, and that table has rows. Every one of
+those is a statement about the file's **shape**. None of them is a statement about **whose** it
+is.
+
+So a complete, healthy SQLite database belonging to something else — a state directory copied
+from another machine, a template, a database restored from elsewhere, a file left by another
+installation — passed every check the store made, was adopted as *this* database's recovery
+point, and the recovery that followed installed **that** database's rows over this one.
+
+**Measured, before the fix.** A foreign, fully migrated database with one row of its own was
+snapshotted through the production path and planted at the live database's canonical path. The
+migration then failed, as it was arranged to; the recovery obligation pointed at the foreign
+file; and the recovery the caller performs installed the foreign content:
+
+```
+canonical snapshot path: /tmp/data004-386336/state.db.pre-migration.bak
+LIVE    database rows before: live-1
+snapshot rows (foreign)    : foreign-1
+migrate -> migration failed; a snapshot at /tmp/data004-386336/state.db.pre-migration.bak must be restored after releasing the database
+recovery obligation points at: /tmp/data004-386336/state.db.pre-migration.bak
+LIVE    database rows after : foreign-1
+```
+
+The live database's own row was **gone**, replaced by the other installation's, and the store
+reported success throughout. The restore's logical verification did not object: it compares the
+installed content against the snapshot it was handed, and both were the foreign database's. The
+check was working, on the wrong pair.
+
+**Resolution, in five parts.**
+
+1. **The database says what it is.** A new table, `database_identity`, holds one row: a 128-bit
+   hex identity, minted from the operating system's entropy (`RandomState`'s keys are OS-seeded
+   and incremented per instance), mixed with the time and the pid, and read back inside the same
+   `IMMEDIATE` transaction that created it. The `singleton` primary key is constrained to `1`, so
+   the table holds exactly one row — which is not decoration: the insert is
+   `ON CONFLICT(singleton) DO NOTHING`, and a table that could hold two rows would let a
+   concurrent creator put a second identity beside the first.
+
+   It is **not a migration**, and deliberately so. A migration changes the *shape* of a database
+   and is recorded in `schema_meta`; this is a property of the *instance*. It is created before
+   the first snapshot is taken — so that every snapshot this build takes carries it — and a
+   database that has never been migrated still needs one.
+
+2. **The snapshot carries it, because the identity is written first.** `migrate` gives the
+   database its identity **before** it takes the snapshot, and `Backup::verify` now reports what
+   it found (`VerifiedSnapshot::identity`). The ephemeral path creates it too, so an in-memory
+   database and a migrated one have the same tables: "the schema contains exactly the declared
+   tables" is true of one and false of the other otherwise.
+
+3. **The adoption compares, before it touches anything.** The provenance check runs **before** the
+   file is modified in any way: a file that cannot be shown to be ours is not made private, not
+   adopted, and not overwritten. **No identity at all** is
+   `MigrationError::SnapshotProvenanceMissing`; **another database's identity** is
+   `MigrationError::SnapshotProvenanceMismatch`, naming both identities. Both leave the file
+   exactly where it was — it is not this store's to delete, and it may be the only good copy of
+   something. **That promise is kept by the callers' cleanup as well**, which is part 6 below.
+
+4. **The refusal is classified as what it is.** Both variants map to
+   `EngineErrorKind::Unavailable` in the task layer: the migration **did not proceed**, the
+   schema is untouched, and the operator can act and start again. That is the same shape as
+   SEC-003's privacy and alias refusals, and it is retryable for the same reason.
+
+5. **A snapshot that vanishes is not a privacy failure.** The canonical snapshot path is shared
+   by every process migrating the same database, and one of them finishing successfully removes
+   the file the others are looking at. (That sharing has a second consequence, which this
+   part does **not** cover: the removal is by pathname, so it can remove a *concurrent
+   migrator's* published snapshot and leave that migrator's recovery obligation naming a file
+   that is gone. That is recorded separately as **V-101** / **A-022**.) The adoption restricted the file it had verified, and the
+   restriction failed with `ENOENT` — reported as a *privacy* failure, failing an open that had
+   lost nothing. That was a **pre-existing** defect in SEC-003's adoption path: measured at
+   **1 in 10** full store-suite runs on the tree without DATA-004's change. DATA-004's write
+   (the identity is a transaction on the live database, and the write-lock traffic it adds
+   stretches the window in which the file can disappear) made it reachable at roughly **1 in 2**,
+   which is why it is fixed here: a file that is **gone** is now reported as gone
+   (`Secured::Gone`), and the caller takes a fresh snapshot instead of failing the open. A file
+   that is still there and cannot be made private is still refused, and is still left alone.
+   After the fix: **16 consecutive green store-suite runs** in the implementation round (the
+   measurement that produced the 1-in-10 and roughly-1-in-2 figures above is a
+   load-stressed one, and those two rates are what *that* measurement produced — they are not
+   universal rates). See "Checks executed" below for what was run in this follow-up round and
+   what is inherited.
+
+6. **The cleanup does not delete the canonical recovery snapshot.** The refusal says the file is
+   left in place and tells the operator to move it aside — and the caller that cleans up after
+   a failed *initialisation* used to delete it. The cleanup's guard was on whether the **live
+   database** existed before the call, which says nothing about the file at the snapshot path:
+   that file is not this call's, and it may be the only good copy of a pre-migration state.
+   The rule is now the simpler one: **the cleanup removes the live database and its sidecars,
+   and nothing else.** It does not touch the canonical snapshot path, whatever is at it — not
+   a valid database, not a legacy snapshot, not a foreign one, and not a stray non-database
+   file.
+   The rule the cleanup is built on is unchanged and now explicit: **it removes what this call
+   created.** This call publishes a snapshot at the canonical path only on the paths that end
+   in a recovery obligation — the paths where the caller restores it — so on every path that
+   reaches the cleanup, the file there was already on disk before the call.
+
+   *Why there is no "it is only debris" exception.* There was one, and it was wrong in a way no
+   care in the classification could fix. The exception classified the file at the path — by
+   reading its first sixteen bytes — and then removed **the path**. Between those two steps the
+   file at the path can change: another process migrating the same database publishes its own
+   snapshot there, and the removal then deletes *that* snapshot, which is a valid recovery point
+   of the same database.
+   Nothing prevents that interleaving. The lease is keyed on the **database** path, not the
+   snapshot path; the migration path holds only a **shared** lease, which does not exclude
+   another migrator; and the cleanup runs after the connection and the lease have been dropped,
+   so it holds no ownership lock at all. Publication is a `rename` over the canonical path,
+   which is atomic as a replacement and takes no lock the cleanup honours. SQLite's own
+   locking covers the database file, not the snapshot path.
+   A `dev`/`inode` comparison immediately before the unlink would not close the window either —
+   it narrows it to the instructions between the comparison and the unlink — and a same-directory
+   rename would move whatever occupies the path at that instant, which is the same harm under
+   another name. On POSIX there is no unlink-by-descriptor, so the only way to remove *that*
+   file is to unlink a name known to refer to it, and the canonical path is not such a name.
+   The check-then-delete sequence is therefore **gone**, not narrowed.
+
+   *What is left at the canonical path, and who replaces it.* A stale **non-database** file may
+   sit at the canonical path until the next successful migration publishes a fresh snapshot
+   over it. That is safe and needs no special handling: `Backup::verify` refuses a file that is
+   not a database, so the next migration takes the **take** branch, and `Backup::publish` renames
+   the staged copy over the canonical path — an atomic replacement, staged, verified, restricted
+   and alias-checked exactly as any other published snapshot is. The stale file is replaced by
+   that publication, not by the cleanup. The live database and its sidecars are still removed on
+   the cleanup path, so a failed first migration still leaves no half-built store behind.
+
+**Evidence.** `crates/orxnud-store/tests/snapshot_provenance.rs` (5) — the finding itself, the
+classification, the legacy case, and the identity's stability and uniqueness;
+`crates/orxnud-store/tests/snapshot_adoption.rs` (4, one new: the vanished-snapshot case);
+`crates/orxnud-task/src/error.rs` (1) — the classification of the refusals; and, in the
+follow-up rounds, **6 tests added in `crates/orxnud-store/src/migration.rs`** — the cleanup rule
+itself, the three production entry points that clean up after a failed initialisation
+(`open_and_migrate`, `SqliteAuditJournal::open`, `SqliteApprovalLedger::open`) driven with a
+refused candidate at the canonical path while the live database is absent, and the replacement
+of stale non-database debris by the next successful publication — plus one **existing** test
+reworded to the new contract
+(`discarding_a_failed_initialisation_removes_the_database_and_its_sidecars`, which used to
+require the snapshot to be removed with the database and now requires the opposite). Each of the refusal cases
+asserts that the **provenance** refusal reaches the caller (not an ownership, alias or privacy
+one), that the file is still there **byte-identical**, and that the live database is in the
+intended failure state rather than holding the refused snapshot's content. The first
+provenance test was written **before** the fix and **fails against the unmodified code**
+(`left: "foreign-1", right: "live-1"`), so the defect is demonstrated rather than argued.
+
+**Mutation-checked: 6 of 6 caught, 0 unobserved, 0 skipped** (the implementation round). The
+comparison removed (3 tests fail); a missing identity accepted (1); the insert changed to one
+that **overwrites** an existing identity (1); the identity created *after* the snapshot instead
+of before it (2); the vanished-snapshot fallback removed (1); the error classification changed
+to `Invariant` (1). The third of those was **not** caught at first: an "it already has one"
+shortcut in `ensure_database_identity` returned the existing identity without touching the row,
+so the insert's own semantics — which are what decide whether an existing identity is *kept* —
+were never exercised. The shortcut was removed. It saved one small write transaction on a path
+that only runs when there is a migration to apply, and it cost the only thing that matters here:
+the evidence that the identity is stable.
+
+**Mutation-checked in the F-A follow-up round: 4 of 4 caught, 0 unobserved, 0 skipped**, run in an
+isolated copy of the working tree (the repository's own checkout was never mutated, and
+`scripts/mutate.sh` was not used because it refuses a dirty tree). The cleanup removing the
+canonical file unconditionally — the pre-fix behaviour — (5 tests fail); the header check
+answering "yes" for every file, so debris is preserved (1); the header check answering "no" for
+every file, so a candidate is deleted (5); and the `pre_existing` guard dropped from the cleanup
+(2). Every temporary mutation was reverted and the copy was diffed against the working tree to
+prove it. **The header check those two mutations exercised no longer exists**: the round that
+removed the check-then-delete sequence removed it with it, because a classification that cannot
+bind a removal to the file it classified is not a safe thing to keep.
+
+**Mutation-checked in this round: 4 of 4 caught, 0 unobserved, 0 skipped**, again in an isolated
+copy of the working tree (verified to contain the current uncommitted changes before it was
+used, and diffed against the working tree afterwards to prove every mutation was reverted).
+The cleanup unlinking the canonical path unconditionally — the behaviour this round removed
+(6 tests fail); the classification inverted, so the cleanup deletes a file that *is* a database
+(5); the `pre_existing` guard dropped from the cleanup (2); and the publication no longer
+replacing the canonical path, so stale debris would survive it (8, including
+`a_successful_migration_replaces_stale_non_database_debris`).
+
+**Checks executed, and what each number is.** The counts below are separated on purpose,
+because they are not the same kind of evidence.
+
+*This round (the cleanup-race correction), run on the tree as it now stands:* the whole
+workspace suite — **`1951 run, 1951 passed, 6 skipped`** (the figure is from the gate run
+below; a separate run of the same command in the same round carried the **known pre-existing
+flake** in `orxnud-task::durability n_workers_sharing_a_file_produce_exactly_one_winner_per_task`
+— measured at 1/8 on the *pristine* tree under CPU load before any of this work — and no
+other failure); the CI gate suite
+(`CI=true ./scripts/ci-gates.sh`, **exit 0**, one gate skipped: G12); `cargo fmt --all -- --
+check`; `cargo clippy --workspace --all-targets -- -D warnings`; and `git diff --check`. The
+store crate on its own: `428 run, 428 passed, 1 skipped`. The focused migration-cleanup,
+snapshot-provenance and snapshot-adoption suites were run individually and passed.
+
+*The F-A round before it, whose numbers are superseded by the above but whose evidence
+stands:* the workspace suite (`1950 run, 1950 passed, 6 skipped`), the gate suite (exit 0), the
+store crate on its own (`427 run, 427 passed, 1 skipped`), and the red-before-green evidence
+for its five new tests, produced in an **isolated copy** of the working tree
+(`/tmp/opencode/fa-red`), never in the repository's own checkout: with the cleanup reverted
+there, those five tests fail (`the refused snapshot must still be there`) and the other thirty
+migration tests still pass.
+
+*Inherited from the implementation round, and not re-run here:* the implementation round's own
+suite run (`1945 run, 1945 passed, 6 skipped`) and gate run (exit 0); the sixteen consecutive
+green store-suite runs; and the load-stressed measurements of the vanished-snapshot flake
+(**1 in 10** on the tree without DATA-004's change, **roughly 1 in 2** with it). Those two
+rates are what *that* measurement produced under CPU load; they are not universal rates, and
+they are reported as measurements rather than as properties.
+
+*Implementation-reported but not independently reconstructable from the persisted logs:* the
+implementation round's "**25 green full-workspace runs**". Ten of those runs had the DATA-004
+identity gate **deliberately disabled** (to measure the pre-fix flake rate) and were therefore
+**not green** — the identity tests failed by construction — so the figure as written was wrong,
+and this entry no longer states it. What the persisted logs in `/tmp/opencode/` support is
+fifteen consecutive full-workspace runs with the gate enabled, of which one carried a
+**known pre-existing flake** in another test (`orxnud-task::durability
+n_workers_sharing_a_file_produce_exactly_one_winner_per_task`, measured at 1/8 on the *pristine*
+tree under CPU load before this work began) and the rest were green; the mutation results of
+that round (**6 of 6 caught**) are the implementation's report and were **not re-run here**,
+because re-running them would mean mutating the tree this follow-up was told to preserve. This
+round's own mutation results (**4 of 4 caught**) are in the isolated copy described above.
+
+**Remaining, and recorded rather than left for a reader to assume otherwise.**
+
+1. **The restore primitive is not bound.** `Backup::restore` and the public
+   `Backup::restore_coordinated` will install any snapshot they are handed over the database in
+   front of them, and `migration::recover_from_snapshot` will do the same for any path it is
+   given. What is now bound is the **adoption** — the step that produces the recovery obligation
+   the daemon acts on — so the obligation a migration hands back is a snapshot of this database.
+   A caller that hands the restore primitive an arbitrary path is outside that binding, and the
+   fix for it is not free: restoring a backup into a *fresh* database is a legitimate workflow,
+   and a restore-side check would have to distinguish it from "restore the wrong database's
+   snapshot" rather than refuse both. It is recorded here as an open edge, not claimed as closed.
+
+2. **A snapshot written before the provenance table existed is refused.** A database whose
+   canonical path holds a snapshot left by a build that predates the identity table cannot adopt
+   it: the file alone cannot say whose it is, and neither can the code. The refusal is
+   actionable — *"Move it aside and retry"* — and **the file is preserved**: by the adoption,
+   which does not modify it, and by the callers' failed-initialisation cleanup, which does not
+   delete the canonical snapshot path at all (part 6 above).
+   This affects exactly one
+   population: an installation that upgrades **after a migration failed** under an older build,
+   where the leftover snapshot is the only good copy of the pre-migration state. That operator
+   must move the file aside; the migration then proceeds normally, because the identity is
+   created by the store and every snapshot it takes from then on carries it.
+
+3. **The identity is a discriminator, not a secret.** It is stored in the clear, inside the
+   database, and anyone who can read the database can read it. What it has to be is **unique per
+   database instance** and **stable for the life of that instance**, and it is: it is a
+   `RandomState`-derived value, not a secret key, and it is not derived from anything an
+   outsider could compute. The threat it addresses is an accidental cross-database adoption —
+   a copied state directory, a stale template, a database from another installation — not an
+   adversary who can write to the state root (who can replace the database outright).
+
+4. **A copy of the database carries the identity with it.** That is the intended behaviour: a
+   copy of `state.db` and a copy of its snapshot still belong together, so the copy's snapshot
+   is still adopted over the copy. The binding is between a snapshot and the database it was
+   taken from, not between a snapshot and a path.
+
+5. **The identity participates in `logical_digest`.** It is one more table in the digest, and
+   both sides of the restore's logical comparison carry the same row, so the comparison is
+   unaffected. It does mean the digest of a database changed when this change shipped — which is
+   true of every schema change, and the restore protocol compares digests computed from the
+   *same* pair of files, never against a stored constant.
+
+| | |
+|---|---|
+| **event** | any change to `database_identity`, `MigrationRunner::ensure_database_identity`, `MigrationRunner::require_snapshot_of_this_database`, `MigrationRunner::secure_adopted_snapshot`, `Backup::verify`, `VerifiedSnapshot`, `MigrationError::SnapshotProvenanceMissing`, `MigrationError::SnapshotProvenanceMismatch`, `MigrationError::ProvenanceUnavailable`, the adoption branch of `MigrationRunner::migrate`, or the canonical snapshot path |
+| **date** | 2026-10-22 |
+| **severity** | **High.** Silent drift re-opens a cross-database adoption in which one installation's durable state is replaced by another's, with the store reporting success and the restore's own verification passing. |
+
+
+### A-022 — the shared pre-migration snapshot path: a successful migrator's discard can remove a concurrent migrator's recovery point
+
+**Status: OPEN — narrowed 2026-10-23. The named lost-recovery-point interleaving is fixed;
+two residuals are recorded below.** This entry records a risk that the DATA-004 acceptance
+review (2026-10-22) identified and deliberately did not fix, so that it is not lost between
+rounds. It is a **separate finding** from DATA-004: DATA-004 binds a snapshot to the
+database it protects *before adoption*, and this is about two migrators of the *same*
+database sharing one pathname for the snapshot.
+
+**What was observed.** `Backup::discard()` (`crates/orxnud-store/src/backup.rs:993`) removes
+the canonical pre-migration snapshot **by pathname**:
+
+```
+    pub fn discard(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+```
+
+`MigrationRunner::migrate` calls it when the migration succeeds
+(`crates/orxnud-store/src/migration.rs:703`), because a stale pre-migration copy should not be
+left behind to be mistaken for a current one.
+
+**The interleaving.**
+
+1. Migrator A holds a `Backup` whose path is the canonical pre-migration snapshot path
+   (`Backup::path_for(db_path)`, `backup.rs:310`) — either one A took or one A adopted.
+2. Migrator B, migrating the same database, publishes a different valid snapshot at that same
+   path. Publication is `std::fs::rename(staging, canonical)` (`backup.rs:377`): atomic as a
+   *replacement*, and it replaces whatever was there.
+3. Migrator A completes its migration successfully and calls `Backup::discard()`.
+4. A's removal is by **pathname**, so it removes the file now occupying that path — B's
+   snapshot.
+
+If B's migration then fails, B hands back a recovery obligation
+(`MigrationError::RecoveryRequired`, `migration.rs:723`) naming that path, and B's caller's
+restore finds nothing: `Backup::restore` returns `BackupError::Missing` (`backup.rs:825`),
+`recover_from_snapshot` maps it to `MigrationError::RestoreFailed` (`migration.rs:1071`), and
+the daemon reports *"the migration failed and its snapshot could not be restored"*
+(`crates/orxnud-daemon/src/task_service.rs:217`).
+
+**Why the shared lease does not exclude it.** The lease is keyed on the **database** path
+(`ownership.rs:196`), never on the snapshot path, and the migration path holds it **shared**
+(`ownership.rs:530`, `try_lock_shared`), which does not exclude a second migrator: the
+store's own `security_state::tests::concurrent_opens_of_one_database_all_succeed` opens one
+database eight times at once. SQLite's transactions serialise the **database** file's schema
+changes; the canonical snapshot is a separate file that those transactions never lock.
+Publication and discard take no lock that each other honours.
+
+**What it can and cannot do.** It can lose a **recovery point**, and it does so **loudly**:
+the restore fails with "missing" rather than installing something. It does **not** silently
+replace the live database with another database's content — the file A removes is a snapshot
+of the **same** database, and B's restore fails rather than succeeding on a wrong file. It
+does **not** weaken DATA-004: the provenance comparison (`migration.rs:666` and `:681`) runs
+before any adoption, so the file A removes is a file that already passed the gate.
+
+**It is pre-existing, and neither SEC-003 nor DATA-004 introduced it.** `Backup::discard` is
+unchanged by the uncommitted work. DATA-004's cleanup correction (A-021 part 6) *reduced* the
+number of places that remove that pathname from two to one.
+
+**A related fact, recorded by A-021 part 5.** Part 5 observes that the canonical snapshot
+path is shared between concurrent migrators and that "one of them finishing successfully
+removes the file the others are looking at". That is the same shared-path fact, and part 5's
+resolution — reporting a vanished file as `Secured::Gone` rather than as a privacy failure —
+covers the *adopting* migrator's reaction to a file that vanished under it. It does **not**
+cover the case recorded here, where the vanished file is the one the *other* migrator's
+recovery obligation names.
+
+**Implementation, 2026-10-23 — serialise the production path, and do not discard what you
+adopted.** `MigrationRunner::migrate` now takes an exclusive `SnapshotLock` on a zero-byte
+sidecar beside the canonical snapshot path before the snapshot decision, and holds it through
+adoption or taking, the migration, the success discard and the failure return. The version is
+read again under the lock, so a migrator that waited while another completed returns the
+no-op result instead of acting on its stale view. The lock is released before `migrate`
+returns, so it is not held across the caller's separate restore step.
+
+`Backup` now records whether the file was **taken by this call or adopted**. `discard()`
+removes only a file this call took. A successful migrator that adopted another migrator's
+pre-migration snapshot therefore leaves that file in place: it may be the other migrator's
+recovery obligation, and a success is not permission to consume someone else's safety net.
+This closes the A-fails/B-succeeds sequence that the lock alone does not: B no longer removes
+the snapshot A is still allowed to restore.
+
+**Evidence.** `crates/orxnud-store/src/migration.rs`:
+`the_snapshot_lock_excludes_a_second_holder` observes that a second open file description
+cannot take the lock while the guard lives and can take it immediately after the guard drops;
+`concurrent_applicators_of_a_non_idempotent_migration_both_succeed` now drives the production
+`migrate` path from four concurrent callers (it previously used `migrate_ephemeral`
+specifically to avoid the shared snapshot); `crates/orxnud-store/src/backup.rs`:
+`discard_does_not_remove_an_adopted_snapshot` pins the adopted-file rule. The store package
+test run passed after these changes; its library portion reported **361 passed, 0 failed, 1
+ignored**, and the package's integration suites passed as well. The lock is an OS file lock
+and is exercised here by two open file descriptions in one process; a separate **multi-process**
+interleaving run was **not** added in this round.
+
+**Residual 1 — an adopted snapshot can remain stale.** If A fails and B adopts A's snapshot and
+succeeds, B correctly leaves it at the canonical path for A. A later migrator can then adopt
+that older pre-A snapshot rather than a snapshot of the state immediately before its own
+migration; if that later migration fails, the restore is to an older state. This is not the
+lost-file failure above, but it is not a clean recovery point either. It is left **OPEN** and
+is the reason V-101 is narrowed rather than closed.
+
+**Residual 2 — direct `Backup` callers are outside the lock.** The lock is taken by
+`MigrationRunner::migrate`, the production entry point. `Backup::take`/`Backup::existing` and
+`Backup::discard` remain crate API primitives and do not acquire it; a caller that publishes
+and discards directly is not serialised by this change. The production path is the path this
+entry fixes, and no claim is made about arbitrary direct use.
+
+**Not chosen: per-migrator snapshot paths.** That would remove the sharing at the root, but it
+would also require changing how a recovery obligation is discovered after a crash and how the
+next migrator adopts it. It was not attempted here. The earlier rejection of a check-then-unlink
+by pathname still stands: the adopted-file flag and the migration lock are the bounds of this
+fix.
+
+| | |
+|---|---|
+| **event** | any change to `Backup::discard`, `Backup::publish`, `Backup::path_for`, `Backup`'s taken/adopted state, `MigrationRunner::SnapshotLock`, the snapshot decision in `MigrationRunner::migrate`, or the lease protocol in `ownership.rs`; and on any change that gives the canonical snapshot path a per-migrator name |
+| **date** | 2026-10-22; narrowed 2026-10-23 |
+| **severity** | **Medium.** It can lose a recovery point, and it does so loudly — the restore reports that the snapshot is missing, so the operator is not misled. The concrete lost-file interleaving is now fixed on the production path; the remaining stale-adoption and direct-API residuals are recorded above and V-101 stays OPEN. It cannot, by itself, replace the live database with another database's content, and it does not affect DATA-004's provenance gate. |
+
+
+### A-023 — CONC-006: the continuation no longer holds the governed mutex across the model's network wait
+
+**What the finding was, and what it is.** A `task/continue` request held the daemon's
+single-writer governed mutex — the one every durable-state route needs — across the provider's
+network round trip, so a slow model stalled every other request for the length of the call. The
+`task/ai-propose` route had been split for exactly this reason long before (A-010's
+"read-ordering" work and the `serve_lifecycle.rs` blocked-provider regression), and the
+continuation had not been: the asymmetry was the finding.
+
+**The scope is liveness and throughput, not data integrity.** Nothing on this path can install
+another database's content, bypass an approval, or duplicate an effect: a continuation writes a
+*proposal* and waits for a human, and the write is fenced by the store. The worst case was that
+**other work waited** — including the daemon's own scheduler pass, which takes the same lock
+(`crates/orxnud-daemon/src/serve.rs`: `run_scheduler_pass`).
+
+**Measured, before the change.** A deterministic provider double that blocks inside the model
+call, reached over a real socket, with `task/list` (a durable read, so it needs the governed
+lock) as the probe — the same probe the `task/ai-propose` regression already used, and the same
+reason it used that one: `daemon/status` takes **no** lock and would answer either way.
+
+* on `task/continue`: `task/list` **did not answer within a 2 s budget** while the provider was
+  blocked — 3 runs, 3 times; `daemon/status` answered, so the daemon was alive and it was the
+  *lock* that was held.
+* on `task/ai-propose`: `task/list` answered in **1.16 ms, 1.24 ms and 0.99 ms** over the same
+  three runs.
+
+**Configured bounds, which are not measurements.** The provider's own timeout is 60 s
+(`crates/orxnud-daemon/src/http_provider.rs`: `DEFAULT_TIMEOUT`), the daemon's request deadline is
+120 s (`crates/orxnud-daemon/src/serve.rs`: `ServeLimits::request`), and the lease is 30 s
+(`crates/orxnud-task/src/limits.rs`: `EngineLimits::lease_duration_ms = 30_000`). The *measured*
+fact above is that a lock-taking route could not answer inside a 2 s budget while a model was
+waiting; it is not a claim about how long a real model takes.
+
+**The lease semantics, and the honest limit of them.** The continuation's claim takes a lease of
+`lease_duration_ms` — 30 s — and **nothing renews it while the model is being asked**: the
+daemon never calls `heartbeat`, and never did. So a model that takes longer than 30 s outlives
+its own claim, and the proposal write is then refused by the store's fencing rather than
+persisted. That is a **pre-existing** condition, unchanged by this correction: with the mutex
+held, the lease expired on exactly the same schedule and the same write was refused. It is
+recorded here rather than glossed, because "the store re-validates" prevents a *stale write*; it
+does not make a legitimate continuation succeed when its lease has lapsed. A task whose model
+call outlasts the lease ends up refused at the write. **Correction (2026-10-22):** the sentence
+that stood here also said the task was "reclaimed by the ordinary recovery path" and returned
+to a claimable boundary; that was imprecise. Nothing reclaims a `Running` lease mid-run — there
+is no expiry reaper, and `recover()` runs only at open/shutdown — so the task remains `Running`
+under its expired lease until recovery or an operator acts. Expiry alone does not return it to a
+claimable boundary. The refusal, not the reclaim, is the property that held. (A provider
+*failure*, by contrast, does release the boundary through the fenced `release_to_boundary`.)
+*Superseded later the same day by the follow-up below (after the
+"What could not be exercised here" paragraph): a renewal was added, and a model call no longer
+has to fit inside the lease. The paragraph is kept as the record of the state at the time of
+this correction.*
+
+**The change.** `continue_task` (`crates/orxnud-daemon/src/runtime.rs`) now runs the same three
+phases as `ai_propose`:
+
+* **lock** — read the task, refuse unless it is at a boundary, claim the next step, gather what
+  the model will be shown, and record the disclosure the request will carry;
+* **release the lock** — the governed guard is dropped before the model is asked;
+* **ask the model** — no governed lock is held, and the provider runs on the blocking pool, so a
+  slow model holds neither the mutex nor a runtime worker;
+* **lock** — persist, or complete, under the store's own fencing.
+
+Nothing was moved out of a store transaction, no second mutex was created, and the disclosure is
+still recorded **before** the request that carries it.
+
+**Why that is safe.** The lock was never the authority for what may be written; the store is.
+`claim_next_step` is a conditional UPDATE inside one transaction, and `propose_action` re-reads
+the task and its live lease holder inside its own transaction and refuses unless the task is
+still `Running` under *this worker's* live lease; the proposal write is then a conditional
+`UPDATE tasks ... WHERE id = ?1 AND state = 'running'`, whose zero-rows outcome is the refusal
+"the task stopped matching before the proposal was recorded". Those fences are independent of the
+mutex, and the mutex now orders the *reads and the claim* only. A task claimed away, completed,
+cancelled or let-expire while the model was being asked is refused at the write; the stale
+continuation's `release_to_boundary` is a fenced write too, so it cannot release a newer worker's
+claim (the store's predicate is `WHERE id = ? AND lease_holder = ? AND lease_expires_at_ms > ?`).
+
+**Regression tests, all deterministic (a latch and an explicit release, never a sleep as the
+synchronisation).**
+
+* `crates/orxnud-daemon/tests/continuation.rs::a_blocked_continuation_does_not_hold_the_governed_lock`
+  — **new**: a blocked `task/continue` does not stop `task/list` answering; `daemon/status`
+  answers too; and the released continuation finishes and persists its proposal (the task waits
+  for a human).
+* `crates/orxnud-daemon/tests/continuation.rs::a_cancelled_task_cannot_receive_a_stale_proposal_from_a_blocked_continuation`
+  — **new**: the task is cancelled while the model is blocked — the cancel *proceeds*, which it
+  could not do while the continuation held the lock — and the released continuation is refused
+  and does not resurrect the task.
+* Pre-existing and still green: `::a_boundary_is_claimed_by_exactly_one_worker` (two concurrent
+  continuations, exactly one claim wins), `::a_provider_failure_returns_the_task_to_its_boundary_and_is_retryable`
+  (the failure path still releases the boundary), `::a_multi_step_task_advances_across_a_verified_step_boundary`,
+  and `crates/orxnud-daemon/tests/serve_lifecycle.rs::a_blocked_provider_does_not_stop_unrelated_requests`
+  (the `task/ai-propose` half).
+
+**Mutation-checked: 2 of 2 caught, 0 unobserved, 0 skipped**, run in an isolated copy of the
+working tree that was verified to contain the current uncommitted changes (`scripts/mutate.sh`
+was not used: it refuses a dirty tree, and nothing was staged or committed to satisfy it).
+
+* **Holding the governed lock across the provider call** — the pre-fix shape — is caught: both
+  new tests fail (`task/list must answer`, `task/cancel must answer`) and the other nine
+  continuation tests still pass, so the new tests are specific to the defect.
+* **Dropping the `release_to_boundary` on the provider-failure path** is caught by
+  `a_provider_failure_returns_the_task_to_its_boundary_and_is_retryable`.
+
+Two further mutations were run and are reported as **equivalent, not as missed detections**.
+Removing the *state* read, or the *live-lease* read, or the `AND state = 'running'` from the
+proposal's conditional UPDATE — each on its own — leaves the stale proposal refused, because the
+other two fences still refuse it. Removing all three together **is** caught: the cancelled-task
+test fails, which is what shows the new test pins the property rather than one fence of it.
+
+**What could not be exercised here, and what covers it instead.** The scenario in which the
+lease *expires* while the model is being asked needs the 30 s lease to lapse, and the daemon's
+lease duration is not configurable per request, so a test would have to wait 30 s or add a
+seam. No such seam was added *in this correction*; one **was** added later the same day — the
+follow-up below, which is what its new tests use. The guarantee that case turns on is the
+store's own fencing, and
+it is covered by the store's existing production-path tests — `an_expired_lease_cannot_complete_even_with_the_right_holder`
+and `a_zombie_whose_task_was_reclaimed_cannot_complete`
+(`crates/orxnud-store/src/task_repo.rs`) — plus the cancelled-task test above, which exercises
+the same conditional write through the daemon.
+
+**Checks run (historical — this is the state before the follow-up; fresh counts are in the
+follow-up's validation paragraph below).** `git diff --check`; `cargo fmt --all -- --check`;
+`cargo clippy --workspace --all-targets -- -D warnings`; `cargo nextest run -p orxnud-daemon`
+(457 passed, 0 skipped); `cargo nextest run -p orxnud-store -p orxnud-task` (682 passed, 5
+skipped); `cargo nextest run --workspace --no-fail-fast`; and `CI=true ./scripts/ci-gates.sh`
+(exit 0; one gate skipped, G12). No mutation was run in the repository's own checkout.
+
+**Follow-up, later on 2026-10-22 — the claim is renewed while the model is being asked
+(CONC-006, still A-023's record).** The honest limit above is closed: the continuation now
+renews its lease while it waits, with the store's **existing** fenced `heartbeat` and no new
+authority, mutex or store role.
+
+**The mechanism.** `DurableEngine::heartbeat` already existed for heartbeat-config routes; the
+follow-up gives it a second caller. `TaskService::heartbeat` wraps it (after `guard_running`, so
+the renewal stops at shutdown), and the continuation's wait loop in `continue_task`
+(`crates/orxnud-daemon/src/runtime.rs`, the `tokio::select!` over the pinned provider call) runs
+a tick alongside the model wait: every `renewal_interval` (one third of
+`EngineLimits::lease_duration_ms`; `runtime.rs`, and 900 ms → 300 ms in the test seam) it takes
+the governed mutex **only for the renewal call**, drops the guard immediately after, and treats
+zero rows as `Ok(false)` — "the claim is lost" — which normally ends the wait in
+`RequestError::Conflict { reason: "claim-lost" }`: the task was cancelled, claimed away, or its
+lease lapsed, so the answer could not be persisted and the request says so rather than asking
+the provider to finish for nothing. A storage error from the heartbeat ends the wait in a
+`task_fault` instead. The renewal's clock is read inside the store's `IMMEDIATE` transaction
+(see the correction below), not before the wait for the write lock.
+
+**Why that is safe.** The renewal is a **write-time-fenced** conditional UPDATE in the store
+(`TaskRepository::heartbeat_at_write`):
+`UPDATE ... WHERE id = ?1 AND lease_holder = ?2 AND lease_expires_at_ms IS NOT NULL AND
+lease_expires_at_ms > ?3`, with the new expiry recomputed from the clock sampled **after**
+`BEGIN IMMEDIATE` (`now_ms.saturating_add(lease_ms)`). It cannot extend another worker's lease,
+cannot revive a cancelled task, and cannot extend a lapsed lease — each refused with `Ok(false)`,
+the same refusal the completion tables use. It also cannot revive a lease that lapsed **while
+the renewal was queued for the write lock**, because the predicate is evaluated against the
+clock taken after the lock. Everything else is unchanged: the proposal persist and the boundary
+return remain fenced writes, so a cancellation or a lost claim between a tick and the final write
+is still refused at the write. The `Ok(false)` tick is *loss, not failure*: it reports the lost
+claim honestly rather than converting it into exhaustion or a fault.
+
+**The tuned bounds, which are not measurements either.** The lease is still 30 s
+(`EngineLimits::lease_duration_ms`), so the tick runs every ~10 s; each tick extends from the
+instant it actually writes, so a claim survives a provider call bounded by the 60 s provider
+timeout (`http_provider.rs`) for as long as a tick lands every ≤ 10 s, and ticks wait on the same
+governed mutex other durable writes use — serialized by the store's operation times, not by the
+model call. A renewal can therefore be delayed by at most one other route's write at a time, and
+the claim tolerates two such delays (10 s of slack per tick under the lease's remaining third)
+before the lease can lapse; a lapsed lease is refused by the same `Ok(false)` path. The lease
+policy itself is unchanged: no per-request lease overrides were built, and the
+`lease_duration_ms` constant remains the one knob.
+
+**The seam the new tests use.** `Runtime::start_with_engine_limits`
+(`crates/orxnud-daemon/src/runtime.rs:644`) is a **runtime-construction** parameter, not a
+per-request one: it threads an `EngineLimits` through `finish`/`build` into `TaskService::open`
+so a test can say "lease ≈ 900 ms" and still exercise the production `continue_task` path. It
+carries a delete-when-covered marker in its doc comment, it is grep-adjacent to every other
+construction-site, and it deliberately does not widen what a *call* can demand of a lease.
+
+**The persistence-boundary correction (added after the acceptance review).** The follow-up as
+first recorded renewed the claim but still let a pre-wait timestamp decide the final lease
+fence, so one of its claims was false in the state it described. `continue_task` captured `now`
+**before** the provider wait (`runtime.rs:2178` at the reviewed revision) and passed that value
+to the final completion and, through `ProposalWrite.now`, to `propose_action`. The store's fence
+compares the value it is given with `lease_expires_at_ms`; a pre-wait value is before the expiry
+by construction, so an expired lease with an unchanged holder and state **passed** the expiry
+check. "The unrenewed lease is refused at the write" was therefore not a property of that code:
+with the renewal it passed because the lease was live; without it, it would have passed on the
+stale timestamp, and only the holder/state clauses could have refused it. The same defect was on
+`task/ai-propose`.
+
+The correction moves the clock to the write, not the call:
+
+* `TaskRepository::propose_action_at_write`, `complete_with_at_write` and `heartbeat_at_write`
+  accept a clock closure, call it **after** `self.tx()?` (`BEGIN IMMEDIATE`) has acquired the
+  write lock and before the state-changing statement, and use that value for the fence, the
+  row timestamps and the event. The existing fixed-timestamp methods remain for deterministic
+  callers (the store's tests, and paths that do not span a wait). `DurableEngine` and
+  `TaskService` carry the same wrapper pairs.
+* `continue_task` and `ai_propose` now use the at-write variants for proposal, completion and
+  renewal. `ProposalWrite.now` is gone. The pre-wait values (`claimed_at`, `gathered_at`) are
+  used only for `claim_next_step` and for naming the proposal id. `release_to_boundary` is also
+  an at-write fenced completion; it no longer receives a caller timestamp.
+* The time source is the daemon's system clock (`crate::task_service::now_ms`), read at the
+  write. `clock_now_ms` remains only on the pre-wait gather path. The renewal cadence is
+  unchanged at lease/3. Cancellation clears the lease and the next renewal returns `Ok(false)`;
+  a lapsed lease is refused by the predicate; a provider failure still returns the task to its
+  boundary; a heartbeat error still becomes a `task_fault`.
+* **Why an expired lease now fails even with an unchanged holder and state:** the fence is
+  `holder != worker || now >= lease_expires_at_ms`, with `now` sampled after the lock. A wait
+  that outlives the lease is now *inside* `now`, so the write is refused. The completion UPDATE
+  repeats `lease_expires_at_ms > ?3`, so there is no second chance between the check and the
+  write in the same transaction.
+
+**Regression tests, deterministic (a latch and an explicit release, never a sleep as the
+synchronisation; waits only advance renewal cadence).**
+
+* `crates/orxnud-daemon/tests/continuation.rs::a_continuation_survives_a_model_call_longer_than_the_lease`
+  — **corrected**. The old test slept `SHORT_LEASE_MS * 2`, asserted only `state = running`,
+  never read the lease, and therefore passed whether or not the renewal existed; it also did not
+  perform a second continuation, and its claim that the task ends at a "claimable boundary" was
+  wrong (the persisted proposal leaves it `waiting-for-user`). The corrected test holds a
+  latched provider for **three** lease durations, reads `state`, `lease_holder` and
+  `lease_expires_at_ms` from the daemon's database, asserts the lease is **live** (with a
+  bounded poll, not a fixed instant), asserts the expiry advanced past the claim's expiry, then
+  asserts the continuation succeeds, the task is `waiting-for-user`, exactly one proposal exists
+  for step 2, and that proposal's `created_at_ms` is **at or after the instant the test released the
+  provider** — the direct witness that persistence sampled its own clock. Mutation `B` below shows this last
+  assertion fails when the pre-wait clock is restored, even with renewal working.
+* `crates/orxnud-daemon/tests/continuation.rs::the_governed_lock_is_released_between_renewals`
+  — `task/list` answers inside its budget while renewal ticks are running, so the tick's lock is
+  held for the heartbeat call only, not between ticks.
+* `crates/orxnud-daemon/tests/continuation.rs::a_cancelled_task_is_not_revived_by_a_renewal`
+  — the task stays cancelled and the request reports `claim-lost`; the released continuation's
+  cleanup does not resurrect it.
+* `crates/orxnud-task/tests/v102_heartbeat_fencing.rs` — **seven tests** over a real store
+  connection: the five heartbeat-clause tests (`a_heartbeat_extends_a_lease_its_worker_still_holds`,
+  `a_heartbeat_cannot_extend_a_lease_that_has_lapsed`,
+  `a_heartbeat_cannot_extend_another_workers_lease`, `a_heartbeat_cannot_revive_a_cancelled_task`,
+  `a_heartbeat_reports_a_storage_failure_as_a_failure`) plus the two persistence-clock tests
+  (`a_proposal_at_write_is_judged_by_the_write_clock_not_the_claim_clock`,
+  `a_completion_at_write_is_judged_by_the_write_clock_not_the_claim_clock`). The latter two use
+  the same worker, row and pre-wait constant `NOW`: an expired write clock is refused and leaves
+  the row untouched; a live write clock is accepted and the row carries that clock, not `NOW`.
+
+**Validation, fresh after the correction (2026-10-22).** `git diff --check` exit 0;
+`cargo fmt --all -- --check` exit 0; `cargo clippy --workspace --all-targets -- -D warnings`
+exit 0; focused `cargo nextest run -p orxnud-daemon --test continuation -p orxnud-task --test
+v102_heartbeat_fencing` **21 passed, 0 failed, 0 skipped**; `cargo nextest run -p orxnud-store -p
+orxnud-task --no-fail-fast` **689 run, 689 passed, 0 failed, 5 skipped**;
+`cargo nextest run --workspace --no-fail-fast` **1963 run, 1963 passed, 0 failed, 6 skipped**
+(the six are the ignored child-process entry-point helpers; 2 sandbox watcher "leaky" flags
+pre-date this work — `a_repeated_kill_stays_deterministic` and
+`cgroup_kill_terminates_a_member_that_forked_a_descendant`); `CI=true ./scripts/ci-gates.sh`
+exit 0, all selected gates passed, **G12 skipped** (the gate script's recorded skip). G15
+initially failed on three private intra-doc links in the new store docs; the links were made
+plain code spans and G15 then passed. The earlier workspace counts in this block (1961 passed /
+6 skipped) and the original follow-up's mutation counts are **historical**; the numbers above
+are the fresh run.
+
+**Mutation-checked: 5 of 5 re-runnable mutants caught, 0 missed, 0 unobserved, 0 skipped**, in an
+isolated copy of the working tree verified file-identical to it before and after (`cmp` on every
+changed source/test file); nothing was staged, committed or mutated in the repository's own
+checkout, and `scripts/mutate.sh` was not used (it refuses a dirty tree).
+
+* caught — `renewal_interval` changed to one hour, i.e. renewal effectively disabled: the
+  corrected survival test fails after the three-lease wait because the observed lease is no
+  longer live (`("running", Some("w1"), Some(<expired>))`). This is the acceptance case.
+* caught — the **original defect reconstructed**: `ProposalWrite` regains `now` and the proposal
+  uses `propose_action(..., now)` with the pre-wait value, renewal left enabled. The
+  continuation itself succeeds (the renewed lease is live), but the test fails on
+  `created_at_ms < released_at` — the proposal was stamped ~2.7 s before the release signal, so
+  before the provider answered.
+  This shows the test pins the persistence clock independently of the renewal.
+* caught — `renewal_interval` changed to the **full lease** instead of lease/3: the tick fires
+  exactly at the expiry instant, where the fence is already false; the survival test fails.
+* caught — the store heartbeat's `lease_holder = ?2` dropped (replaced by an always-true
+  predicate that keeps the parameter count): `a_heartbeat_cannot_extend_another_workers_lease`
+  fails.
+* caught — the store heartbeat's `lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3`
+  dropped: `a_heartbeat_cannot_extend_a_lease_that_has_lapsed` fails.
+* **not run (source-reasoned, not a detection claim):** the daemon tick's `Err` arm turned into
+  "renewed" — the daemon head still has **no deterministic seam** to make
+  `TaskService::heartbeat` return a storage error while a continuation waits; the property is
+  pinned where the failure can be produced, by
+  `a_heartbeat_reports_a_storage_failure_as_a_failure`. The historical record's 8-caught /
+  1-missed / 1-equivalent count belongs to the earlier mutation session; its artifacts were not
+  preserved and it is not re-verified.
+* **not run (structural):** the governed mutex hoisted back across the provider wait. That is
+  not a one-line mutation, the previous session's caught result was not preserved, and this
+  record does not re-assert it. The property is covered by
+  `a_blocked_continuation_does_not_hold_the_governed_lock` and the `ai-propose` sibling, which
+  are green.
+
+**A harness hazard observed during the mutation work, reported rather than hidden.** The mutant
+runs used the repository's `target/` through `CARGO_TARGET_DIR` while building an isolated copy.
+After restoring the copy, the first `cargo nextest run -p orxnud-store -p orxnud-task` in the
+real checkout reported `engine::tests::a_heartbeat_from_a_zombie_does_not_revive_its_lease`
+failing once; that is precisely the symptom of the dropped-expiry mutant, and the same test
+passed under `cargo test` and under a per-test nextest run immediately afterwards. No source in
+the real checkout was mutated (checked by `cmp`/`git diff`), and after `cargo clean -p
+orxnud-store -p orxnud-task -p orxnud-daemon` the full 689-test store/task run and the 1963-test
+workspace run passed with no source change. The linkage to the shared target directory is a
+plausible explanation, **not a proven one**; the durable conclusion is that a shared
+`CARGO_TARGET_DIR` across a mutated copy and the real checkout is not a trustworthy validation
+harness here. The fresh validation counts above were produced after that clean rebuild.
+
+**Residual, not claimed by the follow-up.** Three: (1) the daemon-head storage-error seam just
+described; (2) the seam that makes the new tests possible is **construction-time only**
+(`start_with_engine_limits`), deliberately not reachable from a request — no per-request lease
+authority was added, and the lease policy remains the one `EngineLimits::lease_duration_ms`
+knob; (3) a shutdown during a long model call is not integration-tested. The earlier record
+described that path as `guard_running` refusing pending ticks and the wait ending in a
+`task_fault`, but **`TaskService::shutdown` has no production caller**: production shutdown
+drops the serve future (the request future is cancelled; `serve.rs` drains for 5 s and then
+drops the `JoinSet`), so `guard_running`'s refusal is a **test-only** path and is not the
+production shutdown shape. Production shutdown leaves the claim to its lease expiry and ordinary
+recovery; that is read-reviewed, not exercised, and is **not claimed** as a proven shutdown
+path. The cancellation and expiry behaviour that *is* claimed is the `Ok(false)` / `claim-lost`
+path above, pinned by `a_cancelled_task_is_not_revived_by_a_renewal` and the engine clause
+tests.
+
+**A separate finding, deliberately not merged.** The pre-migration snapshot path is shared
+between concurrent migrators of the same database, and a successful migrator's `Backup::discard()`
+removes it by pathname. That is **V-101** / **A-022**, it is a different mechanism, and nothing in
+this correction touches it.
+
+| | |
+|---|---|
+| **event** | any change to the lock scope of `continue_task` or `ai_propose`, to `call_provider`, to the provider timeout, to the request deadline, to `EngineLimits::lease_duration_ms`, to the fencing in `TaskRepository::propose_action` and `TaskRepository::complete_with`, to the persistence-clock variants `TaskRepository::propose_action_at_write` / `complete_with_at_write` / `heartbeat_at_write`, to `TaskService::heartbeat` or the renewal tick in `continue_task`, or to the fencing in `TaskRepository::heartbeat` and `DurableEngine::heartbeat` |
+| **date** | 2026-10-22 |
+### A-024 — TEST-001: skipped guards record honestly, and a producer record is bound to the full test identity
+
+**The finding.** The TEST-001 inventory reported 35 test functions in which the only reachable
+behaviour on a host without the required guarantees was an early return, a branch that
+asserted nothing, or a tautology. They were not one kind of test. The 14 sandbox paths were
+made vacuous by a host without the cgroup or namespace guarantees they exercise; the 21
+capability/daemon paths were made vacuous by an early return or a macro-expanded skip. `crates/orxnud-capability/tests/cli_e2e.rs` was inspected as well
+and is **not** in this set: its nine refusal paths assert a failed status, the absence of the
+`sandbox guarantees` message, and that no target artefact was produced. The audit's "11+" was a
+sandbox-only lower bound, not the full count; the matrix macro alone hides eight delegation sites.
+One additional path, `resources::pids_max_and_cpu_max_are_separate_capabilities`, was silently
+skipped through `if let Ok(...)` and is now tracked too, which is why the final set is **36**, not
+35: 8 `write_text` + 4 `governed_path` + 9 `uncertain_outcome` + 10 `enforcement` + 4 `resources`
++ 1 `isolation`.
+
+**What changed.** Each tracked path now emits exactly one JSONL record, `verified` or
+`reduced`, through the crate-local helpers in
+`crates/orxnud-capability/src/tests/coverage.rs`,
+`crates/orxnud-daemon/tests/support/coverage.rs` and
+`crates/orxnud-platform-sandbox/tests/support/coverage.rs`. Every tracked test begins by
+entering `coverage::scope(SUITE)`; the returned guard is held for the test body. When
+recording is enabled, the scope derives the **full** harness-assigned identity — not its
+last `::` component — from nextest's per-process `NEXTEST_BINARY_ID` and
+`NEXTEST_TEST_NAME`; both are required, and a missing, partial, or malformed pair panics.
+It strips the registered suite prefix and the `v46` grouping segment and records the exact
+full ID in a thread-local. It does **not** accept a thread name as producer identity while
+recording. Nextest assigns one identity to each test process, and worker threads inherit
+those variables: a worker that deliberately enters `scope` therefore inherits the process
+identity and cannot rename itself into another test's identity. The guard is `!Send` and
+`!Sync`, so a test cannot move its own scope into a worker. `verified` and `reduced` require
+an active scope and exact equality with the full claimed ID; a call with no scope, or with a
+different test's ID, panics before the artifact is opened. The claimed ID is parsed at the
+registered suite boundary, so nested modules are preserved: two real tests ending in the same
+`::` component are distinct and cannot claim each other. This replaces the earlier
+last-component check, which could not distinguish those tests and which accepted any worker
+whose thread name ended in the target test's name.
+
+The payload test now records only itself; the enforced test records its own path after its
+final assertion. The tracked set and its 36 expected IDs are unchanged. `ORXNUD_TEST_COVERAGE`
+names the artefact and `ORXNUD_COVERAGE_RUN` is the run token. With recording enabled, the
+identity check is mandatory: an absent or partial nextest pair is a panic, not a silent skip.
+Without `ORXNUD_TEST_COVERAGE`, an ordinary local `cargo test` may use the harness thread name
+only to keep the source-level regressions runnable; that path writes no record and is not
+provenance. A `reduced` record carries the reason (the missing cgroup controller, the absent
+Tier-1 namespace, or the unavailable capability), so "skipped" is observable rather than
+inferred from a green test. The helper panics if the artifact cannot be written, which makes a
+lost record a test failure.
+
+`scripts/test-coverage.py` checks the artifact: every expected ID must appear exactly once,
+the run token must match, `reduced` must carry a reason, unknown tests, duplicate records and
+malformed lines fail, and any missing expected path fails unless its whole suite was
+explicitly excluded. It also scans only the six tracked test files, and only the expected
+test bodies, for a tautology-shaped `assert!` and for a `return;` that has no coverage guard
+before it. The checker cannot by itself prove who produced a record; it sees only the
+artifact. The helper identity check is the producer-side guard, and
+`scripts/test-coverage-provenance.sh` is the decisive evidence: G9 invokes it before the
+suite. Its first step runs **each of the five** required producer-rejection tests by its
+exact full path in a separate process and parses the runner's own output to require one start
+and one pass of that exact name. One of the five is the named-worker regression that enters
+`scope` and tries to mint another tracked test's record; the other four cover verified,
+reduced, out-of-suite, and malformed claims. A renamed, removed, filtered-out, or ignored
+test therefore fails the regression instead of silently shrinking it; the earlier combined
+filter did not prove that every selected test had run. The step then runs the payload test
+alone, requires exactly its own record, requires the checker to report the enforced-memory
+path as missing even while the payload record is present, runs both tests, and requires each
+to record itself. When nextest is unavailable, the provenance script runs one exact test per
+process and supplies the runner-controlled `NEXTEST_*` identity itself; G9 does not fall back
+to a whole-workspace `cargo test`, because that cannot supply per-test identity, and fails
+closed instead. That fallback identity is explicitly runner-controlled, not nextest-assigned.
+The shifted `ready_on` arguments in `uncertain_outcome` were corrected: each of its nine
+tracked tests names itself, and the table diagnostic passes `None` and emits no tracked
+record.
+
+The producer guard is an in-process correctness check, not an unforgeable capability. While
+recording, the identity is an environment contract: a test that deliberately calls
+`coverage::scope` on a worker inherits the same process identity and may emit a record for
+that **same** test; it cannot claim another test's ID, which the named-worker regression
+pins. Any test with access to the artifact path can append directly, and code that can mutate
+the process environment (for example through `unsafe` `std::env::set_var`) could forge the
+pair; G4 keeps unsafe out of these crates, but this is not a security boundary. The
+named-worker and unnamed-worker regressions cover ordinary cross-test spoofing, not malicious
+test code. This row does not claim that one test cannot mint another's record in the face of
+code written to defeat the guard, nor that nextest's variables are unforgeable by a runner or
+child process.
+
+**The tests that were wrong, not just quiet.** `isolation`'s socket test treated
+`RESULT FAIL` as the pass condition and returned; the helper's `FAIL` line means it *bound* the
+socket, so the old test skipped exactly the dangerous case. Its connect call also parsed
+`127.0.0.1` with no port, which could panic rather than test reachability. It now requires a
+result, records `reduced` if the helper could not bind, parses the reported port, and asserts that
+the host cannot connect to `127.0.0.1:<port>` before recording `verified`.
+`the_cgroup_probe_reports_something_either_way` replaced
+`a.can_create || !a.can_create` with a second-probe stability assertion;
+`pids_max_and_cpu_max_are_separate_capabilities` no longer returns silently on `if let Ok(...)`;
+and `resources`' runner-availability assertion now includes `have.visibility`, because a host with
+delegated controllers but no `bwrap` cannot apply them through that runner. The resource-test
+container is exactly such a host, which is why the old assertion failed there for an environmental
+reason rather than a code defect.
+
+**Evidence.** Before the identity fix the capability named-worker attack failed `rc=100` and
+wrote the target test's record as `verified`; after the fix the same test passed `rc=0` with an
+empty artifact. The daemon and sandbox attacks also pass `rc=0` with empty artifacts. With
+recording enabled and no nextest variables, the producer panics
+(`coverage producer requires the nextest identity`) and creates no artifact; an ordinary
+`cargo test` with recording disabled passes. After the final formatting and test changes,
+`CI=true ./scripts/ci-gates.sh G9` ran **1982 tests: 1982 passed (2 leaky), 6 skipped**, with
+`SUMMARY verified=36 reduced=0 not-exercised=0 missing=0`. After the DATA-006 and
+RUSTSEC-2026-0386 and DATA-006 changes, the full gate rerun is **1991 tests, 1991
+passed, 0 failed, 6 skipped**; the nextest leak count varied 1–2 between runs. An intermediate standalone G9 run
+failed `orxnud-daemon::expiry::a_crash_after_expiry_and_before_reapproval_still_recovers`
+with `EndpointExists("/tmp/orxnud-exp-239001-crash2/orxnud.sock")`; the focused test passed
+immediately afterward, the stale `/tmp` fixture directory was removed, and the next G9 run
+was green. That failure is not evidence about the identity change. **Follow-up, same date:**
+the fixture name was `orxnud-exp-<pid>-<tag>`, so a crashed run that left an endpoint behind
+was indistinguishable from a later run whose process id was reused; the helper now includes
+a timestamp and a process-local counter in the path, and the expiry suite ran **12/12** with
+the stale directory absent. The exact original collision was not reproduced in a separate
+process, so this is a removed collision class rather than a reconstructed root-cause trace. The leak count is nextest process-leak
+accounting, varies with the run, and is not a test failure. The provenance regression ran
+first and printed all five required producer-test lines, then
+`the_payload_is_constrained_before_it_executes_work=verified`,
+`checker correctly reported the enforced-memory path as missing`, and both governed paths
+verified in the complete two-test run; its nextest-mode exit code was `0`. The same script was
+run with `cargo-nextest` removed from `PATH`: the one-exact-test-per-process fallback also
+exited `0` with both records verified. Invoking G9 in that same no-nextest environment failed
+closed with `cargo-nextest is not installed`; it did not run a whole-workspace `cargo test`.
+The full G9 run also covers the eight `write_text` records and the duplicate-final-component
+regressions in `uncertain_outcome` and `enforcement`; no separate focused rerun of those is
+claimed for this follow-up. `python3 scripts/gate-selftest.py` reports **all 144
+boundary-gate self-tests pass**, including
+the thirteen coverage cases. The full `CI=true ./scripts/ci-gates.sh` run passed G1-G7, G9,
+G10, G13-G17 and skipped G12. At that point **G8 and G11 failed on RUSTSEC-2026-0385**,
+published 2026-10-23 against `ctutils 0.4.2` (reached through `secret-service`), whose
+published fix is `ctutils >= 0.4.4`; `Cargo.lock` was protected by that task, so it was not
+changed. **Follow-up, same date (A-025):** the audit-remediation task authorises a narrow
+lockfile update, `ctutils` was updated to `0.4.4`, and G8/G11 now pass. The full gate suite
+is green except the deliberately skipped G12.
+
+**Mutation evidence.** This correction round did **not** run `scripts/mutate.sh` or an
+isolated-copy mutant campaign. The earlier round's mutation counts are historical and are not
+restated as current evidence. No mutation claim is made for the new full-identity,
+named-worker, unnamed-worker, or duplicate-final-component guards.
+
+**Not claimed.** There was no incapable host available to run G9 end-to-end and observe the
+`reduced` summary; the corrected labels were verified by source inspection, the focused capable
+run, and checker fixtures, not by an incapable-host run. The hosted `resource-enforcement` job
+has not run on GitHub, its `--privileged --cgroupns=host` environment is not evidence about the
+unprivileged Tier-1 sandbox, and `./scripts/run-resource-tests.sh` was not rerun in this round.
+The producer identity check now depends on nextest setting `NEXTEST_BINARY_ID` and
+`NEXTEST_TEST_NAME` for the test process; while recording, an absent or partial pair is refused
+rather than accepted as a guess. The local `cargo test` thread-name path exists only when
+recording is disabled and writes nothing. The guard is not an unforgeable capability: a test
+that deliberately calls `coverage::scope` on a worker inherits the same process identity and can
+still emit a record for that same test; any test with the artifact path can append directly; and
+a test capable of mutating its process environment can forge the pair. The named and unnamed
+worker regressions cover ordinary cross-test spoofing, not malicious in-process test code. The
+source scanner is deliberately narrow: it recognises the shapes in the six tracked files and
+does not prove that no other vacuous path exists.
+`the_table_has_an_end_to_end_producer_for_every_row_that_can_have_one` remains a documentation-only
+diagnostic and records no outcome; it is disclosed rather than counted as verified.
+`the_environment_is_reported_explicitly` is likewise diagnostic. TEST-001 is corrected and gated
+for the paths above; it is not a claim that every test in the workspace has been proved
+non-vacuous. The RUSTSEC-2026-0385 gate failure was not caused by this remediation; it was
+cleared separately in A-025.
+
+| | |
+|---|---|
+| **event** | any change to `scripts/test-coverage.py`, `scripts/test-coverage-provenance.sh`, the G9 coverage block in `scripts/ci-gates.sh`, any of the three test coverage helpers, the tracked test list, or a guard that currently records `reduced`; and any change to `scripts/run-resource-tests.sh` or the `resource-enforcement` workflow job |
+| **date** | 2026-10-23 |
+| **severity** | **High, for evidentiary integrity rather than runtime behaviour.** A green suite that skipped every assertion produced a false safety claim, and the sandbox is the boundary that claim is about. The direct effect was on test evidence, not on the daemon's execution path; the reduced record makes the gap visible without pretending it is enforcement. |
+
+### A-025 — RUSTSEC-2026-0385 cleared, and the expiry fixture no longer reuses a crashed run's path
+
+**What changed.** Two release-hygiene defects that were outside TEST-001's identity change
+were corrected in the same remediation task.
+
+1. **`ctutils` 0.4.2 → 0.4.4.** RUSTSEC-2026-0385 was published against 0.4.2 on 2026-10-23;
+   the advisory's fix is 0.4.4. The dependency reaches the tree through
+   `secret-service` (G8/G11). `cargo update -p ctutils --precise 0.4.4` changed exactly the
+   `ctutils` version and checksum in `Cargo.lock`; no manifest edit was needed. `cargo tree -i
+   ctutils --locked` resolved `ctutils v0.4.4` with the same reverse path. G8 and G11 were run
+   after the update and both passed; their earlier red status is historical, not current.
+2. **The expiry fixture path.** `crates/orxnud-daemon/tests/expiry.rs` used
+   `orxnud-exp-<pid>-<tag>`. A crashed run could leave an endpoint there, and a later process
+   that reused that pid could be refused with `EndpointExists` before the test began. The
+   helper now appends a timestamp and a process-local counter, so a path is not reused across
+   runs or callers. The stale `/tmp` directory from the observed failure was removed; the
+   focused expiry suite ran **12 passed, 0 failed**.
+
+**Verification after both changes.** `CI=true ./scripts/ci-gates.sh` completed with **exit 0**;
+**1984 tests run: 1984 passed, 6 skipped**; coverage `verified=36 reduced=0
+not-exercised=0 missing=0`; G1-G11 and G13-G17 passed, and G12 was skipped deliberately.
+`cargo fmt --all -- --check`, `git diff --check`, and G6 (clippy with `-D warnings`) also
+passed. The G11 run still reports the three **unmaintained** warnings for `zbus_names`,
+`zvariant` and `zvariant_derive`; they are allowed warnings, not vulnerabilities.
+
+**2026-10-24 amendment: the crash helper now awaits its aborted task.** A later expiry run
+failed in `bind_owned` with `a stale endpoint could not be removed: No such file or directory`.
+The header claimed a pid collision, but inspection showed the two pids were the same process:
+the helper `Serving::crash` called `self.task.abort()` and returned without awaiting the
+aborted serve task, so its endpoint-release guard could unlink the path concurrently with the
+next `Serving::start`. `crash` now calls `self.task.abort()` followed by
+`let _ = self.task.await;`, which drops the serve future and its endpoint guard before the
+next bind. The focused expiry suite ran **12 passed, 0 failed** after the change, and the
+final full gate runs all 12 expiry tests green. The separate `bind_owned` hardening for a
+non-socket path is recorded under PLAT-011; this amendment is the fixture race only.
+
+**Not claimed.** The lockfile change was not mutation-tested: there is no behaviour to mutate,
+and the property is the advisory database's. The expiry collision was not reproduced with a
+controlled pid-reusing process; the test change removes the shared-name collision class. No
+multi-process snapshot/expiry stress run was added. The `crash` race was diagnosed from the
+observed failure and the test source, not from a controlled replay that forces the exact
+interleaving; the regression is the existing expiry suite running without the failure.
+
+| | |
+|---|---|
+| **event** | any change to the `ctutils`/`secret-service` dependency path, G8/G11, or the expiry suite's temporary-directory helper |
+| **date** | 2026-10-23 |
+| **severity** | **Medium for release hygiene, Low for runtime behaviour.** The advisory blocked the supply-chain gates; the expiry issue could turn an unrelated stale `/tmp` file into a failed test run, obscuring the evidence the test exists to provide. |
+
+### A-026 — Snapshot publication now flushes the file and its parent directory (DATA-005)
+
+**What changed.** `Backup::take` verified the staged snapshot and then renamed it into place
+without flushing either the file or the parent directory, so the rename could be durable
+before the bytes it named. `take_into` now calls `crate::recovery::fsync_file(dst_path)`
+after `verify_against_source` and before `publish`; `take` now flushes the parent directory
+after `publish` with `parent_dir_of` and `fsync_dir`. The ordering is the same file-then-
+directory protocol recovery already used, not a second convention.
+
+**Evidence.** `backup::tests::a_published_snapshot_flushes_the_file_then_the_parent_directory`
+asserts the recorded order: one `fsync_file` on the `.staging-` path before one `fsync_dir`
+on the parent. Focused run: **1 passed**. Removing the file-flush line makes the test fail
+at `the staged snapshot was never flushed` (**mutation caught**), and restoring it makes the
+test pass. `cargo test -p orxnud-store --lib` then ran **363 passed, 0 failed, 1 ignored**
+across repeated runs. One earlier full-suite run failed in the unrelated
+`recovery::scenarios::a_failure_immediately_after_publishing_the_intent_is_rolled_forward_on_the_next_open`
+with a transient `Ownership::Conflicted`; it did not reproduce in six further runs or when
+that test ran alone, and is recorded here rather than treated as green evidence.
+
+**Not claimed.** The directory flush is Unix-only in effect: `fsync_dir` is a no-op on
+Windows, so snapshot directory durability is not claimed there. This entry does not close
+the wider S-11/F-26/F-26b/F-26c/S-30/S-31 restore-drain, alias-identity, or adoption
+questions; it closes DATA-005's file-and-parent flush only. No multi-process snapshot race
+or crash-injection run was added.
+
+| | |
+|---|---|
+| **event** | any change to `Backup::take`/`take_into`, snapshot publication ordering, `fsync_file`/`fsync_dir`, or the snapshot durability test |
+| **date** | 2026-10-23 |
+| **severity** | **Medium.** A snapshot that exists by name but not by content is a false backup; the failure is silent and only appears after the crash the snapshot exists to survive. |
+
+### A-027 — schema history is validated as a history, not as a maximum (DATA-001, DATA-002)
+
+**What changed.** `MigrationRunner::applied_version` used to return
+`COALESCE(MAX(version), 0)`. That made `schema_meta` containing `1, 2, 14` look
+current, so a migration skipped versions 3..13 and opened a database without their
+tables; it also treated a version 15 database as current on a binary whose highest
+migration is 14. The reader now requires a contiguous history starting at 1 and
+refuses a maximum above `CURRENT_VERSION`. `migrate_ephemeral` validates before
+writing the provenance identity, not only inside the first migration transaction.
+
+**Evidence.** `migration::tests::a_gapped_schema_history_is_refused_rather_than_treated_as_current`
+stages `1, 2, 14` and asserts a refusal plus unchanged `schema_meta`;
+`migration::tests::a_newer_schema_version_is_refused_rather_than_silently_accepted`
+stages `1..=15` and asserts the refusal. Each test fails against the old
+maximum-only reader. Both checks were mutation-tested in place: replacing the gap
+predicate or the newer-version predicate with `false` makes its test fail with
+`Ok([])` (both caught); restoring the code makes them pass. After the correction
+`cargo test -p orxnud-store --lib` reported **365 passed, 0 failed, 1 ignored**.
+
+**Not claimed.** The check validates the version rows, not that every table or
+constraint those versions declare is present; a database with a contiguous history
+and a missing table is still outside this guard. It does not validate migration names
+or timestamps. It was not exercised against a multi-process upgrade, and it adds no
+new snapshot or recovery behaviour. `applied_version` is still public, so a direct
+caller now receives these refusals rather than a maximum.
+
+| | |
+|---|---|
+| **event** | any change to `applied_version`/`applied_version_on`, the meaning of `schema_meta`, `CURRENT_VERSION`, or the migration list's numbering |
+| **date** | 2026-10-23 |
+| **severity** | **High for DATA-001, Medium for DATA-002.** The first silently opens a structurally incomplete database; the second silently opens a schema this binary was never written to understand. Both refusals are fail-closed and happen before a snapshot is used or a migration statement runs. |
+
+### A-028 — cancellation no longer hides an unresolved effect (CONC-003)
+
+**What changed.** `TaskRepository::request_cancel` treated cancellation as an
+unconditional terminal transition. A task that had reserved an effect but crashed before
+recording its outcome could therefore be cancelled, and `recover()` — which visits only
+running, leased tasks — would never see the `pending` row again. The effect might already
+have happened and nothing durable would force anyone to decide. Cancellation now checks
+for any `pending` effect for the task before it records the request and refuses with
+`EffectOutcomeUnresolved`. The guard is whole-task, not current-attempt: cancellation ends
+every attempt. Once the effect is resolved (`observed`, `unknown`, or `not-performed`),
+cancellation proceeds.
+
+**Evidence.** `task_repo::tests::cancelling_a_task_with_a_pending_effect_is_refused_and_leaves_it_running`
+claims a task, reserves a non-idempotent effect, attempts cancellation, and asserts the
+refusal plus observable state: still `running`, lease still held, no
+`cancel_requested_at_ms`, and neither `cancel-requested` nor `cancelled` in the event
+stream. It then resolves the effect as `unknown` and proves cancellation succeeds. The
+test fails against the unguarded implementation (`request_cancel` returns `Ok`), and
+removing the new guard makes it fail again (mutation caught); restoring it passes.
+
+**Not claimed.** This blocks the cancellation route only; it does not adjudicate the
+effect, does not add a CLI/UX for resolution, and does not change `recover()`'s predicate.
+A stale `pending` row from an earlier attempt also blocks cancellation, deliberately,
+because cancellation would otherwise end the task with that row unresolved. No
+multi-process cancellation race or crash-restart campaign was added.
+
+| | |
+|---|---|
+| **event** | any change to `request_cancel`, the effect ledger's `pending` semantics, `EffectStatus`, or the `EffectOutcomeUnresolved` mapping |
+| **date** | 2026-10-23 |
+| **severity** | **High.** The failure is silent: a task reports `cancelled` while a non-idempotent effect may exist and recovery has been told there is nothing to recover. |
+
+### A-029 — RUSTSEC-2026-0386 cleared by the tokio patch release
+
+**What changed.** G8 failed on the fresh full-gate run against `tokio 1.53.1`:
+RUSTSEC-2026-0386 says the safe `AsyncFd` constructors accept any `AsRawFd`, so safe code
+can register an arbitrary or closed descriptor and obtain a use-after-free window. The
+advisory's fixed releases are `>=1.51.6, <1.52.0` or `>=1.53.3`. The workspace requirement
+was raised from `1.53.1` to `1.53.3`. The `Cargo.lock` change moves the `tokio` entry and
+also changes four `windows-sys` edges (`errno`, `rustix`, `tempfile`, `winapi-util`) from
+`0.61.2` to `0.52.0`; both `windows-sys` package versions remain in the lock. The exact
+command that produced the edge re-resolution is not recorded here, and no explanation for
+it is asserted.
+`cargo check --workspace --locked` passed, and `cargo deny check` now reports
+`advisories ok, bans ok, licenses ok, sources ok`. The subsequent full gate run
+(2026-10-24, after the later write-helper, endpoint-file and PLAT-007 probe tests) passed:
+**1997 tests run, 1997 passed, 0 failed, 6 skipped**; the nextest leak count varied 1–2
+between runs, and G12 is the only skipped
+gate, and the only remaining advisory output is the three allowed `zbus`-family
+`unmaintained` warnings.
+
+**Not claimed.** This is a dependency update, not a behavioural proof about every
+`AsyncFd` use in the tree; the advisory is cleared by the vendor's fixed release. The
+lockfile change was not mutation-tested (there is no behaviour to mutate). No other
+advisory was re-evaluated, and the three unmaintained warnings for `zbus_names`,
+`zvariant`, and `zvariant_derive` remain allowed warnings rather than vulnerabilities.
+
+| | |
+|---|---|
+| **event** | any change to the `tokio` requirement, `Cargo.lock`, `deny.toml`, or the G8 advisory policy |
+| **date** | 2026-10-23 |
+| **severity** | **High for the advisory, Low for the change.** The advisory describes a use-after-free in safe `AsyncFd` construction; the fix is the upstream patch release. |
+
+### A-030 — `Pragma::verify` now reads back all five settings
+
+**What changed.** `Pragma::verify` read back `journal_mode`, `synchronous`, and
+`foreign_keys`; it now also reads back `busy_timeout` and `cache_size`, matching the
+module header's claim that every pragma is applied and then verified. The comparison is
+exact, including the sign of `cache_size` (negative means KiB rather than pages), so a
+silent unit change is refused rather than accepted as a different number.
+
+**Why it matters.** `busy_timeout` is the pragma whose silent failure turns ordinary
+startup contention into `database is locked`; `cache_size` bounds memory and its negative
+unit is easy to lose. Neither is persistent across connections, so a fresh connection must
+apply the set before verifying it. The concurrency test that previously reopened the
+database and verified without applying was corrected: the journal mode is persistent, but
+the two connection-local settings are not.
+
+The misleading `durability.rs` comment was also corrected. It attributed foreign-key
+enablement to rusqlite; the bundled `libsqlite3-sys` build passes
+`-DSQLITE_DEFAULT_FOREIGN_KEYS=1`. The conclusion — that verification is load-bearing
+because a caller can weaken a setting — is unchanged.
+
+**Evidence.** New test
+`pragma::tests::verify_reads_back_busy_timeout_and_cache_size_too` applies the in-memory
+set, weakens `busy_timeout`, and requires a `Mismatch`; then restores it, weakens
+`cache_size`, and requires the second `Mismatch`. `cargo test -p orxnud-store` is green:
+**367 passed, 0 failed, 1 ignored** in the lib target and all integration targets passed.
+Two separate mutations (removing the `busy_timeout` read-back, then the `cache_size`
+read-back) each failed the regression at its matching assertion (`rc=101`); restoring each
+made it pass.
+
+**Not claimed.** This proves the verification code reads and compares the five values on
+the connections where it is called. It does not make the two connection-local pragmas
+persistent, and it does not add verification to a raw SQLite open that bypasses
+`Pragma::apply`.
+
+| | |
+|---|---|
+| **event** | any change to `Pragma::statements`, `Pragma::apply`, `Pragma::verify`, or the pragma defaults |
+| **date** | 2026-10-23 |
+| **severity** | **Low.** The prior three-of-five check left two startup/memory settings unverified; no exploitation path is claimed. |
+
+### A-031 — an approved action carries the logical step, not the attempt
+
+**What changed.** `execute_proposal` rebuilt the inert `ActionRequest` with
+`proposal.attempt_no` in the `step` field. That made a retried step advertise a different
+step to both the capability-facing `DispatchView` and the policy's correlation label
+(`task#step`). A new `action_from_proposal` helper now uses `proposal.step_no`, which is
+the durable logical step; the attempt number remains available where it belongs, in the
+approval/effect identity.
+
+**Evidence.** New test
+`runtime::tests::read_retention_gate::the_action_step_is_the_logical_step_not_the_attempt`
+builds a proposal with `step_no = 7` and `attempt_no = 3` and requires the rebuilt action
+to carry `step = 7`. Mutating the helper back to `attempt_no` fails the test (`left: 3,
+right: 7`, `rc=101`); restoring it passes.
+
+**Not claimed.** This does not change the wire protocol, the approval digest, the effect
+lease, or the proposal JSON. It corrects which internal field is placed in
+`ActionRequest.step`; no end-to-end retry-with-attempt-two test was added, so the
+remaining evidence is the focused unit test plus the existing continuation suite.
+
+| | |
+|---|---|
+| **event** | any change to `action_from_proposal`, `execute_proposal`'s proposal-to-action mapping, or the `ActionRequest.step` meaning |
+| **date** | 2026-10-23 |
+| **severity** | **Low–Medium.** The field feeds the capability-visible step and the human correlation label; it is not authority and does not by itself admit an unapproved action. |
+
+### A-032 — the developer sandbox lanes name real tests again
+
+**What changed.** `scripts/run-sandbox-tests.sh --host` selected three
+`orxnud-capability --test` targets that do not exist (`governed_path`, `read_text_real`,
+`write_text`): they are modules inside `src/tests/`, not integration binaries. The script
+now uses the same nextest `-E test(suites::…)` filters as
+`run-sandbox-tests-inner.sh` and the CI gate. `scripts/run-resource-tests.sh` still
+carried its stale `orxnud-capability --test governed_path` line; A-034 removes it and
+repairs that lane.
+
+**Guard.** New `scripts/check-test-selectors.sh` reads the lane scripts and asks nextest
+whether every `--test` target exists and every `-E` filter selects at least one test. G9
+runs it before the suite. The acceptance criterion is a check, not a one-time correction,
+because a stale selector fails before the first test and an empty filter is a green lane
+that proves nothing.
+
+**Evidence.** `./scripts/check-test-selectors.sh` → `test selectors: all lane targets and
+filters resolve`. Mutating `--test isolation` to `--test does_not_exist` failed it
+(`orxnud-platform-sandbox has no --test target does_not_exist`); mutating
+`test(suites::governed_path)` to a nonexistent module failed it (`filter selects no tests
+in orxnud-capability`). Restoring both returned exit 0. The three capability filters
+list 69 selected tests through `cargo nextest list`.
+
+**Not claimed.** This repair was not exercised inside the Docker container lane; the
+`--host` lane's individual suites were not run in this batch. What is proven is that every
+selector resolves and that the guard fails on both stale forms.
+
+### A-033 — the source classifier's self-tests run in the gate
+
+**What changed.** `scripts/rustscan.py` carries the lexer that G3 and G4 classify source
+with, and its `_selftest()` (raw strings, comments, char-vs-lifetime, `cfg` predicates,
+test-only stripping) previously ran in no CI lane. G13 now executes it before
+`gate-selftest.py`, so a broken classifier is reported as a classifier failure rather than
+as fixtures that disagree with the gate.
+
+**Evidence.** `python3 scripts/rustscan.py` → `rustscan self-tests: all passed`.
+Injecting `failures.append("intentional mutation")` into `_selftest()` made
+`scripts/ci-gates.sh G13` fail with `FAIL intentional mutation` and
+`the source classifier's own self-tests failed` (`rc=1`); restoring it returned G13 to
+green, including all 144 boundary-gate self-tests.
+
+**Not claimed.** This adds no new lexer cases and does not close TEST-004/V-96: the
+literal-path aliasing bypass in G3 remains open and is tracked separately. It only makes
+the classifier's existing self-tests part of a lane that runs.
+
+### A-034 — the delegated resource lane runs nextest and fails closed on missing evidence
+
+**What changed.** `scripts/run-resource-tests.sh` enabled the coverage producer and then
+ran ordinary `cargo test`. The producer requires nextest's per-process identity, so the
+lane panicked before any resource assertion could be evidence. The script also carried a
+`--test governed_path` selector for a Cargo target that no longer exists. The lane now:
+
+- installs pinned cargo-nextest **0.9.146** with `scripts/install-nextest-verified.sh`
+  into a throwaway directory **inside the constrained container**;
+- lists `orxnud-platform-sandbox --test resources` and fails before the run if the target
+  is absent;
+- runs `cargo nextest run -p orxnud-platform-sandbox --test resources --no-capture`;
+- validates the fresh artifact with `scripts/test-coverage.py check --suite
+  orxnud-platform-sandbox::resources --require-verified`, so a missing, reduced, duplicate,
+  malformed, wrong-run, or zero-record artifact fails;
+- removes the artifact and installer directory through an `EXIT` trap.
+
+The stale `governed_path` selector is removed. That suite is an in-crate lib module, and
+its executing tests need `bwrap` and the hostile-helper test binary, neither of which this
+resource image provides; it is run by G9 and the sandbox lane.
+
+**Evidence.** `./scripts/run-resource-tests.sh` → exit 0, **9 tests run, 9 passed, 0
+skipped**, `SUMMARY verified=4 reduced=0 not-exercised=0 missing=0`, and
+`coverage: all 4 expected paths verified`. Re-ran on 2026-10-24 with the same result; the daemon expiry fixture change is recorded in
+A-025. The pinned installer reported checksum
+`682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428` and nextest 0.9.146.
+No `target/resource-coverage-*.jsonl` artifact and no matching container remained.
+`scripts/check-test-selectors.sh` → all lane targets and filters resolve;
+`scripts/test-coverage-provenance.sh` → exit 0.
+
+**Not claimed.** No hosted `resource-enforcement` run. This closes the runner/selector
+defect, not V-46/V-52's wider end-to-end enforcement verdict. The container still obtains
+the pinned Rust toolchain through `rustup` at run time; that is unchanged.
+
+| | |
+|---|---|
+| **event** | any change to `scripts/run-resource-tests.sh`, `scripts/install-nextest-verified.sh`, the resource coverage expected set, or the `resource-enforcement` workflow job |
+| **date** | 2026-10-24 |
+| **severity** | **High for evidentiary integrity, not runtime behaviour.** The lane previously could not run its own guarded assertions, and a green result would have been impossible rather than meaningful. |
 
 ## 3. The three highest-risk claims
 

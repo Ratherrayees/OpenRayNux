@@ -1,8 +1,9 @@
 # 03 — System Architecture
 
 Status: **Draft v0.5** · Decisions referenced as ADR-NNNN live in
-`09-decisions.md`. Reconciled **2026-10-09** against `HEAD` (`c5934970`). All five CI lanes
-green; one known intermittent failure under load — recorded in
+`09-decisions.md`. Reconciled **2026-10-09** against `HEAD` (`c5934970`). At that snapshot
+all five CI lanes were green; the workflow now has six jobs, and no hosted run is recorded
+against the current worktree. One known intermittent failure under load is recorded in
 [`README.md`](README.md) §8.
 
 **How to read this document now.** Sections 1–6 and 9 describe the architecture as
@@ -649,11 +650,13 @@ constructed outside `orxnud-policy` because its constructor demands a private se
 (ADR-0034). `CapabilityInvocation` does not derive `Deserialize`, so a forged invocation
 cannot enter from JSON — demonstrated by a compile-fail test with a recorded `.stderr`.
 
-Tier-1 execution runs through that path and nowhere else. A `Subprocess` adapter's
-`invoke` **panics by design**, so a bypass surfaces as a loud failure rather than a silent
-unsandboxed run, and gate G2 rejects `Command::new` anywhere in `orxnud-capability`. There
-is deliberately no setter that takes a program and arguments, because that would be the
-`dispatcher -> direct subprocess` bypass the whole design exists to prevent.
+Tier-1 execution runs through that path and nowhere else. A `Subprocess` adapter has no
+in-process implementation: the shipped adapters' `invoke` returns an error rather than
+performing the effect, and the governed-path test adapter panics if the route is bypassed,
+so a bypass surfaces as a loud failure rather than a silent unsandboxed run. Gate G2 rejects
+`Command::new` anywhere in `orxnud-capability`. There is deliberately no setter that takes
+a program and arguments, because that would be the `dispatcher -> direct subprocess`
+bypass the whole design exists to prevent.
 
 Three capabilities are registered (`crates/orxnud-daemon/src/lib.rs::shipped_declarations`,
 one list so the registry, the bundles and the policy table cannot drift):

@@ -1,8 +1,9 @@
 # 08 — Testing & Engineering Standards
 
-Status: **Draft v0.5** · Reconciled **2026-10-09** against `HEAD` (`c5934970`). All five CI
-lanes green; one known intermittent failure under load in `v95_concurrency` — see
-[`README.md`](README.md) §8.
+Status: **Draft v0.5** · Reconciled **2026-10-09** against `HEAD` (`c5934970`). That
+snapshot recorded five CI lanes; the workflow now has **six** (the
+`resource-enforcement` job was added later). One known intermittent failure under load in
+`v95_concurrency` — see [`README.md`](README.md) §8.
 
 **This document previously described a CI that does not exist.** Four items in its gate
 list had no gate behind them, and its platform-lane list named runners that are not
@@ -495,18 +496,20 @@ Transitive additions are reviewed via `cargo deny`.
 
 ## 19. CI — what is configured
 
-Five jobs; all were green on run `37343986458` (2026-10-05). **Currently, on `main` at
-`c5934970`, all five pass** — run `37919194011`, "all selected gates passed", nextest
-1505/1505. One earlier run of the same commit (`37916621851`) failed at G9 on an intermittent
+Six jobs in the current workflow. The historical snapshot below is from the five-job
+workflow: all five were green on run `37343986458` (2026-10-05). **At `c5934970`, all five
+passed** — run `37919194011`, "all selected gates passed", nextest 1505/1505. One earlier
+run of the same commit (`37916621851`) failed at G9 on an intermittent
 `v95_concurrency` `SQLITE_BUSY_SNAPSHOT`; see [`README.md`](README.md) §8.
 
 | Job | Trigger | What it proves |
 |---|---|---|
-| `linux-gates` (G1–G11) | every push and PR | the twelve gates, over the host-applicable test scope |
+| `linux-gates` (G1–G17 + G2d) | every push and PR | the numbered gates G1–G17 plus G2d, over the host-applicable test scope |
 | `windows-check` | every push and PR, plus nightly | all 16 crates compile for MSVC, all targets |
 | `windows-portability` | every push and PR | the platform-neutral suites **run** on Windows, not merely compile |
 | `portable-core` | every push and PR | the portable core builds for `wasm32-unknown-unknown` |
 | `sandbox-integration` | every push and PR | measures whether a Tier-1 sandbox is possible here, and says so |
+| `resource-enforcement` | every push and PR | the delegated cgroup resource suite in a privileged container |
 
 **Not configured**, contrary to what this section previously claimed: Linux aarch64,
 macOS, any feature-combination matrix, and a signed release pipeline.
@@ -657,7 +660,7 @@ rather than declared and assumed.
 
 ### What a green CI run does and does not prove
 
-**It proves:** all twelve gates pass on Linux; every crate compiles for MSVC; the
+**It proves:** the Linux gate run over G1–G17 plus G2d is green (G12 is skipped without a release tag); every crate compiles for MSVC; the
 platform-neutral suites behave on a real Windows host; the portable core is genuinely
 portable; and on the hosted Linux runner a Tier-1 capability is **refused** with the
 missing guarantee named — which is the fail-closed property, and is asserted positively

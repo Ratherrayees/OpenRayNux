@@ -3,15 +3,18 @@
 Status: **Stages 1–4c delivered. Both 4c wirings are in production: the continuation loop
 (`task/continue`, ADR-0047) and the observation/disclosure path (ADR-0048).**
 
-Reconciled **2026-10-09** against `HEAD` (`c5934970`); §7 re-verified **2026-10-16**
-against the working tree containing S-03, S-17, S-30 and S-31. Workspace suite,
-re-measured on 2026-10-16: **1732 run, 1732 passed, 0 failed, 6 skipped, 2 leaky**
-(`cargo nextest run --workspace`, 25 s on a warm target, as run by gate G9).
-`cargo test --workspace` agrees: **1735 passed, 0 failed, 7 ignored**. The previously
-recorded "1652" and "1655" figures are stale. All five CI
-lanes pass on run `37919194011` — but the same commit also has a failing run, so
-`linux-gates` is **not** reliably green: an intermittent `v95_concurrency` failure under
-load is open and undiagnosed. See
+Header, counts and the sections touched by the 2026-10-23/24 remediation were
+re-measured against the current worktree at `HEAD` (`1e1f8cf`). The
+latest full local gate run (2026-10-24) is **1997 run, 1997 passed, 0 failed, 6
+skipped, 2 leaky** (`cargo nextest run --workspace`, as run by gate G9; the leak count
+is process accounting, not a test failure). The suite tracks **36 coverage paths**.
+Gate G9 does **not** accept a `cargo test --workspace` run as equivalent; that old
+claim and the "1652"/"1655" counts are stale. CI has **six jobs** (see §8), but no
+hosted run is recorded against this tree. The historical `v95_concurrency` failure
+under load is still open and undiagnosed. The separate `V-68`
+`n_workers_sharing_a_file_produce_exactly_one_winner_per_task` load-sensitive test
+recurred once on 2026-10-24 and passed on the recorded green rerun; `docs/12` V-68 records
+the occurrence. See
 [§8](#-8-ci-state-the-tool-install-problem-is-resolved-one-test-flake-is-not).
 
 OpenRayNux is a local-first personal AI operating layer: one long-lived Rust process owning
@@ -32,38 +35,54 @@ capability set. One surface ships today.
 | | |
 |---|---|
 | Workspace | 16 Rust crates, 1.98.1, gate-enforced dependency direction |
-| Storage | SQLite (bundled, ≥ 3.51.3), schema at **v14** (`CURRENT_VERSION`, `migration.rs:237`), snapshot-protected migrations |
+| Storage | SQLite (bundled, ≥ 3.51.3), schema at **v15** (`CURRENT_VERSION`, `migration.rs:510`), snapshot-protected migrations |
 | Task engine | Durable, hand-rolled; passes all 12 ADR-0029 properties from a second test binary |
 | Governance | 9-stage dispatcher; `CapabilityInvocation` cannot be constructed outside `orxnud-policy` |
 | Audit | Append-only, hash-chained, durable, survives restart |
 | Approvals | Single-use, digest-bound **v3**, time-boxed, bound to an approver *and* a logical step |
 | Sandbox | Tier-1 execution under `bubblewrap`; cgroup v2 ceilings where the host delegates |
-| Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 17 methods |
+| Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 18 methods |
 | CLI | `orxnuctl` — hand-written parser, 5 verb groups |
-| Daemon | `orxnud` — composition root, single-instance lock, serves the socket |
+| Daemon | `orxnud` — composition root, single-instance endpoint, serves the socket |
 | Provider | **One real HTTPS provider**, TLS with chain and hostname verification |
 | AI | **A real proposer**: registry-derived menu → model → durable proposal → approval → governed execution |
 
 ## 2. What is actually executable
 
 Three capabilities are registered. This is the whole list, from one function
-(`shipped_declarations()`) so the registry, the bundles and the policy table cannot drift:
+(`shipped_declarations()`) so the registry, the bundles and the policy table cannot drift.
+Only `text/word-count` runs without an approval in the shipped build:
 
 ```bash
 orxnuctl capability run --capability text/word-count \
   --params '{"text":"hello world"}'          # Low, Tier 0, in-process, no prompt
+```
 
+`filesystem/read-text` is High, Tier 1, and requires a single-use approval. `filesystem/write-text`
+is also High and Tier 1, but **the shipped build refuses it by default**, even with a valid
+approval:
+
+```bash
 APPROVAL=$(orxnuctl capability approve \
   --capability filesystem/write-text --target notes.txt \
   --params '{"path":"notes.txt","contents":"hello"}' --ttl-ms 60000)
 
 orxnuctl capability run --capability filesystem/write-text \
   --target notes.txt --params '{"path":"notes.txt","contents":"hello"}' \
-  --approval "$APPROVAL"                     # High, Tier 1, sandboxed, single-use
+  --approval "$APPROVAL"
+# refused: argv_payload_exposure_refused; nothing is written
 ```
 
+The refusal is deliberate: ADR-0054 Decision 7 keeps the payload-bearing capability disabled
+until R-1's evidence conditions are met. It is enforced at dispatch before any process exists,
+and an approval does **not** lift it. There is no operator configuration or environment variable
+that enables it; the test-only exception (`with_argv_payload_exception_for_this_process`) is not
+reachable from the shipped CLI. The capability remains registered so its declaration, policy and
+refusal stay visible and testable.
+
 An approval is bound to the exact parameters it was issued for. Presenting it with
-`contents` changed is refused `approval-digest-mismatch` before anything runs.
+`contents` changed is refused `approval-digest-mismatch` before anything runs. This binding is
+part of the governance path; it is not a substitute for the separate default refusal above.
 
 The full AI loop, through the shipped binaries:
 
@@ -74,8 +93,13 @@ orxnuctl task create --id t1 "write notes.txt"
 orxnuctl task claim  --id t1 --worker ai
 orxnuctl task ai-propose --task t1 --worker ai     # model picks a capability from the registry
 orxnuctl capability approve --proposal <id> --ttl-ms 60000
-orxnuctl task execute --proposal <id> --worker ai  # governed; Tier-1; verified
+orxnuctl task execute --proposal <id> --worker ai  # governed; write-text is refused by default
 ```
+
+The model may propose `filesystem/write-text`, but the shipped build refuses it with
+`argv_payload_exposure_refused`, so that loop demonstrates the governed refusal rather
+than a completed write. A successful Tier-1 execution needs a reviewed `read-text`
+proposal.
 
 ## 3. Security guarantees that are real
 
@@ -83,8 +107,10 @@ orxnuctl task execute --proposal <id> --worker ai  # governed; Tier-1; verified
   `Deserialize`; its constructor demands `orxnud-policy`'s private seal. A compile-fail test
   with a recorded `.stderr` proves re-adding the derive breaks the build.
 * **One route out.** `Dispatcher::dispatch` is the only path from an authorised intent to an
-  effect. A `Subprocess` adapter's `invoke` panics by design, so a bypass is loud rather
-  than silent, and gate G2 rejects `Command::new` anywhere in `orxnud-capability`.
+  effect. A `Subprocess` adapter has no in-process implementation: the shipped adapters'
+  `invoke` returns an error rather than performing the effect, and the governed-path test
+  adapter panics if the route is bypassed, so a bypass is loud rather than silent. Gate G2
+  rejects `Command::new` anywhere in `orxnud-capability`.
 * **Fail closed, everywhere.** A host that cannot establish the required guarantees refuses
   every Tier-1 capability — before a credential resolves, before a process exists. There is
   no unsandboxed fallback and no `BestEffort` path in the governed route.
@@ -108,8 +134,9 @@ orxnuctl task execute --proposal <id> --worker ai  # governed; Tier-1; verified
 | Tier-1 sandbox | ✅ where the host provides guarantees | ❌ **refuses** — no backend exists |
 | Isolation proven | ✅ mutation-verified (V-46) | ❌ **NOT PROVEN** (V-29) |
 
-Windows is neither "untested" nor "sandbox-supported". It is **portable and compiled, with
-isolation unproven**: there is no Job Object or AppContainer backend, so a Tier-1 execution
+The Windows entries record the audit-baseline evidence; no hosted Windows run is recorded
+against this worktree. Windows is neither "untested" nor "sandbox-supported". It is
+**portable and compiled, with isolation unproven**: there is no Job Object or AppContainer backend, so a Tier-1 execution
 is refused rather than degraded. Refusing is correct — an unsandboxed Tier-1 subprocess is
 worse than no capability at all.
 
@@ -169,13 +196,12 @@ the surfaces listed last, and nothing else.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**1732 tests run, 1732 passed, 0 failed, 6 skipped** locally (re-measured 2026-10-16),
-with 2 *leaky* results — both are pre-existing `cgroup.kill` tests that pass and
-are named in [`08`](08-testing-engineering-standards.md) §19. All 6 skips are `#[ignore]`d
-child-process entry points, not tests. On the hosted runner, gate G9 runs fewer
-and all of those pass — the difference is the Tier-1 sandbox-evidence suites, which the
-runner cannot execute, and the gate prints which it excluded and why. The hosted figure is
-read from the run rather than recorded here, because it moves with the suite list.
+**1997 tests run, 1997 passed, 0 failed, 6 skipped** in the latest full local gate
+(2026-10-24), with 2 *leaky* results. The leak detector reports processes that outlive
+their test; the count varies between runs and is not a test failure. All 6 skips are
+`#[ignore]`d child-process entry points, not tests. No hosted run is recorded against
+this tree; on a host that cannot isolate, gate G9 excludes the Tier-1 sandbox-evidence
+suites and prints which it excluded and why.
 
 **Two caveats that a green run does not carry, found 2026-10-10.** The enforcement and
 resource suites `println!` and `return` when the host cannot delegate cgroups
@@ -186,9 +212,11 @@ nextest and to gate G9, and no gate reads the reason. One isolation test,
 `bind` succeeds inside the netns — which it does on a host that can create a user
 namespace. On the host this repository was measured on, that is exactly what happened.
 
-**A green CI run proves:** twelve gates on Linux; every crate compiles for MSVC; the
-platform-neutral suites behave on real Windows; the portable core is portable; and on the
-hosted runner a Tier-1 capability is **refused** with the missing guarantee named.
+**A green CI run proves:** the numbered gates G1–G17 plus the G2d sub-gate are
+exercised on Linux (G12 is skipped without a release tag); every crate compiles for MSVC;
+the platform-neutral suites behave on real Windows; the portable core is portable; and on
+a host that cannot isolate, a Tier-1 capability is **refused** with the missing guarantee
+named.
 
 **It does not prove** that a Tier-1 capability executes under isolation.
 `governed_path`, `read_text_real`, `write_text`, `isolation` and the sandbox suites are
@@ -243,6 +271,11 @@ None of these is decided here. The point of this section is that the previous fo
 plan was built on a false premise and has been withdrawn.
 
 ## 8. CI state: the tool-install problem is resolved, one test flake is not
+
+**Current tree (2026-10-24): six jobs** — `linux-gates`, `windows-check`,
+`windows-portability`, `sandbox-integration`, `resource-enforcement`, `portable-core`.
+No hosted run is recorded against this tree. The local full gate and the repaired
+delegated resource lane are the current evidence; the history below is preserved.
 
 **`linux-gates` passes on `main` as of `c5934970`.** It did not, for a while, and the
 failure mode was misleading enough to be worth recording.
@@ -309,7 +342,7 @@ seconds on a warm target directory.
 | # | Document | What it is for |
 |---|----------|----------------|
 | **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, **§9a: where the implementation actually stands**, and **§10: the verifier-admission invariant (K.1)**. |
-| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 96 rows: every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
+| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 103 rows (101 V rows plus `K.1` and `F-26`): every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
 | **09** | [Architecture Decision Records](09-decisions.md) | 51 ADRs, ADR-0001…ADR-0053 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, which is not a separate record). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
@@ -368,11 +401,11 @@ The full table of all 51 is in [09-decisions.md](09-decisions.md).
 ## Reproducing the verification state
 
 ```bash
-./scripts/ci-gates.sh                     # the twelve gates; ~3 min
+./scripts/ci-gates.sh                     # numbered gates G1–G17 plus G2d; ~3 min
 ./scripts/preflight.sh                    # what THIS host can actually isolate
 ./scripts/preflight.sh --require          # fail unless it is the production configuration
 scripts/run-sandbox-tests.sh --host       # the Tier-1 suites, on a capable host
 scripts/run-resource-tests.sh             # cgroup enforcement, in a delegated container
 ```
 
-Last research/verification date: **2026-10-05**.
+Last research/verification date: **2026-10-24**.
