@@ -145,9 +145,10 @@ impl BwrapRunner {
         // write is refused in this user session.
         let av = CgroupV2::discover().availability;
         let resources = visibility && (av.memory || av.processes || av.cpu);
-        // Tree lifetime rides on the same probe: `--unshare-pid` plus
-        // `--die-with-parent` is what the kernel uses to kill a detached descendant,
-        // and `namespace_probe` runs with both.
+        // The probe now runs the product argv, so `--unshare-pid` and
+        // `--die-with-parent` are both exercised. That is not the whole tree-lifetime
+        // claim: this field still aliases visibility rather than probing `cgroup.kill`
+        // (DOC-008/F-02), and the alias is not corrected here.
         let tree_lifetime = visibility;
 
         AvailableGuarantees {
@@ -172,10 +173,9 @@ impl BwrapRunner {
         build_command(spec).map(|(argv, _)| argv)
     }
 
-    /// Whether an unprivileged PID namespace can actually be created.
+    /// Whether the product sandbox can actually be started on this host.
     fn namespace_probe() -> bool {
         Self::namespace_probe_command()
-            .args(["--", "/bin/true"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -183,23 +183,29 @@ impl BwrapRunner {
             .unwrap_or(false)
     }
 
-    /// The probe's command, before the program is supplied.
+    /// The probe's command, built through the same argv builder as production.
     ///
     /// Extracted so [`Self::namespace_probe`] and [`Self::probe_identity`] run the *same*
-    /// namespaces. A diagnostic that built its own would be measuring a different
-    /// configuration from the one that decides whether a capability runs.
+    /// namespaces and the same root construction. A diagnostic that built its own would
+    /// be measuring a different configuration from the one that decides whether a
+    /// capability runs.
     fn namespace_probe_command() -> Command {
+        Self::probe_command("/bin/true", &[])
+    }
+
+    /// Builds a probe command from a minimal spec through [`build_command`].
+    ///
+    /// The probe used to pass `--ro-bind / /`, which mounts the host root and therefore
+    /// did not test the product's closed `--tmpfs` root or its path confinement. Using
+    /// the production builder makes a probe pass mean the product invocation is
+    /// executable, rather than a statement about a different sandbox.
+    fn probe_command(program: &str, args: &[&str]) -> Command {
+        let mut spec = SandboxSpec::new(program);
+        spec.args = args.iter().map(|a| (*a).to_owned()).collect();
+        let (argv, _) = build_command(&spec)
+            .expect("the probe program is absolute; only a relative one is refused");
         let mut c = Command::new(BWRAP);
-        c.args([
-            "--unshare-pid",
-            "--ro-bind",
-            "/",
-            "/",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-        ]);
+        c.args(argv);
         c
     }
 
@@ -226,16 +232,16 @@ impl BwrapRunner {
     /// `None` when the probe cannot run at all, which is the incapable-host case.
     #[must_use]
     pub fn probe_identity() -> Option<(String, String)> {
-        let out = Self::namespace_probe_command()
-            .args([
-                "--",
-                "/bin/sh",
+        let out = Self::probe_command(
+            "/bin/sh",
+            &[
                 "-c",
                 "cat /proc/self/uid_map; grep CapEff /proc/self/status",
-            ])
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
+            ],
+        )
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -1249,6 +1255,27 @@ mod tests {
         assert_eq!(argv[sep + 1], program);
         assert_eq!(argv[sep + 2], "--unshare-everything");
         assert_eq!(argv[sep + 3], "-x");
+    }
+
+    #[test]
+    fn the_namespace_probe_runs_the_product_argv_not_the_host_root() {
+        let probe: Vec<String> = BwrapRunner::namespace_probe_command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let (product, _) = build_command(&SandboxSpec::new("/bin/true")).expect("build");
+        assert_eq!(
+            probe, product,
+            "the probe must run the same argv as a production execution, or it measures a \
+             different sandbox"
+        );
+        assert!(
+            !probe
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/"),
+            "the probe must not mount the host root; that is not the product's path \
+             confinement: {probe:?}"
+        );
     }
 
     #[test]
