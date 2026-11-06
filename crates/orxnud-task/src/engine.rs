@@ -1500,7 +1500,7 @@ mod tests {
         let mut e = mem();
         e.enqueue_new(&NewTask::new(tid("t"), TaskKind::Workflow, NOW), NOW)
             .expect("enqueue");
-        let claimed = e.claim_task("w", NOW).expect("claim").expect("claimed");
+        e.claim_task("w", NOW).expect("claim").expect("claimed");
         e.record_approval(&approval("t", 1, NOW + 60_000))
             .expect("record");
         e.consume_approval(&tid("t"), 1, 1, NOW).expect("consume");

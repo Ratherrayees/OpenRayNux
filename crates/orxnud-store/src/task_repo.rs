@@ -8046,7 +8046,7 @@ mod advancement_tests {
     }
 
     thread_local! {
-        static CURRENT_GEN: std::cell::Cell<i64> = std::cell::Cell::new(1);
+        static CURRENT_GEN: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
     }
     fn set_current_gen(g: i64) {
         CURRENT_GEN.with(|c| c.set(g));
