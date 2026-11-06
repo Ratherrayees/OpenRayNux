@@ -8,6 +8,9 @@ error[E0308]: mismatched types
    |
 note: associated function defined here
   --> $RUST/core/src/convert/mod.rs
+   |
+   |     fn from(value: T) -> Self;
+   |        ^^^^
 
 error[E0277]: the trait bound `DispatchView<'_>: From<ActionRequest>` is not satisfied
   --> tests/compile_fail/dispatch_view_cannot_be_promoted_from_a_request.rs:27:45
