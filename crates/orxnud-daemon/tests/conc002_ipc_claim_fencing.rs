@@ -711,3 +711,86 @@ fn conc002_ipc_live_cross_task_generation_fencing() {
         second.stop().await;
     });
 }
+
+/// CONC-002: `task/ai-propose` with a stale claim generation must be refused
+/// and must not create a proposal row or change durable state.
+///
+/// The sequence exercises the same G1 → recovery → G2 path as the completion
+/// and proposal stale-generation tests, but through the AI-proposal IPC method,
+/// which delegates to the proposal implementation only after gathering context
+/// from the provider.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: the local IPC transport refuses on Windows"
+)]
+#[test]
+fn conc002_ipc_ai_propose_stale_generation_fencing() {
+    rt().block_on(async {
+        let root = dir("ai-stale");
+        let worker = "same-worker";
+
+        let first = Serving::start(root.clone()).await;
+        send(
+            &first.endpoint,
+            "create",
+            "task/create",
+            json!({"id": "t-ai", "content": "conc002"}),
+        );
+
+        let g1 = send(
+            &first.endpoint,
+            "claim",
+            "task/claim",
+            json!({"id": "t-ai", "worker": worker}),
+        )["result"]["claim_generation"]
+            .as_i64()
+            .expect("G1");
+
+        first.stop().await;
+
+        let second = Serving::start(root.clone()).await;
+        let g2 = send(
+            &second.endpoint,
+            "claim-2",
+            "task/claim",
+            json!({"id": "t-ai", "worker": worker}),
+        )["result"]["claim_generation"]
+            .as_i64()
+            .expect("G2");
+        assert_ne!(g1, g2, "recovery must mint a new generation");
+
+        // Stale AI-proposal with G1 must be refused and must not mutate state.
+        let before = read_durable_task(&root, "t-ai");
+        let stale = send(
+            &second.endpoint,
+            "stale-ai",
+            "task/ai-propose",
+            json!({"task": "t-ai", "worker": worker, "claim_generation": g1}),
+        );
+        assert_refusal(
+            &stale,
+            RpcErrorCode::CONFLICT,
+            "conflict",
+            "task/ai-propose with a stale claim generation must be refused",
+        );
+        assert_eq!(
+            read_durable_task(&root, "t-ai"),
+            before,
+            "a stale AI proposal must not change durable state"
+        );
+
+        // The current generation still reaches the configured provider route.
+        let current = send(
+            &second.endpoint,
+            "current-ai",
+            "task/ai-propose",
+            json!({"task": "t-ai", "worker": worker, "claim_generation": g2}),
+        );
+        assert_eq!(
+            current["result"]["proposed_by"], "ai",
+            "the current claim must reach the AI proposal route: {current}"
+        );
+
+        second.stop().await;
+    });
+}
