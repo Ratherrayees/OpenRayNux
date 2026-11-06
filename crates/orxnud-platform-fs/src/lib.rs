@@ -380,7 +380,11 @@ pub fn observe_owner_only(path: &std::path::Path, expected_mode: u32) -> OwnerOn
             },
         }
     }
-    // Existence is knowable everywhere; owner-only-ness is not.
+    // Existence is knowable everywhere; owner-only-ness is not. The expected mode
+    // belongs to the Unix comparison above, so consuming it here states the
+    // non-Unix disuse explicitly instead of suppressing unrelated warnings.
+    #[cfg(not(unix))]
+    let _ = expected_mode;
     #[cfg(not(unix))]
     {
         match std::fs::metadata(path) {
@@ -842,7 +846,7 @@ fn is_runnable(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::hard_link_count;
+    use super::{OwnerOnlyStatus, hard_link_count, observe_owner_only};
 
     /// A freshly created file has exactly one name, and a hard link gives it a second.
     ///
@@ -1165,6 +1169,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The Unix comparison is exact, and a different mode is reported with the
+    /// observed value rather than folded into a generic refusal.
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_reports_the_exact_mode_a_different_mode_and_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "orxnud-platfs-owner-only-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp directory");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, b"x").expect("write file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("set exact mode");
+
+        assert_eq!(
+            observe_owner_only(&file, 0o600),
+            OwnerOnlyStatus::OwnerOnly,
+            "the exact mode must be reported as owner-only"
+        );
+        assert_eq!(
+            observe_owner_only(&file, 0o644),
+            OwnerOnlyStatus::Permissive { mode: 0o600 },
+            "a different expected mode must report the observed mode"
+        );
+        assert_eq!(
+            observe_owner_only(&dir.join("absent.txt"), 0o600),
+            OwnerOnlyStatus::Absent,
+            "a missing path must be reported as absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Windows-only tests: the native identity and the actual SQLite handle.
@@ -1265,5 +1307,30 @@ mod windows_tests {
             "an in-memory main database has no native file; the check must refuse \
              rather than report that there is nothing to check"
         );
+    }
+
+    /// The non-Unix contract is NotApplicable, not OwnerOnly, and the Unix-only
+    /// expected-mode argument cannot change that answer.
+    #[test]
+    fn owner_only_is_not_applicable_and_the_expected_mode_does_not_change_it() {
+        let dir = temp_root("owner-only");
+        let file = dir.join("one.txt");
+        std::fs::write(&file, b"one").expect("write");
+
+        for expected_mode in [0o600, 0o700, 0o644, 0] {
+            assert_eq!(
+                observe_owner_only(&file, expected_mode),
+                OwnerOnlyStatus::NotApplicable,
+                "expected_mode {expected_mode:o} changed the non-Unix answer"
+            );
+        }
+
+        assert_eq!(
+            observe_owner_only(&dir.join("absent.txt"), 0o600),
+            OwnerOnlyStatus::Absent,
+            "a missing path must still be reported as absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
