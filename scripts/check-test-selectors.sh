@@ -5,6 +5,10 @@
 #
 # This is the guard TEST-002 asked for. It deliberately reads the lane scripts rather
 # than a hand-maintained copy: a new selector is checked by being written down once.
+#
+# The listing is nextest's JSON, not its human-readable output. Presentation output
+# is colourised when CI forces CARGO_TERM_COLOR=always, which is exactly what made
+# the old exact-text comparison fail while every target existed.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -12,31 +16,11 @@ cd "$(dirname "$0")/.."
 bad=0
 
 check_target() {
-  local pkg="$1" target="$2" source="$3"
-  local bins
-  if ! bins="$(cargo nextest list -p "$pkg" --list-type binaries-only 2>/dev/null)"; then
-    printf 'selector error: %s: cannot list targets for %s\n' "$source" "$pkg" >&2
-    bad=1
-    return
-  fi
-  if ! grep -qxF "$pkg::$target" <<<"$bins"; then
-    printf 'selector error: %s: %s has no --test target %s\n' "$source" "$pkg" "$target" >&2
-    bad=1
-  fi
+  python3 scripts/check-test-selectors.py target "$1" "$2" "$3" || bad=1
 }
 
 check_filter() {
-  local pkg="$1" filter="$2" source="$3"
-  local selected
-  if ! selected="$(cargo nextest list -p "$pkg" -E "$filter" 2>/dev/null)"; then
-    printf 'selector error: %s: invalid nextest filter for %s: %s\n' "$source" "$pkg" "$filter" >&2
-    bad=1
-    return
-  fi
-  if ! grep -q '::' <<<"$selected"; then
-    printf 'selector error: %s: filter selects no tests in %s: %s\n' "$source" "$pkg" "$filter" >&2
-    bad=1
-  fi
+  python3 scripts/check-test-selectors.py filter "$1" "$2" "$3" || bad=1
 }
 
 while IFS= read -r line; do
