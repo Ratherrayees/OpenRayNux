@@ -52,6 +52,11 @@ pub enum TaskCommand {
         id: String,
         /// The worker identity holding the lease.
         worker: String,
+        /// The generation returned by the claim this completion answers to.
+        ///
+        /// Carried from the claim response, not fabricated: a completion that
+        /// presents a generation the caller never held is refused by the daemon.
+        claim_generation: i64,
     },
     /// Cancel a task.
     ///
@@ -71,6 +76,8 @@ pub enum TaskCommand {
         task: String,
         /// The worker holding the task's lease.
         worker: String,
+        /// The generation returned by the claim this proposal answers to.
+        claim_generation: i64,
         /// Which capability to ask for.
         capability: String,
         /// The capability's parameters, verbatim JSON.
@@ -95,6 +102,8 @@ pub enum TaskCommand {
         task: String,
         /// The worker holding the task's lease.
         worker: String,
+        /// The generation returned by the claim this proposal answers to.
+        claim_generation: i64,
     },
     /// Advance a task that has finished one step to the next.
     ///
@@ -151,6 +160,7 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
         TaskCommand::Propose {
             task,
             worker,
+            claim_generation,
             capability,
             params,
             target,
@@ -162,6 +172,7 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             let mut payload = json!({
                 "task": task,
                 "worker": worker,
+                "claim_generation": claim_generation,
                 "capability": capability,
                 "params": params,
             });
@@ -171,9 +182,15 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             let reply = client.call("task/propose", payload)?;
             Ok(render_proposal(&reply))
         }
-        TaskCommand::AiPropose { task, worker } => {
-            let reply =
-                client.call("task/ai-propose", json!({ "task": task, "worker": worker }))?;
+        TaskCommand::AiPropose {
+            task,
+            worker,
+            claim_generation,
+        } => {
+            let reply = client.call(
+                "task/ai-propose",
+                json!({ "task": task, "worker": worker, "claim_generation": claim_generation }),
+            )?;
             let mut out = render_proposal(&reply);
             // Stated plainly, because the reply's existence is not the interesting part:
             // what matters is that a model asked and a person still has to decide.
@@ -239,8 +256,15 @@ pub fn run(command: &TaskCommand, client: &Client) -> Result<String, ClientError
             ));
             Ok(out)
         }
-        TaskCommand::Complete { id, worker } => {
-            let reply = client.call("task/complete", json!({ "id": id, "worker": worker }))?;
+        TaskCommand::Complete {
+            id,
+            worker,
+            claim_generation,
+        } => {
+            let reply = client.call(
+                "task/complete",
+                json!({ "id": id, "worker": worker, "claim_generation": claim_generation }),
+            )?;
             Ok(render_task_field(&reply, "completed"))
         }
         TaskCommand::Cancel { id } => {
@@ -797,6 +821,9 @@ fn render_claim(reply: &Value) -> String {
     // one that answers "which attempt is this".
     if let Some(n) = reply.get("attempt") {
         out.push_str(&format!("  attempt: {}\n", scalar(n)));
+    }
+    if let Some(g) = reply.get("claim_generation") {
+        out.push_str(&format!("  claim_generation: {}\n", scalar(g)));
     }
     if let Some(ms) = reply.get("lease_expires_at_ms") {
         out.push_str(&format!(

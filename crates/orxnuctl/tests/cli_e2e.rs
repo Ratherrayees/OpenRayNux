@@ -568,6 +568,21 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+/// Extracts the `claim_generation` value from a `task claim` reply.
+///
+/// The daemon owns the generation; the CLI only carries it. A test that completes
+/// a task must present the generation its own claim received, never a fabricated
+/// or freshly-fetched one.
+fn claim_generation_of(claimed: &str) -> String {
+    for line in claimed.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("claim_generation:") {
+            return rest.trim().to_owned();
+        }
+    }
+    panic!("no claim_generation in claim output:\n{claimed}")
+}
+
 /// The whole product loop, driven through the CLI.
 #[cfg_attr(
     not(target_os = "linux"),
@@ -611,7 +626,17 @@ fn a_user_can_create_list_claim_and_complete_a_task() {
     assert!(stdout_of(&out).contains("running"));
 
     // complete
-    let out = d.cli(&["task", "complete", "--id", "t-1", "--worker", "w1"]);
+    let generation = claim_generation_of(&claimed);
+    let out = d.cli(&[
+        "task",
+        "complete",
+        "--id",
+        "t-1",
+        "--worker",
+        "w1",
+        "--claim-generation",
+        generation.as_str(),
+    ]);
     assert!(out.status.success(), "complete failed: {}", stderr_of(&out));
     assert!(stdout_of(&out).contains("completed"));
 
@@ -641,9 +666,20 @@ fn a_wrong_worker_is_refused_by_the_daemon_not_by_the_cli() {
     d.cli(&["task", "create", "--id", "t-1", "x"]);
     let out = d.cli(&["task", "claim", "--id", "t-1", "--worker", "owner"]);
     assert!(out.status.success(), "{}", stderr_of(&out));
+    let claimed = stdout_of(&out);
+    let owner_generation = claim_generation_of(&claimed);
 
     // The intruder.
-    let out = d.cli(&["task", "complete", "--id", "t-1", "--worker", "intruder"]);
+    let out = d.cli(&[
+        "task",
+        "complete",
+        "--id",
+        "t-1",
+        "--worker",
+        "intruder",
+        "--claim-generation",
+        "0",
+    ]);
     assert!(
         !out.status.success(),
         "a worker without the lease must not exit 0"
@@ -665,7 +701,16 @@ fn a_wrong_worker_is_refused_by_the_daemon_not_by_the_cli() {
     assert!(!listed.contains("completed"), "{listed}");
 
     // And the rightful owner can still finish it.
-    let out = d.cli(&["task", "complete", "--id", "t-1", "--worker", "owner"]);
+    let out = d.cli(&[
+        "task",
+        "complete",
+        "--id",
+        "t-1",
+        "--worker",
+        "owner",
+        "--claim-generation",
+        owner_generation.as_str(),
+    ]);
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert!(stdout_of(&out).contains("completed"));
 
@@ -683,7 +728,16 @@ fn a_never_claimed_task_cannot_be_completed_through_the_cli() {
     let d = Daemon::start(&root);
     d.cli(&["task", "create", "--id", "t-1", "x"]);
 
-    let out = d.cli(&["task", "complete", "--id", "t-1", "--worker", "anyone"]);
+    let out = d.cli(&[
+        "task",
+        "complete",
+        "--id",
+        "t-1",
+        "--worker",
+        "anyone",
+        "--claim-generation",
+        "0",
+    ]);
     assert!(!out.status.success(), "must not exit 0");
     assert!(stderr_of(&out).contains("fenced"), "{}", stderr_of(&out));
 
@@ -819,7 +873,18 @@ fn tasks_survive_a_restart_of_the_daemon() {
         assert!(out.status.success(), "{}", stderr_of(&out));
         let out = d.cli(&["task", "claim", "--id", "keep-me", "--worker", "w1"]);
         assert!(out.status.success(), "{}", stderr_of(&out));
-        let out = d.cli(&["task", "complete", "--id", "keep-me", "--worker", "w1"]);
+        let claimed = stdout_of(&out);
+        let generation = claim_generation_of(&claimed);
+        let out = d.cli(&[
+            "task",
+            "complete",
+            "--id",
+            "keep-me",
+            "--worker",
+            "w1",
+            "--claim-generation",
+            generation.as_str(),
+        ]);
         assert!(out.status.success(), "{}", stderr_of(&out));
     }
     // Dropped without an orderly stop, then started again on the same directory.
@@ -925,7 +990,18 @@ fn cancelling_a_completed_task_reports_it_unchanged_rather_than_cancelled() {
     d.cli(&["task", "create", "--id", "t-1", "x"]);
     let out = d.cli(&["task", "claim", "--id", "t-1", "--worker", "w1"]);
     assert!(out.status.success(), "{}", stderr_of(&out));
-    let out = d.cli(&["task", "complete", "--id", "t-1", "--worker", "w1"]);
+    let claimed = stdout_of(&out);
+    let generation = claim_generation_of(&claimed);
+    let out = d.cli(&[
+        "task",
+        "complete",
+        "--id",
+        "t-1",
+        "--worker",
+        "w1",
+        "--claim-generation",
+        generation.as_str(),
+    ]);
     assert!(out.status.success(), "{}", stderr_of(&out));
 
     let out = d.cli(&["task", "cancel", "--id", "t-1"]);
@@ -1757,6 +1833,8 @@ fn a_user_proposes_a_governed_action_approves_it_and_executes_it() {
     daemon.cli(&["task", "create", "--id", "cg1"]);
     let claimed = daemon.cli(&["task", "claim", "--id", "cg1", "--worker", "w1"]);
     assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+    let claimed_out = stdout_of(&claimed);
+    let cg_gen = claim_generation_of(&claimed_out);
 
     let proposed = daemon.cli(&[
         "task",
@@ -1765,6 +1843,8 @@ fn a_user_proposes_a_governed_action_approves_it_and_executes_it() {
         "cg1",
         "--worker",
         "w1",
+        "--claim-generation",
+        cg_gen.as_str(),
         "--capability",
         "filesystem/write-text",
         "--target",
@@ -1841,7 +1921,9 @@ fn the_governed_refusals_reach_the_cli_as_failures() {
     let root = dir("governed-refusals");
     let daemon = Daemon::start(&root);
     daemon.cli(&["task", "create", "--id", "cg2"]);
-    daemon.cli(&["task", "claim", "--id", "cg2", "--worker", "w1"]);
+    let claimed = daemon.cli(&["task", "claim", "--id", "cg2", "--worker", "w1"]);
+    assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+    let cg_gen = claim_generation_of(&stdout_of(&claimed));
 
     let proposed = daemon.cli(&[
         "task",
@@ -1850,6 +1932,8 @@ fn the_governed_refusals_reach_the_cli_as_failures() {
         "cg2",
         "--worker",
         "w1",
+        "--claim-generation",
+        cg_gen.as_str(),
         "--capability",
         "filesystem/write-text",
         "--target",
@@ -1929,7 +2013,9 @@ fn the_governed_execution_is_audited_and_survives_a_restart() {
     {
         let daemon = Daemon::start(&root);
         daemon.cli(&["task", "create", "--id", "cg3"]);
-        daemon.cli(&["task", "claim", "--id", "cg3", "--worker", "w1"]);
+        let claimed = daemon.cli(&["task", "claim", "--id", "cg3", "--worker", "w1"]);
+        assert!(claimed.status.success(), "{}", stderr_of(&claimed));
+        let cg_gen = claim_generation_of(&stdout_of(&claimed));
         let proposed = daemon.cli(&[
             "task",
             "propose",
@@ -1937,6 +2023,8 @@ fn the_governed_execution_is_audited_and_survives_a_restart() {
             "cg3",
             "--worker",
             "w1",
+            "--claim-generation",
+            cg_gen.as_str(),
             "--capability",
             "filesystem/write-text",
             "--target",
@@ -2012,7 +2100,16 @@ fn the_provider_flags_are_wired_and_the_credential_is_required_before_any_reques
             .success()
     );
 
-    let refused = daemon.cli(&["task", "ai-propose", "--task", "k1", "--worker", "ai"]);
+    let refused = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "k1",
+        "--worker",
+        "ai",
+        "--claim-generation",
+        "1",
+    ]);
     assert!(
         !refused.status.success(),
         "no usable request means no proposal"
@@ -2068,7 +2165,16 @@ fn a_daemon_with_no_provider_flags_refuses_to_propose() {
             .success()
     );
 
-    let refused = daemon.cli(&["task", "ai-propose", "--task", "u1", "--worker", "ai"]);
+    let refused = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "u1",
+        "--worker",
+        "ai",
+        "--claim-generation",
+        "1",
+    ]);
     assert!(
         !refused.status.success(),
         "an unconfigured daemon must not propose"
@@ -2110,7 +2216,16 @@ fn a_user_asks_the_ai_proposer_and_the_governed_path_finishes_the_job() {
             .success()
     );
 
-    let proposed = daemon.cli(&["task", "ai-propose", "--task", "e1", "--worker", "ai"]);
+    let proposed = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "e1",
+        "--worker",
+        "ai",
+        "--claim-generation",
+        "1",
+    ]);
     assert!(proposed.status.success(), "{}", stderr_of(&proposed));
     let out = stdout_of(&proposed);
     assert!(out.contains("proposed_by: ai"), "{out}");
@@ -2179,7 +2294,16 @@ fn the_ai_proposer_cannot_approve_or_execute() {
     let daemon = Daemon::start(&root);
     daemon.cli(&["task", "create", "--id", "e2", "x"]);
     daemon.cli(&["task", "claim", "--id", "e2", "--worker", "ai"]);
-    let proposed = daemon.cli(&["task", "ai-propose", "--task", "e2", "--worker", "ai"]);
+    let proposed = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "e2",
+        "--worker",
+        "ai",
+        "--claim-generation",
+        "1",
+    ]);
     let pid = propose_id(&proposed);
 
     // Executing before approval.
@@ -2245,7 +2369,16 @@ fn a_person_can_run_a_two_step_task_through_continue_and_the_capability_approve_
     assert!(claimed.status.success(), "{}", stderr_of(&claimed));
 
     // Step 1, proposed by the model.
-    let first = daemon.cli(&["task", "ai-propose", "--task", "ms1", "--worker", "w1"]);
+    let first = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "ms1",
+        "--worker",
+        "w1",
+        "--claim-generation",
+        "1",
+    ]);
     assert!(first.status.success(), "{}", stderr_of(&first));
     let p1 = propose_id(&first);
 
@@ -2764,6 +2897,8 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
         "ambient-1",
         "--worker",
         "w1",
+        "--claim-generation",
+        "1",
     ]);
     assert!(
         !refused.status.success(),
@@ -2780,7 +2915,16 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
     assert!(created.status.success(), "{}", stderr_of(&created));
     let claimed = daemon.cli(&["task", "claim", "--id", "pty-1", "--worker", "w1"]);
     assert!(claimed.status.success(), "{}", stderr_of(&claimed));
-    let proposed = daemon.cli(&["task", "ai-propose", "--task", "pty-1", "--worker", "w1"]);
+    let proposed = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "pty-1",
+        "--worker",
+        "w1",
+        "--claim-generation",
+        "1",
+    ]);
     assert!(
         proposed.status.success(),
         "the model must propose: {}\n{}",
@@ -3434,7 +3578,16 @@ impl RefusalScenario {
         daemon.cli(&["task", "create", "--id", &task_id]);
         let claimed = daemon.cli(&["task", "claim", "--id", &task_id, "--worker", "w1"]);
         assert!(claimed.status.success(), "{}", stderr_of(&claimed));
-        let proposed = daemon.cli(&["task", "ai-propose", "--task", &task_id, "--worker", "w1"]);
+        let proposed = daemon.cli(&[
+            "task",
+            "ai-propose",
+            "--task",
+            &task_id,
+            "--worker",
+            "w1",
+            "--claim-generation",
+            "1",
+        ]);
         assert!(
             proposed.status.success(),
             "the model must propose: {}\n{}",
@@ -3893,7 +4046,16 @@ fn the_daemons_startup_output_never_carries_a_destination_it_cannot_show() {
             .status
             .success()
     );
-    let proposed = daemon.cli(&["task", "ai-propose", "--task", "s1", "--worker", "w1"]);
+    let proposed = daemon.cli(&[
+        "task",
+        "ai-propose",
+        "--task",
+        "s1",
+        "--worker",
+        "w1",
+        "--claim-generation",
+        "1",
+    ]);
     assert!(
         proposed.status.success(),
         "the model must be asked: {}\n{}",

@@ -269,7 +269,7 @@ pub fn help() -> String {
            {PROGRAM} task list\n  \
            {PROGRAM} task create --id <ID> [--kind <KIND>] <CONTENT>\n  \
            {PROGRAM} task claim --id <ID> --worker <WORKER>\n  \
-           {PROGRAM} task complete --id <ID> --worker <WORKER>\n  \
+           {PROGRAM} task complete --id <ID> --worker <WORKER> --claim-generation <N>\n  \
            {PROGRAM} --help\n\
          \n\
          Commands:\n  \
@@ -501,12 +501,32 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
         "complete" => {
             let id = flags.take("complete", "--id")?;
             let worker = flags.take("complete", "--worker")?;
+            let claim_generation: i64 = flags
+                .take("complete", "--claim-generation")?
+                .parse()
+                .map_err(|e| {
+                    CliError::BadArgument(format!(
+                        "`--claim-generation` is not a valid integer: {e}"
+                    ))
+                })?;
             flags.reject_all("complete")?;
-            TaskCommand::Complete { id, worker }
+            TaskCommand::Complete {
+                id,
+                worker,
+                claim_generation,
+            }
         }
         "propose" => {
             let task = flags.take("propose", "--task")?;
             let worker = flags.take("propose", "--worker")?;
+            let claim_generation: i64 = flags
+                .take("propose", "--claim-generation")?
+                .parse()
+                .map_err(|e| {
+                    CliError::BadArgument(format!(
+                        "`--claim-generation` is not a valid integer: {e}"
+                    ))
+                })?;
             let capability = flags.take("propose", "--capability")?;
             let params = flags.take("propose", "--params")?;
             let target = flags.take_optional("--target");
@@ -514,6 +534,7 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
             TaskCommand::Propose {
                 task,
                 worker,
+                claim_generation,
                 capability,
                 params,
                 target,
@@ -522,8 +543,20 @@ fn parse_task(args: &[String]) -> Result<(TaskCommand, Option<String>), CliError
         "ai-propose" => {
             let task = flags.take("ai-propose", "--task")?;
             let worker = flags.take("ai-propose", "--worker")?;
+            let claim_generation: i64 = flags
+                .take("ai-propose", "--claim-generation")?
+                .parse()
+                .map_err(|e| {
+                    CliError::BadArgument(format!(
+                        "`--claim-generation` is not a valid integer: {e}"
+                    ))
+                })?;
             flags.reject_all("ai-propose")?;
-            TaskCommand::AiPropose { task, worker }
+            TaskCommand::AiPropose {
+                task,
+                worker,
+                claim_generation,
+            }
         }
         "continue" => {
             let task = flags.take("continue", "--task")?;
@@ -698,7 +731,7 @@ impl Flags {
         // question, answered by what that verb `take`s and by `reject_all` refusing
         // whatever is left -- so `task create --target x` parses here and is then
         // refused by the verb, rather than being invisible to the task parser.
-        const KNOWN: [&str; 13] = [
+        const KNOWN: [&str; 14] = [
             "--id",
             "--kind",
             // How many logical steps a task may have. Optional, and defaulted by the
@@ -718,6 +751,8 @@ impl Flags {
             // recomputes its digest, so holding one grants nothing by itself.
             "--approval",
             "--ttl-ms",
+            // The generation returned by `task claim`, carried to `task complete`.
+            "--claim-generation",
             // `schedule add`. The cron expression is one argument containing spaces, which
             // is why it is quoted in every example: unquoted, a shell glob-expands it and
             // the program never sees it.
@@ -1270,7 +1305,16 @@ mod tests {
             vec!["task", "create", "--id", "x", "c"],
             vec!["task", "list"],
             vec!["task", "claim", "--id", "x", "--worker", "w"],
-            vec!["task", "complete", "--id", "x", "--worker", "w"],
+            vec![
+                "task",
+                "complete",
+                "--id",
+                "x",
+                "--worker",
+                "w",
+                "--claim-generation",
+                "1",
+            ],
             vec!["task", "cancel", "--id", "x"],
             vec!["capability", "run", "--capability", "x", "--params", "{}"],
             // The cron expression is ONE argument containing spaces, exactly as a shell
@@ -1334,12 +1378,22 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(["task", "complete", "--id", "t1", "--worker", "w1"])
-                .expect("parses")
-                .command,
+            parse([
+                "task",
+                "complete",
+                "--id",
+                "t1",
+                "--worker",
+                "w1",
+                "--claim-generation",
+                "7"
+            ])
+            .expect("parses")
+            .command,
             Command::Task(TaskCommand::Complete {
                 id: "t1".to_owned(),
                 worker: "w1".to_owned(),
+                claim_generation: 7,
             })
         );
         assert_eq!(
