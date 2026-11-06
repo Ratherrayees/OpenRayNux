@@ -600,11 +600,22 @@ rather than declared and assumed.
 >
 > Full account in [`README.md`](README.md) §8.
 
+### The latest full local gate (2026-11-05)
+
+`CI=true ./scripts/ci-gates.sh` exited 0 with **all selected gates passed**: 17 passed,
+0 failed, and 1 documented skip — G12 semver, which has no release tag to compare
+against. G9 ran **2001 tests: 2001 passed, 0 failed, 6 skipped**, with 2 *leaky*
+results (process accounting, not failures), and all **36 coverage paths** verified
+(`verified=36 reduced=0 not-exercised=0 missing=0`). G6 passed after the two test-code
+Clippy corrections. This is local Linux verification; it is not Windows verification
+and not a completed hosted GitHub Actions run.
+
 ### The current baseline, precisely
 
 * **1655 tests, 1655 passed, 0 failed, 7 ignored** locally on a host that can create an
     unprivileged user namespace. *(Was 1419/1419 with 5 skipped before the 2026-10-08
-    reconciliation: the suite grew by 236 tests and the ignored count by 2.)*
+    reconciliation: the suite grew by 236 tests and the ignored count by 2. This is the
+    2026-10-08 baseline, retained as history; the 2026-11-05 result is above.)*
 * The **7 ignores** are `#[ignore]`d child-process entry points — re-exec targets for
   power-loss and failure injection, and the hostile sandbox helper. They are entry points,
   not tests.

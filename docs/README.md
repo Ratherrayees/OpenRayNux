@@ -5,9 +5,12 @@ Status: **Stages 1–4c delivered. Both 4c wirings are in production: the contin
 
 Header, counts and the sections touched by the 2026-10-23/24 remediation were
 re-measured against the current worktree at `HEAD` (`1e1f8cf`). The
-latest full local gate run (2026-10-24) is **1997 run, 1997 passed, 0 failed, 6
+latest full local gate run (2026-11-05) is **2001 run, 2001 passed, 0 failed, 6
 skipped, 2 leaky** (`cargo nextest run --workspace`, as run by gate G9; the leak count
-is process accounting, not a test failure). The suite tracks **36 coverage paths**.
+is process accounting, not a test failure). The suite tracks **36 coverage paths**, all
+verified on that run (`verified=36 reduced=0 not-exercised=0 missing=0`); G12 remains a
+documented skip because no release tag is available. This is local Linux verification,
+not Windows verification.
 Gate G9 does **not** accept a `cargo test --workspace` run as equivalent; that old
 claim and the "1652"/"1655" counts are stale. CI has **six jobs** (see §8), but no
 hosted run is recorded against this tree. The historical `v95_concurrency` failure
@@ -49,8 +52,13 @@ capability set. One surface ships today.
 
 ## 2. What is actually executable
 
-Three capabilities are registered. This is the whole list, from one function
-(`shipped_declarations()`) so the registry, the bundles and the policy table cannot drift.
+Three shipped capabilities are declared and granted independently of adapter registration.
+`AdapterRegistry::shipped(workspace)` in `crates/orxnud-capability/src/dispatch.rs` always
+registers `text/word-count`; it registers `filesystem/write-text` when the `orxnud-fswrite`
+helper resolves, and registers `filesystem/read-text` when that same helper path resolves,
+deriving the `orxnud-fsread` path without independently validating it. If `orxnud-fswrite`
+cannot be resolved, both filesystem adapters are omitted and dispatch refuses those
+capabilities with `NoImplementation`.
 Only `text/word-count` runs without an approval in the shipped build:
 
 ```bash
@@ -196,8 +204,8 @@ the surfaces listed last, and nothing else.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**1997 tests run, 1997 passed, 0 failed, 6 skipped** in the latest full local gate
-(2026-10-24), with 2 *leaky* results. The leak detector reports processes that outlive
+**2001 tests run, 2001 passed, 0 failed, 6 skipped** in the latest full local gate
+(2026-11-05), with 2 *leaky* results. The leak detector reports processes that outlive
 their test; the count varies between runs and is not a test failure. All 6 skips are
 `#[ignore]`d child-process entry points, not tests. No hosted run is recorded against
 this tree; on a host that cannot isolate, gate G9 excludes the Tier-1 sandbox-evidence
@@ -342,8 +350,8 @@ seconds on a warm target directory.
 | # | Document | What it is for |
 |---|----------|----------------|
 | **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, **§9a: where the implementation actually stands**, and **§10: the verifier-admission invariant (K.1)**. |
-| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 103 rows (101 V rows plus `K.1` and `F-26`): every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
-| **09** | [Architecture Decision Records](09-decisions.md) | 51 ADRs, ADR-0001…ADR-0053 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, which is not a separate record). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
+| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 106 rows (104 V rows plus `K.1` and `F-26`): every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
+| **09** | [Architecture Decision Records](09-decisions.md) | 56 primary ADRs, ADR-0001…ADR-0058 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, and ADR-0058 carries three implementation notes, none of which are separate records). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
 | **06** | [Deployment & Platform Model](06-deployment-platform-model.md) | Profiles, the platform boundary, and **§2.3: the honest per-platform assessment.** |
@@ -387,7 +395,7 @@ seconds on a warm target directory.
 | Disclosure | **One approval, two acts**, bound to `(endpoint, model)` | [0045](09-decisions.md#adr-0045) |
 | CI boundary | **A missing guarantee is a refusal to assert, not a skip** | [0046](09-decisions.md#adr-0046) |
 
-The full table of all 51 is in [09-decisions.md](09-decisions.md).
+The full table of all 56 primary ADRs is in [09-decisions.md](09-decisions.md).
 
 ## Open before implementation
 

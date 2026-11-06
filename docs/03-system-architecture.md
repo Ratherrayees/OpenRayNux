@@ -658,8 +658,18 @@ so a bypass surfaces as a loud failure rather than a silent unsandboxed run. Gat
 a program and arguments, because that would be the `dispatcher -> direct subprocess`
 bypass the whole design exists to prevent.
 
-Three capabilities are registered (`crates/orxnud-daemon/src/lib.rs::shipped_declarations`,
-one list so the registry, the bundles and the policy table cannot drift):
+Three shipped capabilities are declared and granted independently of adapter registration.
+The adapter bundles come from `AdapterRegistry::shipped(workspace)` in
+`crates/orxnud-capability/src/dispatch.rs`: `text/word-count` is always registered;
+`filesystem/write-text` is registered when the `orxnud-fswrite` helper resolves; and
+`filesystem/read-text` is registered when that same helper path resolves, with the
+`orxnud-fsread` path derived by replacing the filename and not independently validated. If
+`orxnud-fswrite` cannot be resolved, both filesystem adapters are omitted even though their
+capabilities remain declared and granted, and dispatch refuses them with
+`NoImplementation`. If `orxnud-fswrite` resolves but `orxnud-fsread` is unavailable, the
+read adapter is still registered and failure occurs later during execution. The composition
+and startup paths do not validate consistency between declarations, policy grants, and
+registered adapters:
 
 | id | Risk | Tier | Target | Idempotent | Approval |
 |---|---|---|---|---|---|

@@ -380,13 +380,24 @@ can establish. See ADR-0035.
 
 ---
 
-## 9. Capability inventory — what is registered at `HEAD`
+## 9. Shipped capability inventory — declarations and authorization at HEAD
 
-**Three capabilities, and this is the whole list.** It comes from one function,
-`shipped_declarations()` in `crates/orxnud-daemon/src/lib.rs`, deliberately a single list
-so the registry, the adapter bundles and the policy table cannot drift apart — three
-hand-written lists eventually disagree, and the disagreement is a capability that is
-declared but unresolvable, or resolvable but undeclared.
+**Three shipped capabilities are declared and granted independently of adapter
+registration.** `AdapterRegistry::shipped(workspace)` in
+`crates/orxnud-capability/src/dispatch.rs` always registers `text/word-count`; it registers
+`filesystem/write-text` when the `orxnud-fswrite` helper resolves, and registers
+`filesystem/read-text` when that same helper path resolves, deriving the `orxnud-fsread`
+path by replacing the filename; the read helper is not independently validated during
+registration. If `orxnud-fswrite` cannot be resolved, both filesystem adapters are omitted
+even though their capabilities remain declared and granted, and dispatch then refuses
+requests for them with `NoImplementation`. If `orxnud-fswrite` resolves but
+`orxnud-fsread` is unavailable, the read adapter is still registered and failure occurs
+later during execution. The composition and startup paths do not validate consistency
+between declarations, policy grants, and registered adapters.
+
+The following table lists the three shipped capabilities declared and granted by the
+daemon. It does not imply that all three adapters are available; adapter registration
+depends on helper resolution as described above.
 
 | id | Risk | Tier | Data classes | Target | Idempotent | Approval |
 |---|---|---|---|---|---|---|

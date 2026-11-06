@@ -573,6 +573,58 @@ distinguish the owner from a compromised process of the owner. Nothing here depe
 on that distinction. `AuthChannel::LocalInteractive` likewise records that the
 caller is local and same-owner, not that a person is at a keyboard.
 
+**The `worker` identity is not that peer identity.** S34 establishes *which OS user*
+the caller is; it says nothing about *which logical worker* a request claims to be.
+`worker` is a caller-supplied lease label with a two-step lifecycle. `task/claim`
+records the supplied identifier as the task's `lease_holder`. Every subsequent
+claim-bound operation (`task/complete`, `task/propose`, `task/ai-propose`) supplies a
+worker identifier and a `claim_generation`, and the store compares both against the
+current task row: `lease_holder` must equal the supplied worker, the lease must still be
+live, and `claim_generation` must equal the current generation. `worker` is never
+compared against the authenticated principal, and no mechanism binds the two. It is a
+fencing label and a stored fact about the lease, not evidence of who is calling.
+
+**Normative (settled 2026-11-05): agent-spawned processes are untrusted by default,
+including when they run as the same OS user as the daemon.** This is a requirement on
+callers and on future work. It is not a description of an implemented control, and
+nothing below may be read as satisfying it.
+
+**Implemented and measured.** The transport asks the kernel for the connected peer's
+credentials with `SO_PEERCRED`. The kernel reports real uid, gid and pid at connect
+time; `TransportPrincipal` retains **only the uid**, so gid and pid are discarded at
+the platform boundary. The daemon compares that uid for equality with the uid that owns
+the bound endpoint and refuses every other connection; the endpoint is `0600` inside a
+`0700` state root, so another OS user cannot connect in the first place. The pid is
+never retained, checked against a process table, or bound to a worker label. What this
+authenticates is *an installation-owner OS user* — not a process, not a session.
+
+**Implemented limitation.** Because `worker` is caller-supplied and unbound, a process
+running as the installation owner can *name* any worker label. Acting as another worker
+takes more than the name: it must also present that worker's current `claim_generation`
+while the lease is live. A same-uid process that obtains both can impersonate the
+worker; an arbitrary worker string alone does not satisfy the current claim checks. The
+transport's principal is a single "installation owner"; it is not a per-agent identity.
+
+**Not implemented.** No per-agent or per-process authentication, no credential or
+capability token bound to a caller, and no OS-enforced isolation between agent-spawned
+processes and the daemon. No code here distinguishes two processes of the
+installation-owner uid. Until such a control exists, any process of that uid that holds
+a worker label and its current generation can speak as that worker, and an agent's
+safety depends on untrusted code not running under that user.
+
+**What generation fencing does and does not buy.** The durable claim generation (V-103)
+requires a claim-bound mutation to present the generation minted by the claim it
+currently holds, alongside the worker name and a live lease. That refuses the accidental
+case — a continuation whose lease was reclaimed while the model was being asked — and it
+refuses a caller *replaying an old generation*. It does not refuse a caller who has a
+current generation and the worker label: the generation is a fencing token, not a
+credential. It is returned in the claim reply and stored in `tasks.claim_generation`;
+the state root (`0700`) and database (`0600`) exclude other OS users, but they do not
+distinguish processes sharing the daemon's uid, which can read the database. The value
+carries no secret. Fencing is therefore concurrency control, never authentication, and
+no code may treat "the worker name and generation matched" as "the caller is that
+worker".
+
 
 ## 5. Approval levels
 
