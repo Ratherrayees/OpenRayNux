@@ -1,0 +1,129 @@
+# Runner-capability probe: measures whether a GitHub-hosted runner image can
+# establish the Tier-1 sandbox guarantees this project requires.
+#
+# # Why this exists
+#
+# The `sandbox-integration` lane measures the Tier-1 posture on `ubuntu-24.04` and
+# reports that the host cannot create the unprivileged user namespace `bwrap` needs:
+# Ubuntu 24.04 sets `kernel.apparmor_restrict_unprivileged_userns`, so every Tier-1
+# dispatch there is refused. That refusal is the *correct* behaviour on a host that
+# cannot isolate -- it is Tier-1 failing closed (ADR-0035, ADR-0046) -- but it is not
+# positive evidence that the governed path executes under isolation anywhere in CI.
+#
+# The question this probe answers is narrow and factual: **on a given runner image,
+# can a Tier-1 capability be sandboxed, and is the sandbox the production one?** The
+# answer comes from `scripts/preflight.sh`, which delegates to the same probe and the
+# same `AvailableGuarantees::check` the dispatcher uses, so it cannot disagree with a
+# dispatch that refused a capability.
+#
+# # What this is not
+#
+# * It is **not a gate**. It gates nothing, is not in any required-checks list, and
+#   cannot make a commit fail. A green probe means "the environment was measured", not
+#   "the sandbox was proven" -- the distinction the `sandbox-integration` lane's own
+#   header insists on.
+# * It is **not a lane**. It is dispatched by hand, and it changes no existing lane,
+#   image pin, or test. If a candidate image turns out to be able to isolate, moving
+#   the Tier-1 lane onto it is a separate, deliberate commit with the reason attached
+#   (the image pin exists so a recorded finding stays attributable to the image it was
+#   taken on).
+# * It is **not a way to weaken the host**. It installs `bubblewrap` if the image does
+#   not ship it -- the production backend, not a substitute -- and it does not disable
+#   AppArmor, grant a capability, or ask for `CAP_SYS_ADMIN`. The whole point is to
+#   find out what the stock image can do.
+#
+# # Why the matrix
+#
+# `ubuntu-24.04` is the pinned image, so it is the control: the probe must reproduce
+# the `sandbox-integration` lane's current result there, or it is not measuring what it
+# claims to measure. A candidate image is measured beside the control rather than on
+# its own, so "this image can isolate" is a statement about the difference between two
+# images rather than about one of them in isolation.
+name: Runner capability probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Sandbox capability on ${{ matrix.image }}
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 20
+    strategy:
+      # Every image is measured, even after one of them answers: the control is what
+      # makes the candidate's answer legible.
+      fail-fast: false
+      matrix:
+        image: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # What the host is, before anything is inferred from a red test. The AppArmor
+      # userns restriction is the reason the current image cannot isolate, so it is
+      # recorded rather than guessed at.
+      - name: Report the host's user-namespace policy
+        run: |
+          set -uo pipefail
+          {
+            echo "### runner capability probe: ${{ matrix.image }}"
+            echo ''
+            echo '```'
+            echo "image:           $(lsb_release -ds 2>/dev/null || echo unknown)"
+            echo "kernel:          $(uname -r)"
+            echo "bwrap:           $(command -v bwrap || echo absent)"
+            echo "apparmor:        $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+            echo "userns_restrict: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+            echo "userns_clone:    $(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure bubblewrap is present
+        run: |
+          set -uo pipefail
+          if command -v bwrap >/dev/null 2>&1; then
+            echo "bwrap is preinstalled: $(bwrap --version)"
+          else
+            echo "bwrap is not preinstalled on this image; installing the production backend"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq bubblewrap
+            bwrap --version
+          fi
+
+      # The measurement. The reporting form never fails, so the log always says what
+      # the host can do.
+      - name: Measure the Tier-1 posture
+        run: ./scripts/preflight.sh
+
+      # The strict form: it also fails unless the sandbox identity is the nested,
+      # unprivileged shape -- the production configuration. A host that can isolate
+      # only by already holding `CAP_SYS_ADMIN` is not the sandbox users run, and
+      # this is the check that refuses to call it one.
+      #
+      # `continue-on-error` is deliberate: the exit status is the measurement, not a
+      # verdict on the repository. It is recorded in the summary either way, so a
+      # probe that answers "this image cannot isolate" is not reported as a failure
+      # of anything.
+      - name: Require the production Tier-1 posture
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          ./scripts/preflight.sh --require
+          status=$?
+          {
+            echo ''
+            echo "preflight --require exit status: $status"
+            if [ "$status" -eq 0 ]; then
+              echo 'result: the production Tier-1 posture is established on this image.'
+            else
+              echo 'result: the production Tier-1 posture is NOT established on this image.'
+              echo '        Nothing about the governed path is proven here; the host refused,'
+              echo '        which is the correct behaviour on a host that cannot isolate.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
