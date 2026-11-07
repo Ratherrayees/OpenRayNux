@@ -846,7 +846,9 @@ fn is_runnable(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnerOnlyStatus, hard_link_count, observe_owner_only};
+    use super::hard_link_count;
+    #[cfg(unix)]
+    use super::{OwnerOnlyStatus, observe_owner_only};
 
     /// A freshly created file has exactly one name, and a hard link gives it a second.
     ///
