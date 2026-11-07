@@ -14,6 +14,6 @@
 
 [toolchain]
 channel = "1.98.1"
-components = ["rustfmt", "clippy", "rust-analyzer", "rust-docs"]
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-docs", "rust-src"]
 targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 profile = "minimal"
