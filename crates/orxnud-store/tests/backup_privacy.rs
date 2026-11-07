@@ -51,17 +51,17 @@ fn dir(tag: &str) -> PathBuf {
     d
 }
 
-/// The mode of `path`, in octal, or `None` where the platform has no mode bits.
+/// The mode of `path`, in octal, or `None` where it cannot be read.
+///
+/// Unix-only, and deliberately not stubbed for the platforms that have no mode
+/// bits: a stub that returns `None` there would be dead code, and this file
+/// compiles under `-D warnings` on Windows. The one test that asserts a mode is
+/// Unix-gated with it.
 #[cfg(unix)]
 fn mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(path).ok()?;
     Some(meta.permissions().mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn mode(_path: &Path) -> Option<u32> {
-    None
 }
 
 /// **The published pre-migration snapshot is private to its owner.**
