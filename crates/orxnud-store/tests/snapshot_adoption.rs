@@ -33,10 +33,16 @@ use orxnud_domain::platform::{
     SqliteMainDatabase, SqliteMainFacts,
 };
 use orxnud_platform_fs::OsIdentity;
+#[cfg(unix)]
 use orxnud_store::backup::Backup;
 use orxnud_store::migration::{MigrationError, MigrationRunner};
 
-/// The mode of `path`, in octal, or `None` where the platform has no mode bits.
+/// The mode of `path`, in octal, or `None` where it cannot be read.
+///
+/// Unix-only, and deliberately not stubbed for the platforms that have no mode
+/// bits: a stub that returns `None` there would be dead code, and this file
+/// compiles under `-D warnings` on Windows. Every assertion on a mode is
+/// Unix-gated with it.
 #[cfg(unix)]
 fn mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
@@ -44,20 +50,12 @@ fn mode(path: &Path) -> Option<u32> {
     Some(meta.permissions().mode() & 0o7777)
 }
 
-#[cfg(not(unix))]
-fn mode(_path: &Path) -> Option<u32> {
-    None
-}
-
-/// Sets `path`'s mode. A no-op where the platform has no mode bits.
+/// Sets `path`'s mode. Unix-only, and not stubbed, for the reason `mode` is not.
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
 }
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
 
 /// A scratch directory, unique per test name and per call.
 fn dir(tag: &str) -> PathBuf {
@@ -100,10 +98,10 @@ fn stage_a_database_whose_next_migration_fails(path: &Path) {
 /// # Why the first run is part of the fixture
 ///
 /// The adoption now refuses a snapshot that cannot be shown to belong to *this*
-/// database, and a snapshot taken with [`Backup::take`] directly from a
-/// database that has never been migrated carries no identity at all — so it is
-/// refused for that reason before the privacy and alias rules are ever reached.
-/// That refusal is a different finding and it is proved in
+/// database, and a snapshot taken with [`orxnud_store::backup::Backup::take`]
+/// directly from a database that has never been migrated carries no identity at
+/// all — so it is refused for that reason before the privacy and alias rules are
+/// ever reached. That refusal is a different finding and it is proved in
 /// `tests/snapshot_provenance.rs`.
 ///
 /// Running the production migration once produces the shape this file is about:

@@ -61,7 +61,12 @@ fn dir(tag: &str) -> PathBuf {
     d
 }
 
-/// The mode of `path`, in octal, or `None` where the platform has no mode bits.
+/// The mode of `path`, in octal, or `None` where it cannot be read.
+///
+/// Unix-only, and deliberately not stubbed for the platforms that have no mode
+/// bits: a stub that returns `None` there would be dead code, and this file
+/// compiles under `-D warnings` on Windows. Every test that asserts a mode is
+/// Unix-gated with it.
 #[cfg(unix)]
 fn mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
@@ -69,20 +74,12 @@ fn mode(path: &Path) -> Option<u32> {
     Some(meta.permissions().mode() & 0o7777)
 }
 
-#[cfg(not(unix))]
-fn mode(_path: &Path) -> Option<u32> {
-    None
-}
-
-/// Sets `path`'s mode. A no-op where the platform has no mode bits.
+/// Sets `path`'s mode. Unix-only, and not stubbed, for the reason `mode` is not.
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
 }
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
 
 /// **A newly opened database is private to its owner.**
 ///
