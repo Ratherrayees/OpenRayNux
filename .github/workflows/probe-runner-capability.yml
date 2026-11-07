@@ -67,19 +67,27 @@ jobs:
       # What the host is, before anything is inferred from a red test. The AppArmor
       # userns restriction is the reason the current image cannot isolate, so it is
       # recorded rather than guessed at.
+      #
+      # The facts go to **stdout as well as** the step summary: a finding that
+      # lives only in a summary is evidence that cannot be quoted from a log.
       - name: Report the host's user-namespace policy
         run: |
           set -uo pipefail
+          facts=$(cat <<EOF
+          image:           $(lsb_release -ds 2>/dev/null || echo unknown)
+          kernel:          $(uname -r)
+          bwrap:           $(command -v bwrap || echo absent)
+          apparmor:        $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)
+          userns_restrict: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)
+          userns_clone:    $(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)
+          EOF
+          )
+          echo "$facts"
           {
             echo "### runner capability probe: ${{ matrix.image }}"
             echo ''
             echo '```'
-            echo "image:           $(lsb_release -ds 2>/dev/null || echo unknown)"
-            echo "kernel:          $(uname -r)"
-            echo "bwrap:           $(command -v bwrap || echo absent)"
-            echo "apparmor:        $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
-            echo "userns_restrict: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
-            echo "userns_clone:    $(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)"
+            echo "$facts"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -92,7 +100,7 @@ jobs:
             echo "bwrap is not preinstalled on this image; installing the production backend"
             sudo apt-get update -qq
             sudo apt-get install -y -qq bubblewrap
-            bwrap --version
+            echo "bwrap installed by the probe: $(bwrap --version)"
           fi
 
       # The measurement. The reporting form never fails, so the log always says what
