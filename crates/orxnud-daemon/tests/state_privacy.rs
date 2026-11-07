@@ -26,6 +26,8 @@
 //! happened — so the assertions here are Unix-gated, and the Windows limit is
 //! stated rather than papered over.
 
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
