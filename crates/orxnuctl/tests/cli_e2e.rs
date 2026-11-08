@@ -1413,6 +1413,24 @@ fn running_a_capability_with_no_daemon_fails_cleanly() {
 // pretending; see `write_text` in the capability suite for the same distinction at
 // the unit level.
 
+/// Creates the workspace the way the daemon does.
+///
+/// `create_dir_all` takes the process umask and yields `0755`; the daemon's own
+/// `ensure_workspace` creates it `0700` through `create_private_dir`. A fixture that
+/// pre-creates a workspace at `0755` is a layout the product never produces, and the
+/// state-root validation refuses it for that reason -- correctly. So the fixture makes
+/// what the daemon makes.
+fn make_workspace(root: &std::path::Path) -> std::path::PathBuf {
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("mkdir the workspace");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700));
+    }
+    ws
+}
+
 /// The workspace the daemon confines writes to.
 fn workspace(root: &std::path::Path) -> std::path::PathBuf {
     root.join("workspace")
@@ -2838,8 +2856,7 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
     use std::time::Duration;
 
     let root = dir("read-pty");
-    let ws = workspace(&root);
-    std::fs::create_dir_all(&ws).expect("mkdir the workspace");
+    let ws = make_workspace(&root);
     let sentinel = "PTY-READ-SENTINEL-4b7e2a";
     std::fs::write(ws.join("a.txt"), sentinel).expect("seed the file");
 
@@ -3558,8 +3575,7 @@ impl RefusalScenario {
 
     fn start_with(tag: &str, provider_path: &str, capture_stderr: bool) -> Self {
         let root = dir(tag);
-        let workspace = workspace(&root);
-        std::fs::create_dir_all(&workspace).expect("mkdir the workspace");
+        let workspace = make_workspace(&root);
         let sentinel = format!("REFUSAL-SENTINEL-{tag}-a91c");
         std::fs::write(workspace.join("a.txt"), &sentinel).expect("seed the file");
         let credential = synthetic_credential();

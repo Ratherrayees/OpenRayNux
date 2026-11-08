@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_protocol::error::RpcErrorCode;
 use serde_json::{Value, json};
@@ -135,10 +135,14 @@ impl Serving {
     /// around a capability the default posture refuses. This one does not, so a test can
     /// observe what a user who installed the daemon and changed nothing actually gets.
     async fn start_default_posture(root: PathBuf) -> Self {
-        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
-            .await
-            .expect("the runtime must start")
-            .with_proposer(orxnud_daemon::runtime::scripted_proposer());
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(orxnud_daemon::runtime::scripted_proposer());
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -164,11 +168,14 @@ impl Serving {
         root: PathBuf,
         provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
     ) -> Self {
-        let runtime =
-            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
-                .await
-                .expect("the runtime must start")
-                .with_proposer(provider);
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

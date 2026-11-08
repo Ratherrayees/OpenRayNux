@@ -81,7 +81,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,6 +94,62 @@ use crate::contract::{
 
 /// The bubblewrap executable.
 const BWRAP: &str = "bwrap";
+
+/// The directories the Linux command builder binds from the host, in emission order.
+///
+/// # Why this is a `pub const` and not an inline array
+///
+/// The daemon validates its state root and workspace against the set of paths that
+/// will actually be mounted, and a second copy of this list would be a second answer
+/// to "what gets mounted" — the two drifting apart is how a validator starts
+/// rejecting nothing. So the list lives here, [`host_backed_bind_destinations`] is
+/// the one function that filters it, and both this file and the daemon call that
+/// function.
+pub const HOST_BACKED_BIND_CANDIDATES: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin"];
+
+/// The destinations bubblewrap creates itself inside the new root.
+///
+/// `/proc` and `/dev` are built by bubblewrap rather than bound from the host, so
+/// they cannot carry a host symlink into the destination walk. They are still
+/// destinations: a grant placed beneath one is later shadowed by it, which is a
+/// namespace collision rather than an escape, and the daemon rejects those too —
+/// through [`BWRAP_CREATED_DESTINATIONS`], for that different reason.
+///
+/// `/tmp` is deliberately **not** here. It is a fresh empty tmpfs, mounted *before*
+/// any grant, so no pre-existing symlink can appear in it.
+pub const BWRAP_CREATED_DESTINATIONS: &[&str] = &["/proc", "/dev"];
+
+/// The host-backed bind destinations this host will actually bind.
+///
+/// The existence filter is the command builder's own: a candidate that does not exist
+/// on this host is not bound, and on a merged-`/usr` layout `/bin`, `/lib`,
+/// `/lib64` and `/sbin` are symlinks into `/usr` that still exist and are still
+/// bound. Filtering here — rather than letting the daemon guess — is what makes the
+/// daemon's overlap check see exactly the mounts that will happen.
+///
+/// # What this does not tell you
+///
+/// These are the *destination* paths as bubblewrap spells them. A caller comparing
+/// its own canonical path against them must also compare against the canonical form
+/// of each one, because on a merged-`/usr` host `realpath("/bin")` is `/usr/bin`
+/// while the mount is still spelled `/bin`. The daemon does both; see its validator.
+#[must_use]
+pub fn host_backed_bind_destinations() -> Vec<&'static str> {
+    HOST_BACKED_BIND_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|d| std::path::Path::new(d).exists())
+        .collect()
+}
+
+/// The destinations bubblewrap creates itself, on this host's backend.
+///
+/// Empty where there is no sandbox backend: nothing is mounted there, so nothing can
+/// collide.
+#[must_use]
+pub fn bwrap_created_destinations() -> Vec<&'static str> {
+    BWRAP_CREATED_DESTINATIONS.to_vec()
+}
 
 /// A Linux sandbox runner.
 ///
@@ -1016,12 +1071,13 @@ fn build_command(spec: &SandboxSpec) -> Result<(Vec<String>, String), SandboxUna
     argv.push("--tmpfs".into());
     argv.push("/tmp".into());
 
-    for dir in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
-        if Path::new(dir).exists() {
-            argv.push("--ro-bind".into());
-            argv.push(dir.into());
-            argv.push(dir.into());
-        }
+    // The one source of truth: the daemon's state-root validation asks this same
+    // function what will be mounted, so the two cannot disagree. Inline it here and
+    // the validator silently checks a shorter list than the sandbox actually builds.
+    for dir in host_backed_bind_destinations() {
+        argv.push("--ro-bind".into());
+        argv.push(dir.into());
+        argv.push(dir.into());
     }
 
     for p in &spec.fs.read_only {
@@ -1099,6 +1155,114 @@ pub fn observed_only_limits() -> ResourceLimits {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // ------------------------------------------- one source of truth for the mounts
+
+    /// **Every host-backed mount `build_command` emits is in
+    /// [`host_backed_bind_destinations`], and nothing else is.**
+    ///
+    /// # Why this test exists
+    ///
+    /// The daemon validates its state root and workspace against that set, so a mount
+    /// that appears in the argv without appearing in the set is a location the daemon
+    /// believes is safe and the sandbox actually mounts. The two lists lived in the same
+    /// expression when this was written; a future edit that adds a bind — a new system
+    /// directory, a capability-supplied runtime path — would leave the validator
+    /// checking a shorter list than the sandbox builds, and nothing else would notice.
+    ///
+    /// This test fails in that case, in the direction that matters: it reads the real
+    /// rendered argv rather than re-deriving the expectation, so it cannot agree with a
+    /// wrong implementation.
+    ///
+    /// # Why it is not a tautology
+    ///
+    /// It is not comparing the function with itself. The expected set is rebuilt here
+    /// from the argv by walking the flag pairs, which is a different traversal from the
+    /// filter the function performs — and it also pins the *literal destination
+    /// strings*, which is what the daemon's validator needs, rather than the resolved
+    /// host paths.
+    #[test]
+    fn every_host_backed_bind_in_the_argv_is_in_the_destination_set() {
+        let spec = SandboxSpec::new("/bin/true");
+        let (argv, _program) = build_command(&spec).expect("a trivial spec renders");
+
+        // Every `--ro-bind SRC DEST` and `--bind SRC DEST` pair, in order.
+        let mut i = 0;
+        let mut bound: Vec<String> = Vec::new();
+        while i < argv.len() {
+            if argv[i] == "--ro-bind" || argv[i] == "--bind" {
+                let src = argv
+                    .get(i + 1)
+                    .expect("a bind flag is followed by a source");
+                let dest = argv
+                    .get(i + 2)
+                    .expect("a bind flag is followed by a destination");
+                // Source and destination are the same string for the system binds this
+                // checks; a capability grant uses its own path. Only the *destination*
+                // matters for overlap, so that is what is collected.
+                assert_eq!(
+                    src, dest,
+                    "a bind whose source and destination differ is a capability grant, not a \
+                     system bind; this check is about the system mounts"
+                );
+                bound.push(dest.clone());
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+
+        let expected: Vec<&str> = host_backed_bind_destinations();
+        // The system binds are the ones whose destination is a candidate. A grant path
+        // that happens to equal a candidate is indistinguishable here and is fine: it
+        // would be bound either way, and the daemon's validator sees it.
+        for dest in &bound {
+            assert!(
+                expected.contains(&dest.as_str()),
+                "build_command emitted --ro-bind for {dest}, which \
+                 host_backed_bind_destinations() does not report; the daemon's state-root \
+                 validator would not know this path is mounted"
+            );
+        }
+        for want in &expected {
+            assert!(
+                bound.iter().any(|b| b == want),
+                "host_backed_bind_destinations() reports {want}, but build_command does not \
+                 bind it; the daemon would reject a state root beneath a path that is not \
+                 actually mounted"
+            );
+        }
+    }
+
+    /// The candidate list and the filtered set agree about what exists.
+    ///
+    /// A candidate that does not exist is filtered out, and one that does is kept — the
+    /// filter is the whole mechanism by which the daemon learns what will be mounted on
+    /// *this* host, so it is worth pinning both halves rather than only the set.
+    #[test]
+    fn the_destination_set_is_the_candidate_list_filtered_by_existence() {
+        let set = host_backed_bind_destinations();
+        for candidate in HOST_BACKED_BIND_CANDIDATES {
+            let exists = std::path::Path::new(candidate).exists();
+            assert_eq!(
+                set.contains(candidate),
+                exists,
+                "{} is {} but the destination set {} it; the daemon's overlap check \
+                 depends on this filter being exactly the build's own",
+                candidate,
+                if exists { "present" } else { "absent" },
+                if set.contains(candidate) {
+                    "includes"
+                } else {
+                    "excludes"
+                }
+            );
+        }
+        assert!(
+            set.len() <= HOST_BACKED_BIND_CANDIDATES.len(),
+            "the filtered set cannot be larger than the candidate list"
+        );
+    }
 
     // ------------------------------------------- `Refused` means "before", structurally
 

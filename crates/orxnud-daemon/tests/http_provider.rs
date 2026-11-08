@@ -1003,7 +1003,7 @@ fn provider_errors_are_vocabulary_and_never_credentials() {
 )]
 #[test]
 fn the_context_a_provider_receives_carries_the_declared_target_semantics() {
-    use orxnud_daemon::Paths;
+    use orxnud_daemon::{Paths, prepare_state_paths};
     use std::sync::Mutex;
 
     let rt = rt();
@@ -1036,7 +1036,8 @@ fn the_context_a_provider_receives_carries_the_declared_target_semantics() {
         ] {
             let root = dir(tag);
             let runtime = orxnud_daemon::runtime::Runtime::start_unconfigured(
-                Paths::under(&root),
+                prepare_state_paths(Paths::under(&root))
+                    .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
                 FixedSecrets::empty(),
             )
             .await
@@ -1133,8 +1134,8 @@ fn recorder_with(
 )]
 #[test]
 fn the_durable_proposal_names_the_model_that_actually_answered() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     const DISTINCTIVE: &str = "test/provider-model-xyz";
 
@@ -1147,7 +1148,10 @@ fn the_durable_proposal_names_the_model_that_actually_answered() {
         ))
         .await;
 
-        let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
+        let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            FixedSecrets::empty())
             .await
             .expect("the runtime starts")
             .with_proposer(Arc::new(
@@ -1227,8 +1231,8 @@ fn the_durable_proposal_names_the_model_that_actually_answered() {
 )]
 #[test]
 fn two_daemons_record_their_own_providers_model() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     let rt = rt();
     rt.block_on(async {
@@ -1250,7 +1254,10 @@ fn two_daemons_record_their_own_providers_model() {
             );
             config.completions_path = "/chat/completions".to_owned();
 
-            let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
+            let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            FixedSecrets::empty())
                 .await
                 .expect("the runtime starts")
                 .with_proposer(Arc::new(
@@ -1338,15 +1345,18 @@ fn recorded_provenance(root: &std::path::Path) -> String {
 )]
 #[test]
 fn a_real_provider_proposes_through_a_real_daemon() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     rt().block_on(async {
         let root = dir("e2e-ok");
         let proposal = r#"{"capability":"filesystem/write-text","target":"final.txt","params":{"path":"final.txt","contents":"from a real provider"}}"#;
         let (address, server) = serve_once(Reply::Content(proposal.to_owned())).await;
 
-        let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
+        let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            FixedSecrets::empty())
             .await
             .expect("the runtime starts with no provider")
             .with_proposer(Arc::new(plaintext_provider(
@@ -1417,8 +1427,8 @@ fn a_real_provider_proposes_through_a_real_daemon() {
 )]
 #[test]
 fn an_unconfigured_daemon_refuses_rather_than_using_the_scripted_provider() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     rt().block_on(async {
         let root = dir("e2e-unconfigured");
@@ -1428,7 +1438,10 @@ fn an_unconfigured_daemon_refuses_rather_than_using_the_scripted_provider() {
             serve_once(Reply::Content(r#"{"capability":"filesystem/write-text","target":"x","params":{"path":"x","contents":"x"}}"#.to_owned())).await;
         let _ = address;
 
-        let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
+        let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            FixedSecrets::empty())
             .await
             .expect("the runtime starts");
         assert!(!runtime.has_proposer(), "no provider must be configured");
@@ -1500,8 +1513,8 @@ fn an_unconfigured_daemon_refuses_rather_than_using_the_scripted_provider() {
 )]
 #[test]
 fn a_provider_failure_leaves_the_task_executable_by_nobody() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     rt().block_on(async {
         let root = dir("e2e-failure");
@@ -1510,13 +1523,17 @@ fn a_provider_failure_leaves_the_task_executable_by_nobody() {
         ))
         .await;
 
-        let runtime = Runtime::start_unconfigured(Paths::under(&root), FixedSecrets::empty())
-            .await
-            .expect("the runtime starts")
-            .with_proposer(Arc::new(plaintext_provider(
-                &address,
-                FixedSecrets::holding("sk-test-key"),
-            )));
+        let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            FixedSecrets::empty(),
+        )
+        .await
+        .expect("the runtime starts")
+        .with_proposer(Arc::new(plaintext_provider(
+            &address,
+            FixedSecrets::holding("sk-test-key"),
+        )));
 
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();

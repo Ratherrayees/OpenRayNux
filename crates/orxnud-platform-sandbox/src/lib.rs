@@ -69,6 +69,7 @@ pub use contract::{
     SandboxUnavailable, TreeLifetime, Visibility,
 };
 pub use platform::{
-    HostCapability, UnsupportedRunner, host_backend, host_backend_mechanism, host_backend_name,
-    host_capability,
+    BWRAP_CREATED_DESTINATIONS, HOST_BACKED_BIND_CANDIDATES, HostCapability, UnsupportedRunner,
+    bwrap_created_destinations, host_backed_bind_destinations, host_backend,
+    host_backend_mechanism, host_backend_name, host_capability,
 };

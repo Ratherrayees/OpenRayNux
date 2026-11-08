@@ -27,8 +27,8 @@
 
 use std::process::ExitCode;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_platform_secrets::KeyringSecrets;
 
 const USAGE: &str = "\
@@ -551,10 +551,23 @@ async fn serve(
     // attached before the endpoint exists. If it fails here, nothing was bound.
     // The two arms are different `async fn`s, so they are awaited separately rather
     // than unified into one future: `bool::then` would give two distinct opaque types.
+    //
+    // The state root and workspace are validated **before** either arm runs, and the
+    // validated paths are the only thing either can accept. Doing it here rather than
+    // inside the constructors is what makes the ordering real: composition — including
+    // building the adapter registry from the workspace path — happens after validation,
+    // not before it.
+    let prepared = match prepare_state_paths(paths.clone()) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            eprintln!("orxnud: refusing to start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let started = if permit_argv_payload_for_tests {
-        Runtime::start_permitting_argv_payload_exposure(paths.clone(), secrets.clone()).await
+        Runtime::start_permitting_argv_payload_exposure(prepared.clone(), secrets.clone()).await
     } else {
-        Runtime::start_unconfigured(paths.clone(), secrets.clone()).await
+        Runtime::start_unconfigured(prepared, secrets.clone()).await
     };
     let mut runtime = match started {
         Ok(r) => r,

@@ -52,6 +52,11 @@ use crate::contract::{
     AvailableGuarantees, ExecutionResult, SandboxRunner, SandboxSpec, SandboxUnavailable,
 };
 
+pub use selected::{
+    BWRAP_CREATED_DESTINATIONS, HOST_BACKED_BIND_CANDIDATES, bwrap_created_destinations,
+    host_backed_bind_destinations,
+};
+
 #[cfg(target_os = "linux")]
 mod selected {
     use std::sync::Arc;
@@ -68,6 +73,23 @@ mod selected {
     #[must_use]
     pub fn runner() -> Arc<dyn SandboxRunner> {
         Arc::new(BwrapRunner::new())
+    }
+
+    /// The directories this backend binds from the host, in emission order.
+    pub const HOST_BACKED_BIND_CANDIDATES: &[&str] = crate::linux::HOST_BACKED_BIND_CANDIDATES;
+    /// The destinations this backend creates itself.
+    pub const BWRAP_CREATED_DESTINATIONS: &[&str] = crate::linux::BWRAP_CREATED_DESTINATIONS;
+
+    /// The host-backed destinations that will actually be bound.
+    #[must_use]
+    pub fn host_backed_bind_destinations() -> Vec<&'static str> {
+        crate::linux::host_backed_bind_destinations()
+    }
+
+    /// The destinations created by this backend rather than bound.
+    #[must_use]
+    pub fn bwrap_created_destinations() -> Vec<&'static str> {
+        crate::linux::bwrap_created_destinations()
     }
 }
 
@@ -87,6 +109,28 @@ mod selected {
     #[must_use]
     pub fn runner() -> Arc<dyn SandboxRunner> {
         Arc::new(UnsupportedRunner::new())
+    }
+
+    /// Nothing is bound from the host where there is no backend.
+    ///
+    /// Empty, and that is the correct answer rather than a gap: this backend mounts
+    /// nothing, so there is no destination for a caller's path to overlap. A caller
+    /// that validates against this set therefore passes — and then has its Tier-1
+    /// request refused by [`UnsupportedRunner`], which is the binding guarantee.
+    pub const HOST_BACKED_BIND_CANDIDATES: &[&str] = &[];
+    /// Nothing is created either.
+    pub const BWRAP_CREATED_DESTINATIONS: &[&str] = &[];
+
+    /// No host-backed destinations exist where there is no backend.
+    #[must_use]
+    pub fn host_backed_bind_destinations() -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// No backend-created destinations exist where there is no backend.
+    #[must_use]
+    pub fn bwrap_created_destinations() -> Vec<&'static str> {
+        Vec::new()
     }
 }
 
@@ -119,7 +163,6 @@ pub fn host_backend_mechanism() -> &'static str {
 }
 
 /// What this host can actually guarantee for a Tier-1 execution.
-///
 /// # Why this is a reported fact and not a probe of its own
 ///
 /// It reads [`host_backend`]'s own [`SandboxRunner::available_guarantees`] and runs the

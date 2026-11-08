@@ -118,6 +118,24 @@ impl Drop for Daemon {
 // capability here would have made the evidence conditional on sandbox infrastructure
 // for a defect that has nothing to do with sandboxing.
 
+/// Creates the workspace the way the daemon does.
+///
+/// `create_dir_all` takes the process umask and yields `0755`; the daemon's own
+/// `ensure_workspace` creates it `0700` through `create_private_dir`. A fixture that
+/// pre-creates a workspace at `0755` is a layout the product never produces, and the
+/// state-root validation refuses it for that reason -- correctly. So the fixture makes
+/// what the daemon makes.
+fn make_workspace(d: &std::path::Path) -> std::path::PathBuf {
+    let ws = d.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700));
+    }
+    ws
+}
+
 /// Injects a failure into the task-domain approval consumption.
 fn block_task_approval_consumption(db: &std::path::Path) {
     orxnud_store::Store::open(db, false, &orxnud_platform_fs::OsIdentity)
@@ -134,7 +152,7 @@ fn block_task_approval_consumption(db: &std::path::Path) {
 #[test]
 fn p1_20_a_consume_failure_must_not_let_the_capability_execute() {
     let d = dir("p1-20");
-    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    let _ws = make_workspace(&d);
     let s = Daemon::start(&d);
 
     send(

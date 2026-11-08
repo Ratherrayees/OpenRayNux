@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use orxnud_daemon::{Daemon, Paths};
+use orxnud_daemon::{Daemon, Paths, prepare_state_paths};
 
 /// A state root unique to this process and this call.
 fn root(tag: &str) -> PathBuf {
@@ -47,7 +47,10 @@ fn the_daemon_refuses_a_database_reachable_through_two_names() {
     // The ordinary path: the daemon attaches its durable security state, which
     // creates and migrates the database.
     {
-        let mut daemon = Daemon::compose(paths.clone());
+        let mut daemon = Daemon::compose(
+            prepare_state_paths(paths.clone())
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+        );
         daemon
             .attach_durable_security_state(&paths.database)
             .expect("the first attach must succeed");
@@ -62,7 +65,10 @@ fn the_daemon_refuses_a_database_reachable_through_two_names() {
     std::fs::hard_link(&paths.database, &alias).expect("hard link the database");
 
     // The daemon's own boundary must refuse it.
-    let mut daemon = Daemon::compose(paths.clone());
+    let mut daemon = Daemon::compose(
+        prepare_state_paths(paths.clone())
+            .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+    );
     let err = daemon
         .attach_durable_security_state(&paths.database)
         .expect_err("a database reachable through two names must be refused at startup");
@@ -82,7 +88,10 @@ fn the_daemon_refuses_a_database_reachable_through_two_names() {
     // Once the second name is gone, the same daemon path works again — so the
     // refusal released the lease rather than wedging the database.
     std::fs::remove_file(&alias).expect("remove the alias");
-    let mut daemon = Daemon::compose(paths.clone());
+    let mut daemon = Daemon::compose(
+        prepare_state_paths(paths.clone())
+            .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+    );
     daemon
         .attach_durable_security_state(&paths.database)
         .expect("the refusal must have released the lease");

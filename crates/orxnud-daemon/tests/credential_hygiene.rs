@@ -269,8 +269,8 @@ fn the_scripted_provider_needs_no_credential() {
 )]
 #[test]
 fn the_credential_reaches_no_file_the_daemon_owns() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -284,13 +284,16 @@ fn the_credential_reaches_no_file_the_daemon_owns() {
 
         // A real daemon, a real store, a real proposal — and the credential present in the
         // store the whole time.
-        let runtime =
-            Runtime::start_unconfigured(Paths::under(&root), RecordingStore::holding(SENTINEL))
-                .await
-                .expect("the runtime starts")
-                .with_proposer(std::sync::Arc::new(provider(RecordingStore::holding(
-                    SENTINEL,
-                ))));
+        let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            RecordingStore::holding(SENTINEL),
+        )
+        .await
+        .expect("the runtime starts")
+        .with_proposer(std::sync::Arc::new(provider(RecordingStore::holding(
+            SENTINEL,
+        ))));
         assert!(runtime.has_proposer());
 
         let endpoint = runtime.endpoint().to_path_buf();
@@ -370,8 +373,8 @@ fn a_store_error_quoting_the_credential_is_redacted() {
 /// the type.
 #[test]
 fn there_is_no_second_provider_to_fall_back_to() {
-    use orxnud_daemon::Paths;
     use orxnud_daemon::runtime::Runtime;
+    use orxnud_daemon::{Paths, prepare_state_paths};
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -383,9 +386,13 @@ fn there_is_no_second_provider_to_fall_back_to() {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a state root");
 
-        let runtime = Runtime::start_unconfigured(Paths::under(&root), RecordingStore::working())
-            .await
-            .expect("the runtime starts");
+        let runtime = Runtime::start_unconfigured(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            RecordingStore::working(),
+        )
+        .await
+        .expect("the runtime starts");
         assert!(!runtime.has_proposer());
         // One slot. `proposer()` returns the one provider or nothing.
         assert!(runtime.proposer().is_none());

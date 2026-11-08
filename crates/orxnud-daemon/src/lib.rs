@@ -109,6 +109,287 @@ pub struct Paths {
     pub log: std::path::PathBuf,
 }
 
+/// The sandbox mount a granted path would overlap, if any.
+///
+/// # Why this is a function and not inline in `prepare_state_paths`
+///
+/// The overlap rule is a pure property of two path sets — the granted paths and the
+/// mounts the backend will build — and it is the single most security-relevant line in
+/// the validation. Inlined, the only way to exercise it was to construct a real
+/// directory beneath `/usr`, which needs root, so on an ordinary run the rule was never
+/// tested at all and a green integration test proved nothing. Extracted, it is tested
+/// directly against the real mount sets, with no privilege required.
+///
+/// # The two sets, and why they are separate
+///
+/// **Host-backed** destinations are compared in *both* their literal and canonical
+/// forms, because those are different namespaces: on a merged-`/usr` host the mount is
+/// spelled `/bin` while its content comes from `/usr/bin`. Adding forms can only ever
+/// reject more, never less, so the union is safe.
+///
+/// **Sandbox-created** destinations (`/proc`, `/dev`) are compared literally. They are
+/// built by the sandbox inside its own root and have no host alias to resolve.
+///
+/// Both are read from `orxnud_platform_sandbox`, which owns `build_command`, so this
+/// cannot drift from what is actually mounted.
+pub(crate) fn mount_overlap(
+    granted: &std::path::Path,
+) -> Option<(std::path::PathBuf, &'static str)> {
+    for candidate in orxnud_platform_sandbox::host_backed_bind_destinations() {
+        let mut forms = vec![std::path::PathBuf::from(candidate)];
+        // A candidate whose canonical form cannot be resolved is still compared in its
+        // literal form, and the granted side is already canonical, so an unresolvable
+        // mount destination cannot silently stop being an overlap.
+        if let Ok(resolved) = std::fs::canonicalize(candidate)
+            && !forms.contains(&resolved)
+        {
+            forms.push(resolved);
+        }
+        for form in forms {
+            if orxnud_platform_fs::is_within(granted, &form) {
+                return Some((form, "host-backed"));
+            }
+        }
+    }
+    for destination in orxnud_platform_sandbox::bwrap_created_destinations() {
+        let form = std::path::PathBuf::from(destination);
+        if orxnud_platform_fs::is_within(granted, &form) {
+            return Some((form, "sandbox-created"));
+        }
+    }
+    None
+}
+
+/// Validates a state root and its workspace, and returns the paths that passed.
+///
+/// # What is checked
+///
+/// Every component from `/` down is walked descriptor-relatively with `O_NOFOLLOW`, so
+/// a symlinked component is refused where it appears rather than followed. Ownership,
+/// mode, and the absence of writable ancestors are checked per component, and the leaf
+/// is tightened to `0700` — which is the behaviour an existing world-readable root has
+/// always had, preserved rather than replaced.
+///
+/// The workspace is validated independently and then checked for containment: it must
+/// be a real directory beneath the canonical state root. A workspace that is a symlink
+/// pointing out of the root would otherwise be the thing the sandbox binds, which is a
+/// violation of the workspace boundary with the state root looking perfectly healthy.
+///
+/// # Where the mount rules come from
+///
+/// The overlap and collision rules are **not** written here**. They are read from
+/// `orxnud_platform_sandbox`, which owns `build_command` and therefore owns the answer
+/// to "what will be mounted". A second copy in this crate would be a second answer, and
+/// the two drifting apart is how a validator ends up rejecting nothing.
+///
+/// The comparison is done in host-canonical space on both sides. On a merged-`/usr`
+/// host, `realpath("/bin")` is `/usr/bin` while the mount is still spelled `/bin`, so
+/// comparing a canonical workspace against the literal candidate alone would miss the
+/// overlap — the union of literal and resolved forms is what closes it, and adding
+/// forms can only ever reject more, never less.
+///
+/// # What is not checked here
+///
+/// The helper executable. Its integrity — link count, ownership, mode, capabilities —
+/// is S3's subject, not this function's, and conflating them would make both harder to
+/// reason about. What *is* checked here is only whether the helper's location would be
+/// mounted, because that is a property of the path layout rather than of the binary.
+///
+/// # Errors
+///
+/// [`crate::runtime::RuntimeError::SecurityState`] naming the component and the rule.
+/// Nothing is left behind: any directory this call created is removed before the error
+/// is returned.
+pub fn prepare_state_paths(paths: Paths) -> Result<PreparedPaths, crate::runtime::RuntimeError> {
+    use orxnud_platform_fs::{
+        Creation, DirPolicy, ModeAction, ValidationError, is_within, validate_dir,
+    };
+
+    let refused = |why: ValidationError| {
+        crate::runtime::RuntimeError::SecurityState(format!("state root: {why}"))
+    };
+
+    let uid = orxnud_platform_fs::effective_uid();
+
+    // The first directory this daemon is entitled to create: the root itself for an
+    // explicit root, and `$HOME/.local` for the default layout, because `.local` and
+    // `state` are application-owned and a clean install does not create them. Walking
+    // up from the root over the names this product owns gives both answers from one
+    // rule, and — for `/var/lib/orxnud` — refuses to create `/var/lib`, which is not
+    // this program's to make.
+    let root = paths.root.clone();
+    // `beneath` is the path ending at the **first** application-owned component, which
+    // is what makes both the default and the explicit layouts come out right:
+    //
+    //   ~/.local/state/orxnud  -> ~/.local        (`.local` is ours to create)
+    //   /var/lib/orxnud        -> /var/lib/orxnud (only the leaf is; `/var/lib` is not)
+    //   /srv/orxnud            -> /srv/orxnud
+    //
+    // Everything above it must already exist, because creating `/home` or `/var/lib` is
+    // not this program's job. Note it stops at the *first* owned component rather than
+    // accumulating them: for the default layout that is `$HOME/.local`, and `.local` is
+    // the boundary, not `.local/state/orxnud`.
+    let mut beneath = std::path::PathBuf::new();
+    for component in root.components() {
+        beneath.push(component.as_os_str());
+        let name = component.as_os_str();
+        if name == "orxnud" || name == "state" || name == ".local" {
+            break;
+        }
+    }
+
+    let state_root = validate_dir(
+        &root,
+        &DirPolicy {
+            creation: Creation::From {
+                beneath: beneath.to_path_buf(),
+            },
+            // Tighten: an existing world-readable root is corrected, as it always was.
+            mode: ModeAction::Tighten,
+            // A state root in the system temporary directory is a real layout, and the
+            // bounded sticky rule is what makes it acceptable without widening the
+            // guarantee into the same-uid case.
+            allow_sticky_ancestor: true,
+        },
+        uid,
+    )
+    .map_err(refused)?;
+
+    let workspace_path = root.join("workspace");
+    let workspace = validate_dir(
+        &workspace_path,
+        &DirPolicy {
+            // The workspace is created beneath the state root, never beside it.
+            creation: Creation::From {
+                beneath: state_root.canonical.clone(),
+            },
+            // Require: an existing workspace may already hold a capability's output, and
+            // its mode is not this walk's to restate.
+            mode: ModeAction::Require,
+            allow_sticky_ancestor: true,
+        },
+        uid,
+    )
+    .map_err(refused)?;
+
+    // Containment, after both are canonical. A workspace that is a symlink out of the
+    // root is refused by the walk above; a workspace that is a *real* directory outside
+    // the root — reachable only through a canonical root that differs from the
+    // caller's spelling — is caught here, which is why the check is not redundant.
+    if !is_within(&workspace.canonical, &state_root.canonical) {
+        return Err(crate::runtime::RuntimeError::SecurityState(format!(
+            "state root: the workspace at {} is not inside the state root at {}; a              workspace the daemon did not choose must not be granted to a sandbox",
+            workspace.canonical.display(),
+            state_root.canonical.display()
+        )));
+    }
+
+    // The paths that will be granted to the sandbox: the workspace, and the helper that
+    // `sibling_executable` will find beside the daemon. Both are checked, because both
+    // reach `build_command` as a bind.
+    let mut granted: Vec<std::path::PathBuf> = vec![workspace.canonical.clone()];
+    if let Some(helper) = orxnud_platform_fs::sibling_executable("orxnud-fswrite") {
+        granted.push(helper);
+    }
+
+    for path in &granted {
+        let label = if path == &workspace.canonical {
+            "workspace"
+        } else {
+            "helper"
+        };
+        // A helper beneath a host-backed tree is refused only when that tree is
+        // modifiable, because the precondition is attacker-influenced *content* in
+        // mounted trees, not the presence of a mount. A root-owned, non-writable system
+        // directory — `/usr/local/bin` beside the daemon — is a normal installation, and
+        // refusing it would break every standard install to no security gain. The
+        // workspace is granted read-write, so it is exactly the tree whose contents
+        // *are* influenceable, and it gets no exemption.
+        let Some((mounted, _kind)) = mount_overlap(path) else {
+            continue;
+        };
+        if label == "helper"
+            && orxnud_platform_fs::is_root_owned_and_not_writable_by_others(&mounted)
+        {
+            continue;
+        }
+        return Err(crate::runtime::RuntimeError::SecurityState(format!(
+            "state root: the {label} at {} is beneath {}, which the sandbox mounts; a bind \
+             destination inside an earlier mount can have its parent components resolved \
+             by the sandbox tool",
+            path.display(),
+            mounted.display()
+        )));
+    }
+
+    Ok(PreparedPaths {
+        inner: Paths {
+            root: state_root.canonical,
+            database: paths.database,
+            audit: paths.audit,
+            instance_lock: paths.instance_lock,
+            log: paths.log,
+        },
+    })
+}
+
+/// Paths that have been validated, and may be used.
+///
+/// # Why this type exists
+///
+/// [`Paths`] is a spelling exercise: it joins a root to five names and checks nothing.
+/// Handing one to the runtime therefore hands it an unvalidated path, and a state root
+/// beneath `/usr` — or a workspace that is a symlink out of the root — would reach the
+/// sandbox as a bind destination before anyone had looked at it.
+///
+/// So this type is the gate. Its field is private, [`prepare_state_paths`] is the only
+/// thing that can build one, and every runtime constructor takes it rather than
+/// [`Paths`]. The result is that "the daemon started" and "the state root and workspace
+/// were validated" are the same statement, enforced by the type rather than by a
+/// convention a future caller could forget.
+///
+/// # What it does not do
+///
+/// It does not make the paths immutable. A directory can still be renamed or replaced
+/// after validation by a process running as the daemon's own uid; that exclusion is
+/// recorded in [`orxnud_platform_fs::validate_dir`]'s module header and is a threat-model
+/// boundary, not something a wrapper type can close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPaths {
+    inner: Paths,
+}
+
+impl PreparedPaths {
+    /// The validated paths.
+    pub(crate) fn paths(&self) -> &Paths {
+        &self.inner
+    }
+
+    /// Builds one without validation.
+    ///
+    /// # Why this exists and why it is not public
+    ///
+    /// The runtime's own tests construct a daemon from paths that are known-good by
+    /// construction — a temporary directory the test just made, owned by the test, with
+    /// no symlinks in it — and running the full validation there would make every test
+    /// pay for a property it has already arranged. So the escape hatch exists, is
+    /// crate-private, and is greppable: anything reaching for it is a test, and a test
+    /// that reaches for it for another reason is the thing to review.
+    #[cfg(test)]
+    pub(crate) fn unchecked(inner: Paths) -> Self {
+        Self { inner }
+    }
+
+    /// The validated paths, for callers outside this crate.
+    ///
+    /// Read-only: a caller may inspect the canonical locations but cannot substitute
+    /// its own, because the private field is what makes the invariant hold.
+    #[must_use]
+    pub fn paths_ref(&self) -> &Paths {
+        &self.inner
+    }
+}
+
 impl Paths {
     /// Derives every path from a root.
     ///
@@ -840,7 +1121,7 @@ impl Daemon {
     ///   probe that asks whether the host *can* sandbox happens at dispatch time,
     ///   where a refusal is actionable.
     #[must_use]
-    pub fn compose(paths: Paths) -> Self {
+    pub fn compose(paths: PreparedPaths) -> Self {
         let mut daemon = Self::compose_inner(paths);
         daemon.install_shipped_declarations();
         daemon
@@ -872,7 +1153,7 @@ impl Daemon {
         self
     }
 
-    fn compose_inner(paths: Paths) -> Self {
+    fn compose_inner(paths: PreparedPaths) -> Self {
         // The registry and the bundles are *composition*: they say what this build
         // can do. `install_shipped_capabilities` separately says what policy permits,
         // and is called later because the policy engine is replaced when durable state
@@ -881,9 +1162,14 @@ impl Daemon {
         let mut registry = CapabilityRegistry::empty();
         register_shipped_declarations(&mut registry);
         let dispatch = DispatchWiring {
-            bundles: orxnud_capability::dispatch::AdapterRegistry::shipped(&paths.workspace()),
+            bundles: orxnud_capability::dispatch::AdapterRegistry::shipped(
+                &paths.paths().workspace(),
+            ),
             execution: Arc::new(SandboxExecutionBackend::new()),
         };
+        // Unwrap once, here: everything below works with the validated `Paths`, and
+        // nothing above this line could have reached it without validation.
+        let paths = paths.paths().clone();
         let instance = InstanceLock::at(paths.instance_lock.clone());
         let components = Components {
             paths,
@@ -1241,7 +1527,7 @@ mod tests {
     }
 
     fn daemon() -> Daemon {
-        Daemon::compose(paths())
+        Daemon::compose(PreparedPaths::unchecked(paths()))
     }
 
     #[test]
@@ -1251,7 +1537,7 @@ mod tests {
         let p = paths();
         let root = p.root.clone();
         let _ = std::fs::remove_dir_all(&root);
-        let d = Daemon::compose(p.clone());
+        let d = Daemon::compose(PreparedPaths::unchecked(p.clone()));
         assert_eq!(d.state(), LifecycleState::Created);
         assert!(!root.exists(), "compose created {}", root.display());
         assert!(!p.database.exists());
@@ -1628,7 +1914,12 @@ mod argv_payload_tests {
     /// config key present and unset, so it is paired with the source guard below.
     #[test]
     fn a_composed_daemon_permits_no_argv_payload() {
-        let d = Daemon::compose(Paths::under(std::path::Path::new("/nonexistent-workspace")));
+        // A deliberately invalid root, composed through the test escape hatch: this test is
+        // about what a composed daemon permits, not about a paths layout, and a root that
+        // does not exist on disk is the point of the fixture.
+        let d = Daemon::compose(PreparedPaths::unchecked(Paths::under(
+            std::path::Path::new("/nonexistent-workspace"),
+        )));
         let exposed = d
             .components()
             .dispatch
@@ -1765,6 +2056,103 @@ mod argv_payload_tests {
             "the credential file flag must be gated on debug_assertions, or a release \
              binary gains a route to a credential outside the platform store; the 12 \
              lines before it are:\n{window}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mount_overlap_tests {
+    use super::*;
+
+    /// A granted path beneath a host-backed mount is an overlap, in every spelling.
+    ///
+    /// # Why this is tested without root
+    ///
+    /// The rule is a property of two path sets, so it is exercised directly against the
+    /// real mount sets. An earlier integration test built a directory beneath `/usr`,
+    /// which only root can do, so on an ordinary run it skipped and reported `ok` — a
+    /// green result that proved nothing about the rule. Here the assertion always runs.
+    ///
+    /// The cases are the ones that separate a component-aware comparison from a prefix
+    /// test, which is the only real risk in this rule.
+    #[test]
+    fn a_granted_path_beneath_a_host_backed_mount_is_an_overlap() {
+        let (mounted, kind) = mount_overlap(std::path::Path::new("/usr/orxnud"))
+            .expect("/usr/orxnud is beneath the /usr bind and must be reported");
+        assert_eq!(kind, "host-backed");
+        assert_eq!(mounted, std::path::PathBuf::from("/usr"));
+
+        // One level deeper, and also beneath `/bin` on a merged-`/usr` host, where
+        // `/bin` resolves to `/usr/bin`. Both spellings have to catch it, which is why
+        // the destination set carries canonical forms as well as literal ones.
+        let (mounted, kind) = mount_overlap(std::path::Path::new("/usr/bin/orxnud"))
+            .expect("/usr/bin/orxnud is beneath a host-backed mount and must be reported");
+        assert_eq!(kind, "host-backed");
+        assert!(
+            orxnud_platform_fs::is_within(std::path::Path::new("/usr/bin/orxnud"), &mounted),
+            "the reported mount must actually contain the granted path; got {mounted:?}"
+        );
+
+        for path in ["/sbin/orxnud", "/lib/orxnud", "/lib64/orxnud"] {
+            assert!(
+                mount_overlap(std::path::Path::new(path)).is_some(),
+                "{path} is beneath a host-backed mount and must be reported as an overlap"
+            );
+        }
+    }
+
+    /// A path that merely shares a prefix with a mount is not an overlap.
+    ///
+    /// `/usr-local/orxnud` is not beneath `/usr`. Refusing it would break an ordinary
+    /// install for no security gain, so this half of the rule is asserted next to the
+    /// other rather than left to inference.
+    #[test]
+    fn a_path_sharing_a_prefix_with_a_mount_is_not_an_overlap() {
+        for path in ["/usr-local/orxnud", "/usrx/orxnud", "/library/orxnud"] {
+            assert!(
+                mount_overlap(std::path::Path::new(path)).is_none(),
+                "{path} only shares a prefix with a mount and must not be reported as an \
+                 overlap; got {:?}",
+                mount_overlap(std::path::Path::new(path))
+            );
+        }
+    }
+
+    /// A path beneath a destination the sandbox builds itself is an overlap too.
+    ///
+    /// `/proc` and `/dev` are created inside the sandbox root, so a workspace there would
+    /// be masked by them later — a namespace collision rather than an escape, but still a
+    /// refused destination. The kind is asserted so the two cannot be conflated.
+    #[test]
+    fn a_path_beneath_a_sandbox_created_destination_is_an_overlap() {
+        for (path, expected) in [("/proc/orxnud", "/proc"), ("/dev/orxnud", "/dev")] {
+            let (mounted, kind) = mount_overlap(std::path::Path::new(path))
+                .unwrap_or_else(|| panic!("{path} must be reported as an overlap"));
+            assert_eq!(mounted, std::path::PathBuf::from(expected));
+            assert_eq!(kind, "sandbox-created");
+        }
+
+        // `/tmp` is a fresh empty tmpfs mounted *before* any grant, so it cannot carry a
+        // pre-existing symlink and is deliberately not a destination. Asserting its
+        // absence keeps a future helpful addition from being silent.
+        assert!(
+            mount_overlap(std::path::Path::new("/tmp/orxnud")).is_none(),
+            "/tmp is a fresh empty tmpfs and must not be reported as an overlap"
+        );
+    }
+
+    /// An ordinary state root overlaps nothing.
+    ///
+    /// Without this, every assertion above would pass just as well if the function
+    /// rejected everything.
+    #[test]
+    fn an_ordinary_state_root_overlaps_nothing() {
+        let overlap = mount_overlap(std::path::Path::new(
+            "/home/rayees/.local/state/orxnud/workspace",
+        ));
+        assert!(
+            overlap.is_none(),
+            "the default state root must not overlap any mount; got {overlap:?}"
         );
     }
 }

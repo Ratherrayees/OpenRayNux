@@ -31,8 +31,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_protocol::error::RpcErrorCode;
 use serde_json::{Value, json};
@@ -127,11 +127,14 @@ impl Serving {
         root: PathBuf,
         provider: std::sync::Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
     ) -> Self {
-        let runtime =
-            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
-                .await
-                .expect("the runtime must start")
-                .with_proposer(provider);
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

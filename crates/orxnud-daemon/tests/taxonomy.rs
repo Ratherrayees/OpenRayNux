@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_protocol::error::RpcErrorCode;
 use serde_json::{Value, json};
@@ -152,11 +152,14 @@ impl Serving {
         root: PathBuf,
         provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
     ) -> Self {
-        let runtime =
-            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
-                .await
-                .expect("the runtime must start")
-                .with_proposer(provider);
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -180,6 +183,24 @@ impl Serving {
         }
         let _ = self.task.await;
     }
+}
+
+/// Creates the workspace the way the daemon does.
+///
+/// `create_dir_all` takes the process umask and yields `0755`; the daemon's own
+/// `ensure_workspace` creates it `0700` through `create_private_dir`. A fixture that
+/// pre-creates a workspace at `0755` is a layout the product never produces, and the
+/// state-root validation refuses it for that reason -- correctly. So the fixture makes
+/// what the daemon makes.
+fn make_workspace(root: &std::path::Path) -> std::path::PathBuf {
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700));
+    }
+    ws
 }
 
 fn workspace(root: &Path) -> PathBuf {
@@ -690,7 +711,7 @@ fn no_refusal_carries_content_a_host_path_or_a_credential() {
     const SENTINEL: &str = "SENTINEL-TAXONOMY-9f31c4";
     rt().block_on(async {
         let d = dir("hygiene");
-        std::fs::create_dir_all(workspace(&d)).expect("workspace");
+        make_workspace(&d);
         std::fs::write(workspace(&d).join("a.txt"), SENTINEL).expect("seed");
         let s = Serving::start(d.clone()).await;
 

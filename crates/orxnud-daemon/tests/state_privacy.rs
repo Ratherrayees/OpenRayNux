@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use orxnud_daemon::Paths;
+use orxnud_daemon::{Paths, prepare_state_paths};
 
 /// A state root unique to this process and this call.
 fn root(tag: &str) -> PathBuf {
@@ -98,7 +98,10 @@ fn a_state_root_the_daemon_creates_is_private_to_its_owner() {
 
     // And the database inside it, through the daemon's own durable-state path.
     {
-        let mut daemon = orxnud_daemon::Daemon::compose(paths.clone());
+        let mut daemon = orxnud_daemon::Daemon::compose(
+            prepare_state_paths(paths.clone())
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+        );
         daemon
             .attach_durable_security_state(&paths.database)
             .expect("attach the durable security state");

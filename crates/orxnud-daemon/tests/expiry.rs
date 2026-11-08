@@ -29,8 +29,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use serde_json::{Value, json};
 
@@ -129,11 +129,14 @@ impl Serving {
         // that is about configuration. `continue_task` checks the provider before it checks
         // whether there is a boundary to cross, so without one every continuation assertion
         // would be testing the wrong refusal.
-        let runtime =
-            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
-                .await
-                .expect("the runtime must start")
-                .with_proposer(orxnud_daemon::runtime::scripted_proposer());
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(orxnud_daemon::runtime::scripted_proposer());
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -166,6 +169,24 @@ impl Serving {
         self.task.abort();
         let _ = self.task.await;
     }
+}
+
+/// Creates the workspace the way the daemon does.
+///
+/// `create_dir_all` takes the process umask and yields `0755`; the daemon's own
+/// `ensure_workspace` creates it `0700` through `create_private_dir`. A fixture that
+/// pre-creates a workspace at `0755` is a layout the product never produces, and the
+/// state-root validation refuses it for that reason -- correctly. So the fixture makes
+/// what the daemon makes.
+fn make_workspace(root: &std::path::Path) -> std::path::PathBuf {
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700));
+    }
+    ws
 }
 
 fn workspace(root: &Path) -> PathBuf {
@@ -650,7 +671,7 @@ fn an_expired_approval_cannot_cross_a_step_boundary() {
 fn an_expired_read_approval_retains_no_observation() {
     rt().block_on(async {
         let d = dir("noread");
-        std::fs::create_dir_all(workspace(&d)).expect("workspace");
+        make_workspace(&d);
         std::fs::write(workspace(&d).join("a.txt"), "SECRET-BYTES").expect("seed");
         let s = Serving::start(d.clone()).await;
 

@@ -45,6 +45,24 @@ mod coverage;
 // harness
 // ---------------------------------------------------------------------------
 
+/// Creates the workspace the way the daemon does.
+///
+/// `create_dir_all` takes the process umask and yields `0755`; the daemon's own
+/// `ensure_workspace` creates it `0700` through `create_private_dir`. A fixture that
+/// pre-creates a workspace at `0755` is a layout the product never produces, and the
+/// state-root validation refuses it for that reason -- correctly. So the fixture makes
+/// what the daemon makes.
+fn make_workspace(root: &std::path::Path) -> std::path::PathBuf {
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700));
+    }
+    ws
+}
+
 fn dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("v92-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -157,8 +175,7 @@ impl Daemon {
     /// did not compile there, and gate **G3** keeps `cfg(unix)` out of this file entirely.
     /// A directory at the target needs neither.
     fn failing_write_target(root: &Path) {
-        let ws = root.join("workspace");
-        std::fs::create_dir_all(&ws).expect("workspace");
+        let ws = make_workspace(root);
         std::fs::create_dir_all(ws.join("out.txt")).expect("a directory where the file goes");
     }
 
@@ -501,7 +518,7 @@ fn a_verified_effect_still_completes_normally() {
     // A working write target here: this test is about the verified path and
     // about a lease that ended before execution, neither of which wants the write
     // to fail. `create_dir_all` already made the workspace.
-    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    make_workspace(&d);
     let s = Daemon::start(&d);
     let pid = s.approved_proposal("v1");
 
@@ -847,7 +864,7 @@ fn a_worker_whose_lease_ended_cannot_settle_the_outcome() {
     // A working write target here: this test is about the verified path and
     // about a lease that ended before execution, neither of which wants the write
     // to fail. `create_dir_all` already made the workspace.
-    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    make_workspace(&d);
     let s = Daemon::start(&d);
     let pid = s.approved_proposal("f1");
 
@@ -959,7 +976,7 @@ fn the_production_dispatch_path_records_a_non_repeatable_effect_before_it_runs()
         return;
     }
     let d = dir("v93-ledger");
-    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    make_workspace(&d);
     let s = Daemon::start(&d);
     let pid = s.approved_proposal("v93l");
 
@@ -1027,7 +1044,7 @@ fn the_production_dispatch_path_records_a_repeatable_effect_for_an_idempotent_ca
         return;
     }
     let d = dir("v93-ledger-idempotent");
-    std::fs::create_dir_all(d.join("workspace")).expect("workspace");
+    make_workspace(&d);
     let s = Daemon::start(&d);
     send(
         s.ep(),

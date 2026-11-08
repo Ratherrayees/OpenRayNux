@@ -49,9 +49,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
 use orxnud_daemon::serve::ServeLimits;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_platform_ipc::BlockingClient;
 use orxnud_protocol::method::Method;
@@ -132,10 +132,14 @@ struct Harness {
 impl Harness {
     async fn start(tag: &str, limits: ServeLimits) -> Self {
         let root = dir(tag);
-        let runtime = Runtime::start(Paths::under(&root), NoSecrets)
-            .await
-            .expect("start")
-            .with_limits(limits);
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("start")
+        .with_limits(limits);
         let endpoint = runtime.endpoint().to_path_buf();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
         let serving = tokio::spawn(runtime.serve(async move {
@@ -781,10 +785,15 @@ fn a_blocked_provider_does_not_stop_unrelated_requests() {
     rt().block_on(async {
         let (provider, entered, release) = BlockedProvider::new();
         let root = dir("slow-provider");
-        let runtime = Runtime::start_with(Paths::under(&root), NoSecrets, provider)
-            .await
-            .expect("start")
-            .with_limits(ServeLimits::default());
+        let runtime = Runtime::start_with(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+            provider,
+        )
+        .await
+        .expect("start")
+        .with_limits(ServeLimits::default());
         let endpoint = runtime.endpoint().to_path_buf();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
         let serving = tokio::spawn(runtime.serve(async move {

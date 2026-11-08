@@ -46,6 +46,15 @@
 #[cfg(windows)]
 mod windows;
 
+#[cfg(unix)]
+mod descriptor;
+mod state_root;
+
+pub use state_root::{
+    Creation, DirPolicy, ModeAction, PreparedDir, ValidationError,
+    is_root_owned_and_not_writable_by_others, is_within, validate_dir,
+};
+
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -53,6 +62,42 @@ use orxnud_domain::platform::{
     FileFacts, FilesystemIdentity, FilesystemPrivacy, FsContract, PrivacyError, PrivacyOutcome,
     SqliteMainDatabase, SqliteMainFacts,
 };
+
+/// The effective uid this process runs as.
+///
+/// # Why the caller cannot work it out
+///
+/// A validator that checks "is this directory owned by me" needs to know who *me* is,
+/// and nothing in `std` says. `std::env::var("USER")` is a convention, not a fact — it
+/// is absent under a service manager and settable by anything — so a check based on it
+/// would be a check based on a string.
+///
+/// # The unsupported-platform case
+///
+/// `u32::MAX`, which matches no uid. A caller comparing ownership against it will find
+/// nothing owned by "the daemon", which is the fail-closed answer: on a platform that
+/// cannot establish the process uid, no directory can be established as the daemon's.
+#[must_use]
+pub fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // `deny(unsafe_code)` at the crate level is deliberate and stays. This one
+        // `allow` is scoped to the single call that needs it, for the same reason the
+        // `descriptor` module carries one: `std` exposes no safe way to ask the kernel
+        // who this process is, and a validator that cannot establish the process uid
+        // cannot establish that a directory belongs to it.
+        #[allow(unsafe_code)]
+        // SAFETY: `geteuid` takes no arguments, returns a plain integer, and cannot
+        // fail. There is no pointer, no lifetime, and no memory to get wrong.
+        unsafe {
+            libc::geteuid() as u32
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        u32::MAX
+    }
+}
 
 /// The number of directory entries that name this inode, or `None` where the platform
 /// does not expose the count.

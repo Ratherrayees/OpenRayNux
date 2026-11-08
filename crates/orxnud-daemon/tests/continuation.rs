@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use serde_json::{Value, json};
 
@@ -115,11 +115,14 @@ impl Serving {
         root: PathBuf,
         provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
     ) -> Self {
-        let runtime =
-            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
-                .await
-                .expect("the runtime must start")
-                .with_proposer(provider);
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -954,9 +957,13 @@ fn prior_step_context_carries_status_and_names_but_never_content() {
 fn continuation_without_a_provider_is_refused_before_the_boundary_is_crossed() {
     rt().block_on(async {
         let d = dir("noprovider");
-        let runtime = Runtime::start_permitting_argv_payload_exposure(Paths::under(&d), NoSecrets)
-            .await
-            .expect("start");
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("start");
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -1292,7 +1299,8 @@ async fn serving_with_a_short_lease(
     provider: Arc<dyn orxnud_daemon::proposer::ProposalProvider>,
 ) -> Serving {
     let runtime = Runtime::start_with_engine_limits(
-        Paths::under(&root),
+        prepare_state_paths(Paths::under(&root))
+            .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
         NoSecrets,
         provider,
         short_lease_limits(),

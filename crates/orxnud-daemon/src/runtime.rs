@@ -88,7 +88,7 @@ use orxnud_task::EngineLimits;
 use orxnud_task::clock::{NowMs, SystemClock};
 
 use crate::task_service::{TaskFault, TaskService};
-use crate::{Daemon, LifecycleError, Paths};
+use crate::{Daemon, LifecycleError, PreparedPaths};
 
 /// The transport's message ceiling.
 ///
@@ -602,7 +602,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     /// database cannot be opened, migrated or recovered, or
     /// [`RuntimeError::Endpoint`] if the local transport cannot be bound. In every
     /// case **no endpoint is left behind**.
-    pub async fn start(paths: Paths, secrets: S) -> Result<Self, RuntimeError> {
+    pub async fn start(paths: PreparedPaths, secrets: S) -> Result<Self, RuntimeError> {
         Self::start_unconfigured(paths, secrets).await
     }
 
@@ -610,7 +610,10 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     ///
     /// What [`Runtime::start`] does. Named separately so the absence is visible at the
     /// call site: `task/ai-propose` on such a runtime answers `provider-not-configured`.
-    pub async fn start_unconfigured(paths: Paths, secrets: S) -> Result<Self, RuntimeError> {
+    pub async fn start_unconfigured(
+        paths: PreparedPaths,
+        secrets: S,
+    ) -> Result<Self, RuntimeError> {
         Self::build(paths, secrets, None).await
     }
 
@@ -619,7 +622,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     /// The public form of the configuration seam: a caller supplies a provider and gets
     /// a daemon that uses it, with no global state and nothing to clean up afterwards.
     pub async fn start_with(
-        paths: Paths,
+        paths: PreparedPaths,
         secrets: S,
         proposer: Arc<dyn crate::proposer::ProposalProvider>,
     ) -> Result<Self, RuntimeError> {
@@ -642,7 +645,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     /// and it is visible — this name is greppable, the call lands in review, and it is
     /// used by nothing outside the test suites.
     pub async fn start_with_engine_limits(
-        paths: Paths,
+        paths: PreparedPaths,
         secrets: S,
         proposer: Arc<dyn crate::proposer::ProposalProvider>,
         engine_limits: EngineLimits,
@@ -674,7 +677,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     /// **Delete this when S-17 lands.** Until then it is a test affordance wearing a
     /// production signature, and it should not outlive the reason it exists.
     pub async fn start_permitting_argv_payload_exposure(
-        paths: Paths,
+        paths: PreparedPaths,
         secrets: S,
     ) -> Result<Self, RuntimeError> {
         let daemon = Daemon::compose(paths.clone()).with_argv_payload_exception_for_this_process();
@@ -682,7 +685,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     }
 
     async fn build(
-        paths: Paths,
+        paths: PreparedPaths,
         secrets: S,
         proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
     ) -> Result<Self, RuntimeError> {
@@ -704,7 +707,7 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
     /// to drift apart, because the order is load-bearing: security state, then the task
     /// subsystem, then `start`, and only then is anything reachable.
     async fn finish(
-        paths: Paths,
+        paths: PreparedPaths,
         secrets: S,
         mut daemon: Daemon,
         proposer: Option<Arc<dyn crate::proposer::ProposalProvider>>,
@@ -722,6 +725,31 @@ impl<S: SecretsContract + Send + Sync + 'static> Runtime<S> {
         // Fatal if it fails. A daemon that cannot make its own state private
         // should not serve requests against it, and there is no degraded mode
         // here to fall back to.
+        //
+        // Belt and braces, and the braces are the point. The caller can only have
+        // reached here through [`crate::prepare_state_paths`], because that is the one
+        // way to build a [`PreparedPaths`] — so this re-verification is not the
+        // security boundary, it is the guard against the boundary quietly moving. An
+        // internal refactor that routes a caller around validation would still fail
+        // here, and the whole invariant is re-checked, not only the state root:
+        // the workspace's symlink status, containment, ownership, mode and mount
+        // overlap are all re-examined, and a canonical result that differs from the one
+        // that was validated is a refusal.
+        let inner = paths.paths_ref().clone();
+        match crate::prepare_state_paths(inner.clone()) {
+            Ok(again) => {
+                if again.paths_ref() != paths.paths_ref() {
+                    return Err(RuntimeError::SecurityState(format!(
+                        "state root: the paths moved under the daemon during start; \
+                         validated {} but found {}",
+                        paths.paths_ref().root.display(),
+                        again.paths_ref().root.display()
+                    )));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        let paths = inner;
         let privacy = paths
             .ensure_state_root()
             .map_err(|e| RuntimeError::SecurityState(format!("state root: {e}")))?;
@@ -6009,6 +6037,7 @@ pub(crate) async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Paths;
 
     /// The read-dispatch registry's capacity is a fail-closed refusal, and it is
     /// refused **before** the approval is created and before anything durable changes.
@@ -6118,7 +6147,7 @@ mod tests {
             async fn start(tag: &str) -> Self {
                 let root = root(tag);
                 let paths = Paths::under(&root);
-                let mut daemon = Daemon::compose(paths.clone());
+                let mut daemon = Daemon::compose(PreparedPaths::unchecked(paths.clone()));
                 daemon
                     .attach_durable_security_state(&paths.database)
                     .expect("durable security state");
@@ -6521,7 +6550,7 @@ mod tests {
         async fn a_full_registry_refuses_the_approval_before_anything_is_written() {
             let root = root("full");
             let paths = Paths::under(&root);
-            let mut daemon = Daemon::compose(paths.clone());
+            let mut daemon = Daemon::compose(PreparedPaths::unchecked(paths.clone()));
             daemon
                 .attach_durable_security_state(&paths.database)
                 .expect("durable security state");

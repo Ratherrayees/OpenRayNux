@@ -31,10 +31,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::observation::{DisclosureSummary, ProviderIdentity};
 use orxnud_daemon::proposer::{ProposalContext, ProposalProvider, ProviderError};
 use orxnud_daemon::runtime::Runtime;
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::security_state::AuditJournal;
 
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
@@ -120,11 +120,14 @@ struct Serving {
 
 impl Serving {
     async fn start_with(root: PathBuf, provider: Arc<dyn ProposalProvider>) -> Self {
-        let runtime =
-            Runtime::start_permitting_argv_payload_exposure(Paths::under(&root), NoSecrets)
-                .await
-                .expect("the runtime must start")
-                .with_proposer(provider);
+        let runtime = Runtime::start_permitting_argv_payload_exposure(
+            prepare_state_paths(Paths::under(&root))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("the runtime must start")
+        .with_proposer(provider);
         let endpoint = runtime.endpoint().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -150,8 +153,22 @@ impl Serving {
     }
 }
 
-fn workspace(root: &Path) -> PathBuf {
-    root.join("workspace")
+/// Creates the workspace the way the daemon does.
+///
+/// `create_dir_all` takes the process umask and yields `0755`; the daemon's own
+/// `ensure_workspace` creates it `0700` through `create_private_dir`. A fixture that
+/// pre-creates a workspace at `0755` is a layout the product never produces, and the
+/// state-root validation refuses it for that reason -- correctly. So the fixture makes
+/// what the daemon makes.
+fn make_workspace(root: &std::path::Path) -> std::path::PathBuf {
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o700));
+    }
+    ws
 }
 
 fn state_of(endpoint: &Path, id: &str) -> String {
@@ -237,8 +254,7 @@ const WRITE_PROPOSAL: &str = r#"{"capability":"filesystem/write-text","target":"
 
 /// Seeds a workspace holding the file the read will return.
 fn seed(root: &Path) {
-    let ws = workspace(root);
-    std::fs::create_dir_all(&ws).expect("workspace");
+    let ws = make_workspace(root);
     std::fs::write(ws.join("a.txt"), SENTINEL).expect("seed");
 }
 

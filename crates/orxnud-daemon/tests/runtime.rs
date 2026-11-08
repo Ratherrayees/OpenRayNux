@@ -18,8 +18,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use orxnud_daemon::Paths;
 use orxnud_daemon::runtime::{Runtime, RuntimeError};
+use orxnud_daemon::{Paths, prepare_state_paths};
 use orxnud_domain::platform::{SecretLookup, SecretRef, SecretsContract};
 use orxnud_domain::security_state::AuditJournal;
 use orxnud_platform_ipc::{IpcError, endpoint_for};
@@ -121,9 +121,13 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let d = dir(tag);
-    let runtime = Runtime::start(Paths::under(&d), NoSecrets)
-        .await
-        .expect("start");
+    let runtime = Runtime::start(
+        prepare_state_paths(Paths::under(&d))
+            .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+        NoSecrets,
+    )
+    .await
+    .expect("start");
     let endpoint = runtime.endpoint().to_path_buf();
     // The runtime must actually be *serving* while the body runs, or nothing answers
     // the client. Serving on its own task is what makes the assertions read the
@@ -154,9 +158,13 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let d = dir(tag);
-    let runtime = Runtime::start(Paths::under(&d), NoSecrets)
-        .await
-        .expect("start");
+    let runtime = Runtime::start(
+        prepare_state_paths(Paths::under(&d))
+            .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+        NoSecrets,
+    )
+    .await
+    .expect("start");
     let endpoint = runtime.endpoint().to_path_buf();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let serving = tokio::spawn(async move {
@@ -183,9 +191,13 @@ where
 fn startup_attaches_durable_security_state_before_the_endpoint_exists() {
     rt().block_on(async {
         let d = dir("durable");
-        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
-            .await
-            .expect("start");
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("start");
         assert!(
             runtime.is_durable().await,
             "a production runtime must never serve from the in-memory defaults"
@@ -214,9 +226,13 @@ fn startup_refuses_when_durable_state_cannot_be_opened_and_binds_nothing() {
         // A directory where the database file should be: `open` cannot succeed, and
         // the endpoint must therefore never appear.
         std::fs::create_dir_all(d.join("state.db")).expect("mkdir");
-        let err = Runtime::start(Paths::under(&d), NoSecrets)
-            .await
-            .expect_err("must refuse");
+        let err = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect_err("must refuse");
         assert!(
             matches!(err, RuntimeError::SecurityState(_)),
             "a missing store must be a security-state refusal: {err:?}"
@@ -485,7 +501,10 @@ fn durable_state_survives_a_restart_and_the_chain_continues() {
     rt().block_on(async {
         let d = dir("restart");
         {
-            let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+            let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets)
                 .await
                 .expect("first start");
             let endpoint = runtime.endpoint().to_path_buf();
@@ -529,7 +548,10 @@ fn durable_state_survives_a_restart_and_the_chain_continues() {
         // runtime that skipped verification would also get here, so this assertion is
         // paired with the one above -- records exist, and a fresh process accepted
         // them as its own history rather than starting a parallel chain at genesis.
-        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets)
             .await
             .expect("second start: the journal must load and verify");
         assert!(
@@ -570,7 +592,10 @@ fn a_dispatch_is_audited_with_a_real_wall_clock_instant() {
     rt().block_on(async {
         let d = dir("stamps");
         let before = SystemClock::new().now_ms();
-        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets)
             .await
             .expect("start");
         let endpoint = runtime.endpoint().to_path_buf();
@@ -621,7 +646,10 @@ fn a_dispatch_is_audited_with_a_real_wall_clock_instant() {
             persisted, stamps,
             "restart must preserve the recorded instants, not restamp them"
         );
-        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets)
             .await
             .expect("restart: the journal must load and verify");
         assert!(runtime.is_durable().await);
@@ -874,9 +902,13 @@ fn the_endpoint_is_removed_when_the_runtime_finishes_serving() {
     // the socket file must not outlive the serve loop.
     rt().block_on(async {
         let d = dir("release");
-        let runtime = Runtime::start(Paths::under(&d), NoSecrets)
-            .await
-            .expect("start");
+        let runtime = Runtime::start(
+            prepare_state_paths(Paths::under(&d))
+                .unwrap_or_else(|e| panic!("the test's state root must validate: {e}")),
+            NoSecrets,
+        )
+        .await
+        .expect("start");
         let endpoint = runtime.endpoint().to_path_buf();
         assert!(endpoint.exists(), "precondition: the endpoint is bound");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
