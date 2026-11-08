@@ -3681,6 +3681,21 @@ Tier-1 dispatch is correctly refused. Three things were wrong with how that surf
    teaches nothing, and the interesting host state — a Linux machine that cannot sandbox —
    was therefore untested everywhere.
 
+> **Amendment, 2026-11-08 — the context above is preserved as written; one fact in it has
+> drifted, and the limitation it describes is narrower than it reads.** The runner of the
+> time shipped `bwrap`; the current hosted images do not (`bwrap: absent`, measured in probe
+> run `42419194419`), and the probe installs it before measuring. **The decision is
+> unchanged**: a host that cannot create the unprivileged user namespace refuses every Tier-1
+> capability, and the lane reports rather than gates. What the measurement adds is that the
+> refusal is a property of the **pinned image**, not of hosted CI as a class: a hosted
+> `ubuntu-22.04` image has `kernel.apparmor_restrict_unprivileged_userns` at `0` and
+> establishes the production posture on the host itself (`visibility=true
+> tree_lifetime=true`, `tier1_executable: yes`, sandbox identity `uid_map 1001 0 1`,
+> `CapEff 0`), while the pinned `ubuntu-24.04` image reproduced the refusal exactly as the
+> control. Decision 4's container is still the only place the *suites* run in CI, so there is
+> still no positive Tier-1 evidence in CI — and running them on that host is a separate,
+> deliberate change, not a consequence of this amendment (V-87).
+
 **Decision 1 — the sandbox contract is unchanged, and nothing here may weaken it.**
 
 No default is relaxed, no requirement becomes `BestEffort`, and no host is exempted. A

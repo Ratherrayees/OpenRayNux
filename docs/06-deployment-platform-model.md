@@ -70,10 +70,10 @@ execution on Windows is refused with a reason rather than degraded. A Windows sa
 backend needs `windows-sys` and `unsafe`, in a platform crate that has not opted in under
 G4 — that is the honest blocker, and it is a design decision rather than an oversight.
 
-**GitHub-hosted Linux CI — a measured limitation, not a defect.** The hosted runner ships
-`bwrap` and **cannot create an unprivileged user namespace**, because Ubuntu 24.04+ sets
-`kernel.apparmor_restrict_unprivileged_userns`. Measured, and printed on every run by the
-preflight step in `linux-gates`:
+**GitHub-hosted Linux CI — a measured limitation of the pinned image, not a defect.** On the
+**pinned** hosted image (`ubuntu-24.04`) the runner cannot create an unprivileged user
+namespace, because Ubuntu 24.04+ sets `kernel.apparmor_restrict_unprivileged_userns`. Measured,
+and printed on every run by the preflight step in `linux-gates`:
 
 ```text
 sandbox backend: bwrap
@@ -87,10 +87,20 @@ AppArmor's restriction applies inside the container too, measured. That job ther
 reports the limitation in capitals and produces **no positive Tier-1 evidence**, rather than
 disabling AppArmor or granting a capability to manufacture a green run.
 
+**The limitation belongs to the image, not to hosted CI as a class.** Measured 2026-11-08
+(probe run `42419194419`): a hosted `ubuntu-22.04` image has the same sysctl at `0` and
+establishes the production Tier-1 posture on the host itself — `visibility=true
+tree_lifetime=true`, `tier1_executable: yes`, and the nested, unprivileged sandbox identity
+(`uid_map 1001 0 1`, `CapEff 0`) that `preflight --require` demands. The pinned image was
+measured beside it as the control and reproduced the refusal exactly. **The Tier-1 suites
+have not been run there**, so there is still no positive Tier-1 evidence in CI; what the
+measurement establishes is that the evidence is *obtainable* on a hosted image, and using it
+is a deliberate change with its own reason attached.
+
 **Positive Tier-1 sandbox evidence comes from a host that can create an unprivileged user
-namespace** — a developer machine via `scripts/run-sandbox-tests.sh --host`, or a container
-on such a host. That is where `governed_path`, `read_text_real`, `write_text`, `isolation`
-and the `cli_e2e` loop are exercised against a real sandbox.
+namespace** — today a developer machine via `scripts/run-sandbox-tests.sh --host`, or a
+container on such a host. That is where `governed_path`, `read_text_real`, `write_text`,
+`isolation` and the `cli_e2e` loop are exercised against a real sandbox.
 
 
 | Platform | Current tier | Target | Evidence and gaps |

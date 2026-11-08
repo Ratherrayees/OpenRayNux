@@ -511,6 +511,22 @@ run of the same commit (`37916621851`) failed at G9 on an intermittent
 | `sandbox-integration` | every push and PR | measures whether a Tier-1 sandbox is possible here, and says so |
 | `resource-enforcement` | every push and PR | the delegated cgroup resource suite in a privileged container |
 
+**One workflow besides this one:** `.github/workflows/probe-runner-capability.yml`, dispatched
+by hand. It measures the Tier-1 posture on a candidate runner image and on the pinned image
+beside it, using `scripts/preflight.sh` — the same probe and the same
+`AvailableGuarantees::check` the dispatcher uses — and it **gates nothing**: it is not in any
+required-checks list, it changes no lane and no image pin, and it does not disable AppArmor or
+ask for a capability. It exists because the `sandbox-integration` result is a *measurement* of
+one image, and "can any hosted image establish the Tier-1 guarantees?" is a question that needs
+a measurement of its own rather than an inference from one image. Measured 2026-11-08 (run
+`42419194419`): the pinned `ubuntu-24.04` cannot create the user namespace `bwrap` needs
+(`kernel.apparmor_restrict_unprivileged_userns` = 1, `tier1_executable: no`), while a hosted
+`ubuntu-22.04` **does** establish the production posture on the host itself
+(`visibility=true tree_lifetime=true`, `tier1_executable: yes`, sandbox identity
+`uid_map 1001 0 1`, `CapEff 0` — the nested, unprivileged shape). What that means for the
+lanes is a decision, not a consequence of the measurement: the Tier-1 suites have **not** been
+run on `ubuntu-22.04`, so there is still no positive Tier-1 evidence in CI.
+
 **Not configured**, contrary to what this section previously claimed: Linux aarch64,
 macOS, any feature-combination matrix, and a signed release pipeline.
 
@@ -677,19 +693,32 @@ portable; and on the hosted Linux runner a Tier-1 capability is **refused** with
 missing guarantee named — which is the fail-closed property, and is asserted positively
 rather than skipped.
 
-**It does not prove:** that a Tier-1 capability executes under isolation. The hosted
-runner ships `bwrap` and cannot create an unprivileged user namespace (Ubuntu 24.04+
-`kernel.apparmor_restrict_unprivileged_userns`), and a container does not escape it either
-— measured, with AppArmor applying inside the container too. **`governed_path`,
+**It does not prove:** that a Tier-1 capability executes under isolation. On the **pinned**
+hosted image (`ubuntu-24.04`) the runner cannot create an unprivileged user namespace (Ubuntu
+24.04+ `kernel.apparmor_restrict_unprivileged_userns`), and a container does not escape it
+either — measured, with AppArmor applying inside the container too. **`governed_path`,
 `read_text_real`, `write_text`, `isolation` and the sandbox suites are positive Tier-1
-evidence only on a host that can create one**, which is a developer machine
+evidence only on a host that can create one**, which today is a developer machine
 (`scripts/run-sandbox-tests.sh --host`) or a container on such a host. The
 `sandbox-integration` job reports this rather than weakening anything to hide it (V-85,
 V-86, V-87, ADR-0046).
 
+**The boundary of that statement, measured 2026-11-08 (probe run `42419194419`):** it is the
+**image**, not hosted CI as a class, that cannot isolate. A hosted `ubuntu-22.04` image has the
+same sysctl at `0` and establishes the production Tier-1 posture on the host itself. So the
+sentence above is true of the pinned image and of the container route that inherits its
+AppArmor policy, and **false as a claim about hosted CI in general**. The Tier-1 suites have
+not been run on that image, so the honest summary is unchanged in the way that matters: **a
+green run is still not positive hosted Tier-1 isolation evidence**, and the measurement that
+such evidence *could* be obtained on a hosted image is a lead for a deliberate change, not
+evidence itself (V-87).
+
 So: **a green run and a full local suite are not the same claim, and neither is positive
-hosted Tier-1 isolation evidence.** That evidence does not exist in GitHub-hosted CI and
-this document now says so where a reader would otherwise assume it.
+hosted Tier-1 isolation evidence.** That evidence does not exist in CI today, and this
+document now says so where a reader would otherwise assume it. The measurement above adds
+one precise sentence to that: **it is obtainable on a hosted image**, so "it does not exist
+in GitHub-hosted CI" was too strong — but a measurement of a capability to produce evidence
+is not the evidence, and until the Tier-1 suites have run on such an image there is none.
 
 ## 20. Code review
 

@@ -148,11 +148,15 @@ against this worktree. Windows is neither "untested" nor "sandbox-supported". It
 is refused rather than degraded. Refusing is correct — an unsandboxed Tier-1 subprocess is
 worse than no capability at all.
 
-**GitHub-hosted Linux CI cannot produce positive Tier-1 sandbox evidence.** The hosted
-runner ships `bwrap` and cannot create an unprivileged user namespace (Ubuntu 24.04+
+**The pinned GitHub-hosted Linux CI image cannot produce positive Tier-1 sandbox evidence.**
+On `ubuntu-24.04` the runner cannot create an unprivileged user namespace (Ubuntu 24.04+
 `kernel.apparmor_restrict_unprivileged_userns`), and a container does not escape it either.
 That is measured and printed on every run. The `sandbox-integration` job reports the
-limitation rather than weakening anything to hide it — see §6.
+limitation rather than weakening anything to hide it — see §6. **The boundary of that
+statement (measured 2026-11-08):** it is the *image* that cannot isolate, not hosted CI as a
+class — a hosted `ubuntu-22.04` image establishes the production Tier-1 posture on the host
+itself. The Tier-1 suites have not been run there, so there is still no positive Tier-1
+evidence in CI.
 
 ## 5. What is intentionally not wired
 

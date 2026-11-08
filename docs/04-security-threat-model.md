@@ -714,7 +714,7 @@ report a run as passing because the thing that would have failed did not run.
 
 **The controls, as implemented.** `BwrapRunner::probe()` measures what the host provides
 by *running* the namespace, because `bwrap --version` succeeding says nothing: a
-GitHub-hosted runner ships `bwrap` and cannot create a user namespace, and reports the
+GitHub-hosted runner on the pinned image cannot create a user namespace, and reports the
 tier-1 capability as refused. `host_capability()` surfaces that through `daemon/status`,
 `orxnud --doctor` and `orxnuctl doctor`, reading the runner's own answer and the same
 `AvailableGuarantees::check` the dispatcher runs — so a diagnostic cannot disagree with the
@@ -735,6 +735,15 @@ restriction, or loading a per-binary AppArmor profile for `bwrap`, on the runner
 host security-policy changes made so a test can pass. Neither was done. The lane reports
 the limitation and produces no positive evidence, and a green run there means "the
 environment was measured", not "the sandbox was proven" (V-85, V-86, V-87).
+
+**Weakening the host is not the only alternative, and the boundary was measured rather than
+assumed.** A hand-dispatched probe (`.github/workflows/probe-runner-capability.yml`) measured
+the same question on a second hosted image on 2026-11-08: a hosted `ubuntu-22.04` image
+establishes the production Tier-1 posture on the host itself, with nothing weakened and no
+capability granted. The lane still runs on the pinned image, and the Tier-1 suites have not
+been run there, so there is still no positive Tier-1 evidence in CI. Moving the lane is a
+deliberate change with its own reason attached — the image pin exists so that a recorded
+finding stays attributable to the image it was taken on (V-87).
 
 ### T-n6 — a sandbox measured in a configuration no user runs
 
