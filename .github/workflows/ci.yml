@@ -192,12 +192,18 @@ jobs:
 
       # What this runner can actually do, before anything is inferred from a red test.
       #
-      # `bwrap` is preinstalled on `ubuntu-24.04` but cannot create a user namespace
-      # there, so a host-level `bwrap --version` check would report success on a runner
-      # that can isolate nothing — which is exactly how two governed CLI tests came to
-      # fail with no visible reason. The suites are environment-aware and assert whichever
-      # property is true here (a refusal, on a host that cannot isolate), so this step
-      # exists to make the *reason* legible rather than to gate anything.
+      # The backend name is a compile-time constant, so it says `bwrap` on a host
+      # that cannot isolate anything; and the host *cannot* isolate, because
+      # `ubuntu-24.04` sets `kernel.apparmor_restrict_unprivileged_userns` and the
+      # user namespace `bwrap` needs is refused. The guarantee probe therefore
+      # fails here even with `bwrap` installed -- which is why a host-level
+      # `bwrap --version` check would report success on a runner that can isolate
+      # nothing, and is exactly how two governed CLI tests came to fail with no
+      # visible reason. (The current image does not ship `bwrap` either; measured
+      # 2026-11-08, probe run `42419194419`.) The suites are environment-aware and
+      # assert whichever property is true here (a refusal, on a host that cannot
+      # isolate), so this step exists to make the *reason* legible rather than to
+      # gate anything.
       #
       # Deliberately not `--require`: this host is allowed to be incapable, and the lane
       # that must execute Tier-1 work is the container job below.
@@ -407,6 +413,13 @@ jobs:
       # point: it is the only place the gap is recorded against the exact image it happens
       # on. It is not made green by disabling AppArmor or granting a capability, both of
       # which `scripts/run-sandbox-tests.sh` declines in more words.
+      #
+      # The same question has been measured on a second hosted image -- a hand-dispatched
+      # probe, `.github/workflows/probe-runner-capability.yml`, found that a hosted
+      # `ubuntu-22.04` image establishes the production posture with nothing weakened
+      # (2026-11-08, run 42419194419; V-87). The suites have NOT been run there, so there
+      # is still no positive Tier-1 evidence in CI, and moving this lane onto that image is
+      # a deliberate change with its own commit rather than a consequence of the probe.
       - name: Measure the environment and run the Tier-1 suites if it can isolate
         run: ./scripts/run-sandbox-tests.sh
 

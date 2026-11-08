@@ -658,7 +658,7 @@ gate_G9() {
     #
     # Some suites assert that a Tier-1 capability *executes under isolation*, and
     # that is only observable on a host that can isolate. A GitHub-hosted Linux
-    # runner ships `bwrap` and cannot create a user namespace, so those suites
+    # runner on the pinned image cannot create a user namespace, so those suites
     # cannot pass there and their failure says nothing about OpenRayNux.
     #
     # So the host's capability is asked first, via the same probe the dispatcher

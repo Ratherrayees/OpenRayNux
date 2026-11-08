@@ -5,14 +5,14 @@
 #
 # # Why this exists
 #
-# `linux-gates` runs on a GitHub-hosted Linux runner, which ships `bwrap` and cannot use
-# it: `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04+ forbids the
-# unprivileged user namespace `bwrap` needs. So every Tier-1 dispatch there is refused --
-# correctly, by design (ADR-0035, V-49) -- which means that job cannot show that a Tier-1
-# capability *does* execute under isolation. Something has to, or the governed path has no
-# positive evidence in CI at all.
+# `linux-gates` runs on a GitHub-hosted Linux runner, on the pinned `ubuntu-24.04` image,
+# which cannot create the user namespace `bwrap` needs:
+# `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04+ forbids it. So every
+# Tier-1 dispatch there is refused -- correctly, by design (ADR-0035, V-49) -- which means
+# that job cannot show that a Tier-1 capability *does* execute under isolation. Something
+# has to, or the governed path has no positive evidence in CI at all.
 #
-# # The measured outcome: on a GitHub-hosted runner, it still cannot
+# # The measured outcome: on the pinned GitHub-hosted runner, it still cannot
 #
 # Inside this container, on `ubuntu-latest`:
 #
@@ -26,6 +26,17 @@
 # too, so neither `seccomp=unconfined` nor `systempaths=unconfined` is enough. The
 # measurements behind each of those two, and the configurations that were rejected, are in
 # the register as V-86.
+#
+# # The restriction is the image's, not hosted CI's (measured 2026-11-08)
+#
+# A hosted `ubuntu-22.04` image has `kernel.apparmor_restrict_unprivileged_userns` at 0 and
+# establishes the production Tier-1 posture on the host itself -- `visibility=true
+# tree_lifetime=true`, `tier1_executable: yes`, sandbox identity `uid_map 1001 0 1` with
+# `CapEff 0`. The pinned image was measured beside it as the control and reproduced the
+# refusal exactly (probe run `42419194419`; V-87). So the lane below is measuring *this
+# image*, and running the suites on that host instead is a deliberate change with its own
+# reason attached -- not a consequence of the measurement. Until then, there is still no
+# positive Tier-1 evidence in CI.
 #
 # This was not predictable from a developer machine. On a host with no AppArmor loaded, the
 # same container *does* reproduce production -- verified, with the nested signature
