@@ -9,7 +9,7 @@ Trade-offs · Consequences · Rejected alternatives · **Revisit conditions**.
 Revisit conditions are mandatory. A decision without them is a decision that
 will never be revisited, which is a smell.
 
-**56 ADRs, numbered ADR-0001 … ADR-0058.** Two numbers in that range are
+**57 ADRs, numbered ADR-0001 … ADR-0059.** Two numbers in that range are
 deliberately unused: **ADR-0041** and **ADR-0042**. They are recorded rather than
 renumbered because renumbering would break every existing citation, and because a
 silent gap is indistinguishable from an omission. `V-44` is unused in the
@@ -7268,3 +7268,133 @@ assertion are exactly as they were.
 the sidecars, and a hard link created after the handle observation — and S-31 still awaits an
 explicit acceptance of the narrowed threat model. This is not a claim of Windows support and not
 a release-readiness claim.
+\n
+
+---
+
+<a id="adr-0059"></a>
+
+## ADR-0059 — A state root is validated before anything is composed from it, and the only way to compose is through paths that passed
+
+**Status.** **Decided and implemented** (2026-11-08, commit `e5d387ca`; register row
+V-106). Not yet run against a hosted daemon.
+
+**Context.** The daemon held a state root and a workspace as `Paths` — a struct that
+joins a root to five names and validates nothing. That struct was passed straight to
+composition, which is what built the adapter registry *from the workspace path*, and
+only later to the code that created the root on disk.
+
+Two consequences followed from that ordering, and neither was hypothetical:
+
+1. **Composition preceded validation.** `Runtime::build` evaluated
+   `Daemon::compose(paths)` as an argument to `finish`, and `finish`'s first step was
+   `ensure_state_root`. So the registry — which resolves the helper by searching beside
+   the daemon binary and grants the workspace into the sandbox — was built from a path
+   nobody had looked at.
+2. **A path could be safe and its contents not.** The workspace is what gets bound into
+   the sandbox, and it was derived, never examined. A state root can be entirely
+   legitimate — real directories, owned correctly — while the workspace inside it is a
+   symlink to the user's documents. That is a workspace boundary violation with the
+   state root looking healthy.
+
+The reason the second one matters is bubblewrap 0.8.0's destination setup. `bwrap`
+builds `/newroot` with `mkdir_with_parents` and `ensure_dir`, both of which use `stat()`
+and `mkdir()` — path-based, symlink-following operations, the CVE-2026-87766
+precondition. A grant whose destination parent is a symlink therefore resolves through
+it. OpenRayNux emitted no `--dir`, `--file` or `--symlink` and its shipped path was not
+reachable — but the precondition was reachable through *configuration* rather than
+content, and CVE-2026-87766 is exactly that class.
+
+**Problem.** Make "the daemon started" and "the state root and workspace were validated"
+the same statement, in a way that does not depend on a future caller remembering.
+
+**Options.**
+
+1. **Validate inside `finish()` only.** Rejected: composition has already happened —
+   the registry is built from the workspace path before `finish` runs, so the unsafe
+   read has already occurred.
+2. **Validate in `main.rs`.** Rejected: integration tests call the runtime constructors
+   directly and bypass `main.rs` entirely — 13 files and 28 call sites do. The check
+   would have been tested by nobody.
+3. **A type that only validation can build.** Chosen.
+4. **A runtime assertion that re-validates everything each time.** Rejected as the only
+   mechanism — an assertion can be moved, refactored around, or short-circuited by a
+   future edit, and nothing fails. Kept as a secondary control.
+
+**Evidence.** The overlap between the state root and the sandbox's system binds is a
+property of the sandbox's own construction, so the daemon asks
+`orxnud_platform_sandbox::host_backed_bind_destinations()` and
+`bwrap_created_destinations()` rather than holding a copy. A second copy is a second
+answer to *what gets mounted*, and the two drifting apart is how a validator starts
+rejecting nothing. A consistency test renders the real argv and asserts the two agree;
+it was verified to fail in both directions against a drifting implementation, because a
+test that cannot fail is not a test.
+
+Two properties needed privileges to observe, which would have left them untested on
+every ordinary run — a green integration test proving nothing, a failure this repository
+has already produced twice. So the overlap rule was extracted into `mount_overlap` and
+exercised against the real mount sets, and the ownership rule was asserted against `/usr`
+and `/etc`, which are genuinely root-owned, so the uid in the refusal is one the walk
+read from a descriptor rather than one the test chose. Both were mutation-tested:
+deleting the check fails the test.
+
+Descriptor-relative traversal needs `openat`, which `std` does not expose. The
+`descriptor` module carries `#![allow(unsafe_code)]` for exactly the reason this crate's
+own Windows module does — stable Rust cannot report the fact, and the safe wrapper does
+not expose it — with the allow scoped to three thin wrappers, SAFETY comments, and no
+logic in the unsafe block. Gate G4 continues to report zero unsafe outside
+`orxnud-platform-*`.
+
+**Decision.**
+
+1. `PreparedPaths` is the only thing the runtime constructors and `Daemon::compose`
+   accept. Its field is private; `prepare_state_paths` is the only constructor; there is
+   no `Default` and no deserialization path; `PreparedPaths::unchecked` is `#[cfg(test)]`
+   **and** `pub(crate)`, so it is unreachable outside the crate's own unit tests.
+2. Validation runs **before** composition. All five public constructors take
+   `PreparedPaths`, and `main.rs` prepares before either arm.
+3. The walk is descriptor-relative with `O_NOFOLLOW` at every step, and nothing is
+   canonicalised before the walk — `canonicalize` follows symlinks and would erase the
+   evidence the walk exists to find. The canonical path is derived from the descriptor
+   that survived.
+4. The workspace is validated independently, then checked for containment.
+5. The mode policy is deliberately asymmetric: the state root is **tightened** to `0700`
+   (preserving existing behaviour for an existing world-readable root), and an existing
+   workspace is **required** to be `0700` (it may already hold a capability's output and
+   its mode is not the walk's to restate).
+6. `finish()` independently re-runs the whole validation and refuses on error or on
+   changed paths. This is not the boundary; it is the guard against the boundary moving.
+7. A root-owned sticky parent with the sticky bit is the only writable ancestor
+   accepted. A daemon-owned sticky directory is **not** — the sticky bit stops other
+   users replacing a child, not an owner replacing its own, so accepting it would
+   silently widen the guarantee into the same-uid case Decision 8 excludes.
+
+**Why.** Option 3 makes the invariant structural. A future caller cannot pass
+`Paths`, so the question "did anybody validate this?" has one answer that is visible in
+the type signature rather than in a convention a reader must know.
+
+**Trade-offs.** A breaking public API change: five constructor signatures and
+`Daemon::compose`, plus 15 test files migrated. `validate_dir` is ~900 lines and the
+security-critical part of the startup path, which is a real maintenance cost. The
+descriptor module is the first Unix `unsafe` in a crate whose own header advertises
+`deny` rather than `forbid`.
+
+**Consequences.** A daemon that cannot establish a safe state root refuses to start,
+naming the component and the rule, and creates nothing. Fixtures that pre-created a
+workspace with `create_dir_all` (umask `0755`) now create `0700`, because the validation
+refuses a layout the product never produces.
+
+**Rejected alternatives.** Validating only the leaf (misses the ancestor symlinks, which
+is where the danger is). String-prefix overlap comparison (refuses `/usr-local/orxnud`,
+an ordinary installation). Canonicalising first, then walking (follows the symlinks and
+hides them). Having the daemon hold its own copy of the mount list. `fchmodat2` on an
+`O_PATH` descriptor to repair mode `0000` — measured to need a raw syscall and a kernel
+floor for one edge case, and the existing code already fails closed there, so mode
+`0000` is refused with a message naming the mode and the remedy.
+
+**Revisit conditions.** (a) `openat2` with `RESOLVE_IN_ROOT` reaching stable `std`, or a
+scrubbed `libc` binding, would let the whole walk become one syscall — adopt it then and
+delete the incremental walk. (b) A same-uid hostile process becoming a threat in scope
+requires a service-identity isolation design; this decision explicitly excludes it.
+(c) A second OS sandbox backend means the destination accessors are no longer
+Linux-shaped and the composition must be revisited.

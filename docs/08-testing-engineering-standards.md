@@ -616,15 +616,31 @@ rather than declared and assumed.
 >
 > Full account in [`README.md`](README.md) §8.
 
-### The latest full local gate (2026-11-05)
+### The latest full local gate (2026-11-08)
 
 `CI=true ./scripts/ci-gates.sh` exited 0 with **all selected gates passed**: 17 passed,
 0 failed, and 1 documented skip — G12 semver, which has no release tag to compare
-against. G9 ran **2001 tests: 2001 passed, 0 failed, 6 skipped**, with 2 *leaky*
-results (process accounting, not failures), and all **36 coverage paths** verified
-(`verified=36 reduced=0 not-exercised=0 missing=0`). G6 passed after the two test-code
-Clippy corrections. This is local Linux verification; it is not Windows verification
-and not a completed hosted GitHub Actions run.
+against, at commit `e5d387ca` with the state-root validation of ADR-0059 / V-106 in the
+tree. G9 ran **2036 tests: 2036 passed, 0 failed, 6 skipped**, with 2 *leaky* results
+(process accounting, not failures), and all **36 coverage paths** verified
+(`verified=36 reduced=0 not-exercised=0 missing=0`).
+
+**The 2026-11-05 figure is retained as history:** 2001 tests, 2001 passed, 6 skipped,
+2 leaky, 36 coverage paths, all gates passed.
+
+**This is local Linux verification; it is not Windows verification and not a completed
+hosted GitHub Actions run.**
+
+**A later run of the same tree, on the same day, failed G8 and G11 — and the cause is not
+this tree.** A new advisory, `RUSTSEC-2026-0459` (`CVE-2026-119375` in `libsqlite3-sys`
+0.38.2, published 2026-10-30, fixed in `>=0.39.0`), is now reported by cargo-deny (G8's
+advisories check) and cargo-audit (G11). `Cargo.lock` is unmodified by ADR-0059 and no
+dependency was added, so this is a pre-existing transitive dependency whose advisory
+landed between the two runs. It is a **dependency-upgrade decision the owner has not
+taken** and is recorded here as open rather than resolved: the gate figures above were
+true when measured, and a run of the same commit will now fail G8/G11 for a reason
+unrelated to the validation work. Recorded because a document that says "all gates pass"
+without the qualification would be describing an earlier state of the world.
 
 ### The current baseline, precisely
 
