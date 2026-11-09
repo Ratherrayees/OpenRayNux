@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The behaviour the state-root and workspace validation is supposed to have.
 //!
 //! # What these tests do and do not establish

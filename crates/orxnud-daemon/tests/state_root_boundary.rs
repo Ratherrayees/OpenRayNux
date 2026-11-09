@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! What the state-root boundary refuses, at the point the runtime is started.
 //!
 //! # Why these live here and not only in `orxnud-platform-fs`

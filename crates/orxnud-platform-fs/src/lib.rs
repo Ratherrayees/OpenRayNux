@@ -890,6 +890,26 @@ fn is_runnable(path: &std::path::Path) -> bool {
 }
 
 #[cfg(test)]
+mod cross_platform_path_tests {
+    use super::state_root::is_within;
+    use std::path::Path;
+
+    /// The component-aware containment check is pure logic, so it is tested here as
+    /// well as in the Unix-only integration suite. Gate G3 keeps it in a
+    /// `platform-*` crate, but its body has no platform branch and runs everywhere.
+    #[test]
+    fn is_within_is_component_wise() {
+        assert!(is_within(Path::new("/usr"), Path::new("/usr")));
+        assert!(is_within(Path::new("/usr/orxnud"), Path::new("/usr")));
+        assert!(!is_within(
+            Path::new("/usr-local/orxnud"),
+            Path::new("/usr")
+        ));
+        assert!(!is_within(Path::new("/usr"), Path::new("/usr/orxnud")));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::hard_link_count;
     #[cfg(unix)]

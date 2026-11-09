@@ -44,7 +44,9 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // The policy
@@ -343,19 +345,25 @@ pub fn is_within(path: &Path, ancestor: &Path) -> bool {
 /// 4. The component was verified through a descriptor, not by a path lookup.
 ///
 /// This is what makes `/tmp` usable as a state root and nothing more.
+#[cfg(unix)]
 fn sticky_ancestor_is_acceptable(mode: u32, uid: u32, daemon_uid: u32) -> bool {
     mode & 0o1000 != 0 && uid == 0 && daemon_uid != 0
 }
 
 /// The mode a validated directory must end up with.
+#[cfg(unix)]
 const REQUIRED_MODE: u32 = 0o700;
 /// Group and other permission bits, any of which disqualifies a directory.
+#[cfg(unix)]
 const GROUP_OTHER_BITS: u32 = 0o077;
 /// The owner-read bit, which is the precondition for an ordinary directory open.
+#[cfg(unix)]
 const OWNER_READ_BIT: u32 = 0o400;
 /// The owner write, read and execute bits together.
+#[cfg(unix)]
 const OWNER_RWX_BITS: u32 = 0o700;
 /// Bits that make a directory writable by someone other than its owner.
+#[cfg(unix)]
 const OTHERS_WRITE_BITS: u32 = 0o022;
 /// Root's uid, the one ownership that makes a writable ancestor acceptable.
 #[cfg(unix)]
