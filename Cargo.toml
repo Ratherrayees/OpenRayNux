@@ -48,11 +48,11 @@ thiserror = "2.0.21"
 # link the host's library). `backup` adds the online-backup API, which ADR-0017
 # requires for the pre-migration snapshot -- a naive file copy of a WAL database
 # is not a backup.
-rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
 # A build-dependency only: it makes `DEP_SQLITE3_INCLUDE` available to
 # `orxnud-store`'s build script, which parses the bundled `sqlite3.h` to
 # assert the linked version at compile time. Never linked into the library.
-libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "signal", "net", "io-util"] }
 # Unix-only peer credentials (`SO_PEERCRED`), used by `orxnud-platform-ipc` to
 # establish who a local caller actually is. Already a transitive dependency of tokio on
