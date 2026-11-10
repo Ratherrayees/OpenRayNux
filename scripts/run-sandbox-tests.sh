@@ -155,8 +155,248 @@ docker run --rm \
     set -euo pipefail
     export PATH="/usr/local/cargo/bin:$PATH"
 
+    # Bubblewrap 0.13.1, built from pinned upstream source (V-107 remediation).
+    #
+    # Why not the distribution package: this base is Debian Bookworm, whose
+    # bubblewrap 0.8.0-2+deb12u1 is affected by CVE-2026-87766, and Debian marks the
+    # bookworm backport as ignored because the fix is a rewrite -- there is no fixed
+    # package to install from the repositories this image configures, and the trixie
+    # binary needs GLIBC 2.38 where this base has 2.36. Upstream 0.13.1 replaced
+    # pathname resolution with descriptor-based openat2/RESOLVE_IN_ROOT.
+    #
+    # The three values below travel together and are re-read together: version,
+    # source URL, SHA-256. The digest is the one published on the upstream release
+    # page, and it was measured from this URL as well. It is a pin on the SOURCE:
+    # the build dependencies installed below still resolve from the live Bookworm
+    # repositories, so the build is not claimed to be reproducible, only the source
+    # is pinned.
+    BUBBLEWRAP_VERSION="0.13.1"
+    BUBBLEWRAP_URL="https://deb.debian.org/debian/pool/main/b/bubblewrap/bubblewrap_0.13.1.orig.tar.xz"
+    BUBBLEWRAP_SHA256="0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d"
+
+    # meson and ninja-build build it, libcap/libselinux/libpcre2 are what the
+    # distribution package links, and gcc is already in this image. util-linux is
+    # still required -- it provides the setpriv the unprivileged transition below
+    # depends on -- and curl with ca-certificates fetch the source over HTTPS with
+    # normal certificate validation. No setuid build: upstream no longer supports
+    # building one, which is the posture this lane wants regardless.
     apt-get update -qq
-    apt-get install -y -qq bubblewrap util-linux curl ca-certificates
+    apt-get install -y -qq meson ninja-build pkg-config libcap-dev libselinux1-dev \
+                       libpcre2-dev util-linux curl ca-certificates
+
+    BW_BUILD_DIR=$(mktemp -d /tmp/bubblewrap-build.XXXXXX)
+    trap "rm -rf -- $BW_BUILD_DIR" EXIT
+
+    # Fetch, failing on HTTP errors and incomplete transfers, then verify the digest
+    # BEFORE the archive is extracted or anything from it is executed. The archive is
+    # never piped unverified into tar.
+    curl -fsSL -o "$BW_BUILD_DIR/bubblewrap.tar.xz" "$BUBBLEWRAP_URL"
+    echo "$BUBBLEWRAP_SHA256  $BW_BUILD_DIR/bubblewrap.tar.xz" | sha256sum -c - ||
+      { echo "FATAL: bubblewrap source digest mismatch; refusing to build"; exit 1; }
+
+    tar -C "$BW_BUILD_DIR" -xf "$BW_BUILD_DIR/bubblewrap.tar.xz"
+    cd "$BW_BUILD_DIR/bubblewrap-$BUBBLEWRAP_VERSION"
+    # assume_kernel is deliberately NOT passed. Upstream documents that assuming 5.6
+    # compiles out the openat2 fallback, and that assuming 5.12 makes mount_setattr
+    # a runtime requirement. Leaving it empty keeps every old-kernel fallback in, so
+    # a developer on an older kernel is not silently turned away. The resolved value
+    # is asserted below rather than assumed.
+    meson setup _build -Dman=disabled -Dselinux=enabled -Dtests=false >/dev/null
+    ninja -C _build >/dev/null
+    meson install -C _build >/dev/null
+    cd /src
+
+    # Assert the resolved build option, not the default we hoped for: a missing or
+    # nonempty value means the fallbacks were compiled out and the lane must fail
+    # rather than ship a binary that assumes whatever kernel built it.
+    BW_BUILDDIR="$BW_BUILD_DIR/bubblewrap-$BUBBLEWRAP_VERSION"
+    BW_ASSUME_KERNEL=$(python3 -c "import json;d=json.load(open(\"$BW_BUILDDIR/_build/meson-info/intro-buildoptions.json\"));v=[o[\"value\"] for o in d if o[\"name\"]==\"assume_kernel\"];print(v[0] if v else \"MISSING\")")
+    if [ "$BW_ASSUME_KERNEL" != "" ]; then
+      echo "FATAL: meson assume_kernel resolved to \"$BW_ASSUME_KERNEL\"; leaving it empty is"
+      echo "       what keeps the old-kernel openat2 and mount_setattr fallbacks compiled in."
+      exit 1
+    fi
+
+    # Post-install assertions, absolute paths, failing the lane on any of them.
+    BW_BIN="/usr/local/bin/bwrap"
+    if [ ! -f "$BW_BIN" ]; then
+      echo "FATAL: $BW_BIN does not exist"; exit 1
+    fi
+    if [ -L "$BW_BIN" ]; then
+      echo "FATAL: $BW_BIN is a symlink; the installed binary must be a regular file"; exit 1
+    fi
+    if [ ! -x "$BW_BIN" ]; then
+      echo "FATAL: $BW_BIN is not executable"; exit 1
+    fi
+    BW_MODE=$(stat -c %a "$BW_BIN")
+    if [ "$BW_MODE" != "755" ]; then
+      echo "FATAL: $BW_BIN mode is $BW_MODE, expected 755"; exit 1
+    fi
+    BW_REPORTED=$("$BW_BIN" --version)
+    if [ "$BW_REPORTED" != "bubblewrap $BUBBLEWRAP_VERSION" ]; then
+      echo "FATAL: $BW_BIN reports \"$BW_REPORTED\", expected \"bubblewrap $BUBBLEWRAP_VERSION\""; exit 1
+    fi
+    # The suites spawn bwrap by PATH lookup (BWRAP = "bwrap" in linux.rs), so the
+    # resolution has to land on the binary just installed.
+    if [ "$(command -v bwrap)" != "$BW_BIN" ]; then
+      echo "FATAL: bwrap resolves to $(command -v bwrap), expected $BW_BIN"; exit 1
+    fi
+
+    # Why the /usr/local install alone is not enough, and what closes the gap.
+    #
+    # `spawn_supervisor` runs `Command::new(BWRAP)` with `env_clear()` (linux.rs) so a
+    # parent secret cannot reach the child. With an empty environment the exec lookup no
+    # longer uses the caller PATH: it falls back to glibc default path, measured on this
+    # image as `/bin:/usr/bin`, where `/usr/local/bin` does not appear.
+    #
+    # So installing only to /usr/local leaves every sandboxed execution failing with
+    # ENOENT, while the preflight -- which does not clear the environment -- still finds
+    # bwrap and reports that a Tier-1 capability can execute. That asymmetry is how this
+    # was found: the lane asserted the binary several ways and still ran nothing, and a
+    # shell PATH check of any thoroughness cannot see it. The emptied-environment
+    # assertion below performs the lookup the runner actually performs.
+    #
+    # The fix is to expose the same binary at the default path as a symlink, not a second
+    # copy, so there is one binary and two names. The checks that follow make that safe:
+    # nothing package-owned may already hold the path, no unexpected object may be
+    # replaced, and the link is created without force.
+    #
+    # Package-level check against the installed-package status database, which is a
+    # different database from the path-ownership search below.
+    #
+    # `dpkg-query -S` searches the per-package file lists under /var/lib/dpkg/info, so a
+    # missing or damaged <package>.list hides the files of that package from it while the
+    # package remains installed. dpkg says so only in a warning on stderr, which this
+    # guard discards, so a negative answer from the path search is not trustworthy on its
+    # own. /var/lib/dpkg/status is a separate file, unaffected by that loss: deleting
+    # bubblewrap.list does not remove the package status, and this check still sees the
+    # installation. Deleting the file-list record and the status record at once is a
+    # different kind of damage, and the sentinel below is what catches it.
+    #
+    # The decision is on the machine-readable status word, never on English output:
+    #
+    #   rc=0 and the status word is not-installed -> the package is unequivocally absent
+    #   rc=0 and any other status word            -> installed, residual (config-files) or
+    #                                               transitional (unpacked, half-installed,
+    #                                               half-configured): FATAL
+    #   rc=1                                      -> no record of the package; permitted
+    #                                               only because the sentinel above has
+    #                                               already shown the database readable
+    #   rc=2 or any unexpected result             -> a fatal or unrecoverable error; it is
+    #                                               never read as evidence of absence: FATAL
+    #
+    # Only the first outcome is acceptable, and ambiguity never reads as absence. The
+    # query is also first shown to work against a package that is certainly installed --
+    # the same sentinel pattern the path check uses -- because if that control cannot be
+    # found the status database is not readable and absence cannot be established, which
+    # is not evidence of absence.
+    if ! dpkg-query -W -f="\${Status}\n" dpkg >/dev/null 2>&1; then
+      echo "FATAL: cannot read the installed-package status database -- dpkg-query found no"
+      echo "       record for the dpkg package itself -- so the absence of the bubblewrap"
+      echo "       package cannot be established"
+      exit 1
+    fi
+
+    set +e
+    BW_PKG_STATUS=$(dpkg-query -W -f="\${db:Status-Status}\n" bubblewrap 2>/dev/null)
+    BW_PKG_RC=$?
+    set -e
+    case "$BW_PKG_RC" in
+      0)
+        if [ "$BW_PKG_STATUS" != "not-installed" ]; then
+          echo "FATAL: the bubblewrap package is present in the installed-package status"
+          echo "       database (status: $BW_PKG_STATUS); the distribution bubblewrap package"
+          echo "       must not be installed, and a local symlink must not shadow it"
+          exit 1
+        fi
+        ;;
+      1)
+        # No record of the package at all. Permitted only because the sentinel above has
+        # already shown the status database readable, so this is not exit 1 relied on
+        # alone.
+        ;;
+      *)
+        echo "FATAL: the bubblewrap status query exited $BW_PKG_RC; 2 is a fatal or"
+        echo "       unrecoverable error, and an unexpected result is not evidence that the"
+        echo "       package is absent"
+        exit 1
+        ;;
+    esac
+
+    # Fail closed on path ownership.
+    #
+    # `dpkg-query -S` cannot be trusted on its exit code alone: it exits 1 both when no
+    # package owns a path and when it cannot read a usable database, and it prints the
+    # same "no path found matching pattern" wording in both cases -- so exit status and
+    # message text are both incapable of telling "unowned" from "unable to tell". The
+    # probe is therefore first shown to work, by finding a path that is certainly owned
+    # in any Debian container: the dpkg-query binary being executed right now. If that
+    # control does not resolve to a package, ownership could not be established at all,
+    # and an inability to establish ownership is not evidence of non-ownership -- so the
+    # lane stops here rather than writing to a path it cannot reason about.
+    if ! dpkg-query -S /usr/bin/dpkg-query >/dev/null 2>&1; then
+      echo "FATAL: cannot establish package ownership -- dpkg-query found no owner for its"
+      echo "       own /usr/bin/dpkg-query -- so /usr/bin/bwrap ownership is unknown"
+      exit 1
+    fi
+    if dpkg-query -S /usr/bin/bwrap >/dev/null 2>&1; then
+      echo "FATAL: /usr/bin/bwrap is owned by a package; the distribution bubblewrap package"
+      echo "       must not be installed, and a local symlink must not shadow it"
+      exit 1
+    fi
+
+    # Reject anything already at the default path, and accept exactly one pre-existing
+    # state: an unowned symlink pointing at the binary just installed. A foreign
+    # symlink, a dangling symlink, a regular file, a directory or any other object is
+    # refused rather than replaced -- which is what keeps a stale build or a
+    # package-managed link from silently taking the name.
+    #
+    # `[ -e ]` alone is not enough: it is false for a dangling symlink, so the symlink
+    # test is made on its own and the object is classified for the failure message.
+    if [ -e /usr/bin/bwrap ] || [ -L /usr/bin/bwrap ]; then
+      if [ -L /usr/bin/bwrap ] && [ "$(readlink /usr/bin/bwrap)" = "$BW_BIN" ]; then
+        echo "   default-path link: /usr/bin/bwrap -> $BW_BIN (already present)"
+      else
+        if [ -L /usr/bin/bwrap ]; then
+          BW_WHAT="a symlink to $(readlink /usr/bin/bwrap)"
+        else
+          BW_WHAT="an existing non-symlink object"
+        fi
+        echo "FATAL: /usr/bin/bwrap already exists as $BW_WHAT and will not be replaced"
+        exit 1
+      fi
+    fi
+
+    # Create the link WITHOUT force, now that absence -- or an already-correct link --
+    # has been established. If anything appears at that path between the check above and
+    # this call, `ln -s` fails and the lane stops, instead of overwriting it.
+    if [ ! -e /usr/bin/bwrap ] && [ ! -L /usr/bin/bwrap ]; then
+      ln -s "$BW_BIN" /usr/bin/bwrap
+    fi
+    if [ "$(readlink /usr/bin/bwrap)" != "$BW_BIN" ]; then
+      echo "FATAL: /usr/bin/bwrap does not resolve to $BW_BIN"; exit 1
+    fi
+
+    # The decisive assertion: the lookup a spawn with an emptied environment performs.
+    # `env -i` clears the environment, so the name is resolved exactly as the sandbox
+    # runner resolves it. If this reports a different binary, or nothing at all, the lane
+    # fails here rather than producing green suites that ran no sandboxed subprocess.
+    BW_EMPTY_ENV=$(env -i python3 -c "import os;os.execvp(\"bwrap\",[\"bwrap\",\"--version\"])" 2>/dev/null)
+    if [ "$BW_EMPTY_ENV" != "bubblewrap $BUBBLEWRAP_VERSION" ]; then
+      echo "FATAL: a process with an emptied environment resolves bwrap as [$BW_EMPTY_ENV];"
+      echo "       the sandbox runner spawns bwrap that way, so execution would fail"; exit 1
+    fi
+
+    echo "== bubblewrap: built from pinned upstream source, not the distribution package =="
+    echo "   source:         $BUBBLEWRAP_URL"
+    echo "   sha256:         $BUBBLEWRAP_SHA256 (verified before extraction)"
+    echo "   version:        $BW_REPORTED"
+    echo "   installed:      $BW_BIN (regular file, mode $BW_MODE)"
+    echo "   PATH resolution: $(command -v bwrap)"
+    echo "   default-path link: /usr/bin/bwrap -> $(readlink /usr/bin/bwrap)"
+    echo "   emptied-environment lookup: $BW_EMPTY_ENV"
+    echo "   assume_kernel:  (empty -- old-kernel fallbacks compiled in)"
+    echo
 
     useradd --create-home --uid 1000 orxnud
     chown -R orxnud /usr/local/cargo/registry
@@ -213,6 +453,36 @@ docker run --rm \
     #
     # The variables are set on the setpriv line rather than exported globally, so the
     # root build above still sees the root environment.
+    # The suites resolve bwrap by PATH lookup, so the binary that actually runs is
+    # the one the unprivileged test process resolves -- and that process is started
+    # by the exec below, whose environment is not the root shell environment. So
+    # assert the resolution inside that exact transition: same uid, same capability
+    # drops, same environment, only the program differs. A PATH that would reach
+    # inner.sh differently fails the lane here instead of silently running a
+    # different binary. The check runs as uid 1000 with no capabilities, which is
+    # also the least privileged state from which it could be asked.
+    setpriv --reuid=1000 --regid=1000 --clear-groups \
+            --inh-caps=-all --bounding-set=-all -- \
+      env HOME=/home/orxnud \
+          XDG_CONFIG_HOME=/home/orxnud/.config \
+          XDG_CACHE_HOME=/home/orxnud/.cache \
+          XDG_DATA_HOME=/home/orxnud/.local/share \
+      /bin/bash -c "
+        resolved=\$(command -v bwrap)
+        if [ \"\$resolved\" != \"$BW_BIN\" ]; then
+          echo \"FATAL: the unprivileged test environment resolves bwrap to \$resolved,\"
+          echo \"       expected $BW_BIN\"
+          exit 1
+        fi
+        reported=\"\$($BW_BIN --version)\"
+        if [ \"\$reported\" != \"bubblewrap $BUBBLEWRAP_VERSION\" ]; then
+          echo \"FATAL: the unprivileged test environment sees \$reported,\"
+          echo \"       expected bubblewrap $BUBBLEWRAP_VERSION\"
+          exit 1
+        fi
+        echo \"   as uid 1000, no capabilities: bwrap resolves to \$resolved (\$reported)\"
+      "
+
     exec setpriv --reuid=1000 --regid=1000 --clear-groups \
                  --inh-caps=-all --bounding-set=-all -- \
       env HOME=/home/orxnud \

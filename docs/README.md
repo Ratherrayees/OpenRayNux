@@ -354,7 +354,7 @@ seconds on a warm target directory.
 | # | Document | What it is for |
 |---|----------|----------------|
 | **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, **§9a: where the implementation actually stands**, and **§10: the verifier-admission invariant (K.1)**. |
-| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 107 rows (105 V rows plus `K.1` and `F-26`): every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
+| **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 109 rows (107 V rows plus `K.1` and `F-26`): every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
 | **09** | [Architecture Decision Records](09-decisions.md) | 57 primary ADRs, ADR-0001…ADR-0059 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, and ADR-0058 carries three implementation notes, none of which are separate records). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
