@@ -149,6 +149,20 @@ manifest_deps() {
 # Kept in Python because `scripts/mutate.sh` already requires `python3`, so this adds no
 # new tool to CI. See scripts/rustscan.py for the reasoning.
 
+# Shared gate helpers. `gate_contains` is the one implementation of a substring
+# search used by the gates, and `scripts/gate-selftest.py` exercises that same
+# function rather than a copy of it: a self-test of a copy proves only that the
+# copy agrees with itself.
+#
+# The helper exists because `printf '%s' "$text" | grep -q "$pattern"` silently
+# fails on large inputs -- `grep -q` exits at its first match, the producer
+# takes SIGPIPE, and under `set -o pipefail` the pipeline's status becomes 141
+# rather than grep's 0. The `if` was then false on a match. `scripts/gate_lib.sh`
+# says the whole of it.
+#
+# shellcheck source=scripts/gate_lib.sh
+source "$REPO_ROOT/scripts/gate_lib.sh"
+
 # The root under test. `ORXNUD_GATE_ROOT` points the boundary gates at a fixture tree
 # instead of this repository, which is how `scripts/gate-selftest.py` drives *these*
 # functions against temporary sources rather than against a reimplementation of them.
@@ -372,11 +386,18 @@ gate_G2() {
     # correct code, which is how a gate earns itself a bypass.
     allowed_names="${layers[*]:0:$i}"
     allowed_names="${allowed_names//|/ }"
+    # The permitted names are matched as whole lines, so `orxnud-domain` never
+    # satisfies a dependency on `orxnud-domain-extra`. `gate_contains_line`
+    # rather than a pipeline into `grep -qx`: the pipeline form lets grep exit
+    # at its first match, the producer takes SIGPIPE, and under `set -o
+    # pipefail` the pipeline then reports 141 rather than grep's 0 -- so the
+    # `!` below cannot tell "found" from "the producer was killed".
+    allowed_lines="$(printf '%s\n' $allowed_names)"
     for crate in $(echo "${layers[$i]}" | tr '|' ' '); do
       manifest="crates/$crate/Cargo.toml"
       [ -f "$manifest" ] || continue
       for dep in $(manifest_deps "$manifest" | grep -E '^orxnud-' || true); do
-        if ! printf '%s\n' $allowed_names | grep -qx -- "$dep"; then
+        if ! gate_contains_line "$dep" "$allowed_lines"; then
           fail_gate "$crate depends on $dep, which is not inward (may depend on: $(echo $allowed_names | tr " " ", "))"
           ok_all=0
         fi
@@ -623,6 +644,17 @@ gate_G9() {
     return
   fi
 
+  # The refusal diagnostic below is only useful if it fires. It was written as
+  # `printf '%s' "$out" | grep -q "$refusal"`, which cannot: `grep -q` exits at
+  # its first match, the producer takes SIGPIPE, and under `set -o pipefail` the
+  # pipeline reports 141 instead of grep's 0, so the `if` was false on a match.
+  # The check below is what stops that coming back -- and what stops the gate
+  # quietly going back to using the helper rather than being wired to it.
+  if ! python3 scripts/check-gate-integration.py "$REPO_ROOT"; then
+    fail_gate "the gates do not use the shared diagnostic helper, or a search has gone back to a pipeline"
+    return
+  fi
+
   # TEST-001: a passing test process is not evidence that a guarded body ran. Tests
   # append a record only when they exercise (or deliberately reduce) their path; the
   # gate validates those records against a fixed expected set. The scanner rejects the
@@ -714,13 +746,25 @@ gate_G9() {
       # proposal, approval, bound and disclosure evidence that holds on any host.
       #
       # The `continuation` ones are named for a sharper reason than the rest: reaching a
-      # step boundary requires a *verified* effect, and the only capability in this build
-      # that verifies is Tier-1 and sandboxed -- `text/word-count` deliberately returns
-      # `Undetermined` rather than `Verified`, because counting words has no effect to
-      # observe. So there is no host-independent way to put a task at a boundary, and the
-      # continuation evidence is sandbox evidence. Six of that file's nine tests are named
-      # here for that reason; the three that do not execute a capability are NOT excluded
-      # and run everywhere.
+      # step boundary requires a *verified* effect. `text/word-count` CAN supply one --
+      # it is Tier-0, it runs in-process, and `WordCountVerifier` independently recomputes
+      # the counts and returns `Verified` on an exact match (`crates/orxnud-capability/
+      # src/text.rs`). A task therefore CAN reach `awaiting-next-step` without Tier-1
+      # execution, and reaching a boundary does not imply needing a sandbox.
+      #
+      # This comment previously said the opposite: that `text/word-count` "deliberately
+      # returns `Undetermined` rather than `Verified`", and that there was "no
+      # host-independent way to put a task at a boundary". Both were false, and the false
+      # premise is what caused a CI failure: two `continuation.rs` tests were excluded on
+      # the reasoning that they needed a sandbox, so the list rotted, and two others that
+      # needed no sandbox at all were left in the suite where they failed on any host
+      # without one. The exclusion is therefore derived from what a test must SET UP, not
+      # from what it asserts and not from which file it lives in -- each test is named
+      # because its own setup executes a Tier-1 capability.
+      #
+      # The classification of `tests/continuation.rs` is six tests needing a Tier-1 setup,
+      # five needing only a Tier-0 setup to reach a boundary, and three needing no
+      # capability execution at all. The five and the three run everywhere.
       filter=(
         -E 'not ((binary(isolation) or binary(hostile_helper) or binary(disclosure))
               or test(suites::governed_path::) or test(suites::read_text_real::) or test(suites::write_text::)
@@ -754,9 +798,9 @@ gate_G9() {
       note "  enforcement and resources RUN here and record reduced coverage rather"
       note "  than disappearing behind the exclusion."
       note "  linux::tests::              -- the Linux backend's own suite."
-      note "  6 named tests               -- sandbox-evidence tests inside tasks.rs."
-      note "  6 named tests               -- continuation.rs, which cannot reach a step"
-      note "                                 boundary without a verified sandboxed effect."
+      note "  5 named tests               -- sandbox-evidence tests inside tasks.rs."
+      note "  6 named tests               -- continuation.rs, whose setup executes a Tier-1"
+      note "                                 capability to reach a step boundary."
       note "  5 named tests               -- expiry.rs, which cannot prove a fresh"
       note "                                 approval works without a verified execution."
       note "  Everything else runs, including every refusal-path assertion."
@@ -767,7 +811,14 @@ gate_G9() {
       out="$(ORXNUD_TEST_COVERAGE="$coverage_file" ORXNUD_COVERAGE_RUN="$coverage_run" \
         cargo nextest run --workspace --no-fail-fast "${filter[@]}" 2>&1)" || rc=$?
       echo "$out"
-      if printf '%s' "$out" | grep -q "$refusal"; then
+      # `gate_contains`, not `printf ... | grep -q`: the pipeline form lets grep
+      # exit at its first match, which SIGPIPEs the producer, and under
+      # `set -o pipefail` the pipeline then reports 141 instead of grep's 0 -- so
+      # the `if` was false on a match and true on a miss. The size of the output
+      # decided it, which is why it worked on small inputs and failed on the
+      # 486 KB this gate actually produces. `scripts/gate_lib.sh` has the whole
+      # of it, and `scripts/gate-selftest.py` pins both directions.
+      if gate_contains "$refusal" "$out"; then
         fail_gate "a suite outside the exclusion list needs a real sandbox: it failed with \"$refusal\" on a host that cannot isolate, so it was never excluded. Add its binary to the G9 filter above, or run it in scripts/run-sandbox-tests.sh"
         return
       fi
@@ -786,7 +837,7 @@ gate_G9() {
         return
       fi
       printf '%s\n' "$coverage_summary" | sed 's/^/     /'
-      if printf '%s' "$coverage_summary" | grep -q 'verified=.* reduced=0 not-exercised=0 missing=0'; then
+      if gate_matches 'verified=.* reduced=0 not-exercised=0 missing=0' "$coverage_summary"; then
         ok "cargo nextest run (all expected paths verified)"
       else
         ok "cargo nextest run (reduced coverage; see the summary above)"
@@ -803,7 +854,7 @@ gate_G9() {
         return
       fi
       printf '%s\n' "$coverage_summary" | sed 's/^/     /'
-      if printf '%s' "$coverage_summary" | grep -q 'verified=.* reduced=0 not-exercised=0 missing=0'; then
+      if gate_matches 'verified=.* reduced=0 not-exercised=0 missing=0' "$coverage_summary"; then
         ok "cargo nextest run (all expected paths verified)"
       else
         ok "cargo nextest run (reduced coverage; see the summary above)"
@@ -927,7 +978,7 @@ gate_G13() {
     return
   fi
   if python3 scripts/gate-selftest.py; then
-    ok "G2d and G3 self-tests pass (real gate logic, temporary fixtures)"
+    ok "G2d, G3 and the G9 diagnostic self-tests pass (real gate logic, temporary fixtures)"
   else
     fail_gate "a boundary-gate self-test failed: the gate does not do what it claims"
   fi

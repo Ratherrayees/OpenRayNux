@@ -300,6 +300,44 @@ fn propose_first_step(endpoint: &Path, target: &str, claim_generation: i64) -> S
         .to_owned()
 }
 
+/// Proposes the first step through the human route, using the Tier-0
+/// `text/word-count`.
+///
+/// The same governed route as [`propose_first_step`] -- propose, approve, execute,
+/// verify -- but with a capability that verifies without a sandbox, so the task
+/// reaches its boundary on any host.
+///
+/// `text/word-count` is Tier-0 and runs in-process, and `WordCountVerifier`
+/// independently recomputes the counts from the invocation's own parameters
+/// before reporting `Verified`. So this reaches a *verified* effect rather than
+/// a manufactured one, and the authorization model is untouched: the proposal
+/// still travels `task/propose` -> `capability/approve` -> `task/execute`.
+///
+/// Use this for a test whose property is about the continuation -- the governed
+/// lock, the lease, the proposal fence -- rather than about a sandbox. A test
+/// that needs the sandbox has to execute a Tier-1 capability, and then it is
+/// sandbox evidence and belongs in the positive lane.
+fn propose_first_step_tier0(endpoint: &Path, claim_generation: i64) -> String {
+    let p = send(
+        endpoint,
+        "q",
+        "task/propose",
+        json!({
+            "task": "t1", "worker": "w1", "capability": "text/word-count",
+            "claim_generation": claim_generation,
+            "params": {"text": "one two three"},
+        }),
+    );
+    assert!(
+        p.get("result").is_some(),
+        "the manual proposal must be written: {p}"
+    );
+    p["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned()
+}
+
 /// Approves and executes `pid`, asserting the step verified.
 fn approve_and_run(endpoint: &Path, pid: &str) {
     send(
@@ -1121,7 +1159,8 @@ fn a_blocked_continuation_does_not_hold_the_governed_lock() {
         let claim_generation = claimed["result"]["claim_generation"]
             .as_i64()
             .expect("claim generation");
-        let pid = propose_first_step(&s.endpoint, "first.txt", claim_generation);
+        // A Tier-0 setup: this test's property is the governed lock, not a sandbox.
+        let pid = propose_first_step_tier0(&s.endpoint, claim_generation);
         approve_and_run(&s.endpoint, &pid);
         assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
 
@@ -1222,7 +1261,9 @@ fn a_cancelled_task_cannot_receive_a_stale_proposal_from_a_blocked_continuation(
         let claim_generation = claimed["result"]["claim_generation"]
             .as_i64()
             .expect("claim generation");
-        let pid = propose_first_step(&s.endpoint, "first.txt", claim_generation);
+        // A Tier-0 setup: this test's property is the proposal fence and the
+        // cancellation, not a sandbox.
+        let pid = propose_first_step_tier0(&s.endpoint, claim_generation);
         approve_and_run(&s.endpoint, &pid);
         assert_eq!(state_of(&s.endpoint, "t1"), "awaiting-next-step");
 

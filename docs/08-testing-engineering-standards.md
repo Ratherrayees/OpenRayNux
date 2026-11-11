@@ -616,14 +616,21 @@ rather than declared and assumed.
 >
 > Full account in [`README.md`](README.md) §8.
 
-### The latest full local gate (2026-11-08)
+### The latest full local gate
 
-`CI=true ./scripts/ci-gates.sh` exited 0 with **all selected gates passed**: 17 passed,
-0 failed, and 1 documented skip — G12 semver, which has no release tag to compare
-against, at commit `e5d387ca` with the state-root validation of ADR-0059 / V-106 in the
-tree. G9 ran **2036 tests: 2036 passed, 0 failed, 6 skipped**, with 2 *leaky* results
-(process accounting, not failures), and all **36 coverage paths** verified
-(`verified=36 reduced=0 not-exercised=0 missing=0`).
+`CI=true ./scripts/ci-gates.sh` at the tree containing the G9 diagnostic fix and the
+`continuation.rs` / `cli_e2e.rs` corrections: G9 ran **2040 tests: 2040 passed, 0 failed,
+6 skipped**, with 2 *leaky* results (process accounting, not failures), and all **36 coverage
+paths** verified (`verified=36 reduced=0 not-exercised=0 missing=0`).
+
+**The figure is measured, not carried forward.** It moves with the suite list, and a stale
+number is worse than none — the 2036 above was the count at commit `e5d387ca`, and the
+2040 above is the count after the three cases this work added (the read case split into a
+success case and a refusal case, plus the two refusal-recovery cases). Read the count from
+the run.
+
+**The 2026-11-08 figure is retained as history:** 2036 tests, 2036 passed, 6 skipped,
+2 leaky, 36 coverage paths, all gates passed.
 
 **The 2026-11-05 figure is retained as history:** 2001 tests, 2001 passed, 6 skipped,
 2 leaky, 36 coverage paths, all gates passed.
@@ -667,21 +674,45 @@ without the qualification would be describing an earlier state of the world.
   gate prints which ones it excluded and why. The exact figure is not recorded here because
   it moves with the suite list and a stale number is worse than none — read it from the run.
 
-  **Continuation is sandbox evidence, and that is a property of the code rather than a
-  choice about the tests.** Reaching `AwaitingNextStep` requires a *verified* effect, and
-  `text/word-count` deliberately returns `Undetermined` rather than `Verified` — counting
-  words has no effect to observe — so `filesystem/write-text` is the only capability that can
-  put a task at a boundary. Six of the nine tests in `tests/continuation.rs` therefore have
-  to execute one first, are named in the G9 exclusion list, and run in the ADR-0046
-  container. The three that do not execute a capability — the `max_steps` bounds, the
-  `done`-shape refusals, and the prior-step disclosure shape — run on every host.
+  **Continuation is *partly* sandbox evidence, and the classification follows each test's
+  setup rather than the file it lives in.** Reaching `AwaitingNextStep` requires a *verified*
+  effect. `text/word-count` **can** supply one: it is Tier-0, it runs in-process, and
+  `WordCountVerifier` independently recomputes the four counts from the invocation's own
+  parameters — by a different algorithm from the adapter's — and returns `Verified` on an
+  exact match (`crates/orxnud-capability/src/text.rs`). So a task **can** reach a boundary
+  without Tier-1 execution, and "needs a boundary" does **not** imply "needs a sandbox".
 
-  This was got wrong once: the first version of that exclusion list named five, on the
-  reasoning that a test which only *asserts a race* does not need a sandbox. It does —
-  it has to put the task at a boundary to have a boundary to race over — and hosted CI
-  caught it (`a_boundary_is_claimed_by_exactly_one_worker`). The lesson is that the
-  exclusion list has to be derived from what a test must *set up*, not from what it
-  asserts.
+  > **This paragraph previously said the opposite.** It claimed `text/word-count`
+  > "deliberately returns `Undetermined` rather than `Verified`", and that "the only
+  > capability that can put a task at a boundary" was `filesystem/write-text`. Both were
+  > false, and the false premise caused a CI failure: two `continuation.rs` tests were
+  > excluded on the reasoning that they needed a sandbox, the list then rotted, and two
+  > others that needed no sandbox at all were left in the suite where they failed on any
+  > host without one. The verifier has returned `Verified` on a matching count since the
+  > capability was first added (`ba7df4a`, 2026-10-03) — before the comment was written
+  > (`0d0ea4b`, 2026-10-06).
+
+  The measured classification of `tests/continuation.rs`, all fourteen tests:
+
+  | Setup the test needs | Tests | Treatment |
+  |---|---:|---|
+  | A Tier-1 capability to reach a boundary | 6 | Excluded from G9; run in the positive Tier-1 lane |
+  | A Tier-0 capability to reach a boundary | 5 | Run everywhere |
+  | No capability execution at all | 3 | Run everywhere |
+
+  The five in the middle row reach the boundary through `text/word-count`; the three in the
+  last row are the `max_steps` bounds, the `done`-shape refusals and the prior-step
+  disclosure shape. The six in the first row execute `filesystem/write-text` and are named in
+  the G9 exclusion list.
+
+  This was got wrong twice, in both directions. The first version of that exclusion list
+  named five, on the reasoning that a test which only *asserts a race* does not need a
+  sandbox. It does — it has to put the task at a boundary to have a boundary to race over —
+  and hosted CI caught it (`a_boundary_is_claimed_by_exactly_one_worker`). The second
+  mistake was the false premise above, which excluded too much and left two host-independent
+  tests to fail on every incapable host. The lesson is that the exclusion list has to be
+  derived from what a test must *set up*, not from what it asserts and not from which file
+  it lives in.
 
   **The same argument covers `binary(disclosure)` in its entirety.** Every test in it has to
   produce a *verified* `filesystem/read-text` before it can assert anything about disclosure,

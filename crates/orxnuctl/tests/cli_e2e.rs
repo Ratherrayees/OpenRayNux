@@ -322,7 +322,31 @@ impl Daemon {
         provider: &TlsProvider,
         credential_file: &Path,
     ) -> Self {
-        Self::start_with_tls_provider_at(root, provider, credential_file, "/v1", false).0
+        Self::start_with_tls_provider_at(root, provider, credential_file, "/v1", false, &[]).0
+    }
+
+    /// Starts a TLS-provider daemon whose child environment excludes `bwrap`.
+    ///
+    /// Only the *spawned daemon* is given this PATH. The test runner's own PATH
+    /// is untouched, so the runner keeps whatever capability it has and the
+    /// daemon is made incapable deterministically -- the refusal branch is then
+    /// exercised on every machine, including one that could have run the read.
+    /// No production policy is changed: `bwrap` remains the production backend
+    /// and is simply not reachable by the child's PATH lookup.
+    fn start_with_tls_provider_without_bwrap(
+        root: &Path,
+        provider: &TlsProvider,
+        credential_file: &Path,
+    ) -> Self {
+        Self::start_with_tls_provider_base(
+            root,
+            provider,
+            credential_file,
+            &format!("https://{}/v1", provider.address),
+            false,
+            &[("PATH", path_without_bwrap().as_str())],
+        )
+        .0
     }
 
     /// Starts a daemon pointed at a TLS provider, at `path` after the authority.
@@ -330,12 +354,14 @@ impl Daemon {
     /// `path` is the provider's path prefix, so a scenario can configure an
     /// endpoint the safe-label projection refuses without touching the transport.
     /// With `capture_stderr`, the daemon's own standard error is collected.
+    /// `extra_env` is applied to the spawned child only.
     fn start_with_tls_provider_at(
         root: &Path,
         provider: &TlsProvider,
         credential_file: &Path,
         path: &str,
         capture_stderr: bool,
+        extra_env: &[(&str, &str)],
     ) -> (Self, Option<CapturedStderr>) {
         Self::start_with_tls_provider_base(
             root,
@@ -343,6 +369,7 @@ impl Daemon {
             credential_file,
             &format!("https://{}{path}", provider.address),
             capture_stderr,
+            extra_env,
         )
     }
 
@@ -350,12 +377,17 @@ impl Daemon {
     ///
     /// The URL is used as given: the daemon's configuration is not the thing under
     /// test here, only what the daemon says about it.
+    ///
+    /// `extra_env` is applied to the spawned child only. It exists so a case can
+    /// make the *daemon* incapable without touching the test runner's own
+    /// environment; the TLS and credential setup below is unchanged by it.
     fn start_with_tls_provider_base(
         root: &Path,
         provider: &TlsProvider,
         credential_file: &Path,
         base_url: &str,
         capture_stderr: bool,
+        extra_env: &[(&str, &str)],
     ) -> (Self, Option<CapturedStderr>) {
         let mut command = Command::new(daemon_bin());
         command
@@ -372,8 +404,14 @@ impl Daemon {
             // The ambient credential store is made unreachable for this process, so
             // the test does not depend on the machine holding a usable secret. The
             // variable belongs to this child alone.
-            .env("DBUS_SESSION_BUS_ADDRESS", BROKEN_SESSION_BUS)
-            .stdout(Stdio::null());
+            .env("DBUS_SESSION_BUS_ADDRESS", BROKEN_SESSION_BUS);
+        // Extra environment for the child only. The test runner's own environment
+        // is never modified: the daemon is what must be made incapable, not the
+        // test.
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command.stdout(Stdio::null());
         if capture_stderr {
             command.stderr(Stdio::piped());
         } else {
@@ -449,6 +487,206 @@ impl Daemon {
             other => panic!("doctor reported an unreadable Tier-1 verdict {other:?}:\n{text}"),
         }
     }
+}
+
+/// A `PATH` without `bwrap`, but otherwise complete.
+///
+/// Only the *spawned daemon* is given this PATH. The test runner's own PATH is
+/// untouched, so the runner keeps whatever capability it has and the daemon is
+/// made incapable deterministically -- the refusal branch is then exercised on
+/// every machine, including one that could have run the read. No production
+/// policy is changed: `bwrap` remains the production backend and is simply not
+/// reachable by the child's PATH lookup.
+fn path_without_bwrap() -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut kept: Vec<&str> = Vec::new();
+    for dir in current.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        if std::path::Path::new(dir).join("bwrap").exists() {
+            continue;
+        }
+        kept.push(dir);
+    }
+    kept.join(":")
+}
+
+/// The task id the model-initiated read cases create.
+///
+/// The proposal id is a DIFFERENT identifier -- the daemon mints it from the
+/// model's answer -- so a state lookup must never use it.
+const TASK_ID: &str = "pty-1";
+
+/// One JSON-RPC call to the daemon, returning the whole reply.
+///
+/// A direct request rather than the CLI, because the CLI renders replies for a
+/// human and a test must not parse a rendered table to make an assertion about
+/// a structured field.
+fn rpc_call(
+    endpoint: &std::path::Path,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream =
+        orxnud_platform_ipc::connect_blocking(endpoint).expect("connect to the daemon");
+    // The read deadline is CHECKED. It is the only thing standing between a
+    // silent peer and a hung test, so a failure to establish it must not be
+    // discarded: `.ok()` would leave the call able to block forever, which is
+    // exactly what the deadline exists to prevent.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .expect("set the RPC read deadline");
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "t",
+        "method": method,
+        "params": params,
+    });
+    stream
+        .write_all(&serde_json::to_vec(&frame).expect("encode"))
+        .expect("write the request");
+    stream.write_all(b"\n").expect("write the newline");
+    stream.flush().expect("flush");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read the reply");
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("the reply must be JSON: {e}\n{line}"))
+}
+
+/// The `state` of the task with this id, read from the **structured** route.
+///
+/// The CLI's `task list` renders a human-readable table, so reading the state
+/// out of it means splitting on whitespace and guessing which column is which.
+/// This asks the daemon directly over JSON-RPC instead, and asserts the shape of
+/// the reply before reading a field out of it:
+///
+/// 1. `result.tasks` must be an array;
+/// 2. rows are selected whose structured `id` **exactly** equals `task_id`;
+/// 3. **exactly one** row must match -- zero means the task is not there, more
+///    than one means the lookup would be silently resolved to the first match;
+/// 4. that row's `state` must be a string.
+///
+/// The state is returned exactly as the daemon reported it.
+fn task_state_of(daemon: &Daemon, task_id: &str) -> String {
+    let reply = rpc_call(&daemon.endpoint(), "task/list", serde_json::json!({}));
+    let tasks = reply["result"]["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("task/list must return a `tasks` array: {reply}"));
+    let mut matched: Vec<&serde_json::Value> =
+        tasks.iter().filter(|t| t["id"] == task_id).collect();
+    assert_eq!(
+        matched.len(),
+        1,
+        "exactly one task row must match {task_id:?}, found {} in: {reply}",
+        matched.len()
+    );
+    matched.pop().expect("one match")["state"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the task state must be a string: {reply}"))
+        .to_owned()
+}
+
+/// Asserts that the read really executed and was independently verified.
+///
+/// Exit code 0 is NOT evidence of verification: `task execute` exits 0 for any
+/// successful RPC, including an execution whose outcome was undetermined. The
+/// three verdict flags are the evidence, and all three are asserted -- a
+/// `verified: true` alongside `refuted: true` would be a contradiction, so the
+/// other two are checked too.
+fn assert_read_succeeded(
+    executed: &Output,
+    root: &std::path::Path,
+    sentinel: &str,
+    proposal_id: &str,
+) {
+    let out = stdout_of(executed);
+    let err = stderr_of(executed);
+    let verdict = |key: &str| -> bool {
+        out.lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("{key}: ")))
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false)
+    };
+    assert!(
+        verdict("verified"),
+        "the read must be independently verified: {out}"
+    );
+    assert!(!verdict("refuted"), "the read must not be refuted: {out}");
+    assert!(
+        !verdict("undetermined"),
+        "the read must not be undetermined: {out}"
+    );
+    // Both output streams: a disclosure through either is a disclosure.
+    assert!(
+        !out.contains(sentinel) && !err.contains(sentinel),
+        "the file's contents reached the terminal: {out}{err}"
+    );
+    // The file is unchanged: the read did not modify what it read.
+    let ws = make_workspace(root);
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).expect("the seeded file"),
+        sentinel,
+        "a read must leave the file it read unchanged"
+    );
+    let state = state_bytes(root);
+    assert!(
+        state.contains(proposal_id),
+        "the proposal must be in the durable state"
+    );
+    assert!(
+        !state.contains(sentinel),
+        "the file's contents must not be in the durable state"
+    );
+}
+
+/// Asserts that the read was refused because the host cannot sandbox.
+///
+/// The refusal is positive and specific: it names the missing guarantee, it is
+/// not a generic failure, and nothing about the file's contents reached either
+/// output stream or the durable state.
+fn assert_read_refused(
+    executed: &Output,
+    root: &std::path::Path,
+    sentinel: &str,
+    proposal_id: &str,
+) {
+    let out = stdout_of(executed);
+    let err = stderr_of(executed);
+    assert!(
+        !executed.status.success(),
+        "a host that cannot isolate must refuse the read, not run it: {out}"
+    );
+    assert!(
+        err.contains("sandbox guarantees"),
+        "the refusal must name the missing guarantee: {err}"
+    );
+    assert!(
+        err.contains("sandbox-unavailable"),
+        "the refusal must be the sandbox refusal, not some other failure: {err}"
+    );
+    // Both output streams: a disclosure through either is a disclosure.
+    assert!(
+        !out.contains(sentinel) && !err.contains(sentinel),
+        "the file's contents reached the terminal: {out}{err}"
+    );
+    // The file is unchanged: nothing read it, so nothing altered it.
+    let ws = make_workspace(root);
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.txt")).expect("the seeded file"),
+        sentinel,
+        "a refused read must leave the file unchanged"
+    );
+    let state = state_bytes(root);
+    assert!(
+        state.contains(proposal_id),
+        "the proposal must be in the durable state"
+    );
+    assert!(
+        !state.contains(sentinel),
+        "the file's contents must not be in the durable state"
+    );
 }
 
 /// Describes the host to the test log, so a failure says which environment produced it.
@@ -2842,6 +3080,21 @@ fn model_proposal_id(out: &Output) -> String {
         .unwrap_or_else(|| panic!("a proposal id in the output: {text}"))
 }
 
+/// How the daemon is started for a model-initiated read case.
+///
+/// The two cases below are the *same* body under the two modes. The mode decides
+/// how the daemon is started; it never decides what the body asserts, so the
+/// assertions cannot drift between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadStartup {
+    /// The ordinary TLS startup: the daemon gets the host's real `PATH`, so it
+    /// can sandbox exactly when the host can.
+    HostCapability,
+    /// The TLS startup with a `PATH` that excludes `bwrap`: the daemon is
+    /// incapable by construction, on every host.
+    WithoutBwrap,
+}
+
 /// A model-initiated file read, approved through the real interactive confirmation.
 ///
 /// The real `orxnuctl` binary, the real daemon binary, the real Unix socket, and a
@@ -2853,9 +3106,39 @@ fn model_proposal_id(out: &Output) -> String {
 )]
 #[test]
 fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
+    model_initiated_read_body(ReadStartup::HostCapability);
+}
+
+/// The model-initiated read, on a daemon that cannot sandbox whatever the host
+/// can do.
+///
+/// The daemon is started with a `PATH` that excludes `bwrap`, so the refusal
+/// branch is exercised on every machine, including one that could have run the
+/// read. Without this case the refusal would only ever be observed on a host
+/// that happens to lack a sandbox, and the branch would go untested wherever the
+/// suite is most likely to run.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
+#[test]
+fn a_model_initiated_read_is_refused_when_the_host_cannot_sandbox() {
+    model_initiated_read_body(ReadStartup::WithoutBwrap);
+}
+
+/// The shared body of the two model-initiated read cases.
+///
+/// `mode` decides how the daemon is started. Everything the body asserts is the
+/// same under both modes, so the two cases cannot drift apart.
+fn model_initiated_read_body(mode: ReadStartup) {
     use std::time::Duration;
 
-    let root = dir("read-pty");
+    // The two cases must not share a state root: `dir()` keys on the pid and the
+    // tag, and the tag differs per mode.
+    let root = dir(match mode {
+        ReadStartup::HostCapability => "read-pty",
+        ReadStartup::WithoutBwrap => "read-pty-nobwrap",
+    });
     let ws = make_workspace(&root);
     let sentinel = "PTY-READ-SENTINEL-4b7e2a";
     std::fs::write(ws.join("a.txt"), sentinel).expect("seed the file");
@@ -2869,7 +3152,32 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
     // The synthetic provider, answering with a model-initiated read proposal. It
     // requires the credential, so a daemon that used anything else would be refused.
     let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
-    let daemon = Daemon::start_with_tls_provider(&root, &provider, &credential_file);
+    let daemon = match mode {
+        ReadStartup::HostCapability => {
+            Daemon::start_with_tls_provider(&root, &provider, &credential_file)
+        }
+        ReadStartup::WithoutBwrap => {
+            Daemon::start_with_tls_provider_without_bwrap(&root, &provider, &credential_file)
+        }
+    };
+
+    // The mode's own precondition. The refusal case is only meaningful if the
+    // daemon really is incapable, and the capable case is only meaningful if the
+    // host really is capable -- so each is asserted rather than assumed.
+    match mode {
+        ReadStartup::HostCapability => {
+            // The host decides: this case asserts the successful read where the
+            // host can sandbox and the refusal where it cannot. That is the same
+            // rule every other Tier-1 case in this file follows.
+        }
+        ReadStartup::WithoutBwrap => {
+            assert!(
+                !daemon.tier1_executable(),
+                "the bwrap-less startup must leave the daemon incapable, or this case is \
+                 not exercising the refusal branch it claims to"
+            );
+        }
+    }
 
     // The provider refuses an unauthenticated request.
     let refused = probe_without_credential(&provider);
@@ -3069,12 +3377,36 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
         stdout_of(&executed),
         stderr_of(&executed)
     );
-    assert!(
-        executed.status.success(),
-        "the approved read must execute: {}\n{}",
-        stdout_of(&executed),
-        stderr_of(&executed)
-    );
+    // The closure determines ONLY the host outcome. It contains no assertion, so
+    // nothing inside it can be skipped by an early return: a `return` here yields
+    // a value to the caller and cannot bypass anything that follows.
+    //
+    // The closure is deliberate rather than a direct call. A `return` inside a
+    // closure returns from the CLOSURE; the same `return` in the test body would
+    // end the test *successfully*, silently skipping every assertion after it.
+    #[allow(
+        clippy::redundant_closure_call,
+        reason = "the closure is the point: a `return` inside it must not leave the test"
+    )]
+    let tier1_available = (|| print_host_environment(&daemon))();
+
+    // The branch-specific checks, OUTSIDE the closure, so neither branch can skip
+    // its own execution or refusal assertion by returning early.
+    if tier1_available {
+        // Capable host: the real read executes. Exit code 0 alone proves nothing --
+        // `task execute` exits 0 for any successful RPC, including an unverified
+        // one -- so the verdict triple is asserted explicitly.
+        assert!(
+            executed.status.success(),
+            "the approved read must execute: {}\n{}",
+            stdout_of(&executed),
+            stderr_of(&executed)
+        );
+        assert_read_succeeded(&executed, &root, sentinel, &proposal_id);
+    } else {
+        // Incapable host: the refusal is asserted, positively and specifically.
+        assert_read_refused(&executed, &root, sentinel, &proposal_id);
+    }
 
     // The approval is single-use: a second approval of the same proposal must be
     // refused, so exactly one approval can exist for it.
@@ -3090,12 +3422,18 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
         "a second approval must not be issued"
     );
 
-    // The proposal reached a decided state.
-    let listed = daemon.cli(&["task", "list"]);
-    assert!(
-        stdout_of(&listed).contains("completed"),
-        "the task must be completed: {}",
-        stdout_of(&listed)
+    // The proposal reached a decided state. The state is read from the STRUCTURED
+    // route, selected BY TASK ID -- the proposal id is a different identifier --
+    // and the lookup fails if it does not resolve to exactly one row.
+    let task_state = task_state_of(&daemon, TASK_ID);
+    assert_eq!(
+        task_state,
+        if tier1_available {
+            "completed"
+        } else {
+            "running"
+        },
+        "the task must be in the state the execution outcome implies"
     );
 
     // Durable state: the approval is there, and the file's contents are not.
@@ -3141,6 +3479,307 @@ fn a_model_initiated_read_is_approved_through_an_interactive_confirmation() {
         provider.rejected()
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// The refusal contract: what a host that cannot sandbox leaves behind.
+//
+// Two INDEPENDENT scenarios, because they are mutually exclusive. `recover()`
+// selects tasks that are `running` and still hold a lease; a cancel clears the
+// lease and makes the task terminal. A cancelled task therefore satisfies
+// neither predicate, and can never also take the startup-recovery route.
+//
+// Both use `filesystem/write-text`, which carries no read-specific
+// authorization layer, so the sandbox refusal is isolated from the read
+// authorization question.
+// ---------------------------------------------------------------------------
+
+/// A daemon started with a `PATH` that excludes `bwrap`, so it cannot isolate.
+///
+/// Only the child is affected: the test runner's own PATH is untouched, so the
+/// refusal branch is exercised on every host rather than only on one that
+/// happens to lack a sandbox.
+fn spawn_daemon_without_bwrap(root: &Path) -> std::process::Child {
+    Command::new(daemon_bin())
+        .arg("--state-root")
+        .arg(root)
+        .arg("--permit-argv-payload-exposure-for-tests")
+        .env("PATH", path_without_bwrap())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn orxnud")
+}
+
+/// Waits for the daemon to bind its socket, then gives it a moment to serve.
+fn await_socket(root: &Path) {
+    for _ in 0..200 {
+        if root.join("orxnud.sock").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("the daemon never bound its socket");
+}
+
+/// The tasks the daemon reports, over the structured route.
+fn rpc_task_list(root: &Path) -> serde_json::Value {
+    rpc_call(
+        &root.join("orxnud.sock"),
+        "task/list",
+        serde_json::json!({}),
+    )
+}
+
+/// Proposes, approves and executes a `filesystem/write-text`, returning the
+/// execution reply and the proposal id.
+fn propose_approve_and_execute(root: &Path) -> (serde_json::Value, String) {
+    let claimed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/claim",
+        serde_json::json!({"id": "t1", "worker": "w1"}),
+    );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
+    let proposed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/propose",
+        serde_json::json!({
+            "task": "t1", "worker": "w1", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
+            "target": "x.txt", "params": {"path": "x.txt", "contents": "hello"},
+        }),
+    );
+    let proposal_id = proposed["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned();
+    rpc_call(
+        &root.join("orxnud.sock"),
+        "capability/approve",
+        serde_json::json!({"proposal": proposal_id, "ttl_ms": 60_000}),
+    );
+    let executed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/execute",
+        serde_json::json!({"proposal": proposal_id, "worker": "w1"}),
+    );
+    (executed, proposal_id)
+}
+
+/// A refused Tier-1 execution leaves the task cancellable, and cancelling it
+/// ends it.
+///
+/// The refusal is the correct outcome on a host that cannot isolate, and it is
+/// a *state* refusal rather than a lost effect: the effect is recorded
+/// `not-performed`, the approval is consumed, and the task is `running` under a
+/// lease until somebody cancels it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
+#[test]
+fn a_sandbox_refusal_leaves_the_task_cancellable() {
+    let root = dir("refusal-cancellable");
+    let mut child = spawn_daemon_without_bwrap(&root);
+    await_socket(&root);
+
+    rpc_call(
+        &root.join("orxnud.sock"),
+        "task/create",
+        serde_json::json!({"id": "t1", "max_steps": 2, "content": "write x"}),
+    );
+    let (executed, proposal_id) = propose_approve_and_execute(&root);
+
+    // 1. The refusal is the sandbox refusal, and it names the missing guarantee.
+    assert_eq!(
+        executed["error"]["code"], -32043,
+        "the execution must be refused as sandbox-unavailable: {executed}"
+    );
+    assert_eq!(
+        executed["error"]["data"]["reason"], "sandbox-unavailable",
+        "the refusal must be the sandbox refusal: {executed}"
+    );
+
+    // The task is `running` under its lease.
+    let task = &rpc_task_list(&root)["result"]["tasks"][0];
+    assert_eq!(task["id"], "t1");
+    assert_eq!(task["state"], "running", "the task must still be running");
+    assert!(
+        task["lease_holder"].is_string(),
+        "the task must still hold its lease: {task}"
+    );
+
+    // 2. Re-execution is refused by the TASK-STATE check, before any sandbox
+    //    attempt -- it is not a second sandbox refusal.
+    let again = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/execute",
+        serde_json::json!({"proposal": proposal_id, "worker": "w1"}),
+    );
+    assert_eq!(
+        again["error"]["code"], -32041,
+        "the task is not waiting-for-user, so the proposal cannot execute again: {again}"
+    );
+    assert_eq!(again["error"]["data"]["reason"], "conflict", "{again}");
+
+    // 3. Re-approval is refused because the approval was consumed.
+    let reapproved = rpc_call(
+        &root.join("orxnud.sock"),
+        "capability/approve",
+        serde_json::json!({"proposal": proposal_id, "ttl_ms": 60_000}),
+    );
+    assert_eq!(
+        reapproved["error"]["data"]["reason"], "approval-already-consumed",
+        "the approval was already consumed: {reapproved}"
+    );
+
+    // 4. Re-claiming by another worker is refused: the task is not claimable.
+    let reclaimed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/claim",
+        serde_json::json!({"id": "t1", "worker": "w2"}),
+    );
+    assert_eq!(
+        reclaimed["error"]["code"], -32041,
+        "a running task must not be claimable by another worker: {reclaimed}"
+    );
+    assert_eq!(
+        reclaimed["error"]["data"]["reason"], "not-claimable",
+        "{reclaimed}"
+    );
+
+    // 5. Cancelling succeeds, and the task becomes terminal with the lease cleared.
+    let cancelled = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/cancel",
+        serde_json::json!({"id": "t1"}),
+    );
+    assert_eq!(
+        cancelled["result"]["cancelled"], true,
+        "the cancel must succeed: {cancelled}"
+    );
+    let task = &rpc_task_list(&root)["result"]["tasks"][0];
+    assert_eq!(task["state"], "cancelled", "the task must be cancelled");
+    assert!(
+        task["lease_holder"].is_null(),
+        "a cancelled task must not hold its lease: {task}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A refused Tier-1 execution is recovered by the next daemon start.
+///
+/// The daemon is terminated WITHOUT cancelling the task, so the task is still
+/// `running` under its lease when the next daemon starts. Startup recovery
+/// returns it to `pending` and clears the lease, because the attempt-1 effect
+/// was recorded `not-performed` -- a proven absence, not an uncertainty.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "Unix-socket daemon evidence: starts a real orxnud and talks to it over a Unix domain socket; the local IPC transport refuses on Windows rather than binding a named pipe"
+)]
+#[test]
+fn a_sandbox_refusal_recovers_on_the_next_daemon_start() {
+    let root = dir("refusal-recovery");
+    let mut child = spawn_daemon_without_bwrap(&root);
+    await_socket(&root);
+
+    rpc_call(
+        &root.join("orxnud.sock"),
+        "task/create",
+        serde_json::json!({"id": "t1", "max_steps": 2, "content": "write x"}),
+    );
+    let (executed, _) = propose_approve_and_execute(&root);
+    assert_eq!(
+        executed["error"]["code"], -32043,
+        "the execution must be refused as sandbox-unavailable: {executed}"
+    );
+    assert_eq!(
+        executed["error"]["data"]["reason"], "sandbox-unavailable",
+        "{executed}"
+    );
+
+    // Terminate the daemon WITHOUT cancelling the task.
+    let _ = child.kill();
+    let _ = child.wait();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Restart against the SAME persistent database, with the same restricted
+    // child PATH so the refusal is reproduced on both sides of the restart.
+    let mut child = spawn_daemon_without_bwrap(&root);
+    await_socket(&root);
+
+    // Startup recovery returned the task to `pending` and cleared the lease.
+    let task = &rpc_task_list(&root)["result"]["tasks"][0];
+    assert_eq!(task["id"], "t1");
+    assert_eq!(
+        task["state"], "pending",
+        "startup recovery must return it to pending"
+    );
+    assert!(
+        task["lease_holder"].is_null(),
+        "startup recovery must clear the lease: {task}"
+    );
+
+    // A fresh claim, proposal and approval are all possible.
+    let claimed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/claim",
+        serde_json::json!({"id": "t1", "worker": "w2"}),
+    );
+    assert_eq!(
+        claimed["result"]["attempt"], 2,
+        "the recovered task must be claimable as attempt 2: {claimed}"
+    );
+    let claim_generation = claimed["result"]["claim_generation"]
+        .as_i64()
+        .expect("claim generation");
+    let proposed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/propose",
+        serde_json::json!({
+            "task": "t1", "worker": "w2", "capability": "filesystem/write-text",
+            "claim_generation": claim_generation,
+            "target": "x.txt", "params": {"path": "x.txt", "contents": "hello2"},
+        }),
+    );
+    let proposal_id = proposed["result"]["proposal"]["proposal_id"]
+        .as_str()
+        .expect("a proposal id")
+        .to_owned();
+    let approved = rpc_call(
+        &root.join("orxnud.sock"),
+        "capability/approve",
+        serde_json::json!({"proposal": proposal_id, "ttl_ms": 60_000}),
+    );
+    assert!(
+        approved.get("result").is_some(),
+        "a fresh approval must be accepted: {approved}"
+    );
+
+    // The fresh proposal reaches the dispatcher and receives the expected refusal.
+    let executed = rpc_call(
+        &root.join("orxnud.sock"),
+        "task/execute",
+        serde_json::json!({"proposal": proposal_id, "worker": "w2"}),
+    );
+    assert_eq!(
+        executed["error"]["code"], -32043,
+        "attempt 2 must reach the dispatcher and be refused as sandbox-unavailable: {executed}"
+    );
+    assert_eq!(
+        executed["error"]["data"]["reason"], "sandbox-unavailable",
+        "{executed}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3588,6 +4227,7 @@ impl RefusalScenario {
             &credential_file,
             provider_path,
             capture_stderr,
+            &[],
         );
         let proxy = RecordingProxy::start(&daemon.endpoint(), tag);
         let task_id = format!("task-{tag}");
@@ -4011,7 +4651,7 @@ fn the_daemons_startup_output_never_carries_a_destination_it_cannot_show() {
     let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
     let base = format!("https://{USERINFO}@{}/v1", provider.address);
     let (daemon, stderr) =
-        Daemon::start_with_tls_provider_base(&root, &provider, &credential_file, &base, true);
+        Daemon::start_with_tls_provider_base(&root, &provider, &credential_file, &base, true, &[]);
     // The daemon starts: the configuration is accepted.
     assert!(daemon.cli(&["task", "list"]).status.success());
     let said = stderr
@@ -4038,7 +4678,7 @@ fn the_daemons_startup_output_never_carries_a_destination_it_cannot_show() {
     let provider = TlsProvider::answering(READ_PROPOSAL_JSON, &credential);
     let base = format!("https://{}/v1?{QUERY}#{FRAGMENT}", provider.address);
     let (daemon, stderr) =
-        Daemon::start_with_tls_provider_base(&root, &provider, &credential_file, &base, true);
+        Daemon::start_with_tls_provider_base(&root, &provider, &credential_file, &base, true, &[]);
     let said = stderr
         .expect("the daemon's standard error was captured")
         .text();

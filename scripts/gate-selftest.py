@@ -1694,6 +1694,71 @@ pub fn f() {}
 ]
 
 
+# ---------------------------------------------------------------------------
+# The G9 diagnostic: the shared helper, and the gate script's use of it.
+#
+# The refusal diagnostic was written as
+#
+#     printf '%s' "$out" | grep -q "$refusal"
+#
+# and it never fired, despite the refusal string being present in the output it
+# was searching. `grep -q` exits at its first match, which closes the pipe; the
+# producer then takes SIGPIPE and dies with 141; and because the gates run
+# under `set -o pipefail`, the PIPELINE's status is that 141 rather than grep's
+# 0. The `if` was therefore false on a match and true on a miss -- the exact
+# inverse of what it was written to do.
+#
+# The size of the output decided it, which is why it worked on small inputs and
+# failed on the 486 KB the gate actually produces. These cases pin the
+# behaviour on an output large enough to trigger it, in both directions.
+# ---------------------------------------------------------------------------
+
+# The refusal string the G9 diagnostic searches for.
+REFUSAL = "cannot establish the required sandbox guarantees"
+
+# A large output with the refusal near the beginning, in the same shape as the
+# real one: the match is early, so `grep -q` exits while the producer is still
+# writing, and the producer takes SIGPIPE.
+LARGE_OUTPUT_WITH_REFUSAL = (
+    "    PASS [  0.001s] (   1/1000) some::suite::a_test\n"
+    f"error: {REFUSAL} (missing: the requested sandbox guarantees)\n"
+    + "".join(
+        f"    PASS [  0.100s] ({n:5d}/1000) some::suite::another_test_{n:05d}\n"
+        for n in range(2, 1000)
+    )
+)
+
+# The same output with the refusal removed.
+LARGE_OUTPUT_WITHOUT_REFUSAL = "".join(
+    f"    PASS [  0.100s] ({n:5d}/1000) some::suite::another_test_{n:05d}\n"
+    for n in range(1, 1000)
+)
+
+# The refusal at the very end, so `grep -q` has read everything before it exits
+# and the producer has nothing left to write.
+LATE_REFUSAL_OUTPUT = "".join(
+    f"    PASS [  0.100s] ({n:5d}/1000) some::suite::another_test_{n:05d}\n"
+    for n in range(1, 1000)
+) + f"error: {REFUSAL} (missing: the requested sandbox guarantees)\n"
+
+# The gate script's three former pipeline sites, and the helper calls that
+# replaced them.
+G9_PIPELINE_SITES = (
+    (
+        '      if gate_contains "$refusal" "$out"; then',
+        '      if printf \'%s\' "$out" | grep -q "$refusal"; then',
+    ),
+    (
+        "      if gate_matches 'verified=.* reduced=0 not-exercised=0 missing=0' \"$coverage_summary\"; then",
+        "      if printf '%s' \"$coverage_summary\" | grep -q 'verified=.* reduced=0 not-exercised=0 missing=0'; then",
+    ),
+    (
+        '        if ! gate_contains_line "$dep" "$allowed_lines"; then',
+        '        if ! printf \'%s\\n\' $allowed_names | grep -qx -- "$dep"; then',
+    ),
+)
+
+
 def run_transform(
     tmp: str, gate: str, rel: str, name: str, source: str, expect_fail: bool = True
 ) -> str | None:
@@ -1868,11 +1933,165 @@ def run_coverage_case(tmp: str, name: str, *, expect_ok: bool, args: list[str], 
     )
 
 
+def run_gate_lib_case(
+    tmp: str, name: str, *, text: str, expect_found: bool
+) -> tuple[bool, str]:
+    """Run the shared helper against a text and report whether it found the pattern.
+
+    The helper is the SAME implementation the gates call, loaded from
+    `scripts/gate_lib.sh` rather than reimplemented here: a self-test of a copy
+    proves only that the copy agrees with itself.
+    """
+    lib = os.path.join(REPO, "scripts", "gate_lib.sh")
+    script = os.path.join(tmp, "helper-case.sh")
+    with open(script, "w", encoding="utf-8") as fh:
+        fh.write(
+            'set -euo pipefail\n'
+            f'source "{lib}"\n'
+            'text=$(cat "$1")\n'
+            'if gate_contains "$2" "$text"; then echo FOUND; else echo MISSING; fi\n'
+        )
+    with open(os.path.join(tmp, "input.txt"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    result = subprocess.run(
+        ["bash", script, os.path.join(tmp, "input.txt"), REFUSAL],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    found = "FOUND" in result.stdout
+    if found == expect_found:
+        return True, ""
+    return (
+        False,
+        f"{name}\n     the shared helper "
+        f"{'found' if found else 'did not find'} the refusal string, "
+        f"but the case expected the opposite.\n"
+        f"     stdout:\n{result.stdout}\n     stderr:\n{result.stderr}",
+    )
+
+
+def run_gate_integration_case(
+    tmp: str, name: str, *, mutate: str | None, expect_ok: bool
+) -> tuple[bool, str]:
+    """Run the gate-integration check over a fixture gate script.
+
+    `mutate` is a substitution applied to a copy of the real gate script, so the
+    case exercises the REAL check against a fixture that differs from the tree in
+    exactly one way.
+    """
+    root = os.path.join(tmp, "integration")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(os.path.join(root, "scripts"), exist_ok=True)
+    with open(os.path.join(REPO, "scripts", "gate_lib.sh"), encoding="utf-8") as fh:
+        lib = fh.read()
+    with open(os.path.join(REPO, "scripts", "ci-gates.sh"), encoding="utf-8") as fh:
+        gate = fh.read()
+    if mutate is not None:
+        old, new = mutate
+        if old not in gate:
+            return (
+                False,
+                f"{name}\n     the mutation did not apply: {old!r} is not in the gate script",
+            )
+        gate = gate.replace(old, new)
+    with open(os.path.join(root, "scripts", "gate_lib.sh"), "w", encoding="utf-8") as fh:
+        fh.write(lib)
+    with open(os.path.join(root, "scripts", "ci-gates.sh"), "w", encoding="utf-8") as fh:
+        fh.write(gate)
+    result = subprocess.run(
+        [sys.executable, os.path.join(REPO, "scripts", "check-gate-integration.py"), root],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    ok = (result.returncode == 0) == expect_ok
+    if ok:
+        return True, ""
+    return (
+        False,
+        f"{name}\n     the integration check was expected to "
+        f"{'ACCEPT' if expect_ok else 'REJECT'} the fixture, but exited "
+        f"{result.returncode}\n     stdout:\n{result.stdout}\n     stderr:\n{result.stderr}",
+    )
+
+
 def main() -> int:
     failures: list[str] = []
     total = 0
 
     with tempfile.TemporaryDirectory(prefix="orxnud-gate-selftest-") as tmp:
+        # The G9 diagnostic: the shared helper's behaviour on an output large
+        # enough to trigger the SIGPIPE that used to swallow it, in both
+        # directions, plus the gate script's use of it.
+        diagnostic_cases = [
+            (
+                "diagnostic: the refusal is found in a large output",
+                LARGE_OUTPUT_WITH_REFUSAL,
+                True,
+            ),
+            (
+                "diagnostic: a large output without the refusal is not a match",
+                LARGE_OUTPUT_WITHOUT_REFUSAL,
+                False,
+            ),
+            (
+                "diagnostic: the refusal is found when it comes last",
+                LATE_REFUSAL_OUTPUT,
+                True,
+            ),
+        ]
+        for name, text, expect_found in diagnostic_cases:
+            total += 1
+            ok, detail = run_gate_lib_case(
+                tmp, name, text=text, expect_found=expect_found
+            )
+            if ok:
+                print(f"  ok    {name}")
+            else:
+                print(f"  FAIL  {name}")
+                failures.append(detail)
+
+        # The gate script must use the shared helper at every former pipeline
+        # site, and must not have the pipeline back. A helper-only self-test
+        # would pass with the gate reverted to the pipeline form, because the
+        # helper would still be correct -- the gate would just not be using it.
+        integration_cases: list[tuple[str, str | None, bool]] = [
+            (
+                "integration: the gates use the shared helper",
+                None,
+                True,
+            ),
+        ]
+        for index, (current, pipeline) in enumerate(G9_PIPELINE_SITES, start=1):
+            integration_cases.append(
+                (
+                    f"integration: the G9 pipeline at site {index} is rejected",
+                    (current, pipeline),
+                    False,
+                )
+            )
+        integration_cases.append(
+            (
+                "integration: a gate script that does not source the helper is rejected",
+                (
+                    'source "$REPO_ROOT/scripts/gate_lib.sh"',
+                    "",
+                ),
+                False,
+            )
+        )
+        for name, mutate, expect_ok in integration_cases:
+            total += 1
+            ok, detail = run_gate_integration_case(
+                tmp, name, mutate=mutate, expect_ok=expect_ok
+            )
+            if ok:
+                print(f"  ok    {name}")
+            else:
+                print(f"  FAIL  {name}")
+                failures.append(detail)
+
         for name, gate, rel, expect_fail in G2D_CASES + G2D_ANY_TEST_CASES + G3_CASES:
             total += 1
             ok, detail = run_case(tmp, name, gate, rel, expect_fail, source_for(name))
