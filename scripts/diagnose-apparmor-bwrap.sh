@@ -16,12 +16,28 @@
 # # The question being asked
 #
 # When bubblewrap is executed from a process confined by `docker-default`, does it enter
-# the `bwrap` profile -- and why does its user-namespace creation fail?
+# the `bwrap` profile -- and where does its run fail?
 #
 # The answer has to come from the PROCESS, not from the profile file. An attachment path
 # in a profile does not by itself establish a transition: a process already confined by
 # another profile does not automatically enter another one. So the label of the bubblewrap
 # process itself is read, from `/proc/<pid>/attr/current`, while it is alive.
+#
+# Note that this script does not assume WHERE the failure is. It was originally written
+# to ask about user-namespace creation, and the measurement contradicted that: the
+# namespace clone succeeds and the failure is a later mount. The runs below report which
+# operation failed rather than presupposing it.
+#
+# # What the errno does and does not establish
+#
+# The observed failure is "Permission denied", which is EACCES. That is CONSISTENT with
+# an AppArmor mount-policy denial -- the kernel's AppArmor mount path initialises its
+# denial result to -EACCES, and MS_SLAVE is routed through that path -- but the errno
+# alone does not identify the denying subsystem: AppArmor may return EACCES or EPERM,
+# and the kernel's own mount(2) failures use EACCES for some cases and EPERM for others.
+# The errno is therefore corroboration, not proof. What identifies the denier is the
+# conjunction of the enforced label, the rule in the runner's own daemon template, and
+# the host control that succeeds under a different label with the same argv and uid.
 #
 # # Reproducing the production caller identity
 #
@@ -107,6 +123,21 @@ set -euo pipefail
 IMAGE="rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6"
 
 section() { printf '\n===== %s =====\n' "$1"; }
+
+  # The errno mapping, exported so that the container block -- which runs in a
+  # SEPARATE `bash -lc` and therefore does not inherit shell functions -- uses
+  # exactly the same table. One copy of the logic, two callers.
+  errno_of() {
+    case "$1" in
+      *Permission\ denied*)      echo "EACCES (13)" ;;
+      *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+      *Invalid\ argument*)       echo "EINVAL (22)" ;;
+      *No\ such\ file*)          echo "ENOENT (2)" ;;
+      *)                         echo "(unrecognised)" ;;
+    esac
+  }
+  export -f errno_of
+
 
 # ---------------------------------------------------------------------------
 # SELF-CHECK: the blocks below are passed to `bash` as single quoted strings, so
@@ -265,6 +296,8 @@ docker run --rm \
     # generic "Creating new namespace failed: ..." when it did not request one.
     # Helpers: the nested quoting of a command substitution inside a
     # double quoted string is easy to get wrong, so it is done once here.
+    # The errno table, taken from the one definition above.
+
     ver_of() { "$1" --version 2>/dev/null || echo "(not reported)"; }
     sha_of() { sha256sum "$1" 2>/dev/null | cut -d" " -f1; }
 
@@ -274,6 +307,7 @@ docker run --rm \
         "${BW_EXEC:-/usr/bin/bwrap}" "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
       echo "  exit status       : $?"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+      echo "  errno            : $(errno_of "$(head -1 /tmp/bw.err 2>/dev/null)")"
     }
 
     # OBSERVED RUN: the ordinary, production invocation, with the label of the
@@ -326,6 +360,7 @@ docker run --rm \
           echo "  bubblewrap comm           : ${comm:-NOT OBSERVED}"
           echo "  exit status       : $rc"
           echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+          echo "  errno            : $(errno_of "$(head -1 /tmp/bw.err 2>/dev/null)")"
           echo "  (label observed on attempt $attempts)"
           return 0
         fi
@@ -334,6 +369,7 @@ docker run --rm \
       echo "  (the process could not be read; this is NOT evidence that no profile applied)"
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+      echo "  errno            : $(errno_of "$(head -1 /tmp/bw.err 2>/dev/null)")"
       return 1
     }
 
@@ -400,6 +436,7 @@ docker run --rm \
       local rc=0; wait "$pid" 2>/dev/null || rc=$?
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+      echo "  errno            : $(errno_of "$(head -1 /tmp/bw.err 2>/dev/null)")"
       rm -f /tmp/userns.fifo /tmp/info.fifo
     }
 
@@ -542,6 +579,7 @@ else
       >/tmp/host-bw.out 2>/tmp/host-bw.err || host_rc=$?
   echo "  exit status       : $host_rc"
   echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
+  echo "  errno            : $(errno_of "$(head -1 /tmp/host-bw.err 2>/dev/null)")"
 
   echo
   echo "--- the AppArmor label of the bubblewrap PROCESS on the host ---"
@@ -600,6 +638,7 @@ else
     echo "  bubblewrap Uid           : ${uidline:-NOT OBSERVED}"
     echo "  exit status       : $rc"
     echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
+    echo "  errno            : $(errno_of "$(head -1 /tmp/host-bw.err 2>/dev/null)")"
     rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
   ' || echo "  (the host control run could not be completed)"
 
