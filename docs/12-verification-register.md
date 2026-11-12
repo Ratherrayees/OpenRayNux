@@ -4228,11 +4228,16 @@ dependency.
 | G8 (licences) | `cargo deny check licenses` | exit 0 | exit 0 — `licenses ok` |
 | G8 (supply chain) | `cargo deny check bans sources advisories` | **exit 1** — `advisories FAILED, bans ok, sources ok`, RUSTSEC-2026-0486 | **exit 0** — `advisories ok, bans ok, sources ok` |
 | G11 | `cargo audit` | exit 0 — 4 allowed warnings, 0 vulnerabilities | exit 0 — 4 allowed warnings, 0 vulnerabilities |
-| G9 | `cargo nextest run --workspace --all-targets` | 2040 passed, 6 skipped | **2040 passed, 6 skipped** |
+| G9 | `cargo nextest run --workspace` (scope is host-dependent, see below) | 1884 run, 1884 passed, 116 skipped on a hosted runner | **1884 run, 1884 passed, 116 skipped** on the hosted runner; **2040 run, 2040 passed, 6 skipped** locally |
 
 `./scripts/ci-gates.sh` passes with G8 among the gates (G12 skips with its loud message,
 as it always does without a release tag). RUSTSEC-2026-0486 appears **zero** times in
 `cargo deny check advisories` and zero times in `cargo audit --json`.
+
+**The two G9 figures are different scopes, not a discrepancy.** G9 asks the host whether
+it can isolate and follows the answer: on a hosted runner that cannot, the sandbox-evidence
+binaries are excluded with a stated reason and 1884 tests run; on a host that can, all
+2040 run. The hosted figure is the CI one, and both were measured on this change.
 
 **What was deliberately not done.** No advisory exception was added: `deny.toml`'s
 `ignore = []` is untouched and must stay empty, because an advisory id added there hides a
