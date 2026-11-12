@@ -920,10 +920,54 @@ gate_G10() {
 gate_G11() {
   banner G11
   if have cargo-audit; then
-    if cargo audit; then
-      ok "cargo audit: no known advisory"
-    else
+    # `cargo audit` exits 0 for warning-class findings -- unmaintained, unsound and
+    # yanked -- and only for those. It is not passed `--deny warnings`, so those
+    # findings are reported but do not fail the gate. Saying "no known advisory"
+    # when warnings are present would misdescribe what was measured, so the
+    # warnings are counted and reported instead.
+    #
+    # The JSON form is used because its summary is countable. The human-readable
+    # form prints the same findings but its summary line is not part of a stable
+    # interface.
+    local audit_json audit_rc=0
+    audit_json="$(cargo audit --json 2>/dev/null)" || audit_rc=$?
+    if [ "$audit_rc" != "0" ]; then
       fail_gate "cargo audit reported an advisory"
+      return
+    fi
+    local vulns warnings
+    vulns="$(printf '%s' "$audit_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(-1); raise SystemExit
+print(len(d.get("vulnerabilities", {}).get("list", [])))
+' 2>/dev/null)" || vulns=-1
+    warnings="$(printf '%s' "$audit_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(-1); raise SystemExit
+w = d.get("warnings", {})
+print(sum(len(v) for v in w.values()))
+' 2>/dev/null)" || warnings=-1
+    if [ "$vulns" = "-1" ] || [ "$warnings" = "-1" ]; then
+      # The summary could not be read. That is not a pass and not a failure of the
+      # audit itself: report what is known and let the reader see the gap.
+      note "cargo audit exited 0; its warning summary could not be read"
+      ok "cargo audit: no known vulnerability"
+      return
+    fi
+    if [ "$warnings" = "0" ]; then
+      ok "cargo audit: no known vulnerability and no warning-class finding"
+    else
+      # The gate did not fail: these are warning-class findings and `cargo audit`
+      # does not treat them as failures. They are reported because a green G11
+      # must not read as "nothing was found".
+      note "cargo audit: $warnings warning-class finding(s) (unmaintained, unsound or yanked); these are warnings, not failures -- see the deny.toml [advisories] policy"
+      ok "cargo audit: no known vulnerability"
     fi
     return
   fi

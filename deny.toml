@@ -31,10 +31,29 @@ targets = [
 
 [advisories]
 version = 2
-# Report advisories without failing the build. Phase 1 has no released binary, so
-# an advisory cannot be exploited in the field; a hard failure here would train
-# people to reach for `--no-deny-warnings`, which defeats the gate entirely.
-# Set back to "deny" once there is a shipped artifact to protect.
+# What each class of finding does here, measured rather than assumed:
+#
+#   unsound      -> ERROR. The build fails. This is the class that must fail:
+#                   an unsound advisory is a defect in code we ship, reachable
+#                   or not. RUSTSEC-2026-0486 (rustix 1.1.5, xattr functions
+#                   marking unwritten bytes as initialized) failed this gate on
+#                   2026-11-12 and was fixed by the lockfile-only bump to
+#                   rustix 1.1.6.
+#   yanked       -> WARNING. `yanked = "warn"` below. A yanked release is a
+#                   publisher retraction, not a defect, and Cargo will not
+#                   re-resolve away from one that is already locked.
+#   unmaintained -> WARNING for transitive crates. `unmaintained = "workspace"`
+#                   below scopes the error to crates we author, so an
+#                   unmaintained dependency does not block the build.
+#
+# An earlier version of this comment said the opposite of the first line: that
+# advisories are "reported without failing the build". Under `version = 2` that
+# was not true of the unsound class, and the gate did fail on one. The comment
+# now states what the configuration does.
+#
+# `ignore = []` is deliberate and must stay empty. Adding an advisory id here
+# hides it rather than fixing it; the remediation for each finding is a
+# dependency update, and the register records which ones are open.
 ignore = []
 yanked = "warn"
 # RustSec advisories without a CVE are still real; they are only not-yet-scored.
