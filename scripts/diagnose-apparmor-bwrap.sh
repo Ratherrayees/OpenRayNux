@@ -651,7 +651,7 @@ echo "--- the rules of the profile the CONTAINER runs under, as the kernel has t
 # The loaded policy, not the file: the file is a template and the loaded policy is what
 # mediates. `aa-status` reads the loaded policy.
 if command -v aa-status >/dev/null 2>&1; then
-  sudo aa-status 2>/dev/null | grep -A 60 -i "docker-default" | head -70 \
+  { sudo aa-status 2>/dev/null | grep -A 60 -i "docker-default" | head -70; } \
     || echo "(aa-status produced no docker-default section)"
 else
   echo "(aa-status is not installed on this host)"
@@ -674,22 +674,24 @@ else
   echo "  version : $(sudo "$DOCKERD_BIN" --version 2>/dev/null || echo '(not reported)')"
   echo
   echo "  --- the mount / capability / umount rules in the embedded template ---"
-  sudo strings -a "$DOCKERD_BIN" 2>/dev/null \
-    | grep -nE '^[[:space:]]*(deny[[:space:]]+|allow[[:space:]]+)?(mount|umount|pivot_root|capability|userns)([[:space:]]*,|[[:space:]]*$)' \
-    | head -20 || echo "(no matching lines)"
+  # `|| true` throughout: `set -o pipefail` is in force, so a grep that matches
+  # nothing would otherwise abort the script. A missing match is a RESULT here --
+  # it says the rule is not in the template -- and must not stop the run.
+  { sudo strings -a "$DOCKERD_BIN" 2>/dev/null \
+      | grep -nE '^[[:space:]]*(deny[[:space:]]+|allow[[:space:]]+)?(mount|umount|pivot_root|capability|userns)([[:space:]]*,|[[:space:]]*$)' \
+      | head -20; } || true
   echo
   echo "  --- the ABI line of the template ---"
-  sudo strings -a "$DOCKERD_BIN" 2>/dev/null \
-    | grep -E 'abi <\{\{\.Abi\}\}>|^\{\{if \.Abi\}\}' | head -3 \
-    | sed 's/^/    /' || echo "(no ABI line found)"
+  { sudo strings -a "$DOCKERD_BIN" 2>/dev/null \
+      | grep -E 'abi[[:space:]]*<|\{\{if \.Abi\}\}' | head -3 \
+      | sed 's/^/    /'; } || true
   echo
   echo "  --- the ABI the daemon declares for the generated profile ---"
-  # The template is `{{if .Abi}}abi <{{.Abi}}>,{{- end}}`; the literal below is the
-  # value the daemon substitutes. The EFFECTIVE ABI is what the kernel applies, and
-  # it is only the declared ABI if no override forces otherwise -- so the force
-  # sysctls are read too, below.
-  sudo strings -a "$DOCKERD_BIN" 2>/dev/null | grep -oE 'abi/[0-9]+\.[0-9]+' | sort -u \
-    | sed 's/^/    declared ABI candidate: /' | head -5
+  # The template renders `abi <{{.Abi}}>,` and the daemon substitutes the value.
+  # The EFFECTIVE ABI is what the kernel applies, and it is only the declared ABI
+  # if no override forces otherwise -- so the force sysctls are read too, below.
+  { sudo strings -a "$DOCKERD_BIN" 2>/dev/null | grep -oE 'abi/[0-9]+\.[0-9]+' | sort -u \
+      | sed 's/^/    declared ABI candidate: /' | head -5; } || true
 fi
 
 echo
