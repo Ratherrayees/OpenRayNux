@@ -124,26 +124,12 @@ IMAGE="rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d4
 
 section() { printf '\n===== %s =====\n' "$1"; }
 
-  # The errno mapping, exported so that the container block -- which runs in a
-  # SEPARATE `bash -lc` and therefore does not inherit shell functions -- uses
-  # exactly the same table. One copy of the logic, two callers.
-  errno_of() {
-    case "$1" in
-      *Permission\ denied*)      echo "EACCES (13)" ;;
-      *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-      *Invalid\ argument*)       echo "EINVAL (22)" ;;
-      *No\ such\ file*)          echo "ENOENT (2)" ;;
-      *)                         echo "(unrecognised)" ;;
-    esac
-  }
-  export -f errno_of
-  # Reads the message from a file and maps it to its errno. Taking the FILE rather
-  # than the message keeps the call site free of nested command substitutions, which
-  # silently expand to empty.
-  errno_of_file() {
-    errno_of "$(head -1 "$1" 2>/dev/null)"
-  }
-  export -f errno_of errno_of_file
+  # The errno behind each failure is reported at the point the failure is reported.
+  # The mapping is spelled out at each site rather than shared through a function:
+  # the container block runs inside `docker run`, and an exported shell function does
+  # not survive that boundary, so a shared function would silently read as empty there.
+  #
+  # What the errno does and does not establish is stated in the header.
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +300,11 @@ docker run --rm \
         "${BW_EXEC:-/usr/bin/bwrap}" "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
       echo "  exit status       : $?"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      echo "  errno            : $(errno_of_file /tmp/bw.err)"
+      case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+        *Permission\ denied*)       echo "EACCES (13)" ;;
+        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+        *)                          echo "(unrecognised)" ;;
+      esac
     }
 
     # OBSERVED RUN: the ordinary, production invocation, with the label of the
@@ -367,7 +357,11 @@ docker run --rm \
           echo "  bubblewrap comm           : ${comm:-NOT OBSERVED}"
           echo "  exit status       : $rc"
           echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-          echo "  errno            : $(errno_of_file /tmp/bw.err)"
+          case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+            *Permission\ denied*)       echo "EACCES (13)" ;;
+            *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+            *)                          echo "(unrecognised)" ;;
+          esac
           echo "  (label observed on attempt $attempts)"
           return 0
         fi
@@ -376,7 +370,11 @@ docker run --rm \
       echo "  (the process could not be read; this is NOT evidence that no profile applied)"
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      echo "  errno            : $(errno_of_file /tmp/bw.err)"
+      case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+        *Permission\ denied*)       echo "EACCES (13)" ;;
+        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+        *)                          echo "(unrecognised)" ;;
+      esac
       return 1
     }
 
@@ -443,7 +441,11 @@ docker run --rm \
       local rc=0; wait "$pid" 2>/dev/null || rc=$?
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      echo "  errno            : $(errno_of_file /tmp/bw.err)"
+      case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+        *Permission\ denied*)       echo "EACCES (13)" ;;
+        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+        *)                          echo "(unrecognised)" ;;
+      esac
       rm -f /tmp/userns.fifo /tmp/info.fifo
     }
 
@@ -586,7 +588,11 @@ else
       >/tmp/host-bw.out 2>/tmp/host-bw.err || host_rc=$?
   echo "  exit status       : $host_rc"
   echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
-  echo "  errno            : $(errno_of_file /tmp/host-bw.err)"
+  case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
+    *Permission\ denied*)       echo "EACCES (13)" ;;
+    *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+    *)                          echo "(unrecognised)" ;;
+  esac
 
   echo
   echo "--- the AppArmor label of the bubblewrap PROCESS on the host ---"
@@ -645,7 +651,11 @@ else
     echo "  bubblewrap Uid           : ${uidline:-NOT OBSERVED}"
     echo "  exit status       : $rc"
     echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
-    echo "  errno            : $(errno_of_file /tmp/host-bw.err)"
+    case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
+      *Permission\ denied*)       echo "EACCES (13)" ;;
+      *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+      *)                          echo "(unrecognised)" ;;
+    esac
     rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
   ' || echo "  (the host control run could not be completed)"
 
