@@ -392,7 +392,18 @@ jobs:
   # running a reduced suite and going green.
   sandbox-integration:
     name: Tier-1 sandbox (production configuration)
-    runs-on: ubuntu-24.04
+    # EXPERIMENT (not a promotion): the runner image is changed to `ubuntu-26.04` to
+    # measure whether the PRODUCTION-CONFIGURED container lane -- not merely the host
+    # -- can establish the Tier-1 posture there. The dedicated probe
+    # (`.github/workflows/probe-runner-capability.yml`, run 43182276612) measured the
+    # *host* on this image and found it positive: `tier1_executable: yes`, with the
+    # nested identity `uid_map 1001 0 1` and `CapEff 0000000000000000` observed
+    # INSIDE the probe sandbox. That does not establish that the container's nested
+    # bubblewrap works under the same AppArmor policy, which is what this lane
+    # exercises. Nothing is weakened to find out: the pinned bubblewrap build, the
+    # unprivileged uid, the dropped capabilities and the container flags are all
+    # unchanged.
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
@@ -407,19 +418,43 @@ jobs:
       # A cold build of the workspace, including bundled SQLite. Cached after the first
       # run, which is why the timeout is generous rather than tight.
       #
-      # On `ubuntu-24.04` this job currently *reports* that the environment cannot create
-      # an unprivileged user namespace and produces no positive Tier-1 evidence -- measured,
-      # not assumed, and printed on every run. It still runs because the measurement is the
-      # point: it is the only place the gap is recorded against the exact image it happens
-      # on. It is not made green by disabling AppArmor or granting a capability, both of
-      # which `scripts/run-sandbox-tests.sh` declines in more words.
+      # EXPERIMENT: the lane runs on `ubuntu-26.04` on this branch, so the record it
+      # produces is about *that* image rather than about the pinned `ubuntu-24.04` one.
+      # The suites are the same suites and the posture is the same posture.
       #
-      # The same question has been measured on a second hosted image -- a hand-dispatched
+      # The AppArmor profile inventory is captured because the HOST probe established
+      # that `apparmor_restrict_unprivileged_userns=1` does NOT by itself prevent
+      # bubblewrap from creating the required user namespace: the 26.04 host has the
+      # restriction set to 1 and still sandboxes (run 43182276612). The sysctl alone is
+      # therefore not the explanation, and the profile inventory is what would settle
+      # what is. This step READS that state and changes nothing.
+      - name: Report the host's AppArmor profile inventory
+        run: |
+          set -uo pipefail
+          {
+            echo "### AppArmor profile inventory (read-only)"
+            echo ''
+            echo '```'
+            echo "apparmor enabled:       $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+            echo "restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+            echo "unprivileged_userns_clone:    $(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)"
+            echo "--- loaded profiles (names only) ---"
+            sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null \
+              | cut -d' ' -f1 | sort | grep -vE '^/(snap|docker|containerd)' \
+              || echo "(profile list unavailable)"
+            echo "--- bwrap-related profile files present ---"
+            ls -1 /etc/apparmor.d/ 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "(none)"
+            echo '```'
+          } | tee /dev/stderr >> "$GITHUB_STEP_SUMMARY"
+
+      # The same question has been measured on two other hosted images. A hand-dispatched
       # probe, `.github/workflows/probe-runner-capability.yml`, found that a hosted
       # `ubuntu-22.04` image establishes the production posture with nothing weakened
-      # (2026-11-08, run 42419194419; V-87). The suites have NOT been run there, so there
-      # is still no positive Tier-1 evidence in CI, and moving this lane onto that image is
-      # a deliberate change with its own commit rather than a consequence of the probe.
+      # (2026-11-08, run 42419194419; V-87), and that a hosted `ubuntu-26.04` image does
+      # too (2026-11-12, run 43182276612) -- with `userns_restrict` at 1, which shows
+      # the restriction is not by itself the cause of the refusal on `ubuntu-24.04`. The
+      # suites have NOT been run on either image, so until this lane runs them there is
+      # still no positive Tier-1 evidence in CI.
       - name: Measure the environment and run the Tier-1 suites if it can isolate
         run: ./scripts/run-sandbox-tests.sh
 
