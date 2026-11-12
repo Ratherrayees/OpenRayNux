@@ -123,6 +123,20 @@ set -euo pipefail
 IMAGE="rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6"
 
 section() { printf '\n===== %s =====\n' "$1"; }
+  # The errno mapping for the HOST sites. It is defined at the top level of this
+  # script, where the host ordinary-run site can see it, and is deliberately NOT
+  # exported: an exported function does not survive the `sudo` boundary that the
+  # host handshake site is behind, so that site carries its own copy inline.
+  errno_map() {
+    case "$1" in
+      *Permission\ denied*)       echo "EACCES (13)" ;;
+      *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+      *Invalid\ argument*)        echo "EINVAL (22)" ;;
+      *No\ such\ file*)           echo "ENOENT (2)" ;;
+      *)                          echo "(unrecognised)" ;;
+    esac
+  }
+
 
   # The errno behind each failure is reported at the point the failure is reported.
   # The mapping is spelled out at each site rather than shared through a function:
@@ -198,6 +212,38 @@ docker run --rm \
   bash -lc '
     set -uo pipefail
     export DEBIAN_FRONTEND=noninteractive
+
+    # ---- SELF-TEST: the errno mapping must be total, and must work HERE ----
+    # A mapping that yields nothing is indistinguishable from one that was never
+    # called. That is exactly what happened: the field was empty because the
+    # helper was not defined in this container, and the check on the host passed.
+    # So the mapping is exercised here, in this container, before it is used.
+    errno_map() {
+      case "$1" in
+        *Permission\ denied*)       echo "EACCES (13)" ;;
+        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+        *Invalid\ argument*)        echo "EINVAL (22)" ;;
+        *No\ such\ file*)           echo "ENOENT (2)" ;;
+        *)                          echo "(unrecognised)" ;;
+      esac
+    }
+    errno_selftest_failed=0
+    for probe in "Permission denied:EACCES (13)" \
+                 "Operation not permitted:EPERM (1)" \
+                 "something else:(unrecognised)"; do
+      probe_msg="${probe%%:*}"
+      probe_want="${probe#*:}"
+      probe_got="$(errno_map "$probe_msg")"
+      if [ "$probe_got" != "$probe_want" ]; then
+        echo "FATAL: the errno mapping is not total here: [$probe_msg] gave [$probe_got], expected [$probe_want]"
+        errno_selftest_failed=1
+      fi
+    done
+    if [ "$errno_selftest_failed" = "1" ]; then
+      echo "FATAL: refusing to report an errno this container cannot compute."
+      exit 1
+    fi
+    echo "self-check: the errno mapping is total and works in this container"
 
     echo "--- the diagnostic shell AppArmor label (NOT the bubblewrap label) ---"
     cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
@@ -287,9 +333,21 @@ docker run --rm \
     # hypotheses: bubblewrap emits an explicit "No permissions to create a new
     # namespace..." message when it REQUESTED a user namespace and was refused, and a
     # generic "Creating new namespace failed: ..." when it did not request one.
-    # Helpers: the nested quoting of a command substitution inside a
-    # double quoted string is easy to get wrong, so it is done once here.
-    # The errno table, taken from the one definition above.
+    #
+    # The errno is mapped by errno_map, defined at the top of THIS script and used
+    # at the sites below. It is defined here rather than exported from outside for a
+    # concrete reason: an exported function does not survive either boundary this
+    # script crosses. `docker run` starts the container with a fresh environment,
+    # and `sudo` resets the environment by default. When the mapping was exported
+    # from outside, it was simply not defined in here and the field came out empty.
+    # A function defined in the same script that uses it is always in scope.
+    #
+    # The mapping is TOTAL -- every input produces a value -- and the self-test
+    # below checks that, because a mapping that silently produced nothing is what
+    # made the field empty in the first place. That self-test runs INSIDE the
+    # container, because that is where the field was empty: the mapping was
+    # reachable on the host and not in the container, so a check on the host would
+    # have passed while the container printed nothing.
 
     ver_of() { "$1" --version 2>/dev/null || echo "(not reported)"; }
     sha_of() { sha256sum "$1" 2>/dev/null | cut -d" " -f1; }
@@ -300,11 +358,7 @@ docker run --rm \
         "${BW_EXEC:-/usr/bin/bwrap}" "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
       echo "  exit status       : $?"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
-        *Permission\ denied*)       echo "EACCES (13)" ;;
-        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-        *)                          echo "(unrecognised)" ;;
-      esac)"
+      echo "  errno            : $(errno_map "$(head -1 /tmp/bw.err 2>/dev/null)")"
     }
 
     # OBSERVED RUN: the ordinary, production invocation, with the label of the
@@ -358,11 +412,7 @@ docker run --rm \
           echo "  bubblewrap comm           : ${comm:-NOT OBSERVED}"
           echo "  exit status       : $rc"
           echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-          echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
-            *Permission\ denied*)       echo "EACCES (13)" ;;
-            *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-            *)                          echo "(unrecognised)" ;;
-          esac)"
+          echo "  errno            : $(errno_map "$(head -1 /tmp/bw.err 2>/dev/null)")"
           echo "  (label observed on attempt $attempts)"
           return 0
         fi
@@ -371,11 +421,7 @@ docker run --rm \
       echo "  (the process could not be read; this is NOT evidence that no profile applied)"
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
-        *Permission\ denied*)       echo "EACCES (13)" ;;
-        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-        *)                          echo "(unrecognised)" ;;
-      esac)"
+      echo "  errno            : $(errno_map "$(head -1 /tmp/bw.err 2>/dev/null)")"
       return 1
     }
 
@@ -442,11 +488,7 @@ docker run --rm \
       local rc=0; wait "$pid" 2>/dev/null || rc=$?
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
-        *Permission\ denied*)       echo "EACCES (13)" ;;
-        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-        *)                          echo "(unrecognised)" ;;
-      esac)"
+      echo "  errno            : $(errno_map "$(head -1 /tmp/bw.err 2>/dev/null)")"
       rm -f /tmp/userns.fifo /tmp/info.fifo
     }
 
@@ -589,11 +631,7 @@ else
       >/tmp/host-bw.out 2>/tmp/host-bw.err || host_rc=$?
   echo "  exit status       : $host_rc"
   echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
-  echo "  errno            : $(case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
-    *Permission\ denied*)       echo "EACCES (13)" ;;
-    *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-    *)                          echo "(unrecognised)" ;;
-  esac)"
+  echo "  errno            : $(errno_map "$(head -1 /tmp/host-bw.err 2>/dev/null)")"
 
   echo
   echo "--- the AppArmor label of the bubblewrap PROCESS on the host ---"
@@ -609,6 +647,19 @@ else
   # the only reliable way to read the label of a process that exits in
   # milliseconds. It is disclosed as instrumented.
   sudo env HOST_UID="$HOST_UID" HOST_BWRAP="$HOST_BWRAP" bash -c '
+    # This block is a separate `bash -c` script, so it carries its own copy of the
+    # errno mapping. `sudo` resets the environment, so an exported function from
+    # outside would not be defined here and the field would come out empty.
+    errno_map() {
+      case "$1" in
+        *Permission\ denied*)       echo "EACCES (13)" ;;
+        *Operation\ not\ permitted*) echo "EPERM (1)" ;;
+        *Invalid\ argument*)        echo "EINVAL (22)" ;;
+        *No\ such\ file*)           echo "ENOENT (2)" ;;
+        *)                          echo "(unrecognised)" ;;
+      esac
+    }
+
     set -uo pipefail
     rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
     mkfifo /tmp/host-userns.fifo; mkfifo /tmp/host-info.fifo
@@ -652,11 +703,7 @@ else
     echo "  bubblewrap Uid           : ${uidline:-NOT OBSERVED}"
     echo "  exit status       : $rc"
     echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
-    echo "  errno            : $(case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
-      *Permission\ denied*)       echo "EACCES (13)" ;;
-      *Operation\ not\ permitted*) echo "EPERM (1)" ;;
-      *)                          echo "(unrecognised)" ;;
-    esac)"
+    echo "  errno            : $(errno_map "$(head -1 /tmp/host-bw.err 2>/dev/null)")"
     rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
   ' || echo "  (the host control run could not be completed)"
 
