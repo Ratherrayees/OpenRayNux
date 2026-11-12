@@ -4164,8 +4164,9 @@ crates are transitive. They did not cause the failure and are **not** addressed 
 cargo update -p rustix --precise 1.1.6
 ```
 
-**The exact lockfile delta — six lines: two version and two checksum changes, plus two
-`windows-sys` edge changes explained below.**
+**The exact lockfile delta — twelve changed lines, in six pairs: the rustix
+version, the rustix checksum, and four `windows-sys` dependency edges
+(explained below).**
 
 ```
 -name = "rustix"
