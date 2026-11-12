@@ -13,17 +13,68 @@
 # is loaded and is attached to `/usr/bin/bwrap`. The CONTAINER cannot. This script
 # establishes why, with observations only.
 #
-# # The two restrictions this is trying to separate
+# # The question being asked
 #
-# 1. **Path attachment.** AppArmor attaches a profile to a PATH. The profile is attached
-#    to `/usr/bin/bwrap`; the lane's symlink resolves the executable to
-#    `/usr/local/bin/bwrap`, which no profile covers. But an attachment alone does not
-#    establish a TRANSITION: a process already confined by `docker-default` does not
-#    automatically enter another profile. So the transition has to be OBSERVED, not
-#    inferred from the profile file.
-# 2. **Confinement.** The container runs under `docker-default (enforce)`, and the
-#    mount step that bubblewrap performs after creating its namespaces may be refused
-#    there rather than by the `bwrap` profile.
+# When bubblewrap is executed from a process confined by `docker-default`, does it enter
+# the `bwrap` profile -- and why does its user-namespace creation fail?
+#
+# The answer has to come from the PROCESS, not from the profile file. An attachment path
+# in a profile does not by itself establish a transition: a process already confined by
+# another profile does not automatically enter another one. So the label of the bubblewrap
+# process itself is read, from `/proc/<pid>/attr/current`, while it is alive.
+#
+# # Reproducing the production caller identity
+#
+# The caller identity is the thing that decides bubblewrap behaviour, so it must be
+# reproduced exactly. Bubblewrap 0.13.1 contains:
+#
+#     if (getuid () != 0 && opt_userns_fd == -1)
+#       opt_unshare_user = true;
+#
+# and it adds `CLONE_NEWUSER` to its `clone()` flags only when `opt_unshare_user` is
+# true. So as ROOT it does NOT request a user namespace at all, and its `clone()` fails
+# with a generic error; as an unprivileged uid it DOES request one, and a refusal is
+# reported with an explicit message. The two are different operations and only the second
+# is the one the product performs.
+#
+# This script therefore runs bubblewrap through the SAME `setpriv` invocation the
+# production lane uses: uid 1000, gid 1000, no supplementary groups, no inheritable
+# capabilities, an empty bounding set.
+#
+# # How the label is observed
+#
+# Three runs are made, and their results are reported separately.
+#
+# 1. ORDINARY -- the production invocation, no instrumentation. Its stderr is what
+#    distinguishes the hypotheses: bubblewrap reports an explicit "No permissions to
+#    create a new namespace..." when it REQUESTED a user namespace and was refused
+#    (bubblewrap.c:3123), and a generic "Creating new namespace failed: ..." when it
+#    did not request one (:3129). The two are different operations, and only the first
+#    is the one the product performs.
+#
+# 2. OBSERVED -- the same production invocation, with the label of the bubblewrap
+#    PROCESS read from `/proc/<pid>/attr/current` while that process is alive, and
+#    `/proc/<pid>/comm` used to prove the process really is bubblewrap. The process
+#    exists from execve until its failing clone(), which is a short window; a tight
+#    loop with no forks in it can catch it.
+#
+#    Any non-empty label is recorded. A label equal to the label of the shell is a
+#    RESULT -- "the process ran and inherited docker-default" -- and is not discarded.
+#    The label is read from the /proc entry of the PROCESS, not of its parent: a child
+#    does not inherit the label of the parent merely by being forked.
+#
+# 3. HANDSHAKE -- an INSTRUMENTED run that adds `--userns-block-fd`, which makes
+#    bubblewrap block in the parent branch right after the clone that creates the
+#    namespaces (:3115) and before the child writes the uid map (:3267) and makes its
+#    mounts (:3280). This is the widest window available.
+#
+#    DISCLOSED LIMITATION: `--userns-block-fd` requires an EXPLICIT `--unshare-user`
+#    (the guard at :2953 runs BEFORE the getuid() auto-set at :2972) and also requires
+#    `--info-fd`. The production invocation does not pass `--unshare-user`; it relies
+#    on the auto-set. So this run is NOT the production invocation, and its result is
+#    reported separately. It cannot by itself diagnose a failure that occurs before
+#    the handshake -- but reaching the handshake at all proves the namespace clone
+#    SUCCEEDED, because a refused clone dies at :3121/:3123 and never gets there.
 #
 # # What this does NOT do
 #
@@ -32,16 +83,10 @@
 # does not pass `apparmor=unconfined`. Every command is a read, a copy, or an attempt to
 # execute something that is already installed.
 #
-# The ONE thing it does that is not a read is a COPY of an already-built binary to a
-# second path, to test whether the path or the confinement is the restriction. That copy
-# happens inside a throwaway container, is not installed on the host, and is removed with
-# the container.
-#
 # Kernel messages are collected from the HOST, never from inside the container: the
 # kernel restricts `dmesg` to processes holding `CAP_SYSLOG`, and adding it would be a
-# capability change. Docker's own documentation recommends the host kernel log for
-# AppArmor denials. They are therefore collected AFTER the container has run, not
-# before -- collecting them before would miss the very operation under test.
+# capability change. They are collected AFTER the container has run, because a record of
+# the denial under investigation could not exist before the operation that produced it.
 #
 # # The two configurations compared
 #
@@ -50,8 +95,9 @@
 #    creates it.
 # **B. The candidate installation** -- the SAME bytes at a regular `/usr/bin/bwrap`.
 #
-# Both run in the same container with the same confinement and the same bubblewrap
-# binary, so the only variable is the path the kernel sees.
+# Both run in the same container, as the same uid, with the same confinement and the same
+# bubblewrap binary, and both are invoked as an EXPLICIT `/usr/bin/bwrap` path so the
+# executable under test is never in doubt. Only the path the kernel sees differs.
 
 set -euo pipefail
 
@@ -92,9 +138,6 @@ docker run --rm \
     echo "--- AppArmor state VISIBLE FROM INSIDE the container ---"
     echo "apparmor module enabled : $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
     echo "restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
-    echo "loaded profiles visible from inside:"
-    sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -20 \
-      || echo "(profile list unavailable from inside)"
 
     # ---- build the SAME pinned bubblewrap the lane builds ----
     echo
@@ -116,10 +159,16 @@ docker run --rm \
     BW_BIN="/usr/local/bin/bwrap"
     echo "built and installed: $BW_BIN"
 
+    # The unprivileged user the production lane runs the tests as.
+    id -u orxnud >/dev/null 2>&1 || useradd --create-home --uid 1000 orxnud
+
     # The argv the PRODUCT builds, reproduced here. `build_command` does NOT pass
     # `--unshare-user`: bubblewrap creates the user namespace itself when it is
     # unprivileged. Passing it explicitly would measure a different invocation.
-    # The namespace set, the tmpfs root and the read-only binds are the product'"'"'s.
+    #
+    # The bind list mirrors `host_backed_bind_destinations()`, which is
+    # `HOST_BACKED_BIND_CANDIDATES` filtered by what exists on the host:
+    # /usr, /lib, /lib64, /bin, /sbin.
     BW_ARGV=(
       --unshare-pid
       --unshare-ipc
@@ -129,58 +178,15 @@ docker run --rm \
       --unshare-net
       --tmpfs /tmp
       --ro-bind /usr /usr
-      --ro-bind /bin /bin
       --ro-bind /lib /lib
       --ro-bind /lib64 /lib64
+      --ro-bind /bin /bin
+      --ro-bind /sbin /sbin
     )
 
-    # Runs bubblewrap in the BACKGROUND and reads the label and the effective
-    # capabilities of the bubblewrap PROCESS ITSELF, while it is alive.
-    #
-    # The shell'"'"'s own label is useless here: it is the label of the diagnostic
-    # shell, not of the process that exec'"'"'d bubblewrap. The bubblewrap process
-    # exists from execve until its failing mount, which is a few milliseconds, so
-    # the read is a tight builtin-only loop with no forks in it, retried until it
-    # catches a label that is not the shell'"'"'s.
-    #
-    # If the label is never observed, that is reported as such. It is NOT reported
-    # as evidence that AppArmor was uninvolved.
-    run_bwrap_observing() {
-      local label="" capeff="" attempts=0 rc=0 l c
-      for try in $(seq 1 60); do
-        attempts=$((attempts + 1))
-        bwrap "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err &
-        local pid=$!
-        for i in $(seq 1 2000); do
-          if [ -r "/proc/$pid/attr/current" ]; then
-            l=""; read -r l < "/proc/$pid/attr/current" 2>/dev/null || true
-            if [ -n "$l" ] && [ "$l" != "$SHELL_LABEL" ]; then
-              c=""
-              while read -r _k _v; do
-                [ "$_k" = "CapEff:" ] && c="$_v"
-              done < "/proc/$pid/status" 2>/dev/null
-              label="$l"; capeff="$c"
-              break
-            fi
-          fi
-          kill -0 "$pid" 2>/dev/null || break
-        done
-        rc=0; wait "$pid" 2>/dev/null || rc=$?
-        if [ -n "$label" ]; then
-          echo "  exit status        : $rc"
-          echo "  bubblewrap label   : $label"
-          echo "  bubblewrap CapEff  : ${capeff:-unreadable}"
-          echo "  bubblewrap stderr  : $(cat /tmp/bw.err 2>/dev/null | head -3)"
-          echo "  (observed on attempt $attempts)"
-          return 0
-        fi
-      done
-      echo "  exit status        : $rc"
-      echo "  bubblewrap label   : NOT OBSERVED after $attempts attempts"
-      echo "  bubblewrap CapEff  : NOT OBSERVED"
-      echo "  bubblewrap stderr  : $(cat /tmp/bw.err 2>/dev/null | head -3)"
-      return 1
-    }
+    # The exact identity the production lane uses.
+    RUN_AS_USER=(setpriv --reuid=1000 --regid=1000 --clear-groups
+                 --inh-caps=-all --bounding-set=-all --)
 
     identity() {
       echo "  /usr/bin/bwrap is a symlink? $( [ -L /usr/bin/bwrap ] && echo YES || echo no )"
@@ -189,6 +195,147 @@ docker run --rm \
       echo "  sha256 of the built binary         : $(sha256sum "$BW_BIN" | cut -d" " -f1)"
       stat -c "  stat %n  mode=%a  size=%s  inode=%i  links=%h" /usr/bin/bwrap 2>/dev/null || true
       stat -c "  stat %n  mode=%a  size=%s  inode=%i  links=%h" "$BW_BIN" 2>/dev/null || true
+    }
+
+    # Runs bubblewrap as the production uid and reports what happened.
+    #
+    # ORDINARY RUN: no instrumentation at all. The stderr is what distinguishes the
+    # hypotheses: bubblewrap emits an explicit "No permissions to create a new
+    # namespace..." message when it REQUESTED a user namespace and was refused, and a
+    # generic "Creating new namespace failed: ..." when it did not request one.
+    ordinary_run() {
+      echo "  --- ordinary run (no instrumentation) ---"
+      "${RUN_AS_USER[@]}" env HOME=/home/orxnud PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        /usr/bin/bwrap "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
+      echo "  exit status       : $?"
+      echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+    }
+
+    # OBSERVED RUN: the ordinary, production invocation, with the label of the
+    # bubblewrap PROCESS read from /proc while that process is alive.
+    #
+    # The process exists from execve until its failing clone(), which is a short
+    # window. A tight loop with no forks in it can still catch it. The two rules
+    # that matter:
+    #
+    #   * ANY non-empty label is recorded. A label equal to the label of the
+    #     RESULT -- "the process ran and inherited docker-default" -- and must not
+    #     be discarded. Rejecting it is what made the previous run report NOT
+    #     OBSERVED for what may have been an observation.
+    #   * the reader is the /proc entry of the PROCESS itself, not that of
+    #     the parent. A child does not inherit the parent label merely by
+    #
+    # /proc/<pid>/comm is used to prove the process is bubblewrap, so a read
+    # taken before the exec is not mistaken for one taken after it.
+    observed_run() {
+      echo "  --- observed run (production argv, label read from the process) ---"
+      local label="" capeff="" comm="" seen=0 attempts=0 rc=0
+      for try in $(seq 1 80); do
+        attempts=$((attempts + 1))
+        "${RUN_AS_USER[@]}" env HOME=/home/orxnud PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+          /usr/bin/bwrap "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err &
+        local pid=$!
+        # Tight loop: builtin reads only, no forks.
+        local i
+        for i in $(seq 1 3000); do
+          if [ -r "/proc/$pid/comm" ]; then
+            comm=""; read -r comm < "/proc/$pid/comm" 2>/dev/null || true
+            if [ "$comm" = "bwrap" ]; then
+              local l
+              l=""; read -r l < "/proc/$pid/attr/current" 2>/dev/null || true
+              if [ -n "$l" ]; then
+                label="$l"; seen=1
+                while read -r _k _v; do [ "$_k" = "CapEff:" ] && capeff="$_v"; done \
+                  < "/proc/$pid/status" 2>/dev/null
+                break
+              fi
+            fi
+          fi
+          kill -0 "$pid" 2>/dev/null || break
+        done
+        rc=0; wait "$pid" 2>/dev/null || rc=$?
+        if [ "$seen" = "1" ]; then
+          echo "  bubblewrap AppArmor label : $label"
+          echo "  label == the shell label?  : $( [ "$label" = "$SHELL_LABEL" ] && echo YES || echo no )"
+          echo "  bubblewrap CapEff        : ${capeff:-NOT OBSERVED}"
+          echo "  bubblewrap comm           : ${comm:-NOT OBSERVED}"
+          echo "  exit status       : $rc"
+          echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+          echo "  (label observed on attempt $attempts)"
+          return 0
+        fi
+      done
+      echo "  bubblewrap AppArmor label : NOT OBSERVED after $attempts attempts"
+      echo "  (the process could not be read; this is NOT evidence that no profile applied)"
+      echo "  exit status       : $rc"
+      echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+      return 1
+    }
+
+    # HANDSHAKE RUN: `--userns-block-fd` makes bubblewrap block in the PARENT
+    # branch, right after the clone that creates the namespaces
+    # (bubblewrap.c:3115) and before the CHILD writes the uid map (:3267) and
+    # makes its mounts (:3280). So the process is alive, past the exec
+    # transition, and past the namespace clone.
+    #
+    # The parent is the process whose /proc entry is read here. After a
+    # successful CLONE_NEWUSER the uid of the parent in the new namespace is
+    # unmapped until the map is written, so its Uid line shows that. If the
+    # clone had been REFUSED, bubblewrap would have died at :3121/:3123 with
+    # an explicit message and would never reach this point at all -- which is
+    # why the handshake run ALSO reports the stderr.
+    #
+    # DISCLOSED LIMITATION: bubblewrap requires `--userns-block-fd` to be paired
+    # with an EXPLICIT `--unshare-user` (the guard at bubblewrap.c:2953 runs BEFORE
+    # the getuid() auto-set at :2972), and also requires `--info-fd`. The
+    # production invocation does NOT pass `--unshare-user` -- it relies on the
+    # auto-set. So this run is NOT the production invocation, and its result is
+    # reported separately as an instrumented observation. It cannot by itself
+    # diagnose a failure that occurs before the handshake.
+    handshake_run() {
+      echo "  --- handshake run (INSTRUMENTED: --userns-block-fd + explicit --unshare-user) ---"
+      rm -f /tmp/userns.fifo /tmp/info.fifo; mkfifo /tmp/userns.fifo; mkfifo /tmp/info.fifo
+      exec 3<>/tmp/userns.fifo
+      exec 4<>/tmp/info.fifo
+      "${RUN_AS_USER[@]}" env HOME=/home/orxnud PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        /usr/bin/bwrap --userns-block-fd 3 --info-fd 4 --unshare-user \
+        "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err &
+      local pid=$!
+      local label="" capeff="" comm="" uidline=""
+      for i in $(seq 1 600); do
+        if [ -r "/proc/$pid/comm" ]; then
+          comm=""; read -r comm < "/proc/$pid/comm" 2>/dev/null || true
+          if [ "$comm" = "bwrap" ]; then
+            local l
+            l=""; read -r l < "/proc/$pid/attr/current" 2>/dev/null || true
+            if [ -n "$l" ]; then
+              label="$l"
+              while read -r _k _v; do
+                [ "$_k" = "CapEff:" ] && capeff="$_v"
+                [ "$_k" = "Uid:" ] && uidline="$_v"
+              done < "/proc/$pid/status" 2>/dev/null
+              break
+            fi
+          fi
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.01
+      done
+      echo "  bubblewrap AppArmor label : ${label:-NOT OBSERVED}"
+      if [ -n "$label" ]; then
+        echo "  label == the shell label?  : $( [ "$label" = "$SHELL_LABEL" ] && echo YES || echo no )"
+      fi
+      echo "  bubblewrap CapEff        : ${capeff:-NOT OBSERVED}"
+      echo "  bubblewrap Uid           : ${uidline:-NOT OBSERVED}"
+      echo "  (the handshake is reached only if the namespace clone SUCCEEDED)"
+      # Release the handshake and let it finish, so the mount failure is still seen.
+      printf "x" >&3 2>/dev/null || true
+      exec 3>&- 2>/dev/null || true
+      exec 4>&- 2>/dev/null || true
+      local rc=0; wait "$pid" 2>/dev/null || rc=$?
+      echo "  exit status       : $rc"
+      echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
+      rm -f /tmp/userns.fifo /tmp/info.fifo
     }
 
     # ================= CONFIGURATION A: the current installation =================
@@ -202,22 +349,27 @@ docker run --rm \
     if [ "$(readlink -f /usr/bin/bwrap)" != "$BW_BIN" ]; then echo "FATAL: the symlink does not resolve to the built binary"; exit 1; fi
     echo "--- executable identity ---"
     identity
-    echo "--- execution ---"
-    run_bwrap_observing
+    echo "--- caller identity (as the production lane runs it) ---"
+    "${RUN_AS_USER[@]}" id 2>/dev/null | sed "s/^/  /"
+    "${RUN_AS_USER[@]}" sh -c "awk \"/^CapEff:/{print \\\"  CapEff: \\\" \\\$2}\" /proc/self/status" 2>/dev/null
+    ordinary_run
+    observed_run
+    handshake_run
 
     # ================= CONFIGURATION B: the candidate installation =================
     echo
     echo "################ CONFIGURATION B: the CANDIDATE installation ################"
     echo "# The SAME bytes at a REGULAR /usr/bin/bwrap. Only the path the kernel"
-    echo "# sees differs; the bytes, the container and the confinement do not."
+    echo "# sees differs; the bytes, the caller, the container and the confinement do not."
     rm -f /usr/bin/bwrap
     cp "$BW_BIN" /usr/bin/bwrap
     chmod 0755 /usr/bin/bwrap
     if [ -L /usr/bin/bwrap ]; then echo "FATAL: /usr/bin/bwrap is still a symlink"; exit 1; fi
     echo "--- executable identity ---"
     identity
-    echo "--- execution ---"
-    run_bwrap_observing
+    ordinary_run
+    observed_run
+    handshake_run
 
     echo
     echo "--- the diagnostic shell label AFTER both attempts (for comparison) ---"
@@ -245,11 +397,15 @@ sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null \
 
 echo
 echo "--- the bwrap profile FILES present on the host ---"
-ls -1 /etc/apparmor.d/ 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "(none)"
+ls -1 /etc/apparmor.d/ 2>/dev/null | grep -iE "bwrap|unpriv" || echo "(none)"
 
 echo
 echo "--- the content of bwrap-userns-restrict (attachment + permissions) ---"
-for f in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns; do
+# docker-default is included because it is the confinement the CONTAINER runs under,
+# and the container label was observed to be "docker-default (enforce)". Whether it
+# grants `mount`/`userns`/`capability` is directly relevant to the question.
+for f in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns \
+         /etc/apparmor.d/docker-default; do
   if [ -r "$f" ]; then
     echo "### $f"
     cat "$f"
@@ -259,7 +415,7 @@ for f in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_user
 done
 
 echo
-echo "--- the host's own /proc/self/attr/current (the runner's label) ---"
+echo "--- the /proc/self/attr/current of the host runner (the runner label) ---"
 cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
 
 section "HOST: kernel AppArmor audit records (collected AFTER the container ran)"
@@ -272,12 +428,12 @@ echo "--- journalctl -k | grep -i apparmor | tail -60 ---"
 sudo journalctl -k --no-pager 2>/dev/null | grep -i apparmor | tail -60 || echo "(journalctl unavailable)"
 
 echo
-echo "--- of those, the ones naming bwrap, userns, mount, capability or the container ---"
+echo "--- of those, the ones naming bwrap, userns, mount, capability, clone or the container ---"
 sudo dmesg 2>/dev/null | grep -i apparmor \
-  | grep -iE 'bwrap|userns|mount|capab|docker|container' | tail -40 \
+  | grep -iE 'bwrap|userns|mount|capab|clone|docker|container' | tail -40 \
   || echo "(no such record)"
 sudo journalctl -k --no-pager 2>/dev/null | grep -i apparmor \
-  | grep -iE 'bwrap|userns|mount|capab|docker|container' | tail -40 \
+  | grep -iE 'bwrap|userns|mount|capab|clone|docker|container' | tail -40 \
   || echo "(no such record)"
 
 section "DONE"
