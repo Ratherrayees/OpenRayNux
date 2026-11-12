@@ -458,6 +458,35 @@ jobs:
       - name: Measure the environment and run the Tier-1 suites if it can isolate
         run: ./scripts/run-sandbox-tests.sh
 
+  # READ-ONLY AppArmor forensics for the Tier-1 sandbox lane. Not a gate, not a
+  # promotion, and it changes nothing: it observes the policy as loaded, the
+  # executable attachment, and the kernel's own denial record.
+  #
+  # It exists because the host and the container disagree on `ubuntu-26.04`: the host
+  # sandboxes (probe run 43182276612, `uid_map 1001 0 1` inside the probe sandbox) while
+  # the container does not (run 43193021333, `NO POSITIVE TIER-1 EVIDENCE`). The lane
+  # installs the pinned bubblewrap at `/usr/local/bin/bwrap` with `/usr/bin/bwrap` as a
+  # SYMLINK, and AppArmor attaches a profile to a PATH, so a symlink may resolve the
+  # executable to a path no profile covers.
+  #
+  # That is a HYPOTHESIS, and there is a second independent candidate: a process
+  # confined by `docker-default` does not automatically inherit another profile's rules.
+  # This job measures them apart, with observations only -- no profile is loaded or
+  # unloaded, no sysctl is written, no capability is added, the container is not
+  # privileged, and `apparmor=unconfined` is not passed.
+  #
+  # It is deliberately a SEPARATE job from `sandbox-integration`: that lane's own
+  # posture must not be disturbed by an experiment.
+  apparmor-forensics:
+    name: AppArmor forensics (read-only)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Observe the AppArmor policy and the executable attachment
+        run: ./scripts/diagnose-apparmor-bwrap.sh
+
   # cgroup resource enforcement, in a deliberately different environment from the
   # sandbox lane. `enforcement` and `resources` assert that `memory.max`, `pids.max`,
   # `cpu.max` and `cgroup.kill` actually bite, which requires controller delegation and
