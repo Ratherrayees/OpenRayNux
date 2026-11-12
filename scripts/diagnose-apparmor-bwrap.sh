@@ -374,6 +374,19 @@ docker run --rm \
     echo
     echo "--- the diagnostic shell label AFTER both attempts (for comparison) ---"
     cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
+
+    echo
+    echo "--- the CONTAINER mount table (the tree bubblewrap has to re-mount) ---"
+    # bubblewrap makes "/" a slave mount at bubblewrap.c:3280, and that is where it
+    # fails in the container. Whether it can depends on the mount tree it inherits,
+    # so the tree is reported. "locked" appears in mountinfo for a mount the
+    # container may not change the propagation of.
+    cat /proc/self/mountinfo 2>/dev/null | head -40 || echo "(mountinfo unavailable)"
+    echo "--- the number of mounts in the container ---"
+    wc -l < /proc/self/mountinfo 2>/dev/null || echo "(mountinfo unavailable)"
+    echo "--- the container's own AppArmor label, and the container's uid_map ---"
+    cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
+    cat /proc/self/uid_map 2>/dev/null || echo "(uid_map unavailable)"
   '
 
 # ---------------------------------------------------------------------------
@@ -551,6 +564,14 @@ fi
 echo
 echo "--- the /proc/self/attr/current of the host runner (the runner label) ---"
 cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
+
+echo
+echo "--- the HOST mount table (the tree bubblewrap has to re-mount there) ---"
+# The container's tree and the host's tree are compared, because bubblewrap makes
+# "/" a slave mount and that is where the container fails.
+cat /proc/self/mountinfo 2>/dev/null | head -40 || echo "(mountinfo unavailable)"
+echo "--- the number of mounts on the host ---"
+wc -l < /proc/self/mountinfo 2>/dev/null || echo "(mountinfo unavailable)"
 
 section "HOST: kernel AppArmor audit records (collected AFTER the container ran)"
 
