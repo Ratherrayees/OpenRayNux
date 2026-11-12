@@ -109,6 +109,51 @@ IMAGE="rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d4
 section() { printf '\n===== %s =====\n' "$1"; }
 
 # ---------------------------------------------------------------------------
+# SELF-CHECK: the blocks below are passed to `bash` as single quoted strings, so
+# an apostrophe inside one TERMINATES that string. `bash -n` on this file cannot
+# see it -- the contents are just a string here -- so the mistake survives every
+# local check and shows up only as a container that exits 2 with no explanation.
+# That has happened twice on this branch.
+#
+# Each block is therefore extracted and checked for BOTH properties:
+#   1. it contains no apostrophe at all, so it can be embedded in a single quoted
+#      string safely; and
+#   2. it is valid bash on its own.
+# ---------------------------------------------------------------------------
+check_quoted_block() {
+  local open_re="$1" close_re="$2" label="$3"
+  local tmp start end body
+  tmp=$(mktemp)
+  start=$(grep -nE "$open_re" "$0" | head -1 | cut -d: -f1)
+  if [ -z "$start" ]; then
+    echo "FATAL: could not locate the $label block inside $0" >&2
+    rm -f "$tmp"; exit 1
+  fi
+  end=$(awk -v s="$start" -v re="$close_re" \
+        'NR>s && $0 ~ re {print NR; exit}' "$0")
+  if [ -z "$end" ]; then
+    echo "FATAL: could not locate the end of the $label block inside $0" >&2
+    rm -f "$tmp"; exit 1
+  fi
+  body=$(sed -n "$((start + 1)),$((end - 1))p" "$0")
+  if printf '%s' "$body" | grep -q "'"; then
+    echo "FATAL: the $label block (lines $((start + 1))-$((end - 1)) of $0) contains an apostrophe." >&2
+    echo "       It is embedded in a single quoted string, so the apostrophe would end it." >&2
+    printf '%s' "$body" | grep -n "'" >&2
+    rm -f "$tmp"; exit 1
+  fi
+  printf '%s' "$body" > "$tmp"
+  if ! bash -n "$tmp"; then
+    echo "FATAL: the $label block (lines $((start + 1))-$((end - 1)) of $0) is not valid bash." >&2
+    rm -f "$tmp"; exit 1
+  fi
+  rm -f "$tmp"
+  echo "self-check: the $label block is free of apostrophes and is valid bash"
+}
+check_quoted_block "bash -lc '[^']*$" "^[[:space:]]*'[[:space:]]*$" "container"
+check_quoted_block "bash -c '[^']*$" "^[[:space:]]*'" "host control"
+
+# ---------------------------------------------------------------------------
 # CONTAINER: the same configuration the lane uses, observed from inside.
 #
 # The flags below are COPIED from `scripts/run-sandbox-tests.sh` and must stay in step
@@ -384,7 +429,7 @@ docker run --rm \
     cat /proc/self/mountinfo 2>/dev/null | head -40 || echo "(mountinfo unavailable)"
     echo "--- the number of mounts in the container ---"
     wc -l < /proc/self/mountinfo 2>/dev/null || echo "(mountinfo unavailable)"
-    echo "--- the container's own AppArmor label, and the container's uid_map ---"
+    echo "--- the AppArmor label of the container shell, and the container uid_map ---"
     cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
     cat /proc/self/uid_map 2>/dev/null || echo "(uid_map unavailable)"
   '
