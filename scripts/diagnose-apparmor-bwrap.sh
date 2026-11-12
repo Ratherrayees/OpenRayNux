@@ -300,11 +300,11 @@ docker run --rm \
         "${BW_EXEC:-/usr/bin/bwrap}" "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
       echo "  exit status       : $?"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+      echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
         *Permission\ denied*)       echo "EACCES (13)" ;;
         *Operation\ not\ permitted*) echo "EPERM (1)" ;;
         *)                          echo "(unrecognised)" ;;
-      esac
+      esac)"
     }
 
     # OBSERVED RUN: the ordinary, production invocation, with the label of the
@@ -314,12 +314,13 @@ docker run --rm \
     # window. A tight loop with no forks in it can still catch it. The two rules
     # that matter:
     #
-    #   * ANY non-empty label is recorded. A label equal to the label of the
-    #     RESULT -- "the process ran and inherited docker-default" -- and must not
-    #     be discarded. Rejecting it is what made the previous run report NOT
+    #   * ANY non-empty label is recorded. A label equal to the label of the shell
+    #     is a RESULT -- "the process ran and inherited docker-default" -- and must
+    #     not be discarded. Rejecting it is what made the previous run report NOT
     #     OBSERVED for what may have been an observation.
-    #   * the reader is the /proc entry of the PROCESS itself, not that of
-    #     the parent. A child does not inherit the parent label merely by
+    #   * the reader is the /proc entry of the PROCESS itself, not that of the
+    #     parent. A child does not inherit the parent label merely by being
+    #     forked; it has a label of its own.
     #
     # /proc/<pid>/comm is used to prove the process is bubblewrap, so a read
     # taken before the exec is not mistaken for one taken after it.
@@ -357,11 +358,11 @@ docker run --rm \
           echo "  bubblewrap comm           : ${comm:-NOT OBSERVED}"
           echo "  exit status       : $rc"
           echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-          case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+          echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
             *Permission\ denied*)       echo "EACCES (13)" ;;
             *Operation\ not\ permitted*) echo "EPERM (1)" ;;
             *)                          echo "(unrecognised)" ;;
-          esac
+          esac)"
           echo "  (label observed on attempt $attempts)"
           return 0
         fi
@@ -370,11 +371,11 @@ docker run --rm \
       echo "  (the process could not be read; this is NOT evidence that no profile applied)"
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+      echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
         *Permission\ denied*)       echo "EACCES (13)" ;;
         *Operation\ not\ permitted*) echo "EPERM (1)" ;;
         *)                          echo "(unrecognised)" ;;
-      esac
+      esac)"
       return 1
     }
 
@@ -441,11 +442,11 @@ docker run --rm \
       local rc=0; wait "$pid" 2>/dev/null || rc=$?
       echo "  exit status       : $rc"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
-      case "$(head -1 /tmp/bw.err 2>/dev/null)" in
+      echo "  errno            : $(case "$(head -1 /tmp/bw.err 2>/dev/null)" in
         *Permission\ denied*)       echo "EACCES (13)" ;;
         *Operation\ not\ permitted*) echo "EPERM (1)" ;;
         *)                          echo "(unrecognised)" ;;
-      esac
+      esac)"
       rm -f /tmp/userns.fifo /tmp/info.fifo
     }
 
@@ -588,11 +589,11 @@ else
       >/tmp/host-bw.out 2>/tmp/host-bw.err || host_rc=$?
   echo "  exit status       : $host_rc"
   echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
-  case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
+  echo "  errno            : $(case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
     *Permission\ denied*)       echo "EACCES (13)" ;;
     *Operation\ not\ permitted*) echo "EPERM (1)" ;;
     *)                          echo "(unrecognised)" ;;
-  esac
+  esac)"
 
   echo
   echo "--- the AppArmor label of the bubblewrap PROCESS on the host ---"
@@ -651,11 +652,11 @@ else
     echo "  bubblewrap Uid           : ${uidline:-NOT OBSERVED}"
     echo "  exit status       : $rc"
     echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
-    case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
+    echo "  errno            : $(case "$(head -1 /tmp/host-bw.err 2>/dev/null)" in
       *Permission\ denied*)       echo "EACCES (13)" ;;
       *Operation\ not\ permitted*) echo "EPERM (1)" ;;
       *)                          echo "(unrecognised)" ;;
-    esac
+    esac)"
     rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
   ' || echo "  (the host control run could not be completed)"
 
