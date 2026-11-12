@@ -4125,6 +4125,76 @@ the pinned Rust toolchain through `rustup` at run time; that is unchanged.
 | **date** | 2026-10-24 |
 | **severity** | **High for evidentiary integrity, not runtime behaviour.** The lane previously could not run its own guarded assertions, and a green result would have been impossible rather than meaningful. |
 
+### A-036 — the advisory policy and the G11 report said things the tools did not do
+
+**This corrects two statements about the gates. It changes no gate's behaviour.** No
+advisory was silenced, no gate was weakened, no dependency changed, and no finding closed:
+**F-26c remains OPEN**, **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**, **S-31 remains
+implemented but not complete**, and **F-26 remains OPEN**. The `rustix` remediation is
+recorded separately in **A-035**; nothing here depends on it.
+
+**The first statement: `deny.toml` said advisories do not fail the build.** The
+`[advisories]` comment read "Report advisories without failing the build ... Set back to
+'deny' once there is a shipped artifact to protect", over `version = 2` and
+`ignore = []`. **That was not what the file did.** Under `version = 2`, cargo-deny treats an
+**unsound** advisory as an **error** and the build fails; this is measured, not inferred —
+RUSTSEC-2026-0486 (`rustix 1.1.5`) failed G8 on 2026-11-12 with `error[unsound]` and
+`advisories FAILED, bans ok, sources ok`. The comment described a policy the file did not
+implement, and it described it in the direction that made the gate look weaker than it is.
+
+The comment now states, per class, what the configuration does — **unsound is an error**,
+**yanked is a warning** (`yanked = "warn"`), **transitive-unmaintained is a warning**
+(`unmaintained = "workspace"`) — and records that `ignore = []` is deliberate: an advisory id
+added there hides a finding instead of fixing it. The **policy itself is untouched**:
+`version = 2`, `ignore = []`, `yanked = "warn"` and `unmaintained = "workspace"` are exactly
+as they were, and no advisory id was added. The gate is exactly as strict as it was. Only
+the description of it changed, and it now matches the tool.
+
+**The second statement: G11 reported "no known advisory" while reporting four findings.**
+The success message read `cargo audit: no known advisory`. `cargo audit` was printing four
+warning-class findings — `async-executor` 1.14.0 yanked, and `zbus_names` 4.3.4 /
+`zvariant` 5.15.0 / `zvariant_derive` 5.15.0 unmaintained — and exiting 0, because
+`cargo audit` is **not** passed `--deny warnings`. That is a real difference between the two
+gates, not an accident: **G8 applies the cargo-deny policy, G11 reports.** The message did
+not say so, so a green G11 read as "nothing was found" when four findings had been printed
+on the same line above it.
+
+G11 now counts the warning-class findings from `cargo audit --json` and reports them
+alongside the pass. **The gate still does not fail on them** — making it fail would be a
+policy change, and this is a reporting change — but the line a reader sees now says what was
+measured.
+
+**Evidence.** `cargo audit --json` on this tree reports `vulnerabilities: 0` and
+`warnings: {unmaintained: 3, yanked: 1}`. G11 now prints:
+
+```
+cargo audit: 4 warning-class finding(s) (unmaintained, unsound or yanked); these are
+warnings, not failures -- see the deny.toml [advisories] policy
+ok    cargo audit: no known vulnerability
+```
+
+The failure path was re-tested, not assumed: a `cargo audit` that exits non-zero still fails
+G11 with `cargo audit reported an advisory`, and a `cargo audit` that exits 0 but whose
+summary cannot be read reports **that gap** rather than claiming a clean result. The
+counting uses the JSON form because its summary is countable; the human-readable form
+prints the same findings but its summary line is not a stable interface.
+
+**What was deliberately not done.** `--deny warnings` was **not** added to G11. That would
+make G11 fail on three unmaintained transitive crates and one yanked crate, which is a
+**policy** decision about what should block a build — and it is the migration question
+recorded as open work, not something to be settled by editing a gate. G8 was not weakened
+and no advisory was ignored.
+
+**Not claimed.** No gate's pass/fail behaviour changed, so no statement in this register
+about a gate *failing* is affected. The unsound advisory that made G8 red is fixed by
+**A-035**, not by anything here.
+
+| | |
+|---|---|
+| **event** | any change to `deny.toml`'s `[advisories]` section, to the `cargo audit` invocation in G11, or to the G11 success message |
+| **date** | 2026-11-13 |
+| **severity** | **Low for behaviour, Medium for the record.** Neither gate was wrong: G8 failed correctly and G11 passed correctly. What was wrong was the tree's own description of them, and a description that understates a gate is how a real failure gets carried as "known baseline debt" instead of being fixed. |
+
 ## 3. The three highest-risk claims
 
 Not by severity of consequence alone, but by **(likelihood of silent drift) ×
