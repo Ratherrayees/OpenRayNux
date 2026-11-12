@@ -377,6 +377,129 @@ docker run --rm \
   '
 
 # ---------------------------------------------------------------------------
+# HOST: the same bubblewrap, the same caller, run ON THE HOST.
+#
+# The host is where the lane DOES sandbox, so it is the control. Running the same
+# binary as the same uid on the host and observing the same three things -- the
+# stderr, the AppArmor label of the bubblewrap process, and its capability state --
+# is what turns "the container differs" into "the container differs IN THIS WAY".
+#
+# The host already has bubblewrap installed by the image at /usr/bin/bwrap, which is
+# the path the `bwrap` AppArmor profile is attached to. That is the whole question:
+# does the process enter that profile here, and does it fail to in the container?
+#
+# Read-only: this runs the already-installed binary as an already-existing
+# unprivileged user. It writes nothing, changes no policy and adds no capability.
+# ---------------------------------------------------------------------------
+section "HOST: the same operation, run ON THE HOST (the control)"
+
+HOST_BWRAP=""
+for candidate in /usr/bin/bwrap /usr/local/bin/bwrap; do
+  if [ -x "$candidate" ]; then HOST_BWRAP="$candidate"; break; fi
+done
+
+if [ -z "$HOST_BWRAP" ]; then
+  echo "no bubblewrap on this host; the control cannot be run here"
+else
+  echo "host bubblewrap   : $HOST_BWRAP"
+  echo "host bwrap version: $("$HOST_BWRAP" --version 2>/dev/null || echo '(not reported)')"
+  echo "host bwrap sha256 : $(sha256sum "$HOST_BWRAP" 2>/dev/null | cut -d' ' -f1)"
+  echo "host bwrap is a symlink? $( [ -L "$HOST_BWRAP" ] && echo YES || echo no )"
+
+  # The uid to run as. The host lane uses uid 1000; if it does not exist on this
+  # host the run is skipped rather than performed as root, because running as root
+  # is a DIFFERENT operation (see the getuid() note in the header).
+  if id -u 1000 >/dev/null 2>&1; then
+    HOST_UID=1000
+  else
+    HOST_UID=$(id -u)
+    echo "uid 1000 does not exist on this host; using uid $HOST_UID instead"
+  fi
+
+  echo
+  echo "--- the host run, as the production lane runs it ---"
+  echo "  --- ordinary run (no instrumentation) ---"
+  # The status is captured rather than allowed to abort the script: a NONZERO exit is
+  # the expected result if the host also refuses, and the whole point is to record
+  # what happened rather than to stop.
+  host_rc=0
+  sudo setpriv --reuid="$HOST_UID" --regid="$HOST_UID" --clear-groups \
+       --inh-caps=-all --bounding-set=-all -- \
+    env HOME=/tmp PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    "$HOST_BWRAP" --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
+      --die-with-parent --unshare-net --tmpfs /tmp \
+      --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+      --ro-bind /bin /bin --ro-bind /sbin /sbin -- /bin/true \
+      >/tmp/host-bw.out 2>/tmp/host-bw.err || host_rc=$?
+  echo "  exit status       : $host_rc"
+  echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
+
+  echo
+  echo "--- the AppArmor label of the bubblewrap PROCESS on the host ---"
+  # The same read as in the container: the label of the process itself, taken while
+  # it is alive, with /proc/<pid>/comm proving the process is bubblewrap. Any
+  # non-empty label is recorded, including one equal to the label of the shell.
+  #
+  # This whole block runs under ONE `sudo`, because the process it observes runs as
+  # a different uid and its /proc entries are not readable by the runner, and
+  # because a `sudo` per iteration would be far too slow to catch the window.
+  #
+  # The handshake is used to widen the window, exactly as in the container: it is
+  # the only reliable way to read the label of a process that exits in
+  # milliseconds. It is disclosed as instrumented.
+  sudo env HOST_UID="$HOST_UID" HOST_BWRAP="$HOST_BWRAP" bash -c '
+    set -uo pipefail
+    rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
+    mkfifo /tmp/host-userns.fifo; mkfifo /tmp/host-info.fifo
+    exec 3<>/tmp/host-userns.fifo
+    exec 4<>/tmp/host-info.fifo
+    setpriv --reuid="$HOST_UID" --regid="$HOST_UID" --clear-groups \
+         --inh-caps=-all --bounding-set=-all -- \
+      env HOME=/tmp PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+      "$HOST_BWRAP" --userns-block-fd 3 --info-fd 4 --unshare-user \
+        --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
+        --die-with-parent --unshare-net --tmpfs /tmp \
+        --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+        --ro-bind /bin /bin --ro-bind /sbin /sbin -- /bin/true \
+        >/tmp/host-bw.out 2>/tmp/host-bw.err &
+    pid=$!
+    label=""; capeff=""; comm=""; uidline=""
+    for i in $(seq 1 3000); do
+      if [ -r "/proc/$pid/comm" ]; then
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+        if [ "$comm" = "bwrap" ]; then
+          l=$(cat "/proc/$pid/attr/current" 2>/dev/null || true)
+          if [ -n "$l" ]; then
+            label="$l"
+            while read -r _k _v; do
+              if [ "$_k" = "CapEff:" ]; then capeff="$_v"; fi
+              if [ "$_k" = "Uid:" ]; then uidline="$_v"; fi
+            done < "/proc/$pid/status" 2>/dev/null
+            break
+          fi
+        fi
+      fi
+      kill -0 "$pid" 2>/dev/null || break
+    done
+    printf "x" >&3 2>/dev/null || true
+    exec 3>&- 2>/dev/null || true
+    exec 4>&- 2>/dev/null || true
+    rc=0; wait "$pid" 2>/dev/null || rc=$?
+    echo "  bubblewrap AppArmor label : ${label:-NOT OBSERVED}"
+    echo "  bubblewrap CapEff        : ${capeff:-NOT OBSERVED}"
+    echo "  bubblewrap comm           : ${comm:-NOT OBSERVED}"
+    echo "  bubblewrap Uid           : ${uidline:-NOT OBSERVED}"
+    echo "  exit status       : $rc"
+    echo "  bubblewrap stderr : $(head -3 /tmp/host-bw.err 2>/dev/null)"
+    rm -f /tmp/host-userns.fifo /tmp/host-info.fifo
+  ' || echo "  (the host control run could not be completed)"
+
+  echo
+  echo "  THE COMPARISON: in the container the label was 'docker-default (enforce)';"
+  echo "  here it is recorded above."
+fi
+
+# ---------------------------------------------------------------------------
 # HOST: the AppArmor policy as loaded, and the kernel audit records.
 #
 # The audit records are collected AFTER the container has run, because a record of
@@ -401,18 +524,29 @@ ls -1 /etc/apparmor.d/ 2>/dev/null | grep -iE "bwrap|unpriv" || echo "(none)"
 
 echo
 echo "--- the content of bwrap-userns-restrict (attachment + permissions) ---"
-# docker-default is included because it is the confinement the CONTAINER runs under,
-# and the container label was observed to be "docker-default (enforce)". Whether it
-# grants `mount`/`userns`/`capability` is directly relevant to the question.
+# Read with sudo: docker-default is mode-restricted on Ubuntu, and it is the profile the
+# CONTAINER runs under (its label was observed to be "docker-default (enforce)"). Whether
+# it grants or denies `mount` decides whether the container can sandbox at all.
 for f in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns \
          /etc/apparmor.d/docker-default; do
-  if [ -r "$f" ]; then
+  if sudo test -r "$f"; then
     echo "### $f"
-    cat "$f"
+    sudo cat "$f"
   else
     echo "### $f : (not readable on this host)"
   fi
 done
+
+echo
+echo "--- the rules of the profile the CONTAINER runs under, as the kernel has them ---"
+# The loaded policy, not the file: the file is a template and the loaded policy is what
+# mediates. `aa-status` reads the loaded policy.
+if command -v aa-status >/dev/null 2>&1; then
+  sudo aa-status 2>/dev/null | grep -A 60 -i "docker-default" | head -70 \
+    || echo "(aa-status produced no docker-default section)"
+else
+  echo "(aa-status is not installed on this host)"
+fi
 
 echo
 echo "--- the /proc/self/attr/current of the host runner (the runner label) ---"
@@ -435,5 +569,21 @@ sudo dmesg 2>/dev/null | grep -i apparmor \
 sudo journalctl -k --no-pager 2>/dev/null | grep -i apparmor \
   | grep -iE 'bwrap|userns|mount|capab|clone|docker|container' | tail -40 \
   || echo "(no such record)"
+
+echo
+echo "--- dmesg: EVERY apparmor record that is a DENIED, naming the profile ---"
+# A denial inside the container is recorded in the HOST kernel ring buffer under the
+# container's audit context, so it IS visible here. Looking for every DENIED rather
+# than only the ones matching the earlier grep means a denial that does not mention
+# bwrap by name is still visible.
+sudo dmesg 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -40 || echo "(no DENIED record)"
+sudo journalctl -k --no-pager 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -40 \
+  || echo "(no DENIED record)"
+
+echo
+echo "--- dmesg: the records from the WINDOW in which the container ran ---"
+# The container ran a few seconds ago. Anything recorded after the docker-default
+# profile_load is from the container's own execution.
+sudo dmesg 2>/dev/null | grep -iE 'apparmor|audit:' | tail -25 || echo "(none)"
 
 section "DONE"
