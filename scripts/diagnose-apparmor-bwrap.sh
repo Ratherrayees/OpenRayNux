@@ -193,6 +193,21 @@ docker run --rm \
     apt-get update -qq
     apt-get install -y -qq meson ninja-build pkg-config libcap-dev libselinux1-dev \
                           libpcre2-dev util-linux curl ca-certificates
+    # The DISTRO bubblewrap as well as the pinned build. Configuration C runs the two
+    # under the same confinement, which is what separates "the confinement refuses it"
+    # from "this bubblewrap version refuses it". The package is installed from the
+    # base image own repository and changes nothing about the confinement.
+    apt-get install -y -qq bubblewrap >/dev/null 2>&1 || true
+    # The distro bubblewrap is preserved under its own name BEFORE /usr/bin/bwrap is
+    # overwritten below, because the configurations that follow replace it. Without
+    # this, configuration C would silently compare the pinned build with itself.
+    DISTRO_BWRAP_SAVED="/usr/local/bin/bwrap-distro"
+    if command -v bwrap >/dev/null 2>&1; then
+      cp "$(command -v bwrap)" "$DISTRO_BWRAP_SAVED"
+      echo "distro bubblewrap preserved: $DISTRO_BWRAP_SAVED"
+    else
+      echo "(no distro bubblewrap on this base image)"
+    fi
     BUILD=$(mktemp -d /tmp/bwbuild.XXXXXX)
     curl -fsSL -o "$BUILD/bwrap.tar.xz" "$BW_URL"
     echo "$BW_SHA256  $BUILD/bwrap.tar.xz" | sha256sum -c - || { echo "FATAL: digest mismatch"; exit 1; }
@@ -248,10 +263,15 @@ docker run --rm \
     # hypotheses: bubblewrap emits an explicit "No permissions to create a new
     # namespace..." message when it REQUESTED a user namespace and was refused, and a
     # generic "Creating new namespace failed: ..." when it did not request one.
+    # Helpers: the nested quoting of a command substitution inside a
+    # double quoted string is easy to get wrong, so it is done once here.
+    ver_of() { "$1" --version 2>/dev/null || echo "(not reported)"; }
+    sha_of() { sha256sum "$1" 2>/dev/null | cut -d" " -f1; }
+
     ordinary_run() {
       echo "  --- ordinary run (no instrumentation) ---"
       "${RUN_AS_USER[@]}" env HOME=/home/orxnud PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-        /usr/bin/bwrap "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
+        "${BW_EXEC:-/usr/bin/bwrap}" "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err
       echo "  exit status       : $?"
       echo "  bubblewrap stderr : $(head -3 /tmp/bw.err 2>/dev/null)"
     }
@@ -278,7 +298,7 @@ docker run --rm \
       for try in $(seq 1 80); do
         attempts=$((attempts + 1))
         "${RUN_AS_USER[@]}" env HOME=/home/orxnud PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-          /usr/bin/bwrap "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err &
+          "${BW_EXEC:-/usr/bin/bwrap}" "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err &
         local pid=$!
         # Tight loop: builtin reads only, no forks.
         local i
@@ -421,6 +441,37 @@ docker run --rm \
     cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
 
     echo
+    echo "################ CONFIGURATION C: a DIFFERENT bubblewrap build ################"
+    echo "# The container has been shown to fail with the PINNED 0.13.1 binary, and the"
+    echo "# host has been shown to succeed with the distro binary. Those two differ in"
+    echo "# TWO ways at once: the confinement, and the bubblewrap version. This"
+    echo "# configuration holds the confinement fixed and changes only the binary: the"
+    echo "# distro bubblewrap, run here under docker-default exactly as the pinned one"
+    echo "# was."
+    echo "# If the distro binary ALSO fails here, the version is not what matters."
+    echo "# If it SUCCEEDS here, the version is what matters, and the host result was"
+    echo "# never comparable to begin with."
+    echo
+    echo "--- the distro bubblewrap, as the base image ships it ---"
+    if [ -x "$DISTRO_BWRAP_SAVED" ]; then
+      DISTRO_BWRAP="$DISTRO_BWRAP_SAVED"
+      echo "  path    : $DISTRO_BWRAP"
+      echo "  version : $(ver_of "$DISTRO_BWRAP")"
+      echo "  sha256  : $(sha_of "$DISTRO_BWRAP")"
+      BW_EXEC="$DISTRO_BWRAP"
+      ordinary_run
+      observed_run
+      echo
+      echo "--- the PINNED binary, for the side-by-side in the same confinement ---"
+      echo "  version : $(ver_of "$BW_BIN")"
+      echo "  sha256  : $(sha_of "$BW_BIN")"
+      BW_EXEC="$BW_BIN"
+      ordinary_run
+    else
+      echo "  (no distro bubblewrap on this image; the version cannot be separated here)"
+    fi
+
+    echo
     echo "--- the CONTAINER mount table (the tree bubblewrap has to re-mount) ---"
     # bubblewrap makes "/" a slave mount at bubblewrap.c:3280, and that is where it
     # fails in the container. Whether it can depends on the mount tree it inherits,
@@ -460,7 +511,7 @@ if [ -z "$HOST_BWRAP" ]; then
   echo "no bubblewrap on this host; the control cannot be run here"
 else
   echo "host bubblewrap   : $HOST_BWRAP"
-  echo "host bwrap version: $("$HOST_BWRAP" --version 2>/dev/null || echo '(not reported)')"
+  echo "host bwrap version: $("$HOST_BWRAP" --version 2>/dev/null || echo "(not reported)")"
   echo "host bwrap sha256 : $(sha256sum "$HOST_BWRAP" 2>/dev/null | cut -d' ' -f1)"
   echo "host bwrap is a symlink? $( [ -L "$HOST_BWRAP" ] && echo YES || echo no )"
 
