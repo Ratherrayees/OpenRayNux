@@ -4125,6 +4125,220 @@ the pinned Rust toolchain through `rustup` at run time; that is unchanged.
 | **date** | 2026-10-24 |
 | **severity** | **High for evidentiary integrity, not runtime behaviour.** The lane previously could not run its own guarded assertions, and a green result would have been impossible rather than meaningful. |
 
+### A-035 — RUSTSEC-2026-0486 remediated: `rustix 1.1.5 -> 1.1.6`, and G8 is clean again
+
+**This closes the `rustix` advisory and nothing else.** No finding closed, no threat model
+narrowed, no dependency chain was migrated: **F-26c remains OPEN** (the residual TOCTOU
+window and the remaining Windows limitations), **F-26b/S-30 remain OPEN**, **S-11 remains
+OPEN**, **S-31 remains implemented but not complete**, and **F-26 remains OPEN**. Nothing
+here is a release-readiness claim.
+
+**The advisory.** **RUSTSEC-2026-0486**, package `rustix`, type `INFO`/`Unsound`,
+reported 2026-10-27 and issued 2026-11-11. Patched `>=1.1.6`; unaffected `<1.0.0`. The
+extended-attribute functions in `rustix::fs` (`fgetxattr`, `flistxattr`, `getxattr`,
+`lgetxattr`, `listxattr`, `llistxattr`) write into a `Buffer` and then mark as many bytes
+initialized as the system call reported. With a zero-length buffer the kernel treats the
+call as a size query: it writes nothing and returns the size of the attribute value or of
+the name list. rustix still marked that many bytes initialized, so passing a `Vec` whose
+length equals its capacity through `spare_capacity` set the length past the capacity over
+memory that was never written — undefined behaviour reachable from safe Rust code. From
+1.1.6 these functions return an empty result for a zero-length buffer and new
+`*_query` functions return the size.
+
+**Why this is the G8 blocker, and what is not.** G8 runs `cargo deny check licenses` and
+`cargo deny check bans sources advisories`; G11 runs `cargo audit`. The failure that made
+G8 red was `advisories FAILED, bans ok, sources ok` with `error[unsound]` for
+RUSTSEC-2026-0486 against `rustix 1.1.5`. Under `deny.toml`'s `[advisories] version = 2`,
+cargo-deny treats an **unsound** advisory as an **error**, so it failed the gate. The other
+four findings the scanners print — `async-executor 1.14.0` yanked, and `zbus_names`
+4.3.4 / `zvariant` 5.15.0 / `zvariant_derive` 5.15.0 unmaintained — are **warnings**, not
+failures: `yanked = "warn"` and `unmaintained = "workspace"`, and all three unmaintained
+crates are transitive. They did not cause the failure and are **not** addressed here.
+
+**The fix, and why no manifest changed.** `Cargo.toml` declares
+`rustix = { version = "1.1.5", features = ["pty"] }`, a caret requirement of
+`>=1.1.5, <2.0.0`, so 1.1.6 is already inside the permitted range. The resolution was a
+**lockfile-only** targeted update:
+
+```
+cargo update -p rustix --precise 1.1.6
+```
+
+**The exact lockfile delta — six lines: two version and two checksum changes, plus two
+`windows-sys` edge changes explained below.**
+
+```
+-name = "rustix"
+-version = "1.1.5"
++version = "1.1.6"
+-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
++checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
+```
+
+The new checksum was verified against the crates.io index entry for rustix 1.1.6, and
+**1.1.6 is not yanked** in that index. The package set is unchanged at **276 packages**:
+exactly one `(name, version)` pair changed, no package was added or removed, and no other
+checksum changed.
+
+**The `windows-sys` edge changes, and why they happen.** Four packages (`errno`, `rustix`,
+`tempfile`, `winapi-util`) move from the `windows-sys 0.61.2` node to the `0.52.0`
+node. This is a consequence of the resolver re-resolving the `windows-sys` subgraph, not a
+requirement change: rustix 1.1.6 declares the same `windows-sys >=0.52, <0.62` with the
+same features as 1.1.5, and every affected crate declares a range that 0.52.0 satisfies.
+`ring 0.17.14` pins `windows-sys` to exactly `0.52` for `aarch64-windows`, so a 0.52.0
+node must exist; the resolver reuses it rather than opening a third. The result is
+deterministic: three consecutive runs from a clean lockfile produced the same delta.
+
+Both nodes remain in the graph and both remain consumed — 0.52.0 by
+`errno`/`rustix`/`tempfile`/`winapi-util`/`ring`, 0.61.2 by `mio`/`tokio`/`zbus` and
+others. The windows-sys API surface rustix uses is byte-identical between 1.1.5 and 1.1.6
+(the same `windows_sys::Win32::…` import set), and every module and symbol it imports —
+`Win32::Networking::WinSock`, `Win32::Foundation`, `SOCKET`, `FD_SET`, `WSACleanup`,
+`WSAGetLastError`, `WSAStartup`, `WSADATA` — is present in windows-sys 0.52.0.
+
+**One visible consequence, recorded rather than hidden.** cargo-deny now **reports** the
+`windows-sys` duplicate, which it did not before. The duplication is **not new** — the
+lockfile had two `windows-sys` entries before this change as well — but previously the
+0.52.0 node was reachable only through `ring`, whose `windows-sys` dependency is
+target-specific to `aarch64-windows`, so cargo-deny's duplicate check did not see it. It is
+a **warning** under `multiple-versions = "warn"`, not an error, and G8 still passes. It is
+**not** entered in the `[bans] skip` list, because that list is for duplicates that have
+been *reviewed and kept* with a stated reason, and this one has not been reviewed that
+way.
+
+**Reachability, assessed rather than assumed.** The advisory's precondition is a call with
+a zero-length buffer. **OpenRayNux calls none of the affected functions itself**: no crate
+in this repository references `getxattr`, `listxattr`, `fgetxattr`, `lgetxattr`,
+`llistxattr` or `flistxattr`. The rustix `fs` feature that carries them **is** enabled in
+the resolved graph, through `async-io`, so the functions are compiled in and the defect is
+present in the binary. Whether any path reaches it is a property of the crates that use
+rustix, not of this repository.
+
+The bump was made anyway, for the reason this register used for the four `rustls 0.23.45`
+advisories and for **A-015**: the fix is a patch release inside an already-permitted
+range, it costs nothing, and "no advisory is currently reachable" would be a statement
+about today's call graph rather than a property that survives someone changing a
+dependency.
+
+**Gate evidence, measured with the CI-pinned tools** (`cargo-deny 0.20.2`,
+`cargo-audit 0.22.2`, `rustc 1.98.1`):
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| G8 (licences) | `cargo deny check licenses` | exit 0 | exit 0 — `licenses ok` |
+| G8 (supply chain) | `cargo deny check bans sources advisories` | **exit 1** — `advisories FAILED, bans ok, sources ok`, RUSTSEC-2026-0486 | **exit 0** — `advisories ok, bans ok, sources ok` |
+| G11 | `cargo audit` | exit 0 — 4 allowed warnings, 0 vulnerabilities | exit 0 — 4 allowed warnings, 0 vulnerabilities |
+| G9 | `cargo nextest run --workspace` (scope is host-dependent, see below) | 1884 run, 1884 passed, 116 skipped on a hosted runner | **1884 run, 1884 passed, 116 skipped** on the hosted runner; **2040 run, 2040 passed, 6 skipped** locally |
+
+`./scripts/ci-gates.sh` passes with G8 among the gates (G12 skips with its loud message,
+as it always does without a release tag). RUSTSEC-2026-0486 appears **zero** times in
+`cargo deny check advisories` and zero times in `cargo audit --json`.
+
+**The two G9 figures are different scopes, not a discrepancy.** G9 asks the host whether
+it can isolate and follows the answer: on a hosted runner that cannot, the sandbox-evidence
+binaries are excluded with a stated reason and 1884 tests run; on a host that can, all
+2040 run. The hosted figure is the CI one, and both were measured on this change.
+
+**The two G9 figures are different scopes, not a discrepancy.** G9 asks the host whether
+it can isolate and follows the answer: on a hosted runner that cannot, the sandbox-evidence
+binaries are excluded with a stated reason and 1884 tests run; on a host that can, all
+2040 run. The hosted figure is the CI one, and both were measured on this change.
+
+**What was deliberately not done.** No advisory exception was added: `deny.toml`'s
+`ignore = []` is untouched and must stay empty, because an advisory id added there hides a
+finding instead of fixing it. No gate was weakened. The `keyring`/`secret-service`/`zbus`
+subtree was **not** migrated — the yanked `async-executor 1.14.0` and the three
+unmaintained zbus-family crates are separate work with their own compatibility
+assessment, and silencing them would need that assessment. No manifest was edited.
+
+**Not claimed.** No Windows validation was performed by this work; the windows-sys analysis
+above is a source-level inspection of the API surface rustix uses, not a Windows build.
+CI's `windows-2025` lane is the authority for the Windows build and runs it. The yanked
+and unmaintained findings remain. The two "leaky" sandbox tests are unrelated to this work
+and were not introduced by it. **No release-readiness is claimed.**
+
+| | |
+|---|---|
+| **event** | any change to `rustix` in any manifest or to `Cargo.lock`; and any change to `deny.toml`'s `[advisories]` policy |
+| **date** | 2026-11-13 |
+| **severity** | **High for the advisory itself, Medium for the process.** The advisory is a real undefined-behaviour defect in a crate that is compiled into the binary. The process failure was that G8 was red for a week and repeatedly described as "a known baseline failure" without a prioritised remediation phase being opened; it should have been opened when the advisory was issued on 2026-11-11. |
+
+### A-036 — the advisory policy and the G11 report said things the tools did not do
+
+**This corrects two statements about the gates. It changes no gate's behaviour.** No
+advisory was silenced, no gate was weakened, no dependency changed, and no finding closed:
+**F-26c remains OPEN**, **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**, **S-31 remains
+implemented but not complete**, and **F-26 remains OPEN**. The `rustix` remediation is
+recorded separately in **A-035**; nothing here depends on it.
+
+**The first statement: `deny.toml` said advisories do not fail the build.** The
+`[advisories]` comment read "Report advisories without failing the build ... Set back to
+'deny' once there is a shipped artifact to protect", over `version = 2` and
+`ignore = []`. **That was not what the file did.** Under `version = 2`, cargo-deny treats the
+**vulnerability** and **unsound** classes as **errors** and the build fails. Both were
+measured, not inferred: RUSTSEC-2026-0382 (`rustls-webpki 0.103.15`) reports
+`error[vulnerability]` and fails the gate, and RUSTSEC-2026-0486 (`rustix 1.1.5`) reports
+`error[unsound]` and failed G8 on 2026-11-12 with `advisories FAILED, bans ok, sources
+ok`. The comment described a policy the file did not implement, and it described it in the
+direction that made the gate look weaker than it is.
+
+The comment now states, per class, what the configuration does — **vulnerability is an
+error**, **unsound is an error**, **yanked is a warning** (`yanked = "warn"`),
+**transitive-unmaintained is a warning** (`unmaintained = "workspace"`) — and records that
+`ignore = []` is deliberate: an advisory id added there hides a finding instead of fixing
+it. It also states what a yank is and is not: the publisher asking Cargo not to select
+that version in *new* resolution, which deletes nothing and leaves an existing lockfile
+resolving to it, so a yanked version can sit in a lockfile indefinitely and the yank is
+not on its own evidence that the version is free of defects. The **policy itself is
+untouched**: `version = 2`, `ignore = []`, `yanked = "warn"` and `unmaintained =
+"workspace"` are exactly as they were, and no advisory id was added. The gate is exactly as
+strict as it was. Only the description of it changed, and it now matches the tool.
+
+**The second statement: G11 reported "no known advisory" while reporting four findings.**
+The success message read `cargo audit: no known advisory`. `cargo audit` was printing four
+warning-class findings — `async-executor` 1.14.0 yanked, and `zbus_names` 4.3.4 /
+`zvariant` 5.15.0 / `zvariant_derive` 5.15.0 unmaintained — and exiting 0, because
+`cargo audit` is **not** passed `--deny warnings`. That is a real difference between the two
+gates, not an accident: **G8 applies the cargo-deny policy, G11 reports.** The message did
+not say so, so a green G11 read as "nothing was found" when four findings had been printed
+on the same line above it.
+
+G11 now counts the warning-class findings from `cargo audit --json` and reports them
+alongside the pass. **The gate still does not fail on them** — making it fail would be a
+policy change, and this is a reporting change — but the line a reader sees now says what was
+measured.
+
+**Evidence.** `cargo audit --json` on this tree reports `vulnerabilities: 0` and
+`warnings: {unmaintained: 3, yanked: 1}`. G11 now prints:
+
+```
+cargo audit: 4 warning-class finding(s) (unmaintained, unsound or yanked); these are
+warnings, not failures -- see the deny.toml [advisories] policy
+ok    cargo audit: no known vulnerability
+```
+
+The failure path was re-tested, not assumed: a `cargo audit` that exits non-zero still fails
+G11 with `cargo audit reported an advisory`, and a `cargo audit` that exits 0 but whose
+summary cannot be read reports **that gap** rather than claiming a clean result. The
+counting uses the JSON form because its summary is countable; the human-readable form
+prints the same findings but its summary line is not a stable interface.
+
+**What was deliberately not done.** `--deny warnings` was **not** added to G11. That would
+make G11 fail on three unmaintained transitive crates and one yanked crate, which is a
+**policy** decision about what should block a build — and it is the migration question
+recorded as open work, not something to be settled by editing a gate. G8 was not weakened
+and no advisory was ignored.
+
+**Not claimed.** No gate's pass/fail behaviour changed, so no statement in this register
+about a gate *failing* is affected. The unsound advisory that made G8 red is fixed by
+**A-035**, not by anything here.
+
+| | |
+|---|---|
+| **event** | any change to `deny.toml`'s `[advisories]` section, to the `cargo audit` invocation in G11, or to the G11 success message |
+| **date** | 2026-11-13 |
+| **severity** | **Low for behaviour, Medium for the record.** Neither gate was wrong: G8 failed correctly and G11 passed correctly. What was wrong was the tree's own description of them, and a description that understates a gate is how a real failure gets carried as "known baseline debt" instead of being fixed. |
+
 ## 3. The three highest-risk claims
 
 Not by severity of consequence alone, but by **(likelihood of silent drift) ×
