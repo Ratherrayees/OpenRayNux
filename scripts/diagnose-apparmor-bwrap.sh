@@ -4,16 +4,28 @@
 #
 # # What this is for
 #
-# The lane builds bubblewrap 0.13.1 from pinned upstream source and installs it at
-# `/usr/local/bin/bwrap`, with `/usr/bin/bwrap` as a SYMLINK to it, because the product
+# The lane builds bubblewrap 0.13.1 from pinned upstream source, installs it at
+# `/usr/local/bin/bwrap`, and makes `/usr/bin/bwrap` a SYMLINK to it, because the product
 # execs `bwrap` by bare name with an emptied environment and the default search path
 # resolves to `/bin:/usr/bin`.
 #
 # On `ubuntu-26.04` the HOST can sandbox: the `bwrap-userns-restrict` AppArmor profile
-# is loaded and grants the `userns` permission to the executable it is attached to. The
-# CONTAINER cannot. This script establishes WHY, with observations only.
+# is loaded and is attached to `/usr/bin/bwrap`. The CONTAINER cannot. This script
+# establishes why, with observations only.
 #
-# # What it does NOT do
+# # The two restrictions this is trying to separate
+#
+# 1. **Path attachment.** AppArmor attaches a profile to a PATH. The profile is attached
+#    to `/usr/bin/bwrap`; the lane's symlink resolves the executable to
+#    `/usr/local/bin/bwrap`, which no profile covers. But an attachment alone does not
+#    establish a TRANSITION: a process already confined by `docker-default` does not
+#    automatically enter another profile. So the transition has to be OBSERVED, not
+#    inferred from the profile file.
+# 2. **Confinement.** The container runs under `docker-default (enforce)`, and the
+#    mount step that bubblewrap performs after creating its namespaces may be refused
+#    there rather than by the `bwrap` profile.
+#
+# # What this does NOT do
 #
 # Nothing here changes the security posture. It does not load or unload a profile, does
 # not write a sysctl, does not add a capability, does not use a privileged container, and
@@ -25,17 +37,21 @@
 # happens inside a throwaway container, is not installed on the host, and is removed with
 # the container.
 #
-# # The two restrictions this is trying to separate
+# Kernel messages are collected from the HOST, never from inside the container: the
+# kernel restricts `dmesg` to processes holding `CAP_SYSLOG`, and adding it would be a
+# capability change. Docker's own documentation recommends the host kernel log for
+# AppArmor denials. They are therefore collected AFTER the container has run, not
+# before -- collecting them before would miss the very operation under test.
 #
-# 1. **Path attachment.** AppArmor attaches a profile to a PATH. If the profile is
-#    attached to `/usr/bin/bwrap` and the process execs `/usr/local/bin/bwrap` (which is
-#    what a symlink resolves to), the profile does not apply, and the `userns` permission
-#    it grants is not granted.
-# 2. **Confinement transition.** A process confined by `docker-default` does not
-#    automatically receive another profile's rules; the transition depends on the target
-#    profile's attachment and the child's own confinement.
+# # The two configurations compared
 #
-# Both can independently prevent the nested user namespace. This measures them apart.
+# **A. The current installation** -- the real binary at `/usr/local/bin/bwrap` with
+#    `/usr/bin/bwrap` a verified symlink to it, exactly as `scripts/run-sandbox-tests.sh`
+#    creates it.
+# **B. The candidate installation** -- the SAME bytes at a regular `/usr/bin/bwrap`.
+#
+# Both run in the same container with the same confinement and the same bubblewrap
+# binary, so the only variable is the path the kernel sees.
 
 set -euo pipefail
 
@@ -45,55 +61,6 @@ set -euo pipefail
 IMAGE="rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6"
 
 section() { printf '\n===== %s =====\n' "$1"; }
-
-# ---------------------------------------------------------------------------
-# HOST: the AppArmor policy as it is loaded on this machine.
-# ---------------------------------------------------------------------------
-section "HOST: AppArmor state"
-
-echo "apparmor module enabled : $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
-echo "restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
-echo "unprivileged_userns_clone    : $(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)"
-
-echo
-echo "--- loaded profiles (full lines: <name> <mode>) ---"
-sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null \
-  | grep -iE 'bwrap|unpriv|docker|^/' \
-  | head -40 || echo "(profile list unavailable)"
-
-echo
-echo "--- the bwrap profile FILES present on the host ---"
-ls -1 /etc/apparmor.d/ 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "(none)"
-
-echo
-echo "--- the content of bwrap-userns-restrict (attachment + permissions) ---"
-for f in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns; do
-  if [ -r "$f" ]; then
-    echo "### $f"
-    cat "$f"
-  else
-    echo "### $f : (not readable on this host)"
-  fi
-done
-
-echo
-echo "--- the host's own /proc/self/attr/current (the runner's label) ---"
-cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
-
-# ---------------------------------------------------------------------------
-# HOST: the kernel's own AppArmor audit records.
-#
-# These are the ground truth for a denial: the operation, the profile that refused it,
-# and the requesting program. Read-only; nothing is written or cleared.
-# ---------------------------------------------------------------------------
-section "HOST: kernel AppArmor audit records"
-
-echo "--- dmesg | grep -i apparmor (last 40) ---"
-sudo dmesg 2>/dev/null | grep -i apparmor | tail -40 || echo "(dmesg unavailable)"
-
-echo
-echo "--- journalctl -k | grep -i apparmor (last 40) ---"
-sudo journalctl -k --no-pager 2>/dev/null | grep -i apparmor | tail -40 || echo "(journalctl unavailable)"
 
 # ---------------------------------------------------------------------------
 # CONTAINER: the same configuration the lane uses, observed from inside.
@@ -114,19 +81,22 @@ docker run --rm \
   -w /src \
   "$IMAGE" \
   bash -lc '
-    set -euo pipefail
+    set -uo pipefail
     export DEBIAN_FRONTEND=noninteractive
 
-    echo "--- the container process AppArmor label ---"
+    echo "--- the diagnostic shell AppArmor label (NOT the bubblewrap label) ---"
     cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
+    SHELL_LABEL="$(cat /proc/self/attr/current 2>/dev/null || echo unknown)"
 
     echo
     echo "--- AppArmor state VISIBLE FROM INSIDE the container ---"
     echo "apparmor module enabled : $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
     echo "restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
     echo "loaded profiles visible from inside:"
-    sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -20 || echo "(profile list unavailable from inside)"
+    sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -20 \
+      || echo "(profile list unavailable from inside)"
 
+    # ---- build the SAME pinned bubblewrap the lane builds ----
     echo
     echo "--- build the SAME pinned bubblewrap the lane builds ---"
     BW_VERSION="0.13.1"
@@ -146,45 +116,168 @@ docker run --rm \
     BW_BIN="/usr/local/bin/bwrap"
     echo "built and installed: $BW_BIN"
 
-    echo
-    echo "=== EXECUTABLE IDENTITY ==="
-    echo "real path of /usr/bin/bwrap : $(readlink -f /usr/bin/bwrap 2>/dev/null || echo absent)"
-    echo "sha256 of the real binary   : $(sha256sum "$BW_BIN" | cut -d" " -f1)"
-    stat -c "  %n  mode=%a  size=%s  inode=%i" "$BW_BIN"
-    echo "is /usr/bin/bwrap a symlink? $( [ -L /usr/bin/bwrap ] && echo YES || echo no )"
+    # The argv the PRODUCT builds, reproduced here. `build_command` does NOT pass
+    # `--unshare-user`: bubblewrap creates the user namespace itself when it is
+    # unprivileged. Passing it explicitly would measure a different invocation.
+    # The namespace set, the tmpfs root and the read-only binds are the product'"'"'s.
+    BW_ARGV=(
+      --unshare-pid
+      --unshare-ipc
+      --unshare-uts
+      --unshare-cgroup
+      --die-with-parent
+      --unshare-net
+      --tmpfs /tmp
+      --ro-bind /usr /usr
+      --ro-bind /bin /bin
+      --ro-bind /lib /lib
+      --ro-bind /lib64 /lib64
+    )
 
-    echo
-    echo "=== ATTEMPT 1: the CURRENT install (real binary at /usr/local/bin, symlink at /usr/bin) ==="
-    echo "This is the configuration the lane uses today."
-    set +e
-    OUT=$(/usr/bin/bwrap --unshare-user --unshare-pid --unshare-uts --die-with-parent \
-            --tmpfs /tmp --ro-bind /usr /usr --ro-bind /bin /bin \
-            /bin/true 2>&1)
-    RC=$?
-    set -e
-    echo "exit status: $RC"
-    echo "output: $OUT"
+    # Runs bubblewrap in the BACKGROUND and reads the label and the effective
+    # capabilities of the bubblewrap PROCESS ITSELF, while it is alive.
+    #
+    # The shell'"'"'s own label is useless here: it is the label of the diagnostic
+    # shell, not of the process that exec'"'"'d bubblewrap. The bubblewrap process
+    # exists from execve until its failing mount, which is a few milliseconds, so
+    # the read is a tight builtin-only loop with no forks in it, retried until it
+    # catches a label that is not the shell'"'"'s.
+    #
+    # If the label is never observed, that is reported as such. It is NOT reported
+    # as evidence that AppArmor was uninvolved.
+    run_bwrap_observing() {
+      local label="" capeff="" attempts=0 rc=0 l c
+      for try in $(seq 1 60); do
+        attempts=$((attempts + 1))
+        bwrap "${BW_ARGV[@]}" -- /bin/true >/tmp/bw.out 2>/tmp/bw.err &
+        local pid=$!
+        for i in $(seq 1 2000); do
+          if [ -r "/proc/$pid/attr/current" ]; then
+            l=""; read -r l < "/proc/$pid/attr/current" 2>/dev/null || true
+            if [ -n "$l" ] && [ "$l" != "$SHELL_LABEL" ]; then
+              c=""
+              while read -r _k _v; do
+                [ "$_k" = "CapEff:" ] && c="$_v"
+              done < "/proc/$pid/status" 2>/dev/null
+              label="$l"; capeff="$c"
+              break
+            fi
+          fi
+          kill -0 "$pid" 2>/dev/null || break
+        done
+        rc=0; wait "$pid" 2>/dev/null || rc=$?
+        if [ -n "$label" ]; then
+          echo "  exit status        : $rc"
+          echo "  bubblewrap label   : $label"
+          echo "  bubblewrap CapEff  : ${capeff:-unreadable}"
+          echo "  bubblewrap stderr  : $(cat /tmp/bw.err 2>/dev/null | head -3)"
+          echo "  (observed on attempt $attempts)"
+          return 0
+        fi
+      done
+      echo "  exit status        : $rc"
+      echo "  bubblewrap label   : NOT OBSERVED after $attempts attempts"
+      echo "  bubblewrap CapEff  : NOT OBSERVED"
+      echo "  bubblewrap stderr  : $(cat /tmp/bw.err 2>/dev/null | head -3)"
+      return 1
+    }
 
+    identity() {
+      echo "  /usr/bin/bwrap is a symlink? $( [ -L /usr/bin/bwrap ] && echo YES || echo no )"
+      echo "  readlink -f /usr/bin/bwrap : $(readlink -f /usr/bin/bwrap 2>/dev/null || echo absent)"
+      echo "  sha256 of /usr/bin/bwrap (resolved) : $(sha256sum /usr/bin/bwrap 2>/dev/null | cut -d" " -f1)"
+      echo "  sha256 of the built binary         : $(sha256sum "$BW_BIN" | cut -d" " -f1)"
+      stat -c "  stat %n  mode=%a  size=%s  inode=%i  links=%h" /usr/bin/bwrap 2>/dev/null || true
+      stat -c "  stat %n  mode=%a  size=%s  inode=%i  links=%h" "$BW_BIN" 2>/dev/null || true
+    }
+
+    # ================= CONFIGURATION A: the current installation =================
     echo
-    echo "=== ATTEMPT 2: the SAME binary COPIED to a real /usr/bin/bwrap ==="
-    echo "This isolates the PATH-ATTACHMENT question: identical bytes, identical container,"
-    echo "identical confinement -- only the path the kernel sees differs."
+    echo "################ CONFIGURATION A: the CURRENT installation ################"
+    echo "# The real binary at /usr/local/bin/bwrap, with /usr/bin/bwrap a verified"
+    echo "# SYMLINK to it -- exactly what scripts/run-sandbox-tests.sh creates."
+    rm -f /usr/bin/bwrap
+    ln -s "$BW_BIN" /usr/bin/bwrap
+    if [ ! -L /usr/bin/bwrap ]; then echo "FATAL: /usr/bin/bwrap is not a symlink"; exit 1; fi
+    if [ "$(readlink -f /usr/bin/bwrap)" != "$BW_BIN" ]; then echo "FATAL: the symlink does not resolve to the built binary"; exit 1; fi
+    echo "--- executable identity ---"
+    identity
+    echo "--- execution ---"
+    run_bwrap_observing
+
+    # ================= CONFIGURATION B: the candidate installation =================
+    echo
+    echo "################ CONFIGURATION B: the CANDIDATE installation ################"
+    echo "# The SAME bytes at a REGULAR /usr/bin/bwrap. Only the path the kernel"
+    echo "# sees differs; the bytes, the container and the confinement do not."
     rm -f /usr/bin/bwrap
     cp "$BW_BIN" /usr/bin/bwrap
-    echo "readlink -f /usr/bin/bwrap : $(readlink -f /usr/bin/bwrap)"
-    stat -c "  %n  mode=%a  size=%s  inode=%i" /usr/bin/bwrap
-    set +e
-    OUT=$(/usr/bin/bwrap --unshare-user --unshare-pid --unshare-uts --die-with-parent \
-            --tmpfs /tmp --ro-bind /usr /usr --ro-bind /bin /bin \
-            /bin/true 2>&1)
-    RC=$?
-    set -e
-    echo "exit status: $RC"
-    echo "output: $OUT"
+    chmod 0755 /usr/bin/bwrap
+    if [ -L /usr/bin/bwrap ]; then echo "FATAL: /usr/bin/bwrap is still a symlink"; exit 1; fi
+    echo "--- executable identity ---"
+    identity
+    echo "--- execution ---"
+    run_bwrap_observing
 
     echo
-    echo "=== the container label AFTER both attempts ==="
+    echo "--- the diagnostic shell label AFTER both attempts (for comparison) ---"
     cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
   '
+
+# ---------------------------------------------------------------------------
+# HOST: the AppArmor policy as loaded, and the kernel audit records.
+#
+# The audit records are collected AFTER the container has run, because a record of
+# the denial under investigation could not exist before the operation that
+# produced it.
+# ---------------------------------------------------------------------------
+section "HOST: AppArmor policy as loaded"
+
+echo "apparmor module enabled : $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+echo "restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+echo "unprivileged_userns_clone    : $(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo absent)"
+
+echo
+echo "--- loaded profiles (full lines: <name> <mode>) ---"
+sudo cat /sys/kernel/security/apparmor/profiles 2>/dev/null \
+  | grep -iE 'bwrap|unpriv|docker' \
+  || echo "(profile list unavailable)"
+
+echo
+echo "--- the bwrap profile FILES present on the host ---"
+ls -1 /etc/apparmor.d/ 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "(none)"
+
+echo
+echo "--- the content of bwrap-userns-restrict (attachment + permissions) ---"
+for f in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns; do
+  if [ -r "$f" ]; then
+    echo "### $f"
+    cat "$f"
+  else
+    echo "### $f : (not readable on this host)"
+  fi
+done
+
+echo
+echo "--- the host's own /proc/self/attr/current (the runner's label) ---"
+cat /proc/self/attr/current 2>/dev/null || echo "(unavailable)"
+
+section "HOST: kernel AppArmor audit records (collected AFTER the container ran)"
+
+echo "--- dmesg | grep -i apparmor | tail -60 ---"
+sudo dmesg 2>/dev/null | grep -i apparmor | tail -60 || echo "(dmesg unavailable)"
+
+echo
+echo "--- journalctl -k | grep -i apparmor | tail -60 ---"
+sudo journalctl -k --no-pager 2>/dev/null | grep -i apparmor | tail -60 || echo "(journalctl unavailable)"
+
+echo
+echo "--- of those, the ones naming bwrap, userns, mount, capability or the container ---"
+sudo dmesg 2>/dev/null | grep -i apparmor \
+  | grep -iE 'bwrap|userns|mount|capab|docker|container' | tail -40 \
+  || echo "(no such record)"
+sudo journalctl -k --no-pager 2>/dev/null | grep -i apparmor \
+  | grep -iE 'bwrap|userns|mount|capab|docker|container' | tail -40 \
+  || echo "(no such record)"
 
 section "DONE"
