@@ -62,36 +62,78 @@ fn main() {}
 /// step happens once rather than on every test run.
 ///
 /// The cache is a build artefact: `target/` is git-ignored, and nothing here is
-/// written to the source tree. The name carries the probe source's own fingerprint,
-/// so a changed probe invalidates the cache rather than being checked against a
-/// stale vendored tree.
+/// written to the source tree.
+///
+/// The name carries a fingerprint of **everything that determines what the probe
+/// resolves to**: the probe source, and the contents of the workspace lockfile, the
+/// root manifest, and the manifests of the two path dependencies. A change to any
+/// of them must produce a different directory, because the cached vendor tree
+/// carries a RESOLUTION -- a set of pinned versions -- and a stale one would be
+/// checked against a graph the workspace no longer uses. Fingerprinting only the
+/// probe source left that gap: a dependency update changed the workspace
+/// resolution without changing the key, and the old vendor tree was reused.
+///
+/// Fingerprinting the paths as well as the contents means a moved or renamed crate
+/// invalidates the cache too.
 fn probe_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
+    let workspace_root = crate_dir
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("the workspace root");
+    let platform_fs = crate_dir
+        .parent()
+        .expect("the crates directory")
+        .join("orxnud-platform-fs");
+
+    // The inputs that determine the probe's resolution, in a fixed order.
+    let inputs = [
+        ("probe", PROBE.to_string()),
+        (
+            "workspace Cargo.lock",
+            std::fs::read_to_string(workspace_root.join("Cargo.lock")).unwrap_or_default(),
+        ),
+        (
+            "root Cargo.toml",
+            std::fs::read_to_string(workspace_root.join("Cargo.toml")).unwrap_or_default(),
+        ),
+        (
+            "orxnud-store Cargo.toml",
+            std::fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap_or_default(),
+        ),
+        (
+            "orxnud-platform-fs Cargo.toml",
+            std::fs::read_to_string(platform_fs.join("Cargo.toml")).unwrap_or_default(),
+        ),
+    ];
+
     let fingerprint = {
-        // A cheap, stable hash of the probe source and the crate it probes. The
-        // crate path is included because the probe names it by path, so a moved
-        // crate invalidates the cache too.
+        // A cheap, stable hash (FNV-1a). The label is hashed too, so two different
+        // inputs cannot collide by sharing content.
         let mut h: u64 = 1469598103934665603;
-        for byte in PROBE
-            .as_bytes()
-            .iter()
-            .chain(crate_dir.to_string_lossy().as_bytes().iter())
-        {
-            h ^= u64::from(*byte);
-            h = h.wrapping_mul(1099511628211);
+        for (label, content) in &inputs {
+            for byte in label
+                .as_bytes()
+                .iter()
+                .chain(content.as_bytes().iter())
+                .chain([0u8].iter())
+            {
+                h ^= u64::from(*byte);
+                h = h.wrapping_mul(1099511628211);
+            }
         }
         format!("{h:016x}")
     };
-    let target = crate_dir
-        .parent()
-        .and_then(|crates| crates.parent())
-        .expect("the workspace root")
-        .join("target");
+    let target = workspace_root.join("target");
     target.join(format!("s30-probe-{fingerprint}"))
 }
 
 #[test]
 fn restoring_from_outside_the_crate_does_not_compile() {
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("the workspace root");
     let dir = probe_dir(crate_dir);
     let src = dir.join("src");
 
@@ -135,6 +177,17 @@ fn restoring_from_outside_the_crate_does_not_compile() {
         )
         .expect("write manifest");
         std::fs::write(staging.join("src").join("main.rs"), PROBE).expect("write probe");
+
+        // Seed the probe's lockfile from the workspace's, so the probe resolves to the
+        // versions THIS tree pins rather than to whatever the resolver would pick
+        // afresh. The probe is a different package from the workspace, so cargo adds
+        // it to the seeded lockfile; that is a local addition and does not change
+        // the pinned versions of anything else. Without this, the vendored tree
+        // could carry versions the workspace does not use.
+        let workspace_lock = workspace_root.join("Cargo.lock");
+        if workspace_lock.is_file() {
+            let _ = std::fs::copy(&workspace_lock, staging.join("Cargo.lock"));
+        }
 
         let vendored = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args([

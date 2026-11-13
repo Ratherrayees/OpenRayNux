@@ -4712,9 +4712,30 @@ sources are then in the vendor directory, so nothing has to be resolved or downl
 test time.
 
 Vendoring itself needs the index — it resolves the graph before copying the sources — so
-it happens **once**, into a cache under `target/`, and every later run reuses it. The
-cache is keyed by a fingerprint of the probe source and the crate it probes, so a changed
-probe invalidates it rather than being checked against a stale vendored tree.
+it happens **once**, into a cache under `target/`, and every later run reuses it.
+
+The cache is keyed by a fingerprint of **everything that determines what the probe
+resolves to**: the probe source, and the contents of the workspace lockfile, the root
+manifest, and the manifests of the two path dependencies. A change to any of them produces
+a different directory, because the cached vendor tree carries a **resolution** — a set of
+pinned versions — and a stale one would be checked against a graph the workspace no
+longer uses.
+
+The probe's lockfile is **seeded from the workspace's** rather than generated fresh, so the
+probe resolves to the versions this tree pins rather than to whatever the resolver would
+pick. The probe is a different package from the workspace, so cargo adds it to the seeded
+lockfile; that is a local addition and does not change the pinned version of anything else.
+Without the seed, the vendored tree could carry versions the workspace does not use, and
+the "same versions" claim below would be an accident of timing rather than a property.
+
+**A gap this closed, found in review of its own first form.** The first version of this
+change fingerprinted only the probe source and the crate path, and did not seed the probe's
+lockfile. A dependency update could therefore change the workspace resolution without
+changing the cache key, and the probe would reuse the older vendored graph. That was
+reproduced: modifying the workspace `Cargo.lock` alone left the cache directory unchanged.
+The checksum verification still protected the cached tree against *corruption*; what it
+does not do is establish that the cached tree still matches the *current* workspace graph.
+That distinction is why the fingerprint and the seed are separate fixes and both are needed.
 
 **Nothing is committed.** `target/` is git-ignored; the vendor tree is a build artefact
 and is never written to the source tree. The change is **one file**,
@@ -4729,6 +4750,7 @@ and is never written to the source tree. The change is **one file**,
 | The expected `E0603`/`E0624` failure is still detected | **PASS** — the probe still fails with `error[E0603]: struct \`RestoreGuard\` is private`, `error[E0624]: associated function \`acquire\` is private`, `error[E0624]: method \`restore\` is private`, and the assertion still requires stderr to name the mechanism |
 | A deliberately broken probe fails the test | **PASS** — with the bypass lines removed from the probe, the test FAILS with "the probe must fail specifically because the restore path is unreachable from outside the crate" |
 | Vendored dependencies are pinned and checksum-verified | **PASS** — every vendored crate carries a `.cargo-checksum.json` (45 of 45 in the cache measured), and cargo **refuses** a vendored crate whose package checksum disagrees with the lockfile (`error: checksum for \`bitflags v2.13.2\` changed between lock files`), so the pin is enforced rather than assumed |
+| A dependency update invalidates the cache | **PASS** — changing only the workspace `Cargo.lock` produces a different cache directory, so the old vendored graph cannot be reused; the probe's lockfile is seeded from the workspace's, so the vendored versions are the workspace's pins |
 | No unrelated CI or application behaviour changes | **PASS** — one file changed; the full gate script exits 0 |
 | The ordinary full CI gates pass afterwards | **PASS** — `./scripts/ci-gates.sh` exit 0, `all selected gates passed`; G9 `2040 run, 2040 passed, 6 skipped`; G2d `2 passed, 311 skipped` |
 
