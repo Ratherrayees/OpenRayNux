@@ -4153,7 +4153,9 @@ cargo-deny treats an **unsound** advisory as an **error**, so it failed the gate
 four findings the scanners print — `async-executor 1.14.0` yanked, and `zbus_names`
 4.3.4 / `zvariant` 5.15.0 / `zvariant_derive` 5.15.0 unmaintained — are **warnings**, not
 failures: `yanked = "warn"` and `unmaintained = "workspace"`, and all three unmaintained
-crates are transitive. They did not cause the failure and are **not** addressed here.
+crates are transitive. They did not cause the failure and are **not** addressed here. The
+yanked `async-executor` was subsequently remediated separately, in **A-037**; the three
+unmaintained crates remain open.
 
 **The fix, and why no manifest changed.** `Cargo.toml` declares
 `rustix = { version = "1.1.5", features = ["pty"] }`, a caret requirement of
@@ -4248,9 +4250,10 @@ binaries are excluded with a stated reason and 1884 tests run; on a host that ca
 **What was deliberately not done.** No advisory exception was added: `deny.toml`'s
 `ignore = []` is untouched and must stay empty, because an advisory id added there hides a
 finding instead of fixing it. No gate was weakened. The `keyring`/`secret-service`/`zbus`
-subtree was **not** migrated — the yanked `async-executor 1.14.0` and the three
-unmaintained zbus-family crates are separate work with their own compatibility
-assessment, and silencing them would need that assessment. No manifest was edited.
+subtree was **not** migrated — the three unmaintained zbus-family crates are
+separate work with their own compatibility assessment, and silencing them would need that
+assessment. (The yanked `async-executor` was addressed separately, in **A-037**.) No manifest
+was edited.
 
 **Not claimed.** No Windows validation was performed by this work; the windows-sys analysis
 above is a source-level inspection of the API surface rustix uses, not a Windows build.
@@ -4294,6 +4297,10 @@ not on its own evidence that the version is free of defects. The **policy itself
 untouched**: `version = 2`, `ignore = []`, `yanked = "warn"` and `unmaintained =
 "workspace"` are exactly as they were, and no advisory id was added. The gate is exactly as
 strict as it was. Only the description of it changed, and it now matches the tool.
+(That description names a yanked version as a warning-class finding. A later change moved
+this repository off the yanked `async-executor` version — see **A-037** — but the *policy*
+`yanked = "warn"` is unchanged, and the reasoning above about what a yank does and does not
+establish still applies to any yanked version that appears in future.)
 
 **The second statement: G11 reported "no known advisory" while reporting four findings.**
 The success message read `cargo audit: no known advisory`. `cargo audit` was printing four
@@ -4339,6 +4346,173 @@ about a gate *failing* is affected. The unsound advisory that made G8 red is fix
 | **event** | any change to `deny.toml`'s `[advisories]` section, to the `cargo audit` invocation in G11, or to the G11 success message |
 | **date** | 2026-11-13 |
 | **severity** | **Low for behaviour, Medium for the record.** Neither gate was wrong: G8 failed correctly and G11 passed correctly. What was wrong was the tree's own description of them, and a description that understates a gate is how a real failure gets carried as "known baseline debt" instead of being fixed. |
+
+### A-037 — the yanked `async-executor 1.14.0` remediated: `1.14.0 -> 1.14.1`
+
+**This closes the yanked `async-executor` finding and nothing else.** No manifest changed, no
+advisory exception was added, no gate was weakened, and the `keyring`/`secret-service`/`zbus`
+subtree was **not** migrated: **F-26c remains OPEN**, **F-26b/S-30 remain OPEN**, **S-11
+remains OPEN**, **S-31 remains implemented but not complete**, and **F-26 remains OPEN**. The
+three **unmaintained** zbus-family findings (`zbus_names` 4.3.4 / RUSTSEC-2026-0371,
+`zvariant` 5.15.0 / -0370, `zvariant_derive` 5.15.0 / -0372) **remain open** and are not
+closed by this work. Nothing here is a release-readiness claim.
+
+**The finding, and why a yanked version is not a low-severity one.** `async-executor`
+1.14.0 is yanked in the crates.io index, and the reason is recorded upstream: **smol-rs/async-executor
+issue #163**, "Use-after-free when a Waker fires during Executor::drop (regression in
+1.14.0)". The report carries a reproducer and ThreadSanitizer output. The `schedule` closure
+holds the state by reference and its second statement touches the state *after* the runnable
+has been published:
+
+```text
+move |runnable| {
+    let result = state.queue.push(runnable);   // published -- another thread can take it now
+    debug_assert!(result.is_ok());
+    state.notify();                            // still touches `state`
+}
+```
+
+`Executor::drop` reclaims the `Arc` and frees, so a waker firing between those two lines can
+free the allocation underneath it; the reference remains reachable through `Waker` clones after
+the executor is gone. This is undefined behaviour in safe Rust. The issue records that 1.14.0
+reproduces and 1.13.3 does not, and that the difference traces to the change that replaced the
+owned `Arc<State>` in the schedule closure with `Pin<&'a State>`.
+
+**The fix, and why no manifest changed.** Upstream **PR #164** reverted the change
+responsible, and the fix shipped as **v1.14.1** (published 2026-11-02), whose release note
+reads "Fix use-after-free when a Waker fires during Executor::drop (regression in 1.14.0).
+(#164)". The maintainer closed the issue stating that the fix has been released in 1.14.1 and
+1.14.0 was yanked.
+
+The resolution was a **lockfile-only** targeted update:
+
+```
+cargo update -p async-executor --precise 1.14.1
+```
+
+`zbus 5.19.0` declares `async-executor = { version = "^1.11.0", optional = true }`, and
+1.14.1 is inside that range, so no manifest constraint had to change.
+
+**Registry facts, read from the local index cache cargo resolves against** (not from a
+summary):
+
+| Version | Yanked | Checksum |
+|---|---|---|
+| `1.13.3` | no | `497c00e0fd83a72a79a39fcbd8e3e2f055d6f6c7e025f3b3d91f4f8e76527fb8` |
+| `1.14.0` | **yes** | `c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a` |
+| `1.14.1` | no | `f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37` |
+
+The lockfile's new checksum is `f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37`,
+which matches the index entry for 1.14.1.
+
+**The exact lockfile delta — two changed lines, one package.** The whole diff is:
+
+```
+-name = "async-executor"
+-version = "1.14.0"
++version = "1.14.1"
+-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
++checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
+```
+
+The package set is **unchanged at 276**: exactly one `(name, version)` pair changed
+(`async-executor 1.14.0 -> 1.14.1`), **no** package was added or removed, **no** other
+version moved, **no** other checksum changed, and **no** other package's dependency edge
+changed. This was checked by comparing every package's full lockfile stanza before and
+after, not by reading the diff hunks: **no unrelated package and no unrelated edge moved.**
+That was the condition for accepting this change, and it held.
+
+**The dependency path is unchanged.** `cargo tree -e features -i async-executor` reports the
+same path as before, with the version updated:
+
+```
+async-executor v1.14.1
+└── async-executor feature "default"
+    └── zbus v5.19.0
+        ├── zbus feature "async-executor"
+        │   └── zbus feature "async-io"
+        │       └── zbus feature "default"
+        │           └── zbus-secret-service-keyring-store v1.0.1
+        │               └── zbus-secret-service-keyring-store feature "crypto-rust"
+        │                   └── keyring v4.2.0
+        │                       └── keyring feature "v1"
+        │                           └── orxnud-platform-secrets v0.1.0
+```
+
+**Reachability, assessed rather than assumed.** The advisory's precondition is a waker
+firing from a thread that is not driving the executor, concurrently with the executor being
+dropped. OpenRayNux does not construct an `async_executor::Executor` itself; the crate
+arrives through `zbus`'s `async-io` feature, which is enabled by `zbus`'s default feature, via
+the Secret Service keyring store. Whether a path in this repository's own code can produce
+that schedule is **not established here**, and this work does not claim it. The version was
+moved anyway, for the reason this register used for the four `rustls 0.23.45` advisories,
+for **A-015** and for **A-035**: the fix is a patch release inside an already-permitted
+range, it costs nothing, and "no advisory is currently reachable" would be a statement about
+today's call graph rather than a property that survives someone changing a dependency. Here
+the argument is stronger than for those, because the upstream issue carries a **reproducer**
+rather than a description.
+
+**Gate evidence, measured with the CI-pinned tools** (`cargo-deny 0.20.2`,
+`cargo-audit 0.22.2`, `rustc 1.98.1`):
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| G8 (licences) | `cargo deny check licenses` | exit 0 | exit 0 — `licenses ok` |
+| G8 (supply chain) | `cargo deny check bans sources advisories` | exit 0 | exit 0 — `advisories ok, bans ok, sources ok` |
+| G11 | `cargo audit` | exit 0 — **4** allowed warnings (3 unmaintained, 1 yanked) | exit 0 — **3** allowed warnings (3 unmaintained) |
+| G9 | `cargo nextest run --workspace --all-targets` | 2040 passed, 6 skipped | **2040 passed, 6 skipped** |
+
+`./scripts/ci-gates.sh` exits 0 with `all selected gates passed` (G12 skips with its loud
+message, as it always does without a release tag). The **yanked** finding is now absent from
+both scanners: `cargo deny check bans sources advisories` reports no `warning[yanked]`, and
+`cargo audit --json` reports `vulnerabilities: 0` and `warnings: {unmaintained: 3}` — the
+three unmaintained zbus-family crates and nothing else.
+
+**A note on what the yanked finding was, and was not.** `deny.toml` classifies a yanked
+version as a **warning**, and that policy is unchanged by this work. But the policy is not a
+judgement that a yanked version is harmless: a yank is the publisher asking Cargo not to
+select that version in **new** resolution — it deletes nothing, and an existing `Cargo.lock`
+keeps resolving to it, so a yanked version can sit in a lockfile indefinitely. The yank here
+came with a **use-after-free** and a yank of the offending version, which makes the
+provisional "warning" classification here a description of the *policy*, not a statement
+about the *risk*. That distinction is why this entry records the upstream issue and the
+reproducer rather than treating the removal of a yanked version as routine housekeeping.
+
+**What was deliberately not done.** No manifest was edited. No advisory id was added to
+`deny.toml`'s `ignore = []`, which remains empty. No gate was weakened. The
+`keyring`/`secret-service`/`zbus` subtree was **not** migrated, and the three unmaintained
+zbus-family crates were **not** silenced: silencing them would need the compatibility and
+credential-semantics assessment recorded as open work, not a lockfile edit.
+
+**A correction to the sequencing assumption this work was planned under.** It was expected that
+a zbus 5 -> 6 migration would **not** remove `async-executor` from the dependency graph,
+because zbus 6.2.1's registry entry still lists `async-executor ^1.11.0` as a non-optional
+dependency. **That expectation is wrong, and the difference is the dependency *kind*.** The
+zbus 6.2.1 index entry lists `async-executor` with `kind = "dev"`, and a dev-dependency of
+a crate is **not** part of that crate's **consumers'** dependency graph. Measured directly: a
+scratch crate depending on `zbus = "=6.2.1"` resolves a graph with **zero**
+`async-executor` nodes and no `async-executor` entry in its `Cargo.lock`; the same holds for
+zbus 6.3.0. zbus 5.19.0, by contrast, lists it as `kind = "normal"`, which is why it is in
+this repository's graph.
+
+So the `async-executor` removal does **not** have to wait for Phase 3 — it is reachable by
+this lockfile update alone, and Phase 3 is about the **three unmaintained** crates and about
+credential-storage semantics, not about `async-executor`. This is recorded here because the
+planning assumption was checked rather than inherited, and because the difference between
+`kind = "normal"` and `kind = "dev"` decides whether a crate is in a consumer's build at
+all.
+
+**Not claimed.** No Windows validation was performed by this work. The upstream defect is a
+concurrency defect, and this work does not claim the race is reachable from OpenRayNux's code
+-- only that the affected version was in the Linux dependency graph and has been moved off it.
+The three unmaintained zbus-family findings remain. The two "leaky" sandbox tests are
+unrelated to this work and were not introduced by it. **No release-readiness is claimed.**
+
+| | |
+|---|---|
+| **event** | any change to `async-executor` in any manifest or to `Cargo.lock`; and any change to `deny.toml`'s `[advisories]` policy |
+| **date** | 2026-11-13 |
+| **severity** | **High for the defect, Medium for the process.** The advisory is a use-after-free with a published reproducer, in a crate that was in the production dependency graph. The process point is that it was carried as a *warning* for a week, and a yanked version that upstream yanked **because of a use-after-free** is not a finding that should be filed under "policy says warnings are fine". |
 
 ## 3. The three highest-risk claims
 
