@@ -12,6 +12,30 @@
 //! There is deliberately **no skip path**. A compile-fail probe that can be skipped is
 //! a test that reports success without checking anything, which is the failure mode
 //! this repository has already been bitten by twice.
+//!
+//! # The probe is hermetic
+//!
+//! The probe is a separate cargo project, so resolving it the usual way needs the
+//! registry index. A DNS failure then fails this test for a reason that has nothing
+//! to do with visibility -- a false negative that looks like a real answer.
+//!
+//! So the probe's dependency set is **vendored** and the probe is compiled with
+//! `--offline` against that vendored tree, with the registry source replaced by it.
+//! Vendoring is what makes the probe independent of the index and the cache: the
+//! sources are in the vendor directory, so nothing has to be resolved or downloaded
+//! at test time.
+//!
+//! Vendoring itself needs the index -- it resolves the graph before copying the
+//! sources -- so it happens **once**, into a cache under `target/`, and every later
+//! run reuses it. The cache is a build artefact, not a committed tree: nothing about
+//! the repository changes, and the vendor directory is never written to the source
+//! tree.
+//!
+//! The vendored versions are the ones this workspace's `Cargo.lock` already pins,
+//! and cargo refuses a vendored crate whose package checksum disagrees with the
+//! lockfile -- so the pin is enforced rather than assumed. A stale or absent cache
+//! makes the probe fail loudly (see below); it never makes the test pass for the
+//! wrong reason.
 
 use std::process::Command;
 
@@ -34,13 +58,42 @@ fn bypass(b: &orxnud_store::backup::Backup, db: &std::path::Path) {
 fn main() {}
 "#;
 
+/// The probe project's own directory, cached under `target/` so that the vendoring
+/// step happens once rather than on every test run.
+///
+/// The cache is a build artefact: `target/` is git-ignored, and nothing here is
+/// written to the source tree. The name carries the probe source's own fingerprint,
+/// so a changed probe invalidates the cache rather than being checked against a
+/// stale vendored tree.
+fn probe_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
+    let fingerprint = {
+        // A cheap, stable hash of the probe source and the crate it probes. The
+        // crate path is included because the probe names it by path, so a moved
+        // crate invalidates the cache too.
+        let mut h: u64 = 1469598103934665603;
+        for byte in PROBE
+            .as_bytes()
+            .iter()
+            .chain(crate_dir.to_string_lossy().as_bytes().iter())
+        {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(1099511628211);
+        }
+        format!("{h:016x}")
+    };
+    let target = crate_dir
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("the workspace root")
+        .join("target");
+    target.join(format!("s30-probe-{fingerprint}"))
+}
+
 #[test]
 fn restoring_from_outside_the_crate_does_not_compile() {
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dir = std::env::temp_dir().join(format!("orxnud-s30-visibility-{}", std::process::id()));
+    let dir = probe_dir(crate_dir);
     let src = dir.join("src");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&src).expect("probe dir");
 
     // The probe names the platform adapter as well, because the guard's real
     // signature takes the filesystem-identity capability (ADR-0058 Decision 1) and a
@@ -51,25 +104,73 @@ fn restoring_from_outside_the_crate_does_not_compile() {
         .expect("the crates directory")
         .join("orxnud-platform-fs");
 
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"orxnud-s30-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\norxnud-store = {{ path = \"{}\" }}\n\
-             orxnud-platform-fs = {{ path = \"{}\" }}\n",
-            crate_dir.display(),
-            platform_fs.display()
-        ),
-    )
-    .expect("write manifest");
+    // Prepare the probe project ONCE. Preparing it means vendoring its dependency
+    // set, which is the step that needs the registry index; running it again on
+    // every test run would put the network back on the test's critical path, which
+    // is what this change exists to remove.
+    //
+    // If the cache is already present it is reused as-is. If it is not, it is
+    // built. A failure to build it is NOT a pass: the probe then runs without the
+    // vendored tree, its resolution fails, and the assertion below rejects that,
+    // because a resolution failure does not mention the mechanism. The test can
+    // fail; it must never pass for the wrong reason.
+    let prepared = dir.join(".cargo").join("config.toml").is_file();
+    if !prepared {
+        let staging = dir.with_extension("staging");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(staging.join("src")).expect("probe staging dir");
+        std::fs::write(
+            staging.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"orxnud-s30-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\norxnud-store = {{ path = \"{}\" }}\n\
+                 orxnud-platform-fs = {{ path = \"{}\" }}\n\n\
+                 # An empty workspace table makes this its own workspace root. The\n\
+                 # cache lives under the workspace's `target/`, and without this cargo\n\
+                 # would find the parent workspace and refuse to build here.\n\
+                 [workspace]\n",
+                crate_dir.display(),
+                platform_fs.display()
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(staging.join("src").join("main.rs"), PROBE).expect("write probe");
+
+        let vendored = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "vendor",
+                "--offline",
+                "--versioned-dirs",
+                staging.join("vendor").to_str().expect("vendor path"),
+            ])
+            .current_dir(&staging)
+            .output();
+
+        let vendored_ok = matches!(&vendored, Ok(o) if o.status.success());
+        if vendored_ok {
+            std::fs::create_dir_all(staging.join(".cargo")).expect("cargo config dir");
+            std::fs::write(
+                staging.join(".cargo").join("config.toml"),
+                "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+                 [source.vendored-sources]\ndirectory = \"vendor\"\n",
+            )
+            .expect("write cargo config");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::rename(&staging, &dir).is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+    }
+
+    // The probe source is written on every run even when the cache is reused, so
+    // that the cache's fingerprint and the source it checks cannot drift apart.
+    std::fs::create_dir_all(&src).expect("probe dir");
     std::fs::write(src.join("main.rs"), PROBE).expect("write probe");
 
     let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["check", "--quiet"])
+        .args(["check", "--quiet", "--offline"])
         .current_dir(&dir)
         .output();
-
-    let _ = std::fs::remove_dir_all(&dir);
 
     let output = out.unwrap_or_else(|e| {
         panic!(

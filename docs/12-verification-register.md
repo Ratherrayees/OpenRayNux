@@ -4681,6 +4681,95 @@ contributor-reported, not upstream-CI-verified.
 | **date** | 2026-11-13 |
 | **severity** | **Not a defect.** This row records an investigation whose conclusion is that the three unmaintained findings are **not urgent**: they are transitive, they are warnings under the current policy, they do not fail the gate, and the upstream fix exists but is unreleased. It also records the one thing that **is** actionable independently: the `s30_restore_not_public` probe's registry dependence. |
 
+### A-039 — the S-30 visibility probe no longer depends on the registry
+
+**This closes a CI-reliability defect and nothing else.** It is a reproducibility defect
+in the test harness, not a security vulnerability in the application, and it changes no
+product behaviour. **F-26c remains OPEN**, **F-26b/S-30 remain OPEN**, **S-11 remains OPEN**,
+**S-31 remains implemented but not complete**, and **F-26 remains OPEN**. The three
+**unmaintained** zbus-family findings remain open, and the `async-executor` remediation is
+recorded in **A-037** and the Phase 3 investigation in **A-038**. No release-readiness is
+claimed.
+
+**The defect.** `crates/orxnud-store/tests/s30_restore_not_public.rs` compiles a probe
+crate against `orxnud-store` as an external consumer, to establish that `Backup::restore`
+is unreachable from outside the crate. It did that with `cargo check` in a temporary
+directory. The probe is a separate cargo project, so **resolving it needs the registry
+index** — `orxnud-store` pulls `serde`, `serde_json`, `thiserror` and `rusqlite`, and
+`libsqlite3-sys` pulls `cc`.
+
+A DNS failure therefore failed the test for a reason that has nothing to do with
+visibility. This was observed during **A-037**'s verification: the run failed with
+`error: failed to get \`thiserror\` as a dependency` and `Could not resolve host:
+index.crates.io`, on a tree whose dependency change could not have caused it. It was
+confirmed environmental rather than a regression by running the same test in isolation
+(passes) and on the base commit in a separate worktree (also passes); the full gate run
+then passed cleanly on re-run.
+
+**The fix.** The probe's dependency set is **vendored**, and the probe is compiled with
+`--offline` against that vendored tree with the registry source replaced by it. The
+sources are then in the vendor directory, so nothing has to be resolved or downloaded at
+test time.
+
+Vendoring itself needs the index — it resolves the graph before copying the sources — so
+it happens **once**, into a cache under `target/`, and every later run reuses it. The
+cache is keyed by a fingerprint of the probe source and the crate it probes, so a changed
+probe invalidates it rather than being checked against a stale vendored tree.
+
+**Nothing is committed.** `target/` is git-ignored; the vendor tree is a build artefact
+and is never written to the source tree. The change is **one file**,
+`crates/orxnud-store/tests/s30_restore_not_public.rs`.
+
+**Measured, per acceptance criterion.**
+
+| Criterion | Result |
+|---|---|
+| Probe passes with registry/network access unavailable | **PASS** — with the registry index, cache and source directories all hidden, the pre-built test binary reports `ok` |
+| Probe passes with an empty Cargo index/cache | **PASS** — same run: index, cache and `registry/src` all moved aside |
+| The expected `E0603`/`E0624` failure is still detected | **PASS** — the probe still fails with `error[E0603]: struct \`RestoreGuard\` is private`, `error[E0624]: associated function \`acquire\` is private`, `error[E0624]: method \`restore\` is private`, and the assertion still requires stderr to name the mechanism |
+| A deliberately broken probe fails the test | **PASS** — with the bypass lines removed from the probe, the test FAILS with "the probe must fail specifically because the restore path is unreachable from outside the crate" |
+| Vendored dependencies are pinned and checksum-verified | **PASS** — every vendored crate carries a `.cargo-checksum.json` (45 of 45 in the cache measured), and cargo **refuses** a vendored crate whose package checksum disagrees with the lockfile (`error: checksum for \`bitflags v2.13.2\` changed between lock files`), so the pin is enforced rather than assumed |
+| No unrelated CI or application behaviour changes | **PASS** — one file changed; the full gate script exits 0 |
+| The ordinary full CI gates pass afterwards | **PASS** — `./scripts/ci-gates.sh` exit 0, `all selected gates passed`; G9 `2040 run, 2040 passed, 6 skipped`; G2d `2 passed, 311 skipped` |
+
+**The versions the probe uses are the ones this workspace already pins.** Every one of the
+47 packages in the probe's own resolution appears in the workspace's `Cargo.lock` at the
+**same version** — verified by comparing the two lockfiles, not assumed.
+
+**The failure mode remains loud.** A probe that cannot be resolved reports "no matching
+package", which mentions none of `RestoreGuard`, `restore`, `E0624` or `E0603` — measured,
+0 matching lines. The existing second assertion therefore **rejects** it rather than
+letting it pass. This was verified in both directions: a genuinely broken probe fails the
+test, and a resolution failure produces no matching lines. The test can fail; it must
+never pass for the wrong reason.
+
+**A note on what was found while verifying this, because it is a fact about the
+pre-existing test rather than about this change.** The first attempt to verify "a
+deliberately broken probe fails the test" corrupted only `main` in the probe, leaving the
+bypass lines intact. The compile error for the corrupted `main` was reported **alongside**
+the genuine `E0603`/`E0624` errors for the surviving bypass lines, so the mechanism was
+still named and the test still passed — correctly, because the bypass really was still
+being rejected. Only a probe with the bypass lines **removed** exercises the criterion,
+and that is the form that was verified. The distinction matters: "the probe fails to
+compile" and "the probe fails to compile *because the restore path is private*" are
+different claims, and only the second is what this test asserts.
+
+**What was deliberately not done.** No advisory exception, no gate change, no application
+code change, and no general-purpose vendoring mechanism across the workspace. The vendor
+tree is specific to this one probe's dependency set.
+
+**Not claimed.** The probe's own resolution is still performed once, and that step needs
+the index: a **first** run on a machine with no local cache at all still needs the
+registry. What this change removes is the dependency on the registry from the **test
+run**, which is where the DNS failure bit. A CI machine that has built this workspace
+has the sources locally, so the vendoring step succeeds offline.
+
+| | |
+|---|---|
+| **event** | any change to `crates/orxnud-store/tests/s30_restore_not_public.rs`, to the probe it compiles, or to `Backup::restore`'s visibility |
+| **date** | 2026-11-13 |
+| **severity** | **Low for behaviour, Medium for the record.** The test's verdict was never wrong — it was correct about the mechanism every time — but it could report a false failure for a reason unrelated to what it checks, and a test that fails for the wrong reason trains people to ignore it. |
+
 ## 3. The three highest-risk claims
 
 Not by severity of consequence alone, but by **(likelihood of silent drift) ×
