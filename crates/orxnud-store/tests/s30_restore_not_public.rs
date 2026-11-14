@@ -58,24 +58,108 @@ fn bypass(b: &orxnud_store::backup::Backup, db: &std::path::Path) {
 fn main() {}
 "#;
 
-/// The probe project's own directory, cached under `target/` so that the vendoring
-/// step happens once rather than on every test run.
+/// The version of the prepared-project FORMAT.
+///
+/// The cache is reused whenever its marker file exists, so the key has to change
+/// whenever the thing that was prepared changes shape. A version constant is the
+/// blunt instrument for the part of that which is not visible in any file: if the
+/// LAYOUT of the prepared project changes -- a different vendor directory, a
+/// different source-replacement scheme, a different marker file -- and none of the
+/// fingerprinted inputs change with it, the old cache would be reused under the
+/// new preparation's expectations.
+///
+/// Bump this when the preparation changes in a way the other inputs cannot see.
+const CACHE_FORMAT: &str = "v2";
+
+/// The generated manifest of the probe project.
+///
+/// It is generated HERE, once, and then both fingerprinted and written to disk, so
+/// that the key describes the file that is actually written. Generating it inside
+/// the preparation step while fingerprinting something else left a gap: the cache
+/// could be reused after the generator changed, because nothing that changed was
+/// an input to the key.
+///
+/// The path dependencies carry the ABSOLUTE paths of the two crates, so the
+/// manifest is also what covers the paths. That is what makes a moved or renamed
+/// crate invalidate the cache.
+fn probe_manifest(crate_dir: &std::path::Path, platform_fs: &std::path::Path) -> String {
+    format!(
+        "[package]\nname = \"orxnud-s30-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\norxnud-store = {{ path = \"{}\" }}\n\
+         orxnud-platform-fs = {{ path = \"{}\" }}\n\n\
+         # An empty workspace table makes this its own workspace root. The\n\
+         # cache lives under the workspace's `target/`, and without this cargo\n\
+         # would find the parent workspace and refuse to build here.\n\
+         [workspace]\n",
+        crate_dir.display(),
+        platform_fs.display()
+    )
+}
+
+/// The generated cargo configuration that points the probe at the vendored tree
+/// and at nothing else.
+///
+/// This is the file that makes the probe HERMETIC: it replaces the registry source
+/// with the vendored directory, so an offline check cannot fall back to Cargo's
+/// ordinary registry sources. It is fingerprinted for the same reason as the
+/// manifest -- a different one is a different prepared project.
+fn probe_cargo_config() -> String {
+    "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+     [source.vendored-sources]\ndirectory = \"vendor\"\n"
+        .to_string()
+}
+
+/// The cache key: a fingerprint of everything that determines what the prepared
+/// project is.
+///
+/// Every input here is a file that will be read, or a string that will be written,
+/// or the format version. The order is fixed, and each input carries a label that
+/// is hashed alongside it, so two different inputs cannot collide by sharing
+/// content.
+fn cache_key(inputs: &[(&str, &str)]) -> String {
+    // A cheap, stable hash (FNV-1a).
+    let mut h: u64 = 1469598103934665603;
+    for (label, content) in inputs {
+        for byte in label
+            .as_bytes()
+            .iter()
+            .chain(content.as_bytes().iter())
+            .chain([0u8].iter())
+        {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(1099511628211);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// The prepared probe project: where it lives, and the two generated files that
+/// describe it.
+struct Probe {
+    dir: std::path::PathBuf,
+    manifest: String,
+    cargo_config: String,
+}
+
+/// The probe project, its cache directory, and the key that names it.
 ///
 /// The cache is a build artefact: `target/` is git-ignored, and nothing here is
 /// written to the source tree.
 ///
 /// The name carries a fingerprint of **everything that determines what the probe
-/// resolves to**: the probe source, and the contents of the workspace lockfile, the
-/// root manifest, and the manifests of the two path dependencies. A change to any
-/// of them must produce a different directory, because the cached vendor tree
-/// carries a RESOLUTION -- a set of pinned versions -- and a stale one would be
-/// checked against a graph the workspace no longer uses. Fingerprinting only the
-/// probe source left that gap: a dependency update changed the workspace
+/// resolves to**: the probe source, the GENERATED manifest and cargo
+/// configuration, the cache format version, and the contents of the workspace
+/// lockfile, the root manifest, and the manifests of the two path dependencies. A
+/// change to any of them must produce a different directory, because the cached
+/// vendor tree carries a RESOLUTION -- a set of pinned versions -- and a stale one
+/// would be checked against a graph the workspace no longer uses. Fingerprinting
+/// only the probe source left that gap: a dependency update changed the workspace
 /// resolution without changing the key, and the old vendor tree was reused.
 ///
-/// Fingerprinting the paths as well as the contents means a moved or renamed crate
-/// invalidates the cache too.
-fn probe_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
+/// Fingerprinting the generated manifest is also what covers the PATHS, because the
+/// manifest carries the two crates' absolute paths. A moved or renamed crate
+/// therefore invalidates the cache too.
+fn probe_project(crate_dir: &std::path::Path) -> Probe {
     let workspace_root = crate_dir
         .parent()
         .and_then(|crates| crates.parent())
@@ -85,6 +169,9 @@ fn probe_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
         .expect("the crates directory")
         .join("orxnud-platform-fs");
 
+    let manifest = probe_manifest(crate_dir, &platform_fs);
+    let cargo_config = probe_cargo_config();
+
     // The inputs that determine the probe's resolution, in a fixed order. Each read
     // is REQUIRED: an unreadable input must fail the test, not silently become an
     // empty string. A defaulted read produces a fingerprint that is stable across a
@@ -93,48 +180,31 @@ fn probe_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
         std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {what} at {}: {e}", path.display()))
     };
-    let inputs = [
-        ("probe", PROBE.to_string()),
-        (
-            "workspace Cargo.lock",
-            read_required(&workspace_root.join("Cargo.lock"), "the workspace lockfile"),
-        ),
-        (
-            "root Cargo.toml",
-            read_required(&workspace_root.join("Cargo.toml"), "the root manifest"),
-        ),
-        (
-            "orxnud-store Cargo.toml",
-            read_required(&crate_dir.join("Cargo.toml"), "the orxnud-store manifest"),
-        ),
-        (
-            "orxnud-platform-fs Cargo.toml",
-            read_required(
-                &platform_fs.join("Cargo.toml"),
-                "the orxnud-platform-fs manifest",
-            ),
-        ),
-    ];
+    let workspace_lockfile =
+        read_required(&workspace_root.join("Cargo.lock"), "the workspace lockfile");
+    let root_manifest = read_required(&workspace_root.join("Cargo.toml"), "the root manifest");
+    let store_manifest = read_required(&crate_dir.join("Cargo.toml"), "the orxnud-store manifest");
+    let platform_fs_manifest = read_required(
+        &platform_fs.join("Cargo.toml"),
+        "the orxnud-platform-fs manifest",
+    );
 
-    let fingerprint = {
-        // A cheap, stable hash (FNV-1a). The label is hashed too, so two different
-        // inputs cannot collide by sharing content.
-        let mut h: u64 = 1469598103934665603;
-        for (label, content) in &inputs {
-            for byte in label
-                .as_bytes()
-                .iter()
-                .chain(content.as_bytes().iter())
-                .chain([0u8].iter())
-            {
-                h ^= u64::from(*byte);
-                h = h.wrapping_mul(1099511628211);
-            }
-        }
-        format!("{h:016x}")
-    };
+    let fingerprint = cache_key(&[
+        ("cache format", CACHE_FORMAT),
+        ("probe source", PROBE),
+        ("probe manifest", &manifest),
+        ("probe cargo config", &cargo_config),
+        ("workspace Cargo.lock", &workspace_lockfile),
+        ("root Cargo.toml", &root_manifest),
+        ("orxnud-store Cargo.toml", &store_manifest),
+        ("orxnud-platform-fs Cargo.toml", &platform_fs_manifest),
+    ]);
     let target = workspace_root.join("target");
-    target.join(format!("s30-probe-{fingerprint}"))
+    Probe {
+        dir: target.join(format!("s30-probe-{fingerprint}")),
+        manifest,
+        cargo_config,
+    }
 }
 
 /// Build the probe project if it is not already cached, and require every step to
@@ -147,9 +217,9 @@ fn probe_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
 /// visibility answer without the hermetic property having been established.
 fn prepare_probe(
     dir: &std::path::Path,
-    crate_dir: &std::path::Path,
+    manifest: &str,
+    cargo_config: &str,
     workspace_root: &std::path::Path,
-    platform_fs: &std::path::Path,
     cargo: &std::path::Path,
 ) -> Result<(), String> {
     if dir.join(".cargo").join("config.toml").is_file() {
@@ -159,21 +229,11 @@ fn prepare_probe(
     let staging = dir.with_extension("staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(staging.join("src")).map_err(|e| format!("probe staging dir: {e}"))?;
-    std::fs::write(
-        staging.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"orxnud-s30-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\norxnud-store = {{ path = \"{}\" }}\n\
-             orxnud-platform-fs = {{ path = \"{}\" }}\n\n\
-    # An empty workspace table makes this its own workspace root. The\n\
-    # cache lives under the workspace's `target/`, and without this cargo\n\
-    # would find the parent workspace and refuse to build here.\n\
-             [workspace]\n",
-            crate_dir.display(),
-            platform_fs.display()
-        ),
-    )
-    .map_err(|e| format!("write the probe manifest: {e}"))?;
+    // The manifest and the cargo configuration are the GENERATED strings that the
+    // cache key was computed over. Writing them verbatim is what keeps the key
+    // honest: a different byte here is a different byte in the key.
+    std::fs::write(staging.join("Cargo.toml"), manifest)
+        .map_err(|e| format!("write the probe manifest: {e}"))?;
     std::fs::write(staging.join("src").join("main.rs"), PROBE)
         .map_err(|e| format!("write the probe source: {e}"))?;
 
@@ -220,12 +280,8 @@ fn prepare_probe(
     }
     std::fs::create_dir_all(staging.join(".cargo"))
         .map_err(|e| format!("cargo config dir: {e}"))?;
-    std::fs::write(
-        staging.join(".cargo").join("config.toml"),
-        "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
-         [source.vendored-sources]\ndirectory = \"vendor\"\n",
-    )
-    .map_err(|e| format!("write cargo config: {e}"))?;
+    std::fs::write(staging.join(".cargo").join("config.toml"), cargo_config)
+        .map_err(|e| format!("write cargo config: {e}"))?;
 
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&staging, dir).map_err(|e| {
@@ -242,19 +298,16 @@ fn restoring_from_outside_the_crate_does_not_compile() {
         .parent()
         .and_then(|crates| crates.parent())
         .expect("the workspace root");
-    let platform_fs = crate_dir
-        .parent()
-        .expect("the crates directory")
-        .join("orxnud-platform-fs");
-    let dir = probe_dir(crate_dir);
+    let probe = probe_project(crate_dir);
+    let dir = &probe.dir;
     let src = dir.join("src");
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     prepare_probe(
-        &dir,
-        crate_dir,
+        dir,
+        &probe.manifest,
+        &probe.cargo_config,
         workspace_root,
-        &platform_fs,
         std::path::Path::new(&cargo),
     )
     .unwrap_or_else(|e| panic!("cannot prepare the probe project: {e}"));
@@ -266,7 +319,7 @@ fn restoring_from_outside_the_crate_does_not_compile() {
 
     let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args(["check", "--quiet", "--offline"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .output();
 
     let output = out.unwrap_or_else(|e| {
@@ -314,6 +367,112 @@ fn restoring_from_outside_the_crate_does_not_compile() {
 // reason instead of being silently skipped.
 // ---------------------------------------------------------------------------
 
+/// The cache key must describe the GENERATED project, not only the files around it.
+///
+/// The cache is reused whenever its marker file exists, so a change to the
+/// generated manifest, the generated cargo configuration, or the format of the
+/// prepared project that no fingerprinted file reveals would otherwise reuse a
+/// stale prepared tree. The prepared tree carries a RESOLUTION, so reusing it
+/// after the thing that determines the resolution changed would check the old
+/// graph.
+///
+/// This exercises the key function the cache directory is actually named by, so it
+/// is a test of the real contract and not of a parallel implementation of it.
+#[test]
+fn the_cache_key_covers_the_generated_project_and_its_format() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("the workspace root");
+    let platform_fs = crate_dir
+        .parent()
+        .expect("the crates directory")
+        .join("orxnud-platform-fs");
+
+    let manifest = probe_manifest(crate_dir, &platform_fs);
+    let cargo_config = probe_cargo_config();
+
+    let read = |path: &std::path::Path, what: &str| -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {what} at {}: {e}", path.display()))
+    };
+    let lockfile = read(&workspace_root.join("Cargo.lock"), "the workspace lockfile");
+    let root_manifest = read(&workspace_root.join("Cargo.toml"), "the root manifest");
+    let store_manifest = read(&crate_dir.join("Cargo.toml"), "the orxnud-store manifest");
+    let platform_fs_manifest = read(
+        &platform_fs.join("Cargo.toml"),
+        "the orxnud-platform-fs manifest",
+    );
+
+    let key = |manifest: &str, cargo_config: &str, cache_format: &str| -> String {
+        cache_key(&[
+            ("cache format", cache_format),
+            ("probe source", PROBE),
+            ("probe manifest", manifest),
+            ("probe cargo config", cargo_config),
+            ("workspace Cargo.lock", &lockfile),
+            ("root Cargo.toml", &root_manifest),
+            ("orxnud-store Cargo.toml", &store_manifest),
+            ("orxnud-platform-fs Cargo.toml", &platform_fs_manifest),
+        ])
+    };
+
+    let base = key(&manifest, &cargo_config, CACHE_FORMAT);
+
+    // Stable for identical inputs: a key that moved on every run would never be
+    // reused, which is the whole point of caching it.
+    assert_eq!(
+        base,
+        key(&manifest, &cargo_config, CACHE_FORMAT),
+        "the cache key must be stable for identical inputs"
+    );
+
+    // Changing the GENERATED MANIFEST must change the key.
+    let other_manifest = manifest.replace("orxnud-s30-probe", "orxnud-s30-probe-2");
+    assert_ne!(
+        other_manifest, manifest,
+        "the manifest must actually differ"
+    );
+    assert_ne!(
+        base,
+        key(&other_manifest, &cargo_config, CACHE_FORMAT),
+        "changing the generated manifest must change the cache key"
+    );
+
+    // Changing the GENERATED CARGO CONFIGURATION must change the key: it is the
+    // file that makes the probe hermetic, so a different one is a different
+    // prepared project.
+    let other_config = cargo_config.replace("vendored-sources", "other-sources");
+    assert_ne!(
+        other_config, cargo_config,
+        "the cargo config must actually differ"
+    );
+    assert_ne!(
+        base,
+        key(&manifest, &other_config, CACHE_FORMAT),
+        "changing the generated cargo configuration must change the cache key"
+    );
+
+    // Changing the FORMAT VERSION must change the key even when nothing else
+    // does: the format is the part of the preparation that no file reveals.
+    assert_ne!(
+        base,
+        key(&manifest, &cargo_config, "v999"),
+        "changing the cache format version must change the cache key"
+    );
+
+    // And the real project must be named by this key, so the assertions above are
+    // about the function that names the cache directory.
+    let expected_name = format!("s30-probe-{base}");
+    let probe = probe_project(crate_dir);
+    assert_eq!(
+        probe.dir.file_name().and_then(|n| n.to_str()),
+        Some(expected_name.as_str()),
+        "the cache directory must be named by the key this test exercises"
+    );
+}
+
 /// A preparation that cannot read the workspace lockfile must refuse rather than
 /// proceeding with a resolution nobody chose.
 #[test]
@@ -329,11 +488,12 @@ fn preparation_refuses_when_the_workspace_lockfile_is_missing() {
     // Deliberately no Cargo.lock in workspace_root.
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let manifest = probe_manifest(&crate_dir, &crate_dir.join("platform-fs"));
     let result = prepare_probe(
         &dir.join("probe"),
-        &crate_dir,
+        &manifest,
+        &probe_cargo_config(),
         &workspace_root,
-        &crate_dir.join("platform-fs"),
         std::path::Path::new(&cargo),
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -399,7 +559,14 @@ fn preparation_refuses_when_vendoring_fails_even_with_a_populated_registry_cache
     make_executable(&wrapper);
 
     let probe = dir.join("probe");
-    let result = prepare_probe(&probe, crate_dir, workspace_root, &platform_fs, &wrapper);
+    let manifest = probe_manifest(crate_dir, &platform_fs);
+    let result = prepare_probe(
+        &probe,
+        &manifest,
+        &probe_cargo_config(),
+        workspace_root,
+        &wrapper,
+    );
 
     // The premise, asserted: the REAL vendoring succeeded against the local
     // registry cache. If it did not, this test would be proving less than it
