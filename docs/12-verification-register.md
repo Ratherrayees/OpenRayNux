@@ -4749,6 +4749,8 @@ and is never written to the source tree. The change is **one file**,
 | Probe passes with an empty Cargo index/cache | **PASS** — same run: index, cache and `registry/src` all moved aside |
 | The expected `E0603`/`E0624` failure is still detected | **PASS** — the probe still fails with `error[E0603]: struct \`RestoreGuard\` is private`, `error[E0624]: associated function \`acquire\` is private`, `error[E0624]: method \`restore\` is private`, and the assertion still requires stderr to name the mechanism |
 | A deliberately broken probe fails the test | **PASS** — with the bypass lines removed from the probe, the test FAILS with "the probe must fail specifically because the restore path is unreachable from outside the crate" |
+| A failed preparation cannot pass as a good one | **PASS** — `prepare_probe()` returns a reason instead of skipping, and two failure-injection tests assert the CAUSE, not merely that it failed: `preparation_refuses_when_the_workspace_lockfile_is_missing` and `preparation_refuses_when_vendoring_fails_even_with_a_populated_registry_cache`. Both were **mutation-checked**: making the lockfile copy optional, and separately making the vendoring failure non-fatal, each fails its test |
+| The vendoring guard holds with a populated registry cache | **PASS** — the second test runs the REAL `cargo vendor`, which succeeds against the local registry cache, and then fails the way a broken vendoring step would. The test asserts that the real vendoring succeeded (so the populated-cache scenario was genuinely exercised), that the refusal names the wrapper's own failure rather than an unrelated one, and that **no probe was promoted** — a promoted probe could compile against Cargo's ordinary registry sources and report a visibility answer the hermetic property never earned |
 | Vendored dependencies are pinned and checksum-verified | **PASS** — every vendored crate carries a `.cargo-checksum.json` (45 of 45 in the cache measured), and cargo **refuses** a vendored crate whose package checksum disagrees with the lockfile (`error: checksum for \`bitflags v2.13.2\` changed between lock files`), so the pin is enforced rather than assumed |
 | A dependency update invalidates the cache | **PASS** — changing only the workspace `Cargo.lock` produces a different cache directory, so the old vendored graph cannot be reused; the probe's lockfile is seeded from the workspace's, so the vendored versions are the workspace's pins |
 | No unrelated CI or application behaviour changes | **PASS** — one file changed; the full gate script exits 0 |
@@ -4775,6 +4777,33 @@ being rejected. Only a probe with the bypass lines **removed** exercises the cri
 and that is the form that was verified. The distinction matters: "the probe fails to
 compile" and "the probe fails to compile *because the restore path is private*" are
 different claims, and only the second is what this test asserts.
+
+**A fail-closed gap this also closes, found in review of its own second form.** The first
+form of this change skipped the work on failure: a manifest read that failed silently became
+an empty fingerprint input, an unreadable workspace lockfile silently skipped the seed, and a
+vendoring failure left the probe to run against Cargo ordinary registry sources -- where, with
+a populated local cache, it could still compile and report the visibility answer WITHOUT the
+hermetic property having been established. Every step is now REQUIRED: the reads, the
+lockfile copy, the vendoring, and the existence of the vendor directory. Each failure returns
+a reason rather than being ignored.
+
+Two failure-injection tests pin that in both directions, and both were mutation-checked: making
+the lockfile copy optional fails `preparation_refuses_when_the_workspace_lockfile_is_missing`,
+and making the vendoring failure non-fatal fails
+`preparation_refuses_when_vendoring_fails_even_with_a_populated_registry_cache`.
+An earlier form of the first test asserted only `is_err()` and **passed with the guard
+removed**, because the fixture was missing something else that also made preparation fail -- a
+vacuous test reporting success. It now asserts the cause. The tests are the regression guard
+for the exact defect this branch exists to remove.
+
+The second test exercises the regression scenario rather than a synthetic stand-in for it. It
+uses the REAL workspace and the REAL cargo, so the local registry cache is genuinely in play:
+the wrapper runs the real `cargo vendor`, which SUCCEEDS against that cache, and then fails
+the way a broken vendoring step would. The test asserts that premise explicitly, because a
+wrapper that short-circuited `vendor` without running it would prove less than it claims --
+and on a host with an empty cache it would have proved nothing at all. It also asserts that
+no probe was promoted into place, because a promoted probe is exactly what would go on to
+compile against Cargo's ordinary registry sources.
 
 **What was deliberately not done.** No advisory exception, no gate change, no application
 code change, and no general-purpose vendoring mechanism across the workspace. The vendor
