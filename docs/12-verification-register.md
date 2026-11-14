@@ -4754,7 +4754,7 @@ and is never written to the source tree. The change is **one file**,
 | Vendored dependencies are pinned and checksum-verified | **PASS** — every vendored crate carries a `.cargo-checksum.json` (45 of 45 in the cache measured), and cargo **refuses** a vendored crate whose package checksum disagrees with the lockfile (`error: checksum for \`bitflags v2.13.2\` changed between lock files`), so the pin is enforced rather than assumed |
 | A dependency update invalidates the cache | **PASS** — changing only the workspace `Cargo.lock` produces a different cache directory, so the old vendored graph cannot be reused; the probe's lockfile is seeded from the workspace's, so the vendored versions are the workspace's pins |
 | No unrelated CI or application behaviour changes | **PASS** — one file changed; the full gate script exits 0 |
-| The ordinary full CI gates pass afterwards | **PASS** — `./scripts/ci-gates.sh` exit 0, `all selected gates passed`; G9 `2040 run, 2040 passed, 6 skipped`; G2d `2 passed, 311 skipped` |
+| The ordinary full CI gates pass afterwards | **PASS** — `./scripts/ci-gates.sh` exit 0, `all selected gates passed`; G9 `2042 run, 2042 passed, 6 skipped` locally (the two extra tests are the failure-injection pair added by the fail-closed change), with the same pre-existing sandbox "leaky" tests noted elsewhere in this register and unrelated to this work; G2d `2 passed, 311 skipped`; on the hosted runner, `1886 run, 1886 passed, 116 skipped` (the hosted scope excludes the sandbox-evidence binaries, and the two new tests are inside that scope) |
 
 **The versions the probe uses are the ones this workspace already pins.** Every one of the
 47 packages in the probe's own resolution appears in the workspace's `Cargo.lock` at the
