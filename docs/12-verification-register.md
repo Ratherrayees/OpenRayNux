@@ -377,9 +377,66 @@ no-payload Tier-1 bundle are unaffected, that the disclosure cannot be a constan
 exposure text carries the `hidepid` condition. **Not claimed:** no mutation testing was run.
 
 **Credential handling is a separate risk, and credential redaction does not mitigate this exposure.** `CREDENTIAL_ENV` remains the only channel carrying anything secret and is redacted throughout; that is a distinct and still-latent concern. It does **not** reduce this row: the payload is not a credential and never passes through the redacted path, and because `spec.env` is rendered as `--setenv K V` **argv pairs**, any bundle that populated `env` would place that value in the same world-readable `cmdline`. The two exposures must not be described as one mitigated problem. Adding a stdin channel means changing `SandboxSpec` and the supervisor; that change is specified but **unbuilt**. |
-| **V-68** | ****`orxnud-task`'s `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` fails intermittently under full-workspace parallel load -- now 5 recorded occurrences, and the cause is still undiagnosed**** | Observed once in `./scripts/ci-gates.sh` while 1004 tests ran concurrently; passed 13/13 in isolation and in 8 consecutive `cargo nextest run -p orxnud-task` runs. This slice changed no file in `orxnud-task` or `orxnud-store` | **milestone:** before relying on a full-workspace green run as evidence -- re-read 2026-10-05| 2026-10-24 | **Low, pre-existing, and not this slice's to fix.** Recorded rather than dismissed because a suite that is intermittently red cannot distinguish a real regression from load, which is exactly the value it is being relied on for. It is a concurrency test over a shared file, so the likely cause is timing under CPU contention rather than a logic error — but "likely" is a guess, and the honest next step is to reproduce it under deliberate contention and read what the failure actually says. Left alone here: this slice changed nothing in `orxnud-task`, and a drive-by fix to a task-engine concurrency test would be a worse change than the flake. Corrected 2026-10-05, because the entry understated its own subject. It said "observed once" with a 13/13 isolation pass rate; the commit that introduced multi-step composition recorded the same test failing **twice more** in full runs while passing **8/8** in isolation, and V-42 records a fourth. So: 4 occurrences across V-42 and V-68, and the isolation pass count fell from 13/13 to 8/8. The cause is still not known -- it is a concurrency test over a shared file, so timing under CPU contention is a *guess*, and this register does not record guesses as findings. What is now measured and stable: the full-workspace suite is green, and has been on every run since, including 1360/1360 locally and 1244/1244 on a hosted runner under the G9 scope ADR-0046 defines. A suite that is intermittently red cannot distinguish a regression from load, so this stays open until someone reproduces it under deliberate contention and reads what it says. **A fifth occurrence was observed on 2026-10-24**, in the first full gate run after the PLAT-007 probe regression test was added: the 1997-test run failed with "every task must be claimed exactly once" (`left: 10`, `right: 12`), then passed 5/5 in isolation, and the next full gate was 1997/1997 green. The cause remains undiagnosed, and this row stays open.
+| **V-68** | ****`orxnud-task`'s `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` fails intermittently under full-workspace parallel load -- now 12 recorded occurrences, and the cause is still undiagnosed**** | Observed once in `./scripts/ci-gates.sh` while 1004 tests ran concurrently; passed 13/13 in isolation and in 8 consecutive `cargo nextest run -p orxnud-task` runs. **The slice that first observed this changed no file in `orxnud-task` or `orxnud-store`; the later occurrences were observed in slices that do touch `orxnud-store`, but only `crates/orxnud-store/tests/s30_restore_not_public.rs`, a different file in a different crate from the failing test. `orxnud-task` is untouched by all of them.** | **milestone:** before relying on a full-workspace green run as evidence -- re-read 2026-10-05| 2026-10-24 | **Low, pre-existing, and not this slice's to fix.** Recorded rather than dismissed because a suite that is intermittently red cannot distinguish a real regression from load, which is exactly the value it is being relied on for. It is a concurrency test over a shared file, so the likely cause is timing under CPU contention rather than a logic error — but "likely" is a guess, and the honest next step is to reproduce it under deliberate contention and read what the failure actually says. Left alone here: this slice changed nothing in `orxnud-task`, and a drive-by fix to a task-engine concurrency test would be a worse change than the flake. Corrected 2026-10-05, because the entry understated its own subject. It said "observed once" with a 13/13 isolation pass rate; the commit that introduced multi-step composition recorded the same test failing **twice more** in full runs while passing **8/8** in isolation, and V-42 records a fourth. So: 4 occurrences across V-42 and V-68, and the isolation pass count fell from 13/13 to 8/8. The cause is still not known -- it is a concurrency test over a shared file, so timing under CPU contention is a *guess*, and this register does not record guesses as findings. What is now measured and stable: the full-workspace suite is green, and has been on every run since, including 1360/1360 locally and 1244/1244 on a hosted runner under the G9 scope ADR-0046 defines. A suite that is intermittently red cannot distinguish a regression from load, so this stays open until someone reproduces it under deliberate contention and reads what it says. **A fifth occurrence was observed on 2026-10-24**, in the first full gate run after the PLAT-007 probe regression test was added: the 1997-test run failed with "every task must be claimed exactly once" (`left: 10`, `right: 12`), then passed 5/5 in isolation, and the next full gate was 1997/1997 green. The cause remains undiagnosed, and this row stays open.
 
 **A sixth occurrence was observed on 2026-11-14**, during the S-30 cache-key work: one `cargo nextest run --workspace --all-targets --no-fail-fast` of 2043 tests failed on this test, while the same run passed 3/3 in isolation, 3/3 in three subsequent full-suite runs with the same change, and 2/2 in two full-suite runs at the parent commit. The slice changed one file, `crates/orxnud-store/tests/s30_restore_not_public.rs` -- so unlike the earlier occurrences, which changed no file in `orxnud-task` or `orxnud-store`, this one DID touch a file in `orxnud-store`, though it is a test file in a different crate from the failing one and it added no subprocess work to the suite (the probe's `cargo vendor` and `cargo check` were already present before it). That difference is stated rather than glossed: it is the only respect in which this occurrence is not obviously identical to the previous five, and it is not enough to attribute the failure, so the cause remains undiagnosed and this row stays open. |
+
+**A seventh occurrence was observed on 2026-11-14**, during the PR-3 correction work: one
+`cargo nextest run --workspace --all-targets --no-fail-fast` of 2045 tests failed on this
+test, while the same run passed 5/5 in isolation and the suite was green in seven further
+runs that day (four standalone and three through the gate script). A **second** full-suite
+failure was observed the same day, in a gate run whose failing test name was **not captured**
+-- the output had been filtered to the summary line. It is recorded here rather than
+attributed, because attributing it to this test on the strength of "G9 failed" alone would be
+a guess recorded as a finding, and that is the mistake A-005 exists to prevent. The
+uncaptured failure is a separate, unattributed observation.
+
+**It is not this work's load.** The S-30 probe test is the longest-running test in the
+suite, and a concurrency-sensitive test elsewhere can fail while it holds the CPU. That
+observation prompted a measurement rather than an assumption, because the corrections under
+review DO add two cargo invocations to that test. They cost **0.07 s** (the lockfile-removed
+check, which fails at resolution) and **0.03 s** (the vendor-hidden check, which also fails
+at resolution), against the **10.72 s** of the original probe check that they accompany.
+The corrections therefore add **0.1 s to a 12.4 s test -- 0.8%** -- and cannot plausibly
+account for the rate. The long pole predates this review cycle, and the flake's rate is
+recorded here as observed, with the cause still undiagnosed.
+
+**An eighth occurrence was observed on 2026-11-14**, during the same PR-3 correction work:
+another `cargo nextest run --workspace --all-targets --no-fail-fast` of 2045 tests failed on
+this test, while the test passed 5/5 in isolation immediately afterwards, the next full-suite
+run was green, and the gate run that followed it was green. It is the same intermittent
+failure, not a regression: the change under test touches `crates/orxnud-store`, not
+`orxnud-task`, and the failing test is in `orxnud-task`.
+
+**A ninth occurrence was observed on 2026-11-14**, also during the PR-3 correction work: a
+further `cargo nextest run --workspace --all-targets --no-fail-fast` of 2045 tests failed on
+this test, while the gate run that followed it was green and the full suite was green on the
+next run. The cause is still undiagnosed, and two occurrences in four full-suite runs is a
+rate worth noting rather than a result to explain away.
+
+**A tenth occurrence was observed on 2026-11-15**, in the full gate suite over the S-30 correction tree: `CI=true ./scripts/ci-gates.sh` failed gate G9 with the same test reporting "every task must be claimed exactly once" (`left: 10`, `right: 12`), and G9 passed when it was run on its own. The tree carried the S-30 corrections, which change no file in `orxnud-task`; the only test file they touch is `crates/orxnud-store/tests/s30_restore_not_public.rs`. The cause is still undiagnosed, and this row stays open.
+
+**An eleventh occurrence was observed on 2026-11-16**, in the full gate suite over the
+**layer-2** correction tree: the same test failed with "every task must be claimed exactly
+once" (`left: 8`, `right: 12`), and the test passed in isolation immediately afterwards
+(`1 run, 1 passed`). The tree carried the advisory and async-executor corrections and **not**
+the S-30 corrections, so this occurrence was observed on a tree that does not contain the S-30
+probe at all -- which is a difference from the ninth and tenth occurrences, and is recorded
+rather than smoothed over. The cause remains undiagnosed, and this row stays open.
+
+**A twelfth occurrence was observed on 2026-11-16**, in a second full gate suite over the
+same **layer-2** correction tree, with the same failure ("every task must be claimed exactly
+once", `left: 10`, `right: 12`). Two occurrences in two runs of the same tree, with the test
+passing in isolation each time, is the rate rather than a coincidence to be explained away --
+and it is the strongest evidence yet that the trigger is **load**, not the content of the
+tree: the tree carries no S-30 probe, and no file in `orxnud-task` is changed by any of the
+three layers. The cause remains undiagnosed, and this row stays open.
+
+The count of **this** row's occurrences is now **twelve confirmed** as of 2026-11-16, and the
+cause is still undiagnosed. The unattributed failure recorded above is NOT among them. The
+rate, not the exact integer, is the finding: the flake continues to occur under
+full-workspace parallel load, and the count is the number observed up to this date.
+
 | **V-69** | **An approval carries no approver identity anywhere, so it is a bearer token that proves parameters but not consent** | `ApprovalRecord` (`crates/orxnud-domain/src/approval.rs`) has fields `actor_label`, capability, target, params, issued/expires, risk, digest — no approver. `canonical_bytes` (`crates/orxnud-policy/src/digest.rs`) binds `actor.label()`, `actor.authority_root()`, capability, target, params and the time bounds: the *proposer's* identity is inside the digest, the approver's is not. `actor_label` is written to the record and to `task_approvals.actor_label` and is **never read at dispatch** (`grep` finds no comparison outside tests). `Decision::Gate.approver` is *derived* at `engine.rs:396` from the proposer's `authority_root()` — an inference where evidence belongs | **milestone:** before any actor other than `Human` reaches the dispatcher, and **release:** on any change to `canonical_bytes`, `ApprovalRecord`, or the `can_grant` enforcement at `engine.rs:266` | 2026-10-03 | **High, latent, and it becomes live the moment a delegated actor exists.** Not exploitable today: with one local user behind a 0700 socket, minting an approval on request is equivalent to that user consenting. The reason it is High anyway is the *shape* of the failure. `capability/approve` answers any caller, and the runtime hardcodes the approver to the local human, so a pipeline built on this would let an AI-side workflow obtain its own approval through the same endpoint and every stage would report success — a **false demonstration of governance**, which is worse than no delegation because it would be trusted. The load-bearing consequence is that `can_grant()` is currently enforced in exactly one non-test place and only refuses an actor with neither grant capability nor an authority root; it cannot check *who approved* because there is nothing to check. **Now implemented.** ADR-0037 (D1, D2) landed: the record carries an explicit `approver`, `canonical_bytes` binds both parties under a `v2` prefix, `authorise` refuses a non-granting approver and an approver who is not the proposer's authority root, and `issue_approval` refuses to mint without `can_grant()`. Verified by mutation: removing the approver from the digest fails `the_digest_binds_the_approver_so_one_consent_cannot_be_replayed_by_another`. Demonstrated end-to-end on the governed task path, where a proposal delegated by the local human is approved with `actor_label: ai`, `approver: human`, `authority_root: local`. |
 | **V-70** | **An `Actor` arriving over local IPC is an asserted principal, not an authenticated identity, and the type does not say so** | `Actor` derives `Serialize, Deserialize` (`crates/orxnud-domain/src/actor.rs`), so `Actor { user: "H" }` can be sent by any caller. `crates/orxnud-daemon/src/runtime.rs:560` hardcodes `local_actor()` and never reads an actor from the request, so nothing depends on this yet | **release:** any move to multi-user access, any transport beyond the local socket, or any code that starts treating a deserialised `Actor` as proof of identity | 2026-10-03 | **Medium, and it is a hazard rather than a defect.** Nothing is wrong today: the practical boundary is the 0700 Unix socket plus the single-user local model, and the runtime not accepting an actor at all is the strongest possible current posture. The risk is entirely in what comes next — `Actor` being `Deserialize` is easy to later read as "the daemon knows who this is", which is the same class of mistake ADR-0034 caught in `CapabilityInvocation`. Three things must stay distinct in naming, docs and tests: *principal assertion* ≠ *principal authentication* ≠ *principal authorization*. Recorded so that multi-user work starts by naming the boundary rather than inheriting an ambiguity. Settled as a constraint by ADR-0037 (D6); deliberately **not** fixed, because multi-user authentication is out of scope and inventing a half-measure now would be worse than the honest gap. |
 | **V-71** | **Task lease and worker identity must never grant or derive capability authority — currently true only by absence of code** | A lease grants exactly one capability: completion fencing (`complete` requires a live lease from that worker), plus `extend`/heartbeat and the concurrency slot. Verified: **no `Actor::` is constructed from a task or a lease anywhere in `orxnud-task`, `orxnud-daemon` or `orxnud-store`** — the only non-test construction is the hardcoded local human at `runtime.rs:560` | **milestone:** before `task → capability` execution is wired, and **release:** on any change that derives an actor, a grant or an approval from a task id, a lease or a worker identity | 2026-10-03 | **Low now, and the most important thing in this block to preserve.** It is currently guaranteed by nothing but the absence of the code path that would break it, which is exactly the kind of truth that erodes without anyone deciding to erode it. The foreseeable regression is convenient rather than malicious: wiring task-driven execution makes it natural to derive the actor from the claimed task, and that derivation would silently convert *ownership of a workflow* into *authority to perform every capability the workflow represents*. **Now implemented and demonstrated.** The proposal path builds the proposer from the task identity and never from the lease holder, and the `task_proposals` table has no worker column at all, so the escalation is unavailable by schema as well as by code. ADR-0038 (D5) is a regression test: `the_lease_holder_does_not_become_the_proposer` asserts that a worker without the live lease cannot propose and that a legitimate holder's proposal records a delegated actor rather than itself. Verified by mutation: deriving the actor from the worker string fails it. Also worth keeping in view while wiring: `may_use_approval` checks expiry only and never verifies the digest against the action, deferring that to policy — so it must not be read as "this action is authorised". |
@@ -4902,25 +4959,30 @@ The checksum verification still protected the cached tree against *corruption*; 
 does not do is establish that the cached tree still matches the *current* workspace graph.
 That distinction is why the fingerprint and the seed are separate fixes and both are needed.
 
-**Nothing is committed.** `target/` is git-ignored; the vendor tree is a build artefact
-and is never written to the source tree. The change is **one file**,
-`crates/orxnud-store/tests/s30_restore_not_public.rs`.
+**Nothing generated is committed.** `target/` is git-ignored; the vendor tree and the
+prepared probe project are build artefacts and are never written to the source tree.
+What IS committed is the change itself -- **one file**,
+`crates/orxnud-store/tests/s30_restore_not_public.rs` -- plus this register entry.
 
 **Measured, per acceptance criterion.**
 
 | Criterion | Result |
 |---|---|
-| Probe passes with registry/network access unavailable | **PASS** — with the registry index, cache and source directories all hidden, the pre-built test binary reports `ok` |
+| Probe passes with registry/network access unavailable | **PASS** — with the registry index, cache and source directories all hidden, the PROBE test passes, and so do the cache-key, wrong-reason and cache-validation tests. One test in the file does not: `preparation_refuses_when_vendoring_fails_even_with_a_populated_registry_cache` needs a POPULATED REGISTRY CACHE by construction, because that is the scenario it exists to cover, and it REFUSES when the registry is absent rather than passing for a weaker reason. The scope is stated in the file's own module documentation rather than left for a reader to discover |
 | Probe passes with an empty Cargo index/cache | **PASS** — same run: index, cache and `registry/src` all moved aside |
+| The probe run cannot fall back to ordinary registry sources | **PASS** — the probe test hides the vendor tree and asserts the build FAILS at the dependency source, naming the source it could not load. Source replacement is exclusive, so cargo cannot resolve through the registry when the vendored tree is gone; if the build had succeeded, the privacy error would have come from a build that never had the hermetic property. **Mutation-checked**: removing the source replacement from the generated configuration fails the test |
 | The expected `E0603`/`E0624` failure is still detected | **PASS** — the probe still fails with `error[E0603]: struct \`RestoreGuard\` is private`, `error[E0624]: associated function \`acquire\` is private`, `error[E0624]: method \`restore\` is private`, and the assertion still requires stderr to name the mechanism |
 | A deliberately broken probe fails the test | **PASS** — with the bypass lines removed from the probe, the test FAILS with "the probe must fail specifically because the restore path is unreachable from outside the crate" |
 | A failed preparation cannot pass as a good one | **PASS** — `prepare_probe()` returns a reason instead of skipping, and two failure-injection tests assert the CAUSE, not merely that it failed: `preparation_refuses_when_the_workspace_lockfile_is_missing` and `preparation_refuses_when_vendoring_fails_even_with_a_populated_registry_cache`. Both were **mutation-checked**: making the lockfile copy optional, and separately making the vendoring failure non-fatal, each fails its test |
 | The vendoring guard holds with a populated registry cache | **PASS** — the second test runs the REAL `cargo vendor`, which succeeds against the local registry cache, and then fails the way a broken vendoring step would. The test asserts that the real vendoring succeeded (so the populated-cache scenario was genuinely exercised), that the refusal names the wrapper's own failure rather than an unrelated one, and that **no probe was promoted** — a promoted probe could compile against Cargo's ordinary registry sources and report a visibility answer the hermetic property never earned |
-| Vendored dependencies are pinned and checksum-verified | **PASS** — every vendored crate carries a `.cargo-checksum.json` (45 of 45 in the cache measured), and cargo **refuses** a vendored crate whose package checksum disagrees with the lockfile (`error: checksum for \`bitflags v2.13.2\` changed between lock files`), so the pin is enforced rather than assumed |
+| Vendored dependencies are pinned and checksum-verified | **PASS** — every vendored crate carries a `.cargo-checksum.json` (45 of 45 in the cache measured), and cargo **refuses** a vendored crate whose package checksum disagrees with the lockfile (`error: checksum for \`bitflags v2.13.2\` changed between lock files`), so the pin is enforced rather than assumed. **The limit of that enforcement is stated in the two further claims below: Cargo cannot recompute a crate's tarball checksum from a directory, so the pin is enforced against the tree's METADATA, not against a modified source whose listed checksum was updated with it** |
 | A dependency update invalidates the cache | **PASS** — changing only the workspace `Cargo.lock` produces a different cache directory, so the old vendored graph cannot be reused; the probe's lockfile is seeded from the workspace's, so the vendored versions are the workspace's pins |
+| A damaged cache is not silently trusted | **PASS** — a cache is reused only if its `Cargo.toml` and `.cargo/config.toml` equal the generated strings byte for byte and its vendor directory exists; otherwise it is REBUILT. This is not hypothetical: with the local registry cache populated and the configuration emptied, the probe still fails with the same E0603/E0624 privacy errors, so the old marker-file check would have reported the mechanism unreachable while the probe was in fact compiled through Cargo's ordinary registry sources. A regression test drives the real `prepare_probe()` and the real `cache_is_valid()` with a **fake** cargo whose `vendor` step creates a vendor directory -- it does **not** perform real vendoring, and the cache it prepares is a fixture rather than a real one. It empties the configuration while leaving the marker file present, retries, and asserts the cache was rebuilt; it then removes the lockfile, on its own, and asserts that too is rejected and rebuilt. The measurement with a populated registry quoted above is a **separate, manual experiment**, not something the test does. **Mutation-checked**: restoring the marker-file check fails the test, and removing the lockfile check fails it too |
+| A probe that failed for another reason cannot satisfy the check | **PASS** — the matcher requires one of rustc's two privacy codes AND the item it names, **on the same diagnostic line**: E0603 with `RestoreGuard`, or E0624 with `acquire`/`restore`. The previous form accepted any mention of the word, which is what rustc reports for a type mismatch or a wrong argument count -- exactly what it would say if `restore` were made public with a changed signature. Searching the whole of stderr was still too loose: an unrelated E0603 about a DIFFERENT item could be paired with the name appearing in the source excerpt. A regression test compiles real E0308, E0061 and an unrelated-E0603 diagnostic against a throwaway crate, and asserts the matcher rejects all three while accepting the real privacy diagnostics. **Mutation-checked**: restoring the permissive matcher fails the test |
+| The cached lockfile is validated, the vendored tree is an EXACT match for it, and the build is pinned to it | **PASS** — `cache_is_valid()` requires the prepared `Cargo.lock` to pin only packages the workspace pins -- the same name, the same version, and the same SOURCE, the probe's own package excepted -- and requires the vendored tree to correspond to the lockfile's **remote** dependency set **exactly, in both directions**: every remote pin -- a registry or git package -- must have its own directory in the tree, and every directory in the tree must be a real directory corresponding to a remote pin. A path dependency is NOT vendored -- cargo leaves it where it is -- so it takes no part in either direction, and a directory named after one is not something cargo put there. The probe is compiled with `--locked`, so cargo may not regenerate the resolution from the vendored tree. Without the pin check, a cache whose lockfile was removed or altered would be accepted and cargo would resolve from whatever the tree happened to contain. Without the completeness check **in both directions**, a lockfile that was truncated but still PARSED would be accepted, an EMPTY tree would be accepted, and a tree that had been partly deleted would be accepted -- a one-way check sees an empty tree and passes it. Without the **entry-type** check, a plain FILE or a SYMLINK with the right name would pass a name-based check while the source cargo would load is not there. Without the **source** comparison, a package of the same name and version from a different registry would pass. The regression test, over a scratch workspace whose lockfile has two remote pins and one local one: removes the lockfile **on its own**; TRUNCATES it so it still parses and still carries pins; bumps the version of the crate that is **not** vendored; empties the vendor tree; deletes one crate from it while the rest survive; adds a directory no pin accounts for; replaces a package directory with a regular FILE; adds a directory matching the LOCAL path dependency; and swaps a package's source for a different registry. Each is rejected. The probe test additionally removes the lockfile from the prepared project and asserts the build then fails on the LOCKFILE rather than on the privacy diagnostic. **Mutation-checked**: removing the lockfile check, removing either direction of the completeness check, removing the entry-type check, removing the source comparison, removing the subset check, and removing `--locked`, each fail a test. **Scope:** this validator is a PIN-TO-DIRECTORY MAPPING check, not a content-integrity check. It establishes which packages the tree must contain and that each entry is a real directory; it does not inspect what is inside one, so an empty or corrupt package directory passes it. Content integrity is enforced independently, by Cargo's own directory-source checksum verification at build time: a vendored crate carries `.cargo-checksum.json`, and tampering with one produces `error: the listed checksum of ... has changed` and the build fails (measured, exit 101) |
 | The key describes the GENERATED project, not only the files around it | **PASS** — the generated manifest, the generated cargo configuration, and a cache-format constant are fingerprinted alongside the probe source and the four workspace files, and are written to disk **verbatim** from the same strings the key was computed over. A regression test asserts that changing the manifest, changing the cargo configuration, and changing the format version each change the key, and that the cache directory is named by the key the test exercises. All three were **mutation-checked**: removing any one of the three from the fingerprint fails the test |
 | No unrelated CI or application behaviour changes | **PASS** — one file changed; the full gate script exits 0 |
-| The ordinary full CI gates pass afterwards | **PASS** — `./scripts/ci-gates.sh` exit 0, `all selected gates passed`; G9 `2043 run, 2043 passed, 6 skipped` locally (the three extra tests are the failure-injection pair and the cache-key regression test added by the fail-closed and invalidation changes), with the same pre-existing sandbox "leaky" tests noted elsewhere in this register and unrelated to this work; G2d `2 passed, 311 skipped`; on the hosted runner, `1887 run, 1887 passed, 116 skipped` (1884 before this branch, plus the three tests it adds — all three inside the hosted scope) |
+| The ordinary full CI gates pass afterwards | **PASS** — `./scripts/ci-gates.sh` exit 0, `all selected gates passed`; G9 `2045 run, 2045 passed, 6 skipped` locally (the five extra tests are the failure-injection pair, the cache-key regression test, the cache-validation test and the wrong-reason test added by the fail-closed, invalidation and test-integrity changes), with the same pre-existing sandbox "leaky" tests noted elsewhere in this register and unrelated to this work; G2d `2 passed, 311 skipped`; on the hosted runner, **measured** `1889 run, 1889 passed, 116 skipped` — 1884 before this branch plus the five tests it adds, all five inside the hosted scope. The projection was exact, and it is now a measurement: the hosted run that includes these five tests is [run 43872806884](https://github.com/Ratherrayees/OpenRayNux/actions/runs/43872806884), and the figure is quoted as a result rather than as a projection |
 
 **The versions the probe uses are the ones this workspace already pins.** Every one of the
 47 packages in the probe's own resolution appears in the workspace's `Cargo.lock` at the
@@ -4987,6 +5049,131 @@ contents. Fingerprinting the generated manifest also covers the crate PATHS, bec
 manifest carries the two crates' absolute paths; that makes true a claim the earlier
 comment already made and the earlier code did not deliver.
 
+**Two further test-integrity gaps, found in review of the branch, and closed.** The
+branch was reviewed at the PR-diff level and two problems were found in the test's own
+integrity -- not in the property it measures.
+
+**The cache-hit path trusted the marker file.** The cache was reused whenever
+`.cargo/config.toml` existed, which proves only that a file exists. A damaged cache
+keeping an EMPTY configuration would let cargo resolve the probe's dependencies through
+Cargo's ordinary registry sources, and the probe would STILL fail with the privacy error
+-- so the visibility test would pass having established nothing about hermeticity. This
+was MEASURED, not hypothesised: emptying the configuration of a prepared cache, with the
+local registry cache populated, reproduces exactly the same E0603/E0624 output. The
+contents are now compared with the generated strings byte for byte and the vendor tree
+is required; an invalid cache is rebuilt rather than accepted, and the rebuilt project
+is bound to the vendored tree, which a regression test demonstrates by hiding the vendor
+tree and watching the build fail at the dependency source.
+
+**The compile-failure matcher was too permissive.** It accepted any stderr containing
+`restore`, `RestoreGuard`, `E0624` or `E0603`. A type mismatch or a wrong argument count
+mentions those names in the source excerpt and the note -- and those are exactly what
+rustc reports if `restore` were made PUBLIC with a changed signature, which is the
+regression the test exists to catch. The matcher now requires a privacy code AND the
+item it names, and a regression test compiles real E0308 and E0061 diagnostics (against
+a throwaway crate whose `restore` is public, so the product crate is not modified) and
+asserts they are rejected.
+
+**Two further gaps, found in the same review and closed.** The cached `Cargo.lock` was not
+validated at all, and the probe was compiled without `--locked`: a cache whose lockfile had
+been removed or altered would have been accepted, and cargo would have resolved from
+whatever the vendored tree happened to contain rather than from the workspace's pins. Both
+are now in place, and both are mutation-checked.
+
+The lockfile check was then tightened twice more. Checking that every pin the cache carries
+is a workspace pin is a SUBSET test, so a lockfile that had been truncated but still parsed
+would satisfy it and the cache would be accepted; the build would fail later, when cargo
+found the resolution incomplete, rather than the cache being rebuilt.
+
+And the completeness check was then made BIDIRECTIONAL. Comparing the vendor tree with the
+lockfile only in the direction "every directory has a pin" leaves three gaps: an EMPTY tree
+passes it, a tree that has been partly deleted passes it if the survivors all match, and an
+unreadable directory entry was silently dropped by `flatten()`. The tree must now also
+correspond to the lockfile's **remote** dependency set -- every registry or git pin must
+have its directory -- and a path dependency takes no part, because cargo does not vendor
+one. This was a cache-validation and recovery gap, not a false green: the privacy result
+was never at risk, because the probe's build would fail rather than silently succeed.
+
+The validator was then tightened once more, on three points a name-based check cannot see.
+A vendored crate is a DIRECTORY, and the check now requires `file_type().is_dir()`: a plain
+FILE or a SYMLINK with the right name would otherwise satisfy a name-based check while the
+source cargo would load from it is not there. The reverse direction now matches only REMOTE
+pins, because `cargo vendor` copies registry and git sources and leaves a path dependency
+where it is -- so a directory named after a local package is not something cargo put there,
+and it must not be able to stand in for a missing remote package. And the package's SOURCE is
+preserved and compared, not summarised as a boolean "remote": two packages of the same name
+and version from different registries are different packages, and a lockfile that swapped
+the source would otherwise pass. The measured cache is consistent with all three: 45 remote
+pins, 45 vendor entries, every entry a real directory, and every remote pin from the
+crates.io registry.
+
+**What this validator is not.** It is a mapping check, not a content-integrity check: it
+establishes WHICH packages the vendored tree must contain and that each entry is a real
+directory, and it does not inspect the contents of one. An empty package directory, or a
+crate whose sources were altered, would pass it. That is a cache-recovery limitation and
+not a false-green privacy result -- Cargo would fail to load the package, and the build
+would fail loudly rather than silently compiling from unverified source.
+
+**What Cargo's checksums do and do not establish.** Three claims stay distinct, and the
+second and third were measured rather than assumed.
+
+* **The vendored tree matches the lockfile.** That is this validator's claim: the remote
+  pins and the vendor entries correspond, exactly.
+* **The vendored tree's contents are intact against ACCIDENTAL damage.** Cargo compares
+  each vendored source file against the digest listed in its `.cargo-checksum.json`.
+  Appending a line to a vendored crate's source produced `error: the listed checksum of
+  .../bitflags-2.13.2/src/lib.rs has changed`, with the expected and actual digests, and
+  the build exited 101. Cargo also anchors the tree's package checksum against the
+  lockfile's: corrupting that metadata produced "error: checksum for `bitflags v2.13.2`
+  changed between lock files", and the build exited 101.
+* **The vendored tree's contents are AUTHENTIC.** That is NOT established by either
+  mechanism. Cargo cannot recompute a crate's tarball checksum from a directory, so an
+  actor able to modify a vendored source file AND its listed checksum is not detected:
+  with both changed, the build proceeded to the probe's own expected privacy error with
+  no checksum complaint at all (measured). Cargo's directory-source checksums are not a
+  security mechanism, they do not protect against malicious changes, and they do not
+  independently establish source authenticity.
+
+So the corruption-detection mechanism is worth having, and it must not be described as an
+adversarial integrity guarantee.
+
+Two limits are stated rather than implied. The fixture the regression test uses is a scratch
+workspace, because the real workspace's lockfile carries hundreds of remote pins and no
+fixture tree can hold them all; and the fixture's vendored crates are real registry packages
+at real versions, vendored under the names `cargo vendor --versioned-dirs` gives them,
+because `cargo vendor` copies registry and git sources and leaves path dependencies where
+they are. The unreadable-directory-entry path fails validation by construction, but it has
+no regression test of its own: this suite runs as root, which bypasses the permission
+checks that would produce one.
+
+The matcher was also still too loose after the first correction: it searched the whole of
+stderr for a code and a name, so an unrelated `E0603` about a DIFFERENT item could be paired
+with the name appearing in the source excerpt. The code and the item must now be on the
+SAME diagnostic line, and a regression test compiles a real unrelated-`E0603` diagnostic to
+represent that failure mode.
+
+**The hosted runner found a third defect in that matcher, and this is the record of it.** The
+CI workflow sets `CARGO_TERM_COLOR: always` (`.github/workflows/ci.yml`), so rustc's
+diagnostics arrive with colour escapes in them and the header is split across them:
+`ESC[1mESC[91merror[E0603]ESC[0mESC[1m: struct `RestoreGuard` is privateESC[0m`. The
+matcher compared the raw line against the prefix `error[E0603]:`, so on a host that
+colourises its output it found **no** privacy diagnostic at all -- and the probe test
+failed, having proved nothing about the mechanism it exists to check.
+
+It is recorded here because **the test had never run on a hosted runner before this**:
+every earlier run of it was local, where the colour setting is unset, and the gate suite
+passed in both places for the whole of the S-30 work. The first hosted run of this change
+failed on exactly this test, with the three expected privacy diagnostics plainly present in
+the log and the matcher still declining to see them. Reproduced locally by setting
+`CARGO_TERM_COLOR=always`: the test passes without it and fails with it.
+
+The matcher now strips the ANSI escape sequences before it looks for the code and the item.
+The escapes are **presentation, not content**: the code and the item are still on the same
+diagnostic line, which is the property the matcher is about, and stripping them preserves it
+exactly. The discipline is unchanged and is pinned in both directions: a colourised `E0603`
+about a DIFFERENT item still does **not** satisfy the check, and a colourised diagnostic
+about the restore path does. Four cases were added to the matcher's own regression test.
+
 **What was deliberately not done.** No advisory exception, no gate change, no application
 code change, and no general-purpose vendoring mechanism across the workspace. The vendor
 tree is specific to this one probe's dependency set.
@@ -4999,9 +5186,9 @@ has the sources locally, so the vendoring step succeeds offline.
 
 | | |
 |---|---|
-| **event** | any change to `crates/orxnud-store/tests/s30_restore_not_public.rs`, to the probe it compiles, or to `Backup::restore`'s visibility |
-| **date** | 2026-11-13 |
-| **severity** | **Low for behaviour, Medium for the record.** The test's verdict was never wrong — it was correct about the mechanism every time — but it could report a false failure for a reason unrelated to what it checks, and a test that fails for the wrong reason trains people to ignore it. |
+| **event** | any change to `crates/orxnud-store/tests/s30_restore_not_public.rs`, to the probe it compiles, to `Backup::restore`'s visibility, or to `CARGO_TERM_COLOR` in CI |
+| **date** | 2026-11-13; the colour sensitivity corrected 2026-11-16 after the first hosted run |
+| **severity** | **Low for behaviour, Medium for the record.** The test's verdict was never wrong — it was correct about the mechanism every time — but it could report a false failure for a reason unrelated to what it checks, and a test that fails for the wrong reason trains people to ignore it. The colour defect was the same kind of failure: a false failure for a reason unrelated to the mechanism, found only because the change was finally run on the hosted runner it is meant to run on. |
 
 ## 3. The three highest-risk claims
 
