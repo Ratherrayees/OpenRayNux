@@ -31,10 +31,39 @@ targets = [
 
 [advisories]
 version = 2
-# Report advisories without failing the build. Phase 1 has no released binary, so
-# an advisory cannot be exploited in the field; a hard failure here would train
-# people to reach for `--no-deny-warnings`, which defeats the gate entirely.
-# Set back to "deny" once there is a shipped artifact to protect.
+# What each class of finding does here, measured rather than assumed. Each
+# line was observed by running the gate against a tree that actually contained
+# a finding of that class.
+#
+#   vulnerability -> ERROR. The build fails. A vulnerability advisory is a
+#                   known defect in code we ship. Measured with
+#                   RUSTSEC-2026-0382 (rustls-webpki 0.103.15): cargo-deny
+#                   reports `error[vulnerability]` and the gate fails.
+#   unsound       -> ERROR. The build fails. An unsound advisory is a defect
+#                   in the code itself, reachable or not. Measured with
+#                   RUSTSEC-2026-0486 (rustix 1.1.5): cargo-deny reports
+#                   `error[unsound]` and the gate fails. Fixed by the
+#                   lockfile-only bump to rustix 1.1.6 (register A-035).
+#   yanked        -> WARNING. `yanked = "warn"` below. A yanked release is
+#                   the publisher asking Cargo not to select that version in
+#                   NEW resolution; it deletes nothing, and an existing
+#                   Cargo.lock keeps resolving to it. That is why a yanked
+#                   version can sit in a lockfile indefinitely -- and it is
+#                   also why the yank is not on its own evidence that the
+#                   version is free of defects. Yanking is a distribution
+#                   control, not a defect report.
+#   unmaintained  -> WARNING for transitive crates. `unmaintained = "workspace"`
+#                   below scopes the error to crates we author, so an
+#                   unmaintained dependency does not block the build.
+#
+# An earlier version of this comment said the opposite of the first lines: that
+# advisories are "reported without failing the build". Under `version = 2` that
+# was not true of the vulnerability or unsound classes, and the gate did fail on
+# both. The comment now states what the configuration does, per class.
+#
+# `ignore = []` is deliberate and must stay empty. Adding an advisory id here
+# hides it rather than fixing it; the remediation for each finding is a
+# dependency update, and the register records which ones are open.
 ignore = []
 yanked = "warn"
 # RustSec advisories without a CVE are still real; they are only not-yet-scored.

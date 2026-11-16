@@ -2016,6 +2016,568 @@ def run_gate_integration_case(
     )
 
 
+# --------------------------------------------------------------------------
+# G11: a FINDING must be told apart from an EXECUTION FAILURE
+# --------------------------------------------------------------------------
+#
+# `cargo audit` uses exit 1 for BOTH "an advisory was found" and "the audit could
+# not run" -- a broken or unreachable advisory database lands on 1, not on 2 -- and
+# exit 2 for a lockfile that could not be read. The discriminator is therefore not
+# the exit code but whether a JSON report came back on stdout.
+#
+# A gate that reports every non-zero exit as "an advisory" hides the diagnostic
+# that says what actually went wrong. These cases drive the REAL G11 with a fake
+# `cargo audit`, because the behaviour under test is the gate's, not cargo-audit's.
+
+G11_CLEAN_REPORT = json.dumps(
+    {"vulnerabilities": {"list": []}, "warnings": {}}
+)
+
+# A valid report carrying three warning-class findings, of two kinds.
+#
+# The two kinds are shaped differently, because cargo-audit 0.22.2 reports them
+# differently: an advisory-bearing warning names an advisory, and a yanked
+# finding names no advisory at all -- the crate itself is the finding. The
+# yanked entry below is the shape the tool actually emits, measured on a tree
+# that carries a yanked version. An earlier version of this fixture gave the
+# yanked entry an advisory id, which cargo-audit never does, and the parser was
+# built to that fiction: the gate then rejected the real report and failed on
+# the very tree it was written to report on.
+G11_REPORT_WITH_THREE_WARNINGS = json.dumps(
+    {
+        "vulnerabilities": {"list": []},
+        "warnings": {
+            "unmaintained": [
+                {"kind": "unmaintained", "advisory": {"id": "RUSTSEC-2026-0371"}},
+                {"kind": "unmaintained", "advisory": {"id": "RUSTSEC-2026-0370"}},
+            ],
+            "yanked": [
+                {
+                    "kind": "yanked",
+                    "package": {"name": "async-executor", "version": "1.14.0"},
+                    "advisory": None,
+                },
+            ],
+        },
+    }
+)
+
+# The report this repository's own tree produces, as measured: three
+# unmaintained transitive crates and one yanked crate, and no vulnerability.
+G11_REPORT_WITH_FOUR_WARNINGS = json.dumps(
+    {
+        "vulnerabilities": {"list": []},
+        "warnings": {
+            "unmaintained": [
+                {"kind": "unmaintained", "advisory": {"id": "RUSTSEC-2026-0371"}},
+                {"kind": "unmaintained", "advisory": {"id": "RUSTSEC-2026-0370"}},
+                {"kind": "unmaintained", "advisory": {"id": "RUSTSEC-2026-0372"}},
+            ],
+            "yanked": [
+                {
+                    "kind": "yanked",
+                    "package": {"name": "async-executor", "version": "1.14.0"},
+                    "advisory": None,
+                },
+            ],
+        },
+    }
+)
+
+G11_REPORT_WITH_VULN = json.dumps(
+    {
+        "vulnerabilities": {
+            "list": [
+                {
+                    "advisory": {"id": "RUSTSEC-2020-0071"},
+                    "package": {"name": "time"},
+                    "versions": {"patched": [">=0.2.23"]},
+                }
+            ]
+        },
+        "warnings": {},
+    }
+)
+
+# The executables the gate is allowed to find when a case simulates a host with
+# no cargo-audit.
+#
+# The PATH for that case is a CONTROLLED WHITELIST of symlinks, not the system's
+# directories: a host with cargo-audit installed in /usr/bin would otherwise still
+# find it, and the case would fail for an environmental reason instead of testing
+# what it exists to test. cargo-audit is deliberately not on this list.
+G11_TOOL_WHITELIST = (
+    "bash", "sh", "python3", "rustc", "mktemp", "cat", "rm", "sed", "grep", "awk",
+    "cut", "tr", "sort", "uniq", "wc", "head", "tail", "env", "dirname", "basename",
+    "ls", "cp", "mkdir", "chmod", "expr", "find",
+)
+
+# The fake cargo. The report and the diagnostic live in their own files so that
+# neither the shell nor the Python has to quote them.
+G11_FAKE_CARGO = """#!/bin/sh
+if [ "$1" = "audit" ]; then
+  [ -f "{dir}/stdout" ] && cat "{dir}/stdout"
+  [ -f "{dir}/stderr" ] && cat "{dir}/stderr" >&2
+  exit {rc}
+fi
+exec "{cargo}" "$@"
+"""
+
+G11_CASES: list[dict[str, object]] = [
+    {
+        "name": "G11: an advisory is reported by its id",
+        "rc": 1,
+        "stdout": G11_REPORT_WITH_VULN,
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "RUSTSEC-2020-0071",
+        "expect_absent": "could not complete",
+    },
+    {
+        "name": "G11: an unreachable advisory database is an execution failure, not a finding",
+        "rc": 1,
+        "stdout": "",
+        "stderr": "error: couldn't fetch advisory database: I/O operation failed\n",
+        "expect_fail": True,
+        "expect_contains": "could not complete",
+        "expect_absent": "reported an advisory",
+    },
+    {
+        "name": "G11: an unreadable lockfile is an execution failure, not a finding",
+        "rc": 2,
+        "stdout": "",
+        "stderr": "error: not found: Couldn't load Cargo.lock\n",
+        "expect_fail": True,
+        "expect_contains": "could not complete",
+        "expect_absent": "reported an advisory",
+    },
+    {
+        "name": "G11: the diagnostic is shown rather than swallowed",
+        "rc": 2,
+        "stdout": "",
+        "stderr": "error: not found: Couldn't load Cargo.lock\nCaused by:\n  -> I/O operation failed\n",
+        "expect_fail": True,
+        "expect_contains": "Couldn't load Cargo.lock",
+        "expect_absent": "reported an advisory",
+    },
+    {
+        "name": "G11: a clean audit passes",
+        "rc": 0,
+        "stdout": G11_CLEAN_REPORT,
+        "stderr": "",
+        "expect_fail": False,
+        "expect_contains": "no known vulnerability",
+        "expect_absent": "",
+    },
+    {
+        # A zero exit code must not turn an unreadable report into a clean result.
+        "name": "G11: a malformed report at exit 0 fails closed, not clean",
+        "rc": 0,
+        "stdout": "{not json at all",
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: an empty report at exit 0 fails closed, not clean",
+        "rc": 0,
+        "stdout": "",
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # The shape is checked, not assumed: a report that parses but does not
+        # carry the fields this gate reads would otherwise read as "no
+        # vulnerabilities" and "no warnings" -- a green gate that measured nothing.
+        "name": "G11: a report of the wrong shape fails closed, not clean",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": "none", "warnings": {}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a report whose warnings are not a mapping fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": []}, "warnings": 3}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    # The nested data, not only the top-level types. Each of these would
+    # otherwise turn into a plausible count and a report that read as clean.
+    {
+        "name": "G11: a finding that is not an object fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": ["RUSTSEC-2020-0071"]}, "warnings": {}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a finding whose advisory is not an object fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": [{"advisory": "RUSTSEC-2020-0071"}]}, "warnings": {}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a finding whose advisory id is not a string fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": [{"advisory": {"id": 71}}]}, "warnings": {}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a finding whose advisory id is empty fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": [{"advisory": {"id": ""}}]}, "warnings": {}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a warning kind that is not a list fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": []}, "warnings": {"unmaintained": {"id": "RUSTSEC-2026-0371"}}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a warning entry that is not an object fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": []}, "warnings": {"unmaintained": ["RUSTSEC-2026-0371"]}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        "name": "G11: a warning entry without an advisory id fails closed",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": []}, "warnings": {"unmaintained": [{"kind": "unmaintained"}]}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # A report that CONTAINS vulnerabilities must fail the gate whatever the
+        # process exit status. The real cargo-audit exits 1 when it finds
+        # vulnerabilities, so exit 0 with findings does not arise from it -- but a
+        # gate that reads its own report must not depend on that, and the
+        # register's claim is unconditional.
+        "name": "G11: a valid report with vulnerabilities fails even at exit 0",
+        "rc": 0,
+        "stdout": G11_REPORT_WITH_VULN,
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "RUSTSEC-2020-0071",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # The warning-count path, deterministically. The live audit measures three
+        # warning-class findings on this tree, but a live measurement is not a
+        # regression test: the count must be pinned by a case whose input says
+        # exactly what it contains.
+        "name": "G11: three valid warning-class findings are counted and reported",
+        "rc": 0,
+        "stdout": G11_REPORT_WITH_THREE_WARNINGS,
+        "stderr": "",
+        "expect_fail": False,
+        "expect_contains": "3 warning-class finding(s)",
+        "expect_absent": "",
+    },
+    {
+        # A yanked finding names no advisory, because the crate is the finding.
+        # It is counted like any other warning-class finding.
+        "name": "G11: a yanked finding that names no advisory is counted, not rejected",
+        "rc": 0,
+        "stdout": json.dumps(
+            {
+                "vulnerabilities": {"list": []},
+                "warnings": {
+                    "yanked": [
+                        {
+                            "kind": "yanked",
+                            "package": {"name": "async-executor", "version": "1.14.0"},
+                            "advisory": None,
+                        },
+                    ],
+                },
+            }
+        ),
+        "stderr": "",
+        "expect_fail": False,
+        "expect_contains": "1 warning-class finding(s)",
+        "expect_absent": "could not be read",
+    },
+    {
+        # The report this tree actually produces, as measured. This is the case
+        # that the first version of the parser failed: it required an advisory id
+        # of every warning entry, and a yanked finding has none, so the gate
+        # called a readable report unreadable and failed on the tree it was
+        # written to report on.
+        "name": "G11: the measured report of this tree is counted, not rejected",
+        "rc": 0,
+        "stdout": G11_REPORT_WITH_FOUR_WARNINGS,
+        "stderr": "",
+        "expect_fail": False,
+        "expect_contains": "4 warning-class finding(s)",
+        "expect_absent": "could not be read",
+    },
+    {
+        # The other direction: a yanked finding that does not name the crate
+        # cannot be reported, so it fails closed rather than being counted.
+        "name": "G11: a yanked finding that does not name the crate fails closed",
+        "rc": 0,
+        "stdout": (
+            '{"vulnerabilities": {"list": []}, "warnings": {"yanked": '
+            '[{"kind": "yanked", "advisory": null}]}}'
+        ),
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # And the no-advisory shape is accepted for a yanked finding only: an
+        # advisory-bearing kind that names a package but no advisory is still a
+        # malformed entry, and fails closed.
+        "name": "G11: an advisory-bearing kind without an advisory fails closed",
+        "rc": 0,
+        "stdout": (
+            '{"vulnerabilities": {"list": []}, "warnings": {"unmaintained": '
+            '[{"kind": "unmaintained", "package": {"name": "zbus_names", '
+            '"version": "4.3.4"}, "advisory": null}]}}'
+        ),
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # An entry filed under a kind it does not claim is a malformed report:
+        # the section says one kind of finding and the entry says another.
+        "name": "G11: a finding filed under a kind it does not claim fails closed",
+        "rc": 0,
+        "stdout": (
+            '{"vulnerabilities": {"list": []}, "warnings": {"yanked": '
+            '[{"kind": "unmaintained", "package": {"name": "zbus_names", '
+            '"version": "4.3.4"}, "advisory": null}]}}'
+        ),
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # A yanked finding that does not name the VERSION it found cannot be
+        # reported either.
+        "name": "G11: a yanked finding that does not name a version fails closed",
+        "rc": 0,
+        "stdout": (
+            '{"vulnerabilities": {"list": []}, "warnings": {"yanked": '
+            '[{"kind": "yanked", "package": {"name": "async-executor"}, '
+            '"advisory": null}]}}'
+        ),
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # A yanked finding carries NO advisory -- the crate is the finding. One
+        # that carries an advisory id anyway is not the shape a yanked finding
+        # has, and it must not satisfy the ADVISORY rule by accident: the kind is
+        # branched on first, so a yanked entry is held to the yanked shape --
+        # no advisory, and the package named.
+        "name": "G11: a yanked finding that carries an unexpected advisory id fails closed",
+        "rc": 0,
+        "stdout": (
+            '{"vulnerabilities": {"list": []}, "warnings": {"yanked": '
+            '[{"kind": "yanked", "advisory": {"id": "RUSTSEC-2026-0380"}}]}}'
+        ),
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # The same, with the package named as well: naming the crate does not
+        # make an advisory on a yanked finding acceptable.
+        "name": "G11: a yanked finding that carries both an advisory and a package fails closed",
+        "rc": 0,
+        "stdout": (
+            '{"vulnerabilities": {"list": []}, "warnings": {"yanked": '
+            '[{"kind": "yanked", "package": {"name": "async-executor", '
+            '"version": "1.14.0"}, "advisory": {"id": "RUSTSEC-2026-0380"}}]}}'
+        ),
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "could not be read",
+        "expect_absent": "no known vulnerability",
+    },
+    {
+        # The skip path itself is pinned, so that "the gate skipped the audit" is
+        # a known and identifiable outcome rather than something a case can
+        # stumble into.
+        "name": "G11: a host without cargo-audit is reported as not installed",
+        "rc": 0,
+        "stdout": G11_CLEAN_REPORT,
+        "stderr": "",
+        "hide_cargo_audit": True,
+        "allow_skip": True,
+        "expect_fail": False,
+        "expect_contains": "cargo-audit not installed",
+        "expect_absent": "",
+    },
+    {
+        # The strict-mode counterpart. On a hosted runner the gate is strict, so
+        # a missing cargo-audit is a FAILURE with a different message, and it
+        # must be recognised as "the audit did not run" just as the developer-mode
+        # skip is.
+        "name": "G11: a host without cargo-audit fails in strict mode",
+        "rc": 0,
+        "stdout": G11_CLEAN_REPORT,
+        "stderr": "",
+        "hide_cargo_audit": True,
+        "allow_skip": True,
+        "strict": True,
+        "expect_fail": True,
+        "expect_contains": "cargo-audit is not installed",
+        "expect_absent": "",
+    },
+    {
+        # A report whose findings ARE present but cannot be read in full says so,
+        # rather than pretending nothing was found.
+        "name": "G11: a finding that cannot be read in full is reported as a finding",
+        "rc": 0,
+        "stdout": '{"vulnerabilities": {"list": [{"advisory": {"id": ""}}]}, "warnings": {}}',
+        "stderr": "",
+        "expect_fail": True,
+        "expect_contains": "reported an advisory that could not be read in full",
+        "expect_absent": "no known vulnerability",
+    },
+]
+
+
+def run_g11_case(tmp: str, case: dict[str, object]) -> tuple[bool, str]:
+    """Drive the real G11 with a fake `cargo audit` and check what it reported."""
+    name = str(case["name"])
+    root = os.path.join(tmp, "g11case")
+    shutil.rmtree(root, ignore_errors=True)
+    bindir = os.path.join(root, "bin")
+    os.makedirs(bindir, exist_ok=True)
+
+    with open(os.path.join(root, "stdout"), "w", encoding="utf-8") as fh:
+        fh.write(str(case["stdout"]))
+    with open(os.path.join(root, "stderr"), "w", encoding="utf-8") as fh:
+        fh.write(str(case["stderr"]))
+
+    real_cargo = shutil.which("cargo") or "cargo"
+    fake = os.path.join(bindir, "cargo")
+    with open(fake, "w", encoding="utf-8") as fh:
+        fh.write(
+            G11_FAKE_CARGO.format(dir=root, rc=int(case["rc"]), cargo=real_cargo)
+        )
+    os.chmod(fake, 0o755)
+
+    env = dict(os.environ)
+    if not bool(case.get("hide_cargo_audit", False)):
+        # `have cargo-audit` must succeed, so the binary has to exist. The stub is
+        # load-bearing on a host that has no cargo-audit -- which is exactly the
+        # host where the gate would otherwise SKIP and every case that expects a
+        # failure would pass for the wrong reason.
+        stub = os.path.join(bindir, "cargo-audit")
+        with open(stub, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, 0o755)
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    else:
+        # The audit must NOT be reachable. The PATH is a controlled WHITELIST of
+        # symlinks plus the directory holding the fake cargo -- not the system's
+        # directories, which on a host with cargo-audit installed under /usr/bin
+        # would still find it, and the case would then fail for an environmental
+        # reason rather than testing what it exists to test.
+        toolbin = os.path.join(root, "tools")
+        os.makedirs(toolbin, exist_ok=True)
+        for tool in G11_TOOL_WHITELIST:
+            found = shutil.which(tool)
+            if found is None:
+                continue
+            link = os.path.join(toolbin, tool)
+            if not os.path.exists(link):
+                os.symlink(found, link)
+        env["PATH"] = toolbin + os.pathsep + bindir
+        if bool(case.get("strict", False)):
+            # Strict, so the gate FAILS rather than skipping. This is the hosted
+            # runner's mode, and it is a different message.
+            env["CI"] = "1"
+            env["ORXNUD_STRICT"] = "1"
+        else:
+            # Not strict, so the gate skips.
+            env.pop("CI", None)
+            env["ORXNUD_STRICT"] = ""
+    result = subprocess.run(
+        ["bash", GATE, "G11"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+
+    problems: list[str] = []
+    # The gate must have RUN the audit, not skipped it. `have cargo-audit` fails
+    # when the binary is absent, and on a CI host `is_strict` is then true, so the
+    # gate would FAIL with "cargo-audit is not installed" -- and every case that
+    # expects a failure would pass for the wrong reason. The skip message must
+    # never appear.
+    # TWO different messages say the audit did not run, and they must both be
+    # recognised: the developer-mode skip says "cargo-audit not installed", and
+    # the strict-mode failure says "cargo-audit IS not installed". Matching only
+    # one of them would let a skip pass unnoticed in the other mode.
+    audit_absent = (
+        "cargo-audit not installed" in output or "cargo-audit is not installed" in output
+    )
+    if audit_absent and not bool(case.get("allow_skip", False)):
+        problems.append(
+            "the gate did not run the audit (cargo-audit is not installed), so this "
+            "case would prove nothing"
+        )
+    rejected = result.returncode != 0
+    if rejected != bool(case["expect_fail"]):
+        problems.append(
+            f"expected the gate to "
+            f"{'REJECT' if case['expect_fail'] else 'ACCEPT'}, and it "
+            f"{'rejected' if rejected else 'accepted'}"
+        )
+    want = str(case["expect_contains"])
+    if want and want not in output:
+        problems.append(f"the output did not mention {want!r}")
+    absent = str(case["expect_absent"])
+    if absent and absent in output:
+        problems.append(f"the output wrongly mentioned {absent!r}")
+    if problems:
+        return False, f"{name}\n     " + "\n     ".join(problems) + f"\n     gate output:\n{output}"
+    return True, ""
+
+
 def main() -> int:
     failures: list[str] = []
     total = 0
@@ -2090,6 +2652,17 @@ def main() -> int:
                 print(f"  ok    {name}")
             else:
                 print(f"  FAIL  {name}")
+                failures.append(detail)
+
+        # G11: the advisory gate must tell a FINDING from an EXECUTION FAILURE, and
+        # must show the diagnostic either way.
+        for case in G11_CASES:
+            total += 1
+            ok, detail = run_g11_case(tmp, case)
+            if ok:
+                print(f"  ok    {case['name']}")
+            else:
+                print(f"  FAIL  {case['name']}")
                 failures.append(detail)
 
         for name, gate, rel, expect_fail in G2D_CASES + G2D_ANY_TEST_CASES + G3_CASES:
