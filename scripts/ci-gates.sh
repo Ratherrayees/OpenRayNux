@@ -920,44 +920,213 @@ gate_G10() {
 gate_G11() {
   banner G11
   if have cargo-audit; then
-    # `cargo audit` exits 0 for warning-class findings -- unmaintained, unsound and
-    # yanked -- and only for those. It is not passed `--deny warnings`, so those
-    # findings are reported but do not fail the gate. Saying "no known advisory"
-    # when warnings are present would misdescribe what was measured, so the
-    # warnings are counted and reported instead.
+    # `cargo audit` exits 0 when it finds only warning-class findings --
+    # unmaintained, unsound and yanked -- and also exits 0 when it finds nothing
+    # at all. It is not passed `--deny warnings`, so warning-class findings are
+    # reported but do not fail the gate. Saying "no known advisory" when warnings
+    # are present would misdescribe what was measured, so the warnings are counted
+    # and reported instead.
     #
     # The JSON form is used because its summary is countable. The human-readable
     # form prints the same findings but its summary line is not part of a stable
     # interface.
-    local audit_json audit_rc=0
-    audit_json="$(cargo audit --json 2>/dev/null)" || audit_rc=$?
-    if [ "$audit_rc" != "0" ]; then
-      fail_gate "cargo audit reported an advisory"
+    # `cargo audit` writes its report to stdout and its diagnostics to stderr, and
+    # BOTH are needed: the JSON names the advisories, and the stderr is the only
+    # record of an operation that could not complete. Neither is discarded.
+    #
+    # The exit code alone does not say which happened. Measured against the pinned
+    # cargo-audit 0.22.2:
+    #
+    #   0  the audit completed and found nothing to fail on;
+    #   1  EITHER an advisory was found -- a JSON report is on stdout -- OR the
+    #      audit could not run, in which case stdout is EMPTY and the reason is on
+    #      stderr. A broken or unreachable advisory database lands here, not on 2;
+    #   2  the audit could not run: the lockfile could not be read, and the reason
+    #      is on stderr.
+    #
+    # So the discriminator is not the exit code but whether a report came back.
+    # Reporting an operation failure as "an advisory" hides the one diagnostic a
+    # reader needs, and it is what this replaces.
+    local audit_json audit_err audit_rc=0
+    local audit_err_file
+    audit_err_file="$(mktemp)"
+    audit_json="$(cargo audit --json 2>"$audit_err_file")" || audit_rc=$?
+    audit_err="$(cat "$audit_err_file" 2>/dev/null)"
+    rm -f "$audit_err_file"
+    # One parse, and a SHAPE check rather than an assumption.
+    #
+    # The report must be readable AND have the shape this gate expects. A report
+    # whose `vulnerabilities` key is missing, or is not an object carrying a
+    # `list`, would otherwise read as "no vulnerabilities" and "no warnings" -- a
+    # green gate that measured nothing. An unreadable report is an unreadable
+    # MEASUREMENT, not a clean result, and it fails closed.
+    # The validation is strict about the NESTED data, not only the top-level
+    # types. Every finding must be an object naming an advisory whose id is a
+    # non-empty string, and every warning kind must map to a list of entries
+    # shaped the way that kind is shaped. A finding that is malformed cannot be
+    # named, and a warning entry of the wrong type cannot be counted: both would
+    # otherwise turn into a plausible count and a report that read as clean.
+    #
+    # The warning shapes are NOT all the same, and that is measured rather than
+    # assumed (cargo-audit 0.22.2). An advisory-bearing warning -- `unmaintained`,
+    # `unsound` -- carries a nested `advisory` naming an id. A YANKED finding
+    # carries NO advisory at all: the finding is the crate itself, so the
+    # advisory is null and the package is named instead. Requiring an advisory id
+    # of every warning entry rejects a perfectly good report, and on a tree that
+    # still carries a yanked version it makes G11 fail permanently -- which is
+    # what the first version of this check did. Requiring a package of every
+    # warning entry would reject the advisory-bearing kinds instead. So each
+    # entry is checked against the shape its own kind has.
+    #
+    # Four values come back: the vulnerability count (-1 when that section cannot
+    # be read), the warning count (-1 likewise), the advisory ids, and the length
+    # of the vulnerability list -- which is what tells a reader that findings WERE
+    # reported even when the report could not be read in full.
+    local summary vulns warnings advisory_ids list_len
+    summary="$(printf '%s' "$audit_json" | python3 -c '
+import json, sys
+
+def advisory_id(entry):
+    """The advisory an entry names, or None if the entry is not shaped like one."""
+    if not isinstance(entry, dict):
+        return None
+    advisory = entry.get("advisory")
+    if not isinstance(advisory, dict):
+        return None
+    ident = advisory.get("id")
+    if not isinstance(ident, str) or not ident:
+        return None
+    return ident
+
+
+def named_package(entry):
+    """The package a finding names, or None if it does not name one."""
+    if not isinstance(entry, dict):
+        return None
+    package = entry.get("package")
+    if not isinstance(package, dict):
+        return None
+    name = package.get("name")
+    version = package.get("version")
+    if not isinstance(name, str) or not name:
+        return None
+    if not isinstance(version, str) or not version:
+        return None
+    return name
+
+
+def warning_entry_ok(kind, entry):
+    """Whether a warning entry is shaped the way the kind it is filed under is shaped.
+
+    An advisory-bearing warning (unmaintained, unsound) names an advisory whose
+    id is a non-empty string. A yanked finding names NO advisory -- the crate is
+    the finding -- and must therefore name the package and version instead. An
+    entry of any other shape cannot be counted, so it fails closed.
+
+    The kind is branched on FIRST, so that each kind is held to its own shape
+    rather than to whichever rule happens to be reached first. Branching on the
+    presence of an advisory instead would let a yanked entry that carries an
+    unexpected advisory id satisfy the ADVISORY rule and pass without naming
+    the crate -- which is not the shape a yanked finding has, and which the
+    register describes as rejected.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("kind") != kind:
+        return False
+    if kind == "yanked":
+        return (
+            entry.get("advisory") is None
+            and named_package(entry) is not None
+        )
+    return advisory_id(entry) is not None
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = None
+
+vulns = -1
+warnings = -1
+ids = ""
+list_len = 0
+
+if isinstance(d, dict):
+    v = d.get("vulnerabilities")
+    w = d.get("warnings")
+    if isinstance(v, dict) and isinstance(v.get("list"), list):
+        entries = v["list"]
+        list_len = len(entries)
+        names = []
+        for entry in entries:
+            ident = advisory_id(entry)
+            if ident is None:
+                break
+            names.append(ident)
+        else:
+            vulns = len(entries)
+            ids = ", ".join(names)
+    if isinstance(w, dict):
+        count = 0
+        for kind, entries in w.items():
+            if not isinstance(kind, str) or not isinstance(entries, list):
+                break
+            for entry in entries:
+                if not warning_entry_ok(kind, entry):
+                    break
+            else:
+                count += len(entries)
+                continue
+            break
+        else:
+            warnings = count
+
+print(vulns)
+print(warnings)
+print(ids)
+print(list_len)
+' 2>/dev/null)" || summary=""
+    vulns="$(printf '%s\n' "$summary" | sed -n '1p')"
+    warnings="$(printf '%s\n' "$summary" | sed -n '2p')"
+    advisory_ids="$(printf '%s\n' "$summary" | sed -n '3p')"
+    list_len="$(printf '%s\n' "$summary" | sed -n '4p')"
+    if [ "$vulns" = "-1" ] || [ "$warnings" = "-1" ] || [ -z "$vulns" ] || [ -z "$warnings" ]; then
+      # The report is unreadable, or has the wrong shape somewhere inside it.
+      # Nothing can be claimed from it -- not "no known vulnerability" -- so the
+      # gate fails. An unreadable report is an unreadable MEASUREMENT.
+      if [ "$audit_rc" != "0" ]; then
+        fail_gate "cargo audit could not complete (exit $audit_rc) -- an execution failure, not a finding"
+      elif [ -n "$list_len" ] && [ "$list_len" != "0" ]; then
+        fail_gate "cargo audit reported an advisory that could not be read in full -- the result is unknown, not clean"
+      else
+        fail_gate "cargo audit exited 0 but its report could not be read in full -- the result is unknown, not clean"
+      fi
+      note "cargo audit said:"
+      printf '%s\n' "$audit_err" | sed 's/^/          /'
       return
     fi
-    local vulns warnings
-    vulns="$(printf '%s' "$audit_json" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(-1); raise SystemExit
-print(len(d.get("vulnerabilities", {}).get("list", [])))
-' 2>/dev/null)" || vulns=-1
-    warnings="$(printf '%s' "$audit_json" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(-1); raise SystemExit
-w = d.get("warnings", {})
-print(sum(len(v) for v in w.values()))
-' 2>/dev/null)" || warnings=-1
-    if [ "$vulns" = "-1" ] || [ "$warnings" = "-1" ]; then
-      # The summary could not be read. That is not a pass and not a failure of the
-      # audit itself: report what is known and let the reader see the gap.
-      note "cargo audit exited 0; its warning summary could not be read"
-      ok "cargo audit: no known vulnerability"
+    if [ "$vulns" -gt 0 ] 2>/dev/null; then
+      # The REPORT says there are vulnerabilities. That is a finding, whatever
+      # the process exit status was. The real cargo-audit exits 1 when it finds
+      # vulnerabilities, so exit 0 with findings does not arise from it -- but a
+      # gate that reads "there are findings" and then reports a clean audit
+      # because the exit code happened to be 0 is a FALSE GREEN, and the exit
+      # code is not the thing being checked here: the REPORT is.
+      fail_gate "cargo audit reported an advisory: $advisory_ids"
+      if [ -n "$audit_err" ]; then
+        note "cargo audit also said:"
+        printf '%s\n' "$audit_err" | sed 's/^/          /'
+      fi
+      return
+    fi
+    if [ "$audit_rc" != "0" ]; then
+      # No findings in a readable report, but the process failed anyway: an
+      # execution failure, not a finding.
+      fail_gate "cargo audit exited $audit_rc and reported no advisory -- an execution failure, not a finding"
+      if [ -n "$audit_err" ]; then
+        note "cargo audit also said:"
+        printf '%s\n' "$audit_err" | sed 's/^/          /'
+      fi
       return
     fi
     if [ "$warnings" = "0" ]; then

@@ -4244,11 +4244,6 @@ it can isolate and follows the answer: on a hosted runner that cannot, the sandb
 binaries are excluded with a stated reason and 1884 tests run; on a host that can, all
 2040 run. The hosted figure is the CI one, and both were measured on this change.
 
-**The two G9 figures are different scopes, not a discrepancy.** G9 asks the host whether
-it can isolate and follows the answer: on a hosted runner that cannot, the sandbox-evidence
-binaries are excluded with a stated reason and 1884 tests run; on a host that can, all
-2040 run. The hosted figure is the CI one, and both were measured on this change.
-
 **What was deliberately not done.** No advisory exception was added: `deny.toml`'s
 `ignore = []` is untouched and must stay empty, because an advisory id added there hides a
 finding instead of fixing it. No gate was weakened. The `keyring`/`secret-service`/`zbus`
@@ -4327,11 +4322,147 @@ warnings, not failures -- see the deny.toml [advisories] policy
 ok    cargo audit: no known vulnerability
 ```
 
-The failure path was re-tested, not assumed: a `cargo audit` that exits non-zero still fails
-G11 with `cargo audit reported an advisory`, and a `cargo audit` that exits 0 but whose
-summary cannot be read reports **that gap** rather than claiming a clean result. The
-counting uses the JSON form because its summary is countable; the human-readable form
+**That evidence was false when it was written, and the gate was wrong with it.** The
+paragraph above claimed that a report of `warnings: {unmaintained: 3, yanked: 1}` is counted and
+reported. The first implementation of the shape check required an advisory id of **every**
+warning entry, and a yanked finding has no advisory: cargo-audit 0.22.2 reports it as
+`{"kind": "yanked", "package": {…}, "advisory": null}`, because the crate is the finding rather
+than an advisory about it. So the gate read the tree's own report as unreadable, failed closed
+on it, and could not pass on any tree that still carries a yanked version — which is this one,
+until **A-037** removes `async-executor` 1.14.0. The self-tests did not catch it either,
+because the fixture they used gave the yanked entry an advisory id
+(`{"kind": "yanked", "advisory": {"id": "RUSTSEC-2026-0380"}}`), a shape cargo-audit never
+emits. Twenty-one cases, a mutation check and a live measurement had all been run against a
+fiction.
+
+It was found by **running the gate**, not by reading it. The layer application script runs
+`CI=true ./scripts/ci-gates.sh` over the tree it is about to commit, and G11 refused that
+tree with `cargo audit exited 0 but its report could not be read in full -- the result is
+unknown, not clean` and an empty diagnostic: a readable report treated as an unreadable one.
+
+**The rule now, and what it is based on.** Each warning entry is checked against the shape
+its own kind has, measured on cargo-audit 0.22.2: an advisory-bearing warning (`unmaintained`,
+`unsound`) names an advisory whose `id` is a non-empty string, and a **yanked** finding names
+**no** advisory at all and must name the package and the version instead. The kind is branched
+on **first**, so that each kind is held to its own shape rather than to whichever rule happens
+to be reached first: branching on the advisory's presence instead would let a yanked entry
+that carries an unexpected advisory id satisfy the *advisory* rule and pass without naming the
+crate, which is not the shape a yanked finding has. An entry filed under a kind it does not
+claim is malformed. Anything else fails closed, exactly as before. The gate is not weakened: a
+report that cannot be read is still not a clean audit, and a report that says there are
+vulnerabilities still fails whatever the exit code was.
+
+The failure path was re-tested, not assumed, and **the first version of that claim was
+wrong**. The register said a `cargo audit` that exits 0 but whose summary cannot be read
+"reports that gap rather than claiming a clean result", and the code did the opposite: it
+printed `ok cargo audit: no known vulnerability` and **passed the gate**. An unreadable
+measurement was being reported as a clean audit. The paragraph above described an intention,
+not the behaviour, and the behaviour is now the intention.
+
+**What the failure path does now, and why the exit code alone is not the discriminator.**
+`cargo audit` was measured against the pinned 0.22.2, and the result is not what the exit
+code suggests:
+
+| Condition | exit | stdout | stderr |
+|---|---|---|---|
+| Vulnerabilities found | 1 | the JSON report | — |
+| **Advisory database unreachable** | **1** | **empty** | the error |
+| Cargo.lock missing or malformed | 2 | empty | the error |
+
+So exit 1 covers **both** "an advisory was found" and "the audit could not run", and
+distinguishing exit 1 from exit 2 alone does not separate them. The discriminator is
+**whether a valid JSON report came back**. The gate now:
+
+* **valid report, vulnerabilities present** → fails, naming the advisory ids. This
+  is checked **before** the process exit status, and it does not depend on it: a
+  report that says there are vulnerabilities is a finding whatever the exit code
+  was. An earlier version consulted the count only inside the non-zero branch, so
+  a valid report containing findings with exit 0 fell through to the clean-audit
+  message -- a second false green, found in review, with a regression case;
+* **no report, or a report that cannot be read** → fails as an execution failure, and
+  **shows the diagnostic** instead of discarding it;
+* **valid report, no vulnerabilities** → passes, reporting the warning-class count.
+
+The report's **shape** is checked rather than assumed, and the check is strict about the
+**nested** data, not only the top-level types. Every finding must be an object naming an
+advisory whose `id` is a non-empty string, and every warning kind must map to a list of entries
+shaped the way that kind is shaped. A finding that is malformed cannot be named, and a warning
+entry of the wrong type cannot be counted: both would otherwise turn into a plausible count and
+a report that read as clean. A report whose `vulnerabilities` is missing, is not an object, or
+does not carry a `list` — or whose `warnings` is not a mapping — would likewise read as "no
+vulnerabilities" and "no warnings". An unreadable or wrongly-shaped report **fails closed**,
+including at exit 0, where it used to pass with a clean-audit message.
+
+**The gate cannot silently skip.** `have cargo-audit` failing means the audit never ran.
+The gate then says so in one of **two** different messages, and both must be recognised:
+the developer-mode skip prints `cargo-audit not installed`, and the strict-mode failure
+prints `cargo-audit **is** not installed`. On a CI host the gate is strict, so a missing
+cargo-audit is a FAILURE, and a self-test expecting a failure would pass for the wrong
+reason. Every case therefore asserts that neither message appears, a dedicated case pins
+the developer-mode skip, and a second pins the strict-mode failure.
+
+Measured on a host where cargo-audit cannot be reached: **19 of the 19** cases that expect
+a specific behaviour fail, in **both** modes -- the developer mode, where the gate skips,
+and the strict mode, where it fails. No case passes on a skip, and each failure names that
+the audit did not run. The two dedicated cases are exempt by design: they assert the two
+messages themselves.
+
+The missing-tool case reaches that state through a **controlled whitelist**: the `PATH` it
+sets is a directory of symlinks to an explicit list of executables, and `cargo-audit` is
+not among them. The system's own directories are not used, because a host with
+`cargo-audit` installed under `/usr/bin` would otherwise still find it, and the case would
+fail for an environmental reason instead of testing what it exists to test.
+
+The counting uses the JSON form because its summary is countable; the human-readable form
 prints the same findings but its summary line is not a stable interface.
+
+**Evidence.** Twenty-nine cases in `scripts/gate-selftest.py` drive the **real** `gate_G11`
+through `bash scripts/ci-gates.sh G11` with a fake `cargo audit` on `PATH` -- not a parallel
+implementation of the gate -- covering the advisory path, the unreachable-database path, the
+unreadable-lockfile path, the diagnostic being shown, a clean audit, **a valid report
+containing vulnerabilities at exit 0**, **a deterministic three-warning count**, the
+developer-mode skip, the strict-mode failure, and twelve fail-closed shapes: malformed
+JSON, an empty report, a wrong `vulnerabilities`, a wrong `warnings`, a finding that is not an
+object, a finding whose advisory is not an object, a finding whose advisory id is not a
+string, a finding whose advisory id is empty, a warning kind that is not a list, a warning
+entry that is not an object, a warning entry without an advisory id, and a finding that
+cannot be read in full.
+
+**Eight further cases pin the warning-shape rule**, in both directions. Three assert that the
+shapes cargo-audit really emits are counted rather than rejected: a yanked finding that names
+no advisory, the measured report of this tree (`warnings: {unmaintained: 3, yanked: 1}`, four
+findings), and the three-warning fixture, whose yanked entry was corrected to the shape the
+tool emits instead of the shape it was assumed to emit. Five assert that a malformed entry
+still fails closed: a yanked finding that does not name the crate, a yanked finding that does
+not name a version, an advisory-bearing kind that names a package but no advisory, a yanked
+finding that carries an unexpected advisory id, and a yanked finding that carries both an
+advisory and a package.
+
+The last two were added after review found the gap they close: branching on the *presence of
+an advisory* rather than on the *kind* let a yanked entry that carried an advisory id satisfy
+the advisory rule and pass without naming the crate. The kind is branched on first, and both
+directions of that gap are now pinned.
+
+They are **mutation-checked**. Thirteen mutations were measured against these twenty-nine
+cases, and every one was caught:
+
+| Mutation | Cases that caught it |
+|---|---|
+| the old fail-open gate is restored | 23 |
+| the nested warning validation is loosened to the top-level types | 8 |
+| the yanked shape is rejected (the first implementation's rule) | 3 |
+| the execution failure is no longer distinguished from an unreadable report | 2 |
+| a yanked finding is accepted without naming the crate | 2 |
+| the advisory-id type check is dropped | 2 |
+| the kind is not branched on first (the advisory decides) | 2 |
+| the diagnostic is swallowed | 1 |
+| the vulnerability check is moved back inside the non-zero branch | 1 |
+| the no-advisory shape is accepted for any kind | 1 |
+| the kind match is dropped | 1 |
+| the version check is dropped | 1 |
+| a yanked finding may carry an advisory | 1 |
+
+No mutation was missed. The boundary-gate self-test count is 181.
 
 **What was deliberately not done.** `--deny warnings` was **not** added to G11. That would
 make G11 fail on three unmaintained transitive crates and one yanked crate, which is a
@@ -4339,15 +4470,17 @@ make G11 fail on three unmaintained transitive crates and one yanked crate, whic
 recorded as open work, not something to be settled by editing a gate. G8 was not weakened
 and no advisory was ignored.
 
-**Not claimed.** No gate's pass/fail behaviour changed, so no statement in this register
-about a gate *failing* is affected. The unsound advisory that made G8 red is fixed by
-**A-035**, not by anything here.
+**Not claimed.** The unsound advisory that made G8 red is fixed by **A-035**, not by anything
+here. One pass/fail behaviour **did** change, and it is recorded rather than glossed: a report
+carrying a yanked warning was read as an unreadable report, so G11 **failed** on it; it is now
+counted and reported, and G11 passes. No statement in this register about a gate *failing* on a
+yanked finding is affected, because none was made before this correction was measured.
 
 | | |
 |---|---|
-| **event** | any change to `deny.toml`'s `[advisories]` section, to the `cargo audit` invocation in G11, or to the G11 success message |
-| **date** | 2026-11-13 |
-| **severity** | **Low for behaviour, Medium for the record.** Neither gate was wrong: G8 failed correctly and G11 passed correctly. What was wrong was the tree's own description of them, and a description that understates a gate is how a real failure gets carried as "known baseline debt" instead of being fixed. |
+| **event** | any change to `deny.toml`'s `[advisories]` section, to the `cargo audit` invocation in G11, to the G11 success message, or to the shape the G11 report parser accepts |
+| **date** | 2026-11-13; G11's failure path corrected 2026-11-14; the warning-shape rule corrected 2026-11-15 |
+| **severity** | **Medium for behaviour, Medium for the record.** **Corrected 2026-11-14: the earlier severity was wrong, and so was the claim it rested on.** This row originally read "Low for behaviour, Medium for the record" on the grounds that "neither gate was wrong: G8 failed correctly and **G11 passed correctly**". G11 did NOT pass correctly. Its failure path reported an operation failure as "an advisory", discarded the diagnostic, and turned an unreadable or malformed report into a clean-audit **pass** -- and, separately, a report containing vulnerabilities could pass whenever the process exited 0. Those are false greens: a gate that reports success from a measurement it never made, or from a measurement that said the opposite. The severity is therefore **Medium for behaviour**, not Low. The record-keeping half stays Medium: what was wrong was both the gates' behaviour and the tree's own description of them, and a description that understates a gate is how a real failure gets carried as "known baseline debt" instead of being fixed. |
 
 ### A-037 — the yanked `async-executor 1.14.0` remediated: `1.14.0 -> 1.14.1`
 
@@ -4544,7 +4677,12 @@ rather than upstream-CI-verified, because no check-runs are attached.
 
 **Objective 2 — whether a stable Secret Service 6 preserves the blocking API and the existing
 credential operations.** A stable **`secret-service 6.0.0` does not exist**: the registry lists
-only `6.0.0-rc.1` as the 6.x line. The question was therefore answered against the release
+only `6.0.0-rc.1` as the 6.x line. The distinction is worth stating precisely, because it is
+narrower than "6.0.0 does not exist": the release candidate **is** tagged and published
+upstream — `secret-service-rs` carries the release `v6.0.0-rc.1`, published **2026-11-06**, and
+crates.io carries `6.0.0-rc.1` with `max_stable: 5.2.0` and `max_version: 6.0.0-rc.1`. What
+remains unpublished is the **stable** `6.0.0`, and that is the specific thing upstream PR #39
+waits on. The question was therefore answered against the release
 candidate, which is the only thing that could be answered, and it is answered
 **affirmatively on the blocking API**:
 
@@ -4670,6 +4808,31 @@ a **resolution** failure produces stderr that does **not** mention `RestoreGuard
 correctly fail rather than let a broken probe pass. The failure mode is loud, not silent —
 which is the property that matters most here.
 
+**Monitoring, and the baseline against which a re-check is measured.** There is **no recurring
+automation** in this repository for this: a scheduled job that repeatedly checked unchanged
+information would be infrastructure with no claim behind it. The arrangement is GitHub watch
+plus an on-demand re-check, and the baseline is recorded here so that a later re-check can say
+what changed rather than merely re-reporting a state.
+
+**The Watch subscriptions are not yet in place.** The arrangement is agreed, but the
+authenticated account was measured as **not subscribed** to either repository
+(`user/repos/{owner}/{repo}/subscription` returns "not subscribed" for both). Until that is
+changed, the "GitHub watch" half of the arrangement is **not operational**, and this row must
+not be read as claiming that a notification will arrive. The on-demand re-check works today
+and is the half in use; the watch is the half still outstanding.
+
+| Watched | Baseline at 2026-11-14 |
+|---|---|
+| `open-source-cooperative/zbus-secret-service-keyring-store` — PR #39 | `state=OPEN draft=true head=23e8480 updated=2026-11-09 reviews=0 comments=0` |
+| `open-source-cooperative/secret-service-rs` — releases | `v6.0.0-rc.1` (2026-11-06), `v5.2.0` (2026-08-29), `v5.1.0` (2025-09-03) |
+| crates.io — `secret-service` | `max_stable: 5.2.0`, `max_version: 6.0.0-rc.1`; **no stable 6.x** |
+
+A re-check verifies the crates.io release status, PR #39's state, maintainer reviews, the CI
+results on the PR head, and the adapter's compatibility with the existing `keyring` dependency.
+The change worth watching is the **stable** `secret-service 6.0.0` reaching crates.io: that is
+the event this row's milestone names, and until it happens the three unmaintained findings stay
+warnings under the current policy and the migration stays unimplemented.
+
 **Not claimed.** No upstream release was merged, no profile was changed, no dependency was
 updated for this row, and no credential-compatibility claim is made beyond what was exercised:
 create, retrieve, update, delete and cross-version read, on one host, with the release
@@ -4679,8 +4842,8 @@ contributor-reported, not upstream-CI-verified.
 
 | | |
 |---|---|
-| **event** | any release of `zbus-secret-service-keyring-store`, `secret-service` 6.x or `zbus` 6.x; any change to `crates/orxnud-platform-secrets`'s use of `keyring`; and any upstream decision on PR #39's versioning |
-| **date** | 2026-11-13 |
+| **event** | a **stable** `secret-service` 6.x release (the release candidate is already published, so `6.0.0-rc.1` is not the event); any release of `zbus-secret-service-keyring-store` or `zbus` 6.x; any change to `crates/orxnud-platform-secrets`'s use of `keyring`; and any upstream decision on PR #39's versioning |
+| **date** | 2026-11-13; monitoring baseline recorded 2026-11-14 |
 | **severity** | **Not a defect.** This row records an investigation whose conclusion is that the three unmaintained findings are **not urgent**: they are transitive, they are warnings under the current policy, they do not fail the gate, and the upstream fix exists but is unreleased. It also records the one thing that **is** actionable independently: the `s30_restore_not_public` probe's registry dependence. |
 
 ### A-039 — the S-30 visibility probe no longer depends on the registry
