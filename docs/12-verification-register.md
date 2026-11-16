@@ -4480,6 +4480,370 @@ yanked finding is affected, because none was made before this correction was mea
 | **date** | 2026-11-13; G11's failure path corrected 2026-11-14; the warning-shape rule corrected 2026-11-15 |
 | **severity** | **Medium for behaviour, Medium for the record.** **Corrected 2026-11-14: the earlier severity was wrong, and so was the claim it rested on.** This row originally read "Low for behaviour, Medium for the record" on the grounds that "neither gate was wrong: G8 failed correctly and **G11 passed correctly**". G11 did NOT pass correctly. Its failure path reported an operation failure as "an advisory", discarded the diagnostic, and turned an unreadable or malformed report into a clean-audit **pass** -- and, separately, a report containing vulnerabilities could pass whenever the process exited 0. Those are false greens: a gate that reports success from a measurement it never made, or from a measurement that said the opposite. The severity is therefore **Medium for behaviour**, not Low. The record-keeping half stays Medium: what was wrong was both the gates' behaviour and the tree's own description of them, and a description that understates a gate is how a real failure gets carried as "known baseline debt" instead of being fixed. |
 
+### A-037 — the yanked `async-executor 1.14.0` remediated: `1.14.0 -> 1.14.1`
+
+**This closes the yanked `async-executor` finding and nothing else.** No manifest changed, no
+advisory exception was added, no gate was weakened, and the `keyring`/`secret-service`/`zbus`
+subtree was **not** migrated: **F-26c remains OPEN**, **F-26b/S-30 remain OPEN**, **S-11
+remains OPEN**, **S-31 remains implemented but not complete**, and **F-26 remains OPEN**. The
+three **unmaintained** zbus-family findings (`zbus_names` 4.3.4 / RUSTSEC-2026-0371,
+`zvariant` 5.15.0 / -0370, `zvariant_derive` 5.15.0 / -0372) **remain open** and are not
+closed by this work. Nothing here is a release-readiness claim.
+
+**The finding, and why a yanked version is not a low-severity one.** `async-executor`
+1.14.0 is yanked in the crates.io index, and the reason is recorded upstream: **smol-rs/async-executor
+issue #163**, "Use-after-free when a Waker fires during Executor::drop (regression in
+1.14.0)". The report carries a reproducer and ThreadSanitizer output. The `schedule` closure
+holds the state by reference and its second statement touches the state *after* the runnable
+has been published:
+
+```text
+move |runnable| {
+    let result = state.queue.push(runnable);   // published -- another thread can take it now
+    debug_assert!(result.is_ok());
+    state.notify();                            // still touches `state`
+}
+```
+
+`Executor::drop` reclaims the `Arc` and frees, so a waker firing between those two lines can
+free the allocation underneath it; the reference remains reachable through `Waker` clones after
+the executor is gone. This is undefined behaviour in safe Rust. The issue records that 1.14.0
+reproduces and 1.13.3 does not, and that the difference traces to the change that replaced the
+owned `Arc<State>` in the schedule closure with `Pin<&'a State>`.
+
+**The fix, and why no manifest changed.** Upstream **PR #164** reverted the change
+responsible, and the fix shipped as **v1.14.1** (published 2026-11-02), whose release note
+reads "Fix use-after-free when a Waker fires during Executor::drop (regression in 1.14.0).
+(#164)". The maintainer closed the issue stating that the fix has been released in 1.14.1 and
+1.14.0 was yanked.
+
+The resolution was a **lockfile-only** targeted update:
+
+```
+cargo update -p async-executor --precise 1.14.1
+```
+
+`zbus 5.19.0` declares `async-executor = { version = "^1.11.0", optional = true }`, and
+1.14.1 is inside that range, so no manifest constraint had to change.
+
+**Registry facts, read from the local index cache cargo resolves against** (not from a
+summary):
+
+| Version | Yanked | Checksum |
+|---|---|---|
+| `1.13.3` | no | `497c00e0fd83a72a79a39fcbd8e3e2f055d6f6c7e025f3b3d91f4f8e76527fb8` |
+| `1.14.0` | **yes** | `c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a` |
+| `1.14.1` | no | `f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37` |
+
+The lockfile's new checksum is `f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37`,
+which matches the index entry for 1.14.1.
+
+**The exact lockfile delta — two changed lines, one package.** The whole diff is:
+
+```
+-name = "async-executor"
+-version = "1.14.0"
++version = "1.14.1"
+-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
++checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
+```
+
+The package set is **unchanged at 276**: exactly one `(name, version)` pair changed
+(`async-executor 1.14.0 -> 1.14.1`), **no** package was added or removed, **no** other
+version moved, **no** other checksum changed, and **no** other package's dependency edge
+changed. This was checked by comparing every package's full lockfile stanza before and
+after, not by reading the diff hunks: **no unrelated package and no unrelated edge moved.**
+That was the condition for accepting this change, and it held.
+
+**The dependency path is unchanged.** `cargo tree -e features -i async-executor` reports the
+same path as before, with the version updated:
+
+```
+async-executor v1.14.1
+└── async-executor feature "default"
+    └── zbus v5.19.0
+        ├── zbus feature "async-executor"
+        │   └── zbus feature "async-io"
+        │       └── zbus feature "default"
+        │           └── zbus-secret-service-keyring-store v1.0.1
+        │               └── zbus-secret-service-keyring-store feature "crypto-rust"
+        │                   └── keyring v4.2.0
+        │                       └── keyring feature "v1"
+        │                           └── orxnud-platform-secrets v0.1.0
+```
+
+**Reachability, assessed rather than assumed.** The advisory's precondition is a waker
+firing from a thread that is not driving the executor, concurrently with the executor being
+dropped. OpenRayNux does not construct an `async_executor::Executor` itself; the crate
+arrives through `zbus`'s `async-io` feature, which is enabled by `zbus`'s default feature, via
+the Secret Service keyring store. Whether a path in this repository's own code can produce
+that schedule is **not established here**, and this work does not claim it. The version was
+moved anyway, for the reason this register used for the four `rustls 0.23.45` advisories,
+for **A-015** and for **A-035**: the fix is a patch release inside an already-permitted
+range, it costs nothing, and "no advisory is currently reachable" would be a statement about
+today's call graph rather than a property that survives someone changing a dependency. Here
+the argument is stronger than for those, because the upstream issue carries a **reproducer**
+rather than a description.
+
+**Gate evidence, measured with the CI-pinned tools** (`cargo-deny 0.20.2`,
+`cargo-audit 0.22.2`, `rustc 1.98.1`):
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| G8 (licences) | `cargo deny check licenses` | exit 0 | exit 0 — `licenses ok` |
+| G8 (supply chain) | `cargo deny check bans sources advisories` | exit 0 | exit 0 — `advisories ok, bans ok, sources ok` |
+| G11 | `cargo audit` | exit 0 — **4** allowed warnings (3 unmaintained, 1 yanked) | exit 0 — **3** allowed warnings (3 unmaintained) |
+| G9 | `cargo nextest run --workspace --all-targets` | 2040 passed, 6 skipped | **2040 passed, 6 skipped** |
+
+`./scripts/ci-gates.sh` exits 0 with `all selected gates passed` (G12 skips with its loud
+message, as it always does without a release tag). The **yanked** finding is now absent from
+both scanners: `cargo deny check bans sources advisories` reports no `warning[yanked]`, and
+`cargo audit --json` reports `vulnerabilities: 0` and `warnings: {unmaintained: 3}` — the
+three unmaintained zbus-family crates and nothing else.
+
+**A note on what the yanked finding was, and was not.** `deny.toml` classifies a yanked
+version as a **warning**, and that policy is unchanged by this work. But the policy is not a
+judgement that a yanked version is harmless: a yank is the publisher asking Cargo not to
+select that version in **new** resolution — it deletes nothing, and an existing `Cargo.lock`
+keeps resolving to it, so a yanked version can sit in a lockfile indefinitely. The yank here
+came with a **use-after-free** and a yank of the offending version, which makes the
+provisional "warning" classification here a description of the *policy*, not a statement
+about the *risk*. That distinction is why this entry records the upstream issue and the
+reproducer rather than treating the removal of a yanked version as routine housekeeping.
+
+**What was deliberately not done.** No manifest was edited. No advisory id was added to
+`deny.toml`'s `ignore = []`, which remains empty. No gate was weakened. The
+`keyring`/`secret-service`/`zbus` subtree was **not** migrated, and the three unmaintained
+zbus-family crates were **not** silenced: silencing them would need the compatibility and
+credential-semantics assessment recorded as open work, not a lockfile edit.
+
+**A correction to the sequencing assumption this work was planned under.** It was expected that
+a zbus 5 -> 6 migration would **not** remove `async-executor` from the dependency graph,
+because zbus 6.2.1's registry entry still lists `async-executor ^1.11.0` as a non-optional
+dependency. **That expectation is wrong, and the difference is the dependency *kind*.** The
+zbus 6.2.1 index entry lists `async-executor` with `kind = "dev"`, and a dev-dependency of
+a crate is **not** part of that crate's **consumers'** dependency graph. Measured directly: a
+scratch crate depending on `zbus = "=6.2.1"` resolves a graph with **zero**
+`async-executor` nodes and no `async-executor` entry in its `Cargo.lock`; the same holds for
+zbus 6.3.0. zbus 5.19.0, by contrast, lists it as `kind = "normal"`, which is why it is in
+this repository's graph.
+
+So the `async-executor` removal does **not** have to wait for Phase 3 — it is reachable by
+this lockfile update alone, and Phase 3 is about the **three unmaintained** crates and about
+credential-storage semantics, not about `async-executor`. This is recorded here because the
+planning assumption was checked rather than inherited, and because the difference between
+`kind = "normal"` and `kind = "dev"` decides whether a crate is in a consumer's build at
+all.
+
+**Not claimed.** No Windows validation was performed by this work. The upstream defect is a
+concurrency defect, and this work does not claim the race is reachable from OpenRayNux's code
+-- only that the affected version was in the Linux dependency graph and has been moved off it.
+The three unmaintained zbus-family findings remain. The two "leaky" sandbox tests are
+unrelated to this work and were not introduced by it. **No release-readiness is claimed.**
+
+| | |
+|---|---|
+| **event** | any change to `async-executor` in any manifest or to `Cargo.lock`; and any change to `deny.toml`'s `[advisories]` policy |
+| **date** | 2026-11-13 |
+| **severity** | **High for the defect, Medium for the process.** The advisory is a use-after-free with a published reproducer, in a crate that was in the production dependency graph. The process point is that it was carried as a *warning* for a week, and a yanked version that upstream yanked **because of a use-after-free** is not a finding that should be filed under "policy says warnings are fine". |
+
+### A-038 — Phase 3 investigated, not implemented: the upstream path exists but is not released
+
+**This is an investigation record. It changes no dependency, no manifest, no gate and no
+code.** The three **unmaintained** zbus-family findings (`zbus_names` 4.3.4 /
+RUSTSEC-2026-0371, `zvariant` 5.15.0 / -0370, `zvariant_derive` 5.15.0 / -0372) **remain
+open**, and nothing here closes them: **F-26c remains OPEN**, **F-26b/S-30 remain OPEN**,
+**S-11 remains OPEN**, **S-31 remains implemented but not complete**, and **F-26 remains
+OPEN**. No release-readiness is claimed.
+
+**Objective 1 — upstream maintainer intent: there is none to establish.** The relevant
+upstream work is **open-source-cooperative/zbus-secret-service-keyring-store PR #39**, "Move to
+secret-service 6 and zbus 6 (waits on secret-service 6.0.0)". Measured state of that PR:
+**OPEN and `isDraft: true`**, `mergeable: MERGEABLE`, created 2026-11-09 and **not updated
+since creation**, with **0 review comments, 0 issue comments, 0 formal reviews and 0
+check-runs** on the head SHA `23e8480`. The PR body states its own gating condition
+explicitly: *"This waits on secret-service 6.0.0. It depends on `6.0.0-rc.1` because that is
+the only zbus 6 release so far. I've opened it as a draft so you have it as rc feedback; once
+6.0.0 is out, the requirement can become `"6"` and this can be marked ready."*
+
+So the versioning decision the PR author left to the maintainers — *"Whether that makes this
+a 1.x or a 2.0 release is your call"* — is **still open, and the PR is explicitly parked
+waiting for a release that does not exist**. The adapter's release history has not moved
+either: v1.0.1 (2026-08-15) is still the latest, and v1.0.0 was 2026-04-21. **There is no
+upstream signal to plan against**, and the PR's own test results are contributor-reported
+rather than upstream-CI-verified, because no check-runs are attached.
+
+**Objective 2 — whether a stable Secret Service 6 preserves the blocking API and the existing
+credential operations.** A stable **`secret-service 6.0.0` does not exist**: the registry lists
+only `6.0.0-rc.1` as the 6.x line. The distinction is worth stating precisely, because it is
+narrower than "6.0.0 does not exist": the release candidate **is** tagged and published
+upstream — `secret-service-rs` carries the release `v6.0.0-rc.1`, published **2026-11-06**, and
+crates.io carries `6.0.0-rc.1` with `max_stable: 5.2.0` and `max_version: 6.0.0-rc.1`. What
+remains unpublished is the **stable** `6.0.0`, and that is the specific thing upstream PR #39
+waits on. The question was therefore answered against the release
+candidate, which is the only thing that could be answered, and it is answered
+**affirmatively on the blocking API**:
+
+* the `blocking` module exists in both 5.2.0 and 6.0.0-rc.1, and the public blocking
+  surface is unchanged — `connect`, `connect_with_existing`, `get_all_collections`,
+  `get_collection_by_alias`, `get_default_collection`, `get_any_collection`,
+  `create_collection`, `search_items`, `unlock_all`, `get_item_by_path`,
+  `get_collection_by_path`, `is_locked`, `ensure_unlocked`, `unlock`, `lock`,
+  `get_attributes`, plus `create_item`, `get_secret`, `set_secret` and `delete` on items;
+* the `Error` enum changes shape (`Zvariant(zvariant::Error)` is present in 5.2.0 and absent
+  in 6.0.0-rc.1), which is the public-API change the PR flags;
+* **the credential operations were exercised against a live Secret Service**, not inferred
+  from a compiling API. A `gnome-keyring-daemon` and a session bus are present on this host
+  (`org.freedesktop.secrets` answers `Peer.Ping` on
+  `unix:path=/run/user/1000/bus`), so the same program was run against both stacks against
+  the real `Login` collection:
+
+  | Operation | secret-service 5.2.0 | secret-service 6.0.0-rc.1 |
+  |---|---|---|
+  | create | `orxnud-phase3-probe-339993` written | `orxnud-phase3-probe-340628` written |
+  | retrieve | returned the written value | returned the written value |
+  | update | returned the updated value | returned the updated value |
+  | delete | done | done |
+
+  **A credential written by the OLD stack was then read by the NEW stack**: an item created
+  with `secret-service 5.2.0` carrying `written-by-secret-service-5` was read through
+  `secret-service 6.0.0-rc.1` and returned that exact value. **Pre-existing credentials
+  survive the migration**, on a live keyring.
+
+  What was **not** exercised: a wrong-password/unlock failure path, and an
+  `orxnud-platform-secrets` end-to-end run against the migrated stack.
+
+**Objective 3 — the feature mapping in PR #39, assessed independently.** The diff is six
+files and 14 changed lines. The substantive part is `Cargo.toml`: `secret-service` `"5"` ->
+`"6.0.0-rc.1"`, `zbus` `"5"` -> `{ version = "6", default-features = false }`, MSRV
+`1.88` -> `1.89`, and the four `rt-*` features remapped because **secret-service 6 has no
+runtime-specific crypto features** — its feature set is now `crypto-openssl`, `crypto-rust`,
+`default`, `rt-default`, `rt-tokio`. The compatibility aliases keep the old names building:
+`rt-async-io-crypto-rust` -> `["crypto-rust"]` and `rt-tokio-crypto-rust` ->
+`["crypto-rust", "secret-service/rt-tokio"]`.
+
+The runtime consequence is the part worth stating plainly: **the old
+`rt-async-io-crypto-*` features no longer select an async-io runtime**, because secret-service
+6 brings its own runtime (zbus 6's `zruntime`). The name survives; the runtime does not.
+That is a real behavioural change for any dependent that selected those features
+explicitly.
+
+**Which of those features this repository actually selects** was measured rather than
+assumed. `keyring 4.2.0` requests the adapter with **`features = ["crypto-rust"]`** and
+`default_features = true`; the adapter defines **no `default` feature** in either the
+released 1.0.1 or the PR head, so `default_features = true` selects nothing. The `rt-*`
+aliases are therefore **not selected on our path**. Our path is `crypto-rust` only, and
+`crypto-rust` is unchanged by the PR.
+
+**Objective 4 — whether the complete resolved graph removes the three unmaintained crates.**
+Verified on the **full chain**, not on the direct zbus dependencies: `keyring 4.2.0` ->
+adapter (PR head) -> `secret-service 6.0.0-rc.1` -> `zbus 6.3.0`, resolved with
+`[patch.crates-io]` pointing the adapter at the PR head. In that resolved lockfile
+(96 packages):
+
+| Crate | Present? |
+|---|---|
+| `zbus_names` | **ABSENT** |
+| `zvariant` | **ABSENT** |
+| `zvariant_derive` | **ABSENT** |
+| `async-executor` | **ABSENT** |
+
+All four are gone, and the resolution is reproducible.
+
+**Objective 5 — whether the adapter flows through the existing `keyring 4.2.0` constraint
+without changing our credential behaviour.** Two parts, both measured.
+
+*Constraint.* `keyring 4.2.0` requires the adapter at **`^1`**, and the PR head keeps
+**`version = "1.0.1"`** with no version bump in the diff. So a 1.x release of the adapter
+satisfies `keyring 4.2.0` as it stands and reaches `keyring` users through `cargo update`; a
+2.0 release would need a `keyring` release too. **The MSRV is not a blocker here**: the PR
+raises the adapter's MSRV to `1.89`, and this repository pins `rustc 1.98.1`.
+
+*Behaviour.* The exact API surface `crates/orxnud-platform-secrets` uses —
+`keyring::Entry::new`, `set_password`, `get_password`, `delete_credential`, and
+`keyring::Error::NoEntry` — **compiles unchanged** against `keyring 4.2.0` with the adapter
+PR patched in, `secret-service 6.0.0-rc.1` and `zbus 6.3.0`.
+
+**Why this is an investigation and not an implementation.** The upstream route is real and
+mechanically proven, but it depends on a release that does not exist. Adopting it now would
+mean pinning a **release candidate** (`secret-service 6.0.0-rc.1`) in the credential path of
+a credential store, on the strength of a **draft** PR with **no maintainer response**, and
+against an upstream whose own compatibility alias (`rt-async-io-*`) silently changes which
+runtime is used. The three findings are `unmaintained` warnings under
+`unmaintained = "workspace"` — they do not fail the gate, and the crates are transitive.
+That is the trade this row records, and the decision belongs to a separately authorised change
+once upstream has published.
+
+**Also recorded, because it changes the sequencing: Phase 3 is NOT a prerequisite for
+removing `async-executor`.** The planning assumption was that zbus 6 still depends on
+`async-executor`, so migrating would not remove it. **That is wrong, and the difference is
+the dependency *kind*.** zbus 6.2.1 and 6.3.0 list `async-executor` with `kind = "dev"`,
+and a dev-dependency is **not** part of a crate's **consumers'** dependency graph. Measured
+directly: a scratch crate depending on `zbus = "=6.2.1"` resolves a graph with **zero**
+`async-executor` nodes and no `async-executor` entry in its `Cargo.lock`; the same holds for
+zbus 6.3.0. zbus 5.19.0 lists it as `kind = "normal"`, which is why it is in this
+repository's graph at all. So the `async-executor` removal was reachable by the lockfile
+update alone (**A-037**), and Phase 3 is about the **three unmaintained** crates and about
+credential-storage semantics.
+
+**A separate finding, not a Phase 3 item: `s30_restore_not_public` depends on live registry
+access.** The DNS incident during A-037's verification exposed this. The test compiles a
+probe crate with `cargo check`, which resolves `thiserror`, `serde` and `rusqlite` from the
+registry, so a DNS failure fails it for an unrelated reason. Measured, and the options differ
+materially:
+
+| approach | with the registry index cache present | with the index cache absent |
+|---|---|---|
+| current (`cargo check`) | works | fails on DNS |
+| `cargo check --offline` | **works, and produces the same E0603/E0624 stderr the assertion requires** | fails: "no matching package named `thiserror`" |
+| `cargo check --offline` + `cargo vendor` | works | **works — the probe fails to compile for the right reason with the index hidden** |
+
+So `--offline` alone removes the *network* dependency but still needs the local index cache;
+`cargo vendor` makes the probe genuinely hermetic. Two cautions if this is taken up: the
+vendored tree is ~64 MB and 35 crates, so it is a cache rather than a committed artefact; and
+a **resolution** failure produces stderr that does **not** mention `RestoreGuard`, `restore`,
+`E0624` or `E0603` (0 matching lines, measured), so the existing second assertion would
+correctly fail rather than let a broken probe pass. The failure mode is loud, not silent —
+which is the property that matters most here.
+
+**Monitoring, and the baseline against which a re-check is measured.** There is **no recurring
+automation** in this repository for this: a scheduled job that repeatedly checked unchanged
+information would be infrastructure with no claim behind it. The arrangement is GitHub watch
+plus an on-demand re-check, and the baseline is recorded here so that a later re-check can say
+what changed rather than merely re-reporting a state.
+
+**The Watch subscriptions are not yet in place.** The arrangement is agreed, but the
+authenticated account was measured as **not subscribed** to either repository
+(`user/repos/{owner}/{repo}/subscription` returns "not subscribed" for both). Until that is
+changed, the "GitHub watch" half of the arrangement is **not operational**, and this row must
+not be read as claiming that a notification will arrive. The on-demand re-check works today
+and is the half in use; the watch is the half still outstanding.
+
+| Watched | Baseline at 2026-11-14 |
+|---|---|
+| `open-source-cooperative/zbus-secret-service-keyring-store` — PR #39 | `state=OPEN draft=true head=23e8480 updated=2026-11-09 reviews=0 comments=0` |
+| `open-source-cooperative/secret-service-rs` — releases | `v6.0.0-rc.1` (2026-11-06), `v5.2.0` (2026-08-29), `v5.1.0` (2025-09-03) |
+| crates.io — `secret-service` | `max_stable: 5.2.0`, `max_version: 6.0.0-rc.1`; **no stable 6.x** |
+
+A re-check verifies the crates.io release status, PR #39's state, maintainer reviews, the CI
+results on the PR head, and the adapter's compatibility with the existing `keyring` dependency.
+The change worth watching is the **stable** `secret-service 6.0.0` reaching crates.io: that is
+the event this row's milestone names, and until it happens the three unmaintained findings stay
+warnings under the current policy and the migration stays unimplemented.
+
+**Not claimed.** No upstream release was merged, no profile was changed, no dependency was
+updated for this row, and no credential-compatibility claim is made beyond what was exercised:
+create, retrieve, update, delete and cross-version read, on one host, with the release
+candidate rather than a stable release, and without the unlock-failure path or an
+`orxnud-platform-secrets` end-to-end run. The PR's own reported test results are
+contributor-reported, not upstream-CI-verified.
+
+| | |
+|---|---|
+| **event** | a **stable** `secret-service` 6.x release (the release candidate is already published, so `6.0.0-rc.1` is not the event); any release of `zbus-secret-service-keyring-store` or `zbus` 6.x; any change to `crates/orxnud-platform-secrets`'s use of `keyring`; and any upstream decision on PR #39's versioning |
+| **date** | 2026-11-13; monitoring baseline recorded 2026-11-14 |
+| **severity** | **Not a defect.** This row records an investigation whose conclusion is that the three unmaintained findings are **not urgent**: they are transitive, they are warnings under the current policy, they do not fail the gate, and the upstream fix exists but is unreleased. It also records the one thing that **is** actionable independently: the `s30_restore_not_public` probe's registry dependence. |
+
 ## 3. The three highest-risk claims
 
 Not by severity of consequence alone, but by **(likelihood of silent drift) ×
