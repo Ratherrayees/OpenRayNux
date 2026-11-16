@@ -4675,7 +4675,12 @@ rather than upstream-CI-verified, because no check-runs are attached.
 
 **Objective 2 — whether a stable Secret Service 6 preserves the blocking API and the existing
 credential operations.** A stable **`secret-service 6.0.0` does not exist**: the registry lists
-only `6.0.0-rc.1` as the 6.x line. The question was therefore answered against the release
+only `6.0.0-rc.1` as the 6.x line. The distinction is worth stating precisely, because it is
+narrower than "6.0.0 does not exist": the release candidate **is** tagged and published
+upstream — `secret-service-rs` carries the release `v6.0.0-rc.1`, published **2026-11-06**, and
+crates.io carries `6.0.0-rc.1` with `max_stable: 5.2.0` and `max_version: 6.0.0-rc.1`. What
+remains unpublished is the **stable** `6.0.0`, and that is the specific thing upstream PR #39
+waits on. The question was therefore answered against the release
 candidate, which is the only thing that could be answered, and it is answered
 **affirmatively on the blocking API**:
 
@@ -4801,6 +4806,31 @@ a **resolution** failure produces stderr that does **not** mention `RestoreGuard
 correctly fail rather than let a broken probe pass. The failure mode is loud, not silent —
 which is the property that matters most here.
 
+**Monitoring, and the baseline against which a re-check is measured.** There is **no recurring
+automation** in this repository for this: a scheduled job that repeatedly checked unchanged
+information would be infrastructure with no claim behind it. The arrangement is GitHub watch
+plus an on-demand re-check, and the baseline is recorded here so that a later re-check can say
+what changed rather than merely re-reporting a state.
+
+**The Watch subscriptions are not yet in place.** The arrangement is agreed, but the
+authenticated account was measured as **not subscribed** to either repository
+(`user/repos/{owner}/{repo}/subscription` returns "not subscribed" for both). Until that is
+changed, the "GitHub watch" half of the arrangement is **not operational**, and this row must
+not be read as claiming that a notification will arrive. The on-demand re-check works today
+and is the half in use; the watch is the half still outstanding.
+
+| Watched | Baseline at 2026-11-14 |
+|---|---|
+| `open-source-cooperative/zbus-secret-service-keyring-store` — PR #39 | `state=OPEN draft=true head=23e8480 updated=2026-11-09 reviews=0 comments=0` |
+| `open-source-cooperative/secret-service-rs` — releases | `v6.0.0-rc.1` (2026-11-06), `v5.2.0` (2026-08-29), `v5.1.0` (2025-09-03) |
+| crates.io — `secret-service` | `max_stable: 5.2.0`, `max_version: 6.0.0-rc.1`; **no stable 6.x** |
+
+A re-check verifies the crates.io release status, PR #39's state, maintainer reviews, the CI
+results on the PR head, and the adapter's compatibility with the existing `keyring` dependency.
+The change worth watching is the **stable** `secret-service 6.0.0` reaching crates.io: that is
+the event this row's milestone names, and until it happens the three unmaintained findings stay
+warnings under the current policy and the migration stays unimplemented.
+
 **Not claimed.** No upstream release was merged, no profile was changed, no dependency was
 updated for this row, and no credential-compatibility claim is made beyond what was exercised:
 create, retrieve, update, delete and cross-version read, on one host, with the release
@@ -4810,8 +4840,8 @@ contributor-reported, not upstream-CI-verified.
 
 | | |
 |---|---|
-| **event** | any release of `zbus-secret-service-keyring-store`, `secret-service` 6.x or `zbus` 6.x; any change to `crates/orxnud-platform-secrets`'s use of `keyring`; and any upstream decision on PR #39's versioning |
-| **date** | 2026-11-13 |
+| **event** | a **stable** `secret-service` 6.x release (the release candidate is already published, so `6.0.0-rc.1` is not the event); any release of `zbus-secret-service-keyring-store` or `zbus` 6.x; any change to `crates/orxnud-platform-secrets`'s use of `keyring`; and any upstream decision on PR #39's versioning |
+| **date** | 2026-11-13; monitoring baseline recorded 2026-11-14 |
 | **severity** | **Not a defect.** This row records an investigation whose conclusion is that the three unmaintained findings are **not urgent**: they are transitive, they are warnings under the current policy, they do not fail the gate, and the upstream fix exists but is unreleased. It also records the one thing that **is** actionable independently: the `s30_restore_not_public` probe's registry dependence. |
 
 ## 3. The three highest-risk claims
