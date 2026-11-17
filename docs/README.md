@@ -50,6 +50,7 @@ capability set. One surface ships today.
 | Sandbox | Tier-1 execution under `bubblewrap`; cgroup v2 ceilings where the host delegates |
 | Transport | JSON-RPC 2.0 over a 0600 Unix socket, protocol version 1, 18 methods |
 | CLI | `orxnuctl` — hand-written parser, 5 verb groups |
+| TUI | `orxnu-tui` — narrow Ratatui slice; daemon status, tasks, preview, approval, execution |
 | Daemon | `orxnud` — composition root, single-instance endpoint, serves the socket |
 | Provider | **One real HTTPS provider**, TLS with chain and hostname verification |
 | AI | **A real proposer**: registry-derived menu → model → durable proposal → approval → governed execution |
@@ -206,12 +207,14 @@ the surfaces listed last, and nothing else.
   seam at which the lock could be released mid-effect. A request that needs durable state
   therefore still queues behind an in-flight sandboxed write. Narrowing that is a change to
   the dispatcher, not to the transport.
-* Also absent: no GUI or Tauri application, no TUI, no MCP surface, no messaging, no local
-  ASR/TTS, no general shell capability, no unrestricted filesystem capability, no Windows
-  sandbox backend, no actor runtime beyond the local authority model. The **TUI is the next
-  mandatory deliverable** for the 2026-11-30 MVP, not a deferred enhancement: a narrow
-  Ratatui client over the existing IPC and protocol, with no policy, storage or domain logic
-  duplicated in the surface.
+* A narrow **`orxnu-tui`** now exists: a Ratatui client that reuses `orxnuctl`'s transport and
+  shows daemon status, task listing and inspection, read-only proposal preview, approval and
+  execution, with `NeedsVerification` rendered as unresolved rather than success. It holds no
+  policy, storage or domain rule. Deeper inspection (proposal listing, execution history) is
+  the remaining TUI work for the 2026-11-30 MVP.
+* Also absent: no GUI or Tauri application, no MCP surface, no messaging, no local ASR/TTS, no
+  general shell capability, no unrestricted filesystem capability, no Windows sandbox backend,
+  no actor runtime beyond the local authority model.
 
 ## 6. Where the evidence is, and what it does not prove
 
@@ -285,10 +288,10 @@ plan was built on a false premise and withdrawn; the current order was decided a
    the current source, define the recovery invariant, and design deterministic
    failure-injection tests. A focused investigation first, not an implementation; kept
    separate from S-11, F-26c and S-31. See `docs/12` F-26b.
-3. **TUI vertical slice** — the mandatory 2026-11-30 MVP deliverable. A narrow Ratatui
-   client over the existing IPC and protocol: daemon status and task listing, task and
-   proposal inspection, approval preview and approval actions, execution results and a
-   visible `NeedsVerification` state. No policy, storage or domain logic in the surface.
+3. **TUI vertical slice — first slice landed.** The narrow Ratatui client is in the tree
+   (ADR-0060): daemon status, task listing and inspection, read-only preview, approval and
+   execution, and a visible `NeedsVerification` state. No policy, storage or domain logic in
+   the surface. Remaining: deeper inspection before the 2026-11-30 MVP.
 4. **Remaining F-26 / S-11 / S-31 review** — establish the release safety boundaries.
 
 The enforced constraint is that another extended round of verification-infrastructure work
@@ -426,7 +429,7 @@ directory.
 | Disclosure | **One approval, two acts**, bound to `(endpoint, model)` | [0045](09-decisions.md#adr-0045) |
 | CI boundary | **A missing guarantee is a refusal to assert, not a skip** | [0046](09-decisions.md#adr-0046) |
 
-The full table of all 57 primary ADRs is in [09-decisions.md](09-decisions.md).
+The full table of all 58 primary ADRs is in [09-decisions.md](09-decisions.md).
 
 ## Open before implementation
 

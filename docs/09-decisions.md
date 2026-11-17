@@ -7398,3 +7398,29 @@ delete the incremental walk. (b) A same-uid hostile process becoming a threat in
 requires a service-identity isolation design; this decision explicitly excludes it.
 (c) A second OS sandbox backend means the destination accessors are no longer
 Linux-shaped and the composition must be revisited.
+
+## ADR-0060 — APPROVED 2026-11-17; IMPLEMENTED — `orxnu-tui` joins the crate graph as a thin terminal surface
+
+**Context.** The architecture (`docs/03`) named `orxnu-tui` as a future thin client over UDS /
+named pipe, and the 2026-11-30 MVP requires a surface a human can actually use. `docs/13` §3.1
+fixes the crate graph and requires an ADR to add a member; gate G7 checks the member list and the
+contract mechanically.
+
+**Decision.** Add `crates/orxnu-tui` as the eighteenth workspace member. It depends on
+`orxnuctl` **only to reuse that crate's client module** — the shipped socket, framing and
+version negotiation — and on `ratatui`/`crossterm`/`serde_json` for presentation. It names no
+domain, store, task-engine, policy, capability or daemon type. Task and proposal state arrives
+as the daemon's JSON and is rendered verbatim; the TUI computes no verdict and makes no policy
+decision. There is no `proposal/list` protocol method, so an operator supplies a proposal id in
+an input line; all proposal semantics stay in the daemon.
+
+**Consequences.** One socket implementation remains. Adding the crate required the `docs/13` §3.1
+graph, the `Cargo.toml` member list, gate G7's expected list and this ADR to move together — which
+is the point of the gate. The first slice covers daemon status, task listing, task inspection,
+read-only proposal preview, approval, execution, and a visible `NeedsVerification` state that is
+never rendered as success. Deep inspection (proposal listing, execution history) and non-Linux
+terminal concerns remain out of scope for this slice.
+
+**Revisit conditions.** A second surface needing the same transport should move the client out
+of `orxnuctl` into a shared crate rather than duplicate it here. A protocol method that lists
+proposals should replace the manual id input.

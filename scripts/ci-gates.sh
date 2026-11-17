@@ -78,6 +78,7 @@ EXPECTED_CRATES=(
   orxnud-platform-secrets
   orxnud-platform-notify
   orxnud-platform-ipc
+  orxnu-tui
 )
 
 FAILED=()

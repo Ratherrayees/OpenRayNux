@@ -22,6 +22,7 @@ members = [
     "crates/orxnud-platform-secrets",
     "crates/orxnud-platform-notify",
     "crates/orxnud-platform-ipc",
+    "crates/orxnu-tui",
 ]
 
 # The crate graph is fixed by docs/13 §3.1. Adding, removing, or merging a
@@ -43,6 +44,10 @@ publish = false
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The TUI's only presentation dependencies. Neither crate is nameable by any
+# domain rule: the interface layer renders JSON the daemon already decided.
+ratatui = "0.30.2"
+crossterm = "0.29.0"
 thiserror = "2.0.21"
 # `bundled` pins and compiles SQLite from the amalgamation (ADR-0006 rev 2: never
 # link the host's library). `backup` adds the online-backup API, which ADR-0017
@@ -128,6 +133,7 @@ orxnud-platform-sandbox = { path = "crates/orxnud-platform-sandbox" }
 orxnud-platform-secrets = { path = "crates/orxnud-platform-secrets" }
 orxnud-platform-notify = { path = "crates/orxnud-platform-notify" }
 orxnud-platform-ipc = { path = "crates/orxnud-platform-ipc" }
+orxnuctl = { path = "crates/orxnuctl" }
 
 [profile.release]
 lto = "thin"

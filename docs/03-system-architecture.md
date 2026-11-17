@@ -545,7 +545,7 @@ runner, and is fixed (V-29).
 |---|---|
 | `orxnuctl` | **Ships.** Hand-written argument parser — `clap` is a workspace dependency and is deliberately **unused**, recorded in `crates/orxnuctl/Cargo.toml` as the smaller dependency for a closed verb set. Verbs: `version`, `doctor`, `task {create,list,claim,complete,cancel,propose,execute,ai-propose}`, `capability {run,approve}`, `provider credential {set,delete,status}` |
 | `orxnu-gui` (Tauri 2 + Svelte 5) | **FUTURE** (ADR-0002, ADR-0005). No crate, no `package.json` |
-| `orxnu-tui` (Ratatui) | **FUTURE** |
+| `orxnu-tui` (Ratatui) | **PRESENT — first slice (ADR-0060)** |
 | `orxnu-mcp-host` | **FUTURE** (ADR-0010) |
 | Programmatic API crate | **FUTURE** |
 
@@ -770,7 +770,7 @@ continuation wiring (ADR-0047) and its observation/disclosure wiring (ADR-0048).
 
 ### Not implemented, and not planned into the near milestone
 
-No GUI or Tauri application. No TUI. No MCP surface (ADR-0010 keeps MCP an external
+No GUI or Tauri application. A narrow `orxnu-tui` exists. No MCP surface (ADR-0010 keeps MCP an external
 integration boundary). No messaging integration. No local ASR or TTS runtime. No general
 shell capability. No unrestricted filesystem capability — both filesystem capabilities
 address exactly one file inside a sandbox-controlled workspace, with no directory creation,
