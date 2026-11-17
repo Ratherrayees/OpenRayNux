@@ -403,17 +403,17 @@ impl Durability {
 pub fn fsync_file(p: &Path) -> Result<(), RecoveryError> {
     #[cfg(test)]
     record::note("fsync_file", p);
-    // On Windows `File::open` yields a read-only handle, and `sync_all` bottoms out in
-    // `FlushFileBuffers`, which rejects a handle without write access. Open with write
-    // access there; on Unix keep the read-only open so its permissions are not broadened.
-    #[cfg(windows)]
-    let opened = std::fs::OpenOptions::new().write(true).open(p);
-    #[cfg(not(windows))]
-    let opened = std::fs::File::open(p);
-    let f = opened.map_err(|source| RecoveryError::Io {
-        what: format!("open {} to flush it", p.display()),
-        source,
-    })?;
+    // Open with write access on every platform. Windows' `sync_all` bottoms out in
+    // `FlushFileBuffers`, which rejects the read-only handle `File::open` produces;
+    // a portable write-open supplies that access without truncating the file. Keeping
+    // one operation everywhere also keeps platform branches out of this crate.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(p)
+        .map_err(|source| RecoveryError::Io {
+            what: format!("open {} to flush it", p.display()),
+            source,
+        })?;
     f.sync_all().map_err(|source| RecoveryError::Io {
         what: format!("flush {}", p.display()),
         source,
