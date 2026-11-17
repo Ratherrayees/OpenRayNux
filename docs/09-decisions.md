@@ -7406,7 +7406,7 @@ named pipe, and the 2026-11-30 MVP requires a surface a human can actually use. 
 fixes the crate graph and requires an ADR to add a member; gate G7 checks the member list and the
 contract mechanically.
 
-**Decision.** Add `crates/orxnu-tui` as the eighteenth workspace member. It depends on
+**Decision.** Add `crates/orxnu-tui` as the seventeenth workspace member (17 in total). It depends on
 `orxnuctl` **only to reuse that crate's client module** — the shipped socket, framing and
 version negotiation — and on `ratatui`/`crossterm`/`serde_json` for presentation. It names no
 domain, store, task-engine, policy, capability or daemon type. Task and proposal state arrives
