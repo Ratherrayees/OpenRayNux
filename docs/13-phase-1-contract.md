@@ -67,6 +67,8 @@ orxnud-obs           ── tracing wiring + redaction + optional OTLP.
        │
 orxnud-daemon        ── composition root, supervision, lifecycle, single-instance.
 orxnuctl             ── the CLI. Depends on protocol ONLY.
+orxnu-tui            ── the TUI. A thin Ratatui client that reuses the CLI's
+                        transport; no task, policy or storage rule of its own.
 ```
 
 **Platform adapters** (Phase 1 creates only the three with no OS risk):
