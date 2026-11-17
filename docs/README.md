@@ -386,7 +386,7 @@ directory.
 |---|----------|----------------|
 | **03** | [System Architecture](03-system-architecture.md) | **Start here.** The shape, the crate graph, the 9 dispatcher stages, **§9a: where the implementation actually stands**, and **§10: the verifier-admission invariant (K.1)**. |
 | **12** | [Verification Register](12-verification-register.md) | **The highest-leverage file.** 109 rows (107 V rows plus `K.1` and `F-26`): every claim that can become false, its verification source, its review trigger, and the consequence of drift. |
-| **09** | [Architecture Decision Records](09-decisions.md) | 57 primary ADRs, ADR-0001…ADR-0059 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, and ADR-0058 carries three implementation notes, none of which are separate records). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
+| **09** | [Architecture Decision Records](09-decisions.md) | 58 primary ADRs, ADR-0001…ADR-0060 (0041 and 0042 deliberately unused; ADR-0050 also carries an amendment, and ADR-0058 carries three implementation notes, none of which are separate records). Evidence, trade-offs, rejected alternatives, **revisit conditions**. |
 | **07** | [Extension & Capability Model](07-extension-capability-model.md) | The dispatcher order, the declaration structure, parameter schemas, target semantics, and the real registry. |
 | **04** | [Security & Threat Model](04-security-threat-model.md) | **Normative.** Trust boundaries, threats, controls — and **§5a: the threats Stage 4c and the CI work introduced.** |
 | **06** | [Deployment & Platform Model](06-deployment-platform-model.md) | Profiles, the platform boundary, and **§2.3: the honest per-platform assessment.** |
@@ -400,6 +400,7 @@ directory.
 | **13** | [Phase 1 Contract](13-phase-1-contract.md) | **Historical.** The agreement Phase 1 was measured against. |
 | **14** | [Phase 2 Contract & Delivery Record](14-phase-2-contract.md) | **Historical.** Durability, the engine, measured `synchronous = FULL`. |
 | **15** | [Phase 4a Record](15-phase-4a-record.md) | **Historical.** The verified execution boundary, including the V-45 measurement correction. |
+| **16** | [Release-safety boundary review](16-release-safety-boundary.md) | **Read-only inventory.** F-26/S-11, F-26b and F-26c/S-31: each invariant, every production entry point, its enforcement and evidence, the remaining gap, and the exact closure condition. Nothing is closed by it. |
 | **sources.md** | [Sources](sources.md) | Version claims with URLs and access dates. |
 
 ## The decisions at a glance
