@@ -198,6 +198,10 @@ impl From<&TaskRepoError> for TaskCause {
             // remedy is to let recovery settle it, not to edit the request, which is what
             // makes this a conflict rather than bad input.
             TaskRepoError::EffectOutcomeUnresolved { .. } => Self::Conflict,
+            // The ceiling was reached inside the claim's transaction: the request
+            // is well-formed and the engine is simply saturated, so the client's
+            // remedy is to wait, exactly as for a state conflict.
+            TaskRepoError::ConcurrencyLimitReached { .. } => Self::Conflict,
             // The execution identity is taken: someone already asked for this step's
             // attempt. Same conflict class as a state refusal, and distinct from
             // `AlreadyExists` above, which means the caller's chosen *identifier* collided
@@ -366,9 +370,13 @@ impl From<TaskRepoError> for EngineError {
             // Kept as its own arm rather than folded into the group above: appending a
             // `|` variant to an existing arm's pattern changes every variant already in
             // it, which is how four unrelated refusals once became conflicts at once.
-            | TaskRepoError::EffectOutcomeUnresolved { .. } | TaskRepoError::ClaimFenced { .. } => {
-                EngineErrorKind::ConcurrencyConflict
-            }
+            | TaskRepoError::EffectOutcomeUnresolved { .. }
+            | TaskRepoError::ClaimFenced { .. }
+            // A ceiling reached inside the claim's transaction. Its message is
+            // the same one `EngineLimits::refuse_over_limit` used to produce
+            // when the check happened in this crate, so callers see an unchanged
+            // wire-level reason for the same retryable condition.
+            | TaskRepoError::ConcurrencyLimitReached { .. } => EngineErrorKind::ConcurrencyConflict,
             TaskRepoError::UnknownState { .. } | TaskRepoError::Corrupt(_) => {
                 EngineErrorKind::Invariant
             }

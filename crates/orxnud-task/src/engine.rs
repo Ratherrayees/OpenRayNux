@@ -196,15 +196,17 @@ impl DurableEngine {
         worker: &str,
         now_ms: i64,
     ) -> Result<Option<ClaimedTask>, EngineError> {
-        let live = self
-            .repo_ref()
-            .live_leases(now_ms)
-            .map_err(EngineError::from)?;
         let limits = self.limits;
-        if !limits.can_claim(live, now_ms) {
-            return Err(limits.refuse_over_limit(live));
-        }
-        let outcome = self.repo().claim(worker, now_ms, limits.lease_duration_ms);
+        // The ceiling is enforced by the STORE, inside the claim's own
+        // `BEGIN IMMEDIATE`. A read here, before that transaction, would be a
+        // time-of-check / time-of-use gap: concurrent callers could each observe
+        // a free slot and all take it, which is exactly the defect A-041 fixes.
+        let outcome = self.repo().claim_with_budget(
+            worker,
+            now_ms,
+            limits.lease_duration_ms,
+            limits.max_concurrent_leases,
+        );
         match outcome.map_err(EngineError::from)? {
             ClaimOutcome::Claimed(c) => Ok(Some(*c)),
             // A task past its budget was dead-lettered rather than skipped. The
@@ -235,18 +237,19 @@ impl DurableEngine {
         worker: &str,
         now_ms: i64,
     ) -> Result<ClaimAttempt, EngineError> {
-        let live = self
-            .repo_ref()
-            .live_leases(now_ms)
-            .map_err(EngineError::from)?;
         let limits = self.limits;
-        if !limits.can_claim(live, now_ms) {
-            return Err(limits.refuse_over_limit(live));
-        }
+        // The same atomic ceiling as the generic claim: narrowing the choice to
+        // one task must not open a second way around the limit.
         Ok(
             match self
                 .repo()
-                .claim_specific(id, worker, now_ms, limits.lease_duration_ms)
+                .claim_specific_with_budget(
+                    id,
+                    worker,
+                    now_ms,
+                    limits.lease_duration_ms,
+                    limits.max_concurrent_leases,
+                )
                 .map_err(EngineError::from)?
             {
                 TargetedClaimOutcome::Claimed(c) => ClaimAttempt::Claimed(c),
