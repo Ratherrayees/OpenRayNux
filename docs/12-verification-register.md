@@ -5259,21 +5259,22 @@ on without relying on the race. **Mutation-checked**: with `claim_limits()` reve
 documented limits, that case fails (exit 1) while the concurrency test still passes load-free,
 which is exactly the gap it exists to close.
 
-**The separate defect, still open.** `max_concurrent_leases` is documented as a ceiling, and it
-is not enforced atomically: the budget check is a read outside the claim's write transaction, so
-concurrent callers can each observe a count below the ceiling and all proceed. This is a real
-engine defect, independent of the test, and it is **not** fixed here. It needs its own change,
-with its own failing test first -- N+1 tasks with a budget of N must yield exactly N claims,
-deterministically -- because it touches the claim path, which is authority-adjacent and
-therefore carries the weight ADR-0006 and the G2d gate give it. Until then, `max_concurrent_leases`
-must be read as a *target* that the engine usually keeps, not as an invariant it guarantees.
+**The separate defect, recorded here and now fixed in A-041.** `max_concurrent_leases` is
+documented as a ceiling, and it was not enforced atomically: the budget check was a read outside
+the claim's write transaction, so concurrent callers could each observe a count below the ceiling
+and all proceed. That was a real engine defect, independent of the test, and it was deliberately
+**not** fixed here: it touches the claim path, which is authority-adjacent and therefore carries
+the weight ADR-0006 and the G2d gate give it. A-041 closes it with its own failing test and its
+own reviewed change. Until that landed, `max_concurrent_leases` had to be read as a *target* the
+engine usually kept, not as an invariant it guaranteed.
 
 **What was deliberately not done.** No limit in `EngineLimits::documented()` was changed; the
 documented 8 is untouched, and the fixture opts into a larger budget for itself. No gate was
 weakened, no test was skipped or made conditional, and no parallelism was reduced. The occurrence
 records were not rewritten.
 
-**Not claimed.** The engine-side atomicity defect is open. The three unmaintained zbus-family
+**Not claimed.** The engine-side atomicity defect was open when A-040 was written and is closed
+in A-041; the two outcomes are deliberately kept distinct. The three unmaintained zbus-family
 crates, F-26c, F-26b/S-30, S-11 and S-31 are unaffected and remain as recorded elsewhere.
 
 | | |
@@ -5281,6 +5282,76 @@ crates, F-26c, F-26b/S-30, S-11 and S-31 are unaffected and remain as recorded e
 | **event** | any change to `EngineLimits::documented`, to `claim_task_at`'s budget check, to `TaskRepo::claim`'s transaction, or to the concurrent-claim fixture |
 | **date** | 2026-11-16 |
 | **severity** | **Low for behaviour, Medium for the record, and Medium for the engine defect it exposes.** The test was wrong about its own subject: it asserted a property it could only reach through a race, and the register said the cause was unknown when it was a documented budget. A suite that fails for a reason unrelated to what it checks trains people to discount it, and this one had already been discounted as "a flake" in twelve records. The engine defect is Medium on its own terms: a documented ceiling that is not enforced atomically is a ceiling that holds only while callers do not overlap. |
+
+### A-041 — `max_concurrent_leases` is now enforced inside the claim transaction
+
+**This closes the engine defect that A-040 recorded as separate and open.** The two outcomes are
+kept distinct: A-040 closed the fixture-observation failure of V-68, this entry closes the
+production ceiling's non-atomic enforcement. Neither is silently folded into the other.
+
+**The invariant, stated explicitly.** At every instant, the number of live leases created by
+this engine is **at most `max_concurrent_leases`**, regardless of how many callers are claiming
+concurrently. A "live" lease is one whose `lease_expires_at_ms` is in the future at the instant
+of the check -- the same predicate [`TaskRepository::live_leases`] has always used, so a crashed
+worker's task still does not consume a slot forever. The ceiling is a ceiling, not a target.
+
+**The defect.** `claim_task_at` and `claim_task_id` each read `live_leases()` on the shared
+connection, compared it with the limit, and only then called a store method that opened its own
+`BEGIN IMMEDIATE`. The check and the lease creation were therefore in different critical
+sections. Two callers could observe the same count and both create a lease; with N+1 callers and
+a budget of N, N+1 leases were created. A-040 found it because the V-68 fixture accidentally
+depended on it; the engine's own regrowth was measured in this entry without that fixture.
+
+**The failing test, written first.** `concurrent_claims_never_exceed_the_configured_lease_capacity`
+and `targeted_claims_never_exceed_the_configured_lease_capacity` force the interleaving without
+adding hooks to production code: the test holds an external `BEGIN IMMEDIATE` while N+1 callers
+read the count and queue at their own `BEGIN`, so none can see another's lease before all have
+passed the check. The callers signal once their engines are built; the brief wait after the last
+signal only lets them reach their own BEGIN, which is a local operation. Against the unmodified
+engine the generic case failed **6/6** runs with `left: 4, right: 3` (three callers allowed, four
+leases created); the targeted case failed identically. That is the exact TOCTOU, not a
+probabilistic scheduling artefact.
+
+**The change.** The store gained `claim_with_budget` and `claim_specific_with_budget`, which run
+the ceiling read on the transaction's own connection **immediately after `BEGIN IMMEDIATE`** and
+before `take_lease`. Both the read and the lease creation are in one serialized critical section,
+so a caller that observes a free slot holds the write lock until its own lease exists. The check
+uses one shared `LIVE_LEASES_SQL` constant with `live_leases()`, so the two cannot disagree about
+expiry. When full, the store returns a new `TaskRepoError::ConcurrencyLimitReached { live, max }`,
+which the engine maps to `ConcurrencyConflict` with the **same message** its old pre-check
+produced -- callers see an unchanged retryable reason for the same condition. The engine's
+pre-transaction reads and `can_claim` calls are gone from both paths. The unbounded store methods
+remain for callers that own the policy themselves (the store's own tests and fault injection);
+the engine always supplies a ceiling.
+
+**Verification.** Both tests passed 8/8 after the change (against 6/6 failures before), and each
+is **mutation-checked**: reverting the generic path to the pre-transaction check makes the generic
+test fail with `left: 4, right: 3`; doing the same to the targeted path fails the targeted test
+with the same count. Full gate suite: `CI=true ./scripts/ci-gates.sh` exit 0, `all selected gates
+passed`, **2048 run / 2048 passed / 6 skipped** (up two from the new tests), 181 boundary-gate
+self-tests. `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+are clean.
+
+**What was deliberately not done.** No value in `EngineLimits::documented()` changed; the
+documented budget remains 8. The unbounded store methods were not removed or made to enforce a
+policy they do not own. No gate was weakened, no test was skipped or lowered, and V-68's own
+fixture and occurrence records are untouched. The ceiling is enforced only for claims made
+through `DurableEngine`; a direct caller of the store's unbounded methods is responsible for its
+own policy, and that boundary is stated rather than implied.
+
+**Not claimed.** That leases created outside this engine's claim paths are counted: the query
+counts every durable row with a live lease, whatever wrote it, which is conservative in the right
+direction. That the ceiling is checked again at commit or on heartbeat: it is checked at claim
+time only. That the two new tests prove the *timing* of the external lock is exact -- it is not;
+what makes them decisive is that they fail 6/6 against the unmodified engine and pass 8/8 after
+it, and that both mutations restore the failure. The three unmaintained zbus-family crates,
+F-26c, F-26b/S-30, S-11 and S-31 are unaffected.
+
+| | |
+|---|---|
+| **event** | any change to `claim_task_at`, `claim_task_id`, `TaskRepository::claim*`, `enforce_lease_ceiling`, `LIVE_LEASES_SQL`, or the meaning of a live lease |
+| **date** | 2026-11-17 |
+| **severity** | **Medium.** A documented concurrency ceiling that is not enforced atomically is a limit that holds only while callers do not overlap -- which is precisely when it matters. The failure is silent in the direction that matters: every caller sees a successful claim, and nothing records that the ceiling was exceeded. |
 
 ## 3. The three highest-risk claims
 

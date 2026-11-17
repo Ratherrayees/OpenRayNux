@@ -160,6 +160,22 @@ pub enum TaskRepoError {
         id: String,
     },
 
+    /// The engine's concurrency ceiling was reached before this claim could be
+    /// created.
+    ///
+    /// This is reported from INSIDE the claim's `BEGIN IMMEDIATE` transaction,
+    /// because a ceiling checked before the transaction is a target rather than
+    /// an invariant: concurrent callers can each observe a count below it and
+    /// all proceed. Returning a distinct error lets the engine map it to the
+    /// retryable `ConcurrencyConflict` without guessing from a message.
+    #[error("concurrency limit reached: {live} live leases of {max}")]
+    ConcurrencyLimitReached {
+        /// Live (unexpired) leases observed inside the claim transaction.
+        live: i64,
+        /// The ceiling the caller asked to enforce.
+        max: i64,
+    },
+
     /// The task's current execution still has an unresolved side effect, so it cannot
     /// be handed back to a human for a fresh approval.
     ///
@@ -1063,6 +1079,45 @@ type Taken = (String, String, i64, i64, i64);
 /// task, and a targeted claim has the same race as a generic one — narrowing *which*
 /// row may be taken does not make the taking atomic.
 ///
+/// The single spelling of "a live lease".
+///
+/// A lease is live only while its expiry is in the future: a crashed worker's
+/// task must not consume a concurrency slot for ever. The ceiling check and
+/// [`TaskRepository::live_leases`] use this one query so they cannot disagree
+/// about what counts.
+const LIVE_LEASES_SQL: &str =
+    "SELECT COUNT(*) FROM tasks WHERE lease_holder IS NOT NULL AND lease_expires_at_ms > ?1;";
+
+fn live_leases_on(conn: &rusqlite::Connection, now_ms: i64) -> Result<i64, TaskRepoError> {
+    Ok(conn.query_row(LIVE_LEASES_SQL, [now_ms], |r| r.get(0))?)
+}
+
+/// Enforces the engine's concurrency ceiling **inside** the claim's transaction.
+///
+/// A read on a separate connection before `BEGIN IMMEDIATE` is a time-of-check /
+/// time-of-use gap: several callers can each observe a free slot and all create a
+/// lease, so a documented ceiling of N becomes "N, plus however many callers
+/// overlapped in that window". Doing the read on the transaction's own connection
+/// puts the check and the lease creation in one serialized critical section.
+///
+/// `None` means this store method was called without a ceiling by a caller that
+/// owns that policy (the store's own tests and fault injection); the engine
+/// always supplies one.
+fn enforce_lease_ceiling(
+    tx: &rusqlite::Transaction<'_>,
+    now_ms: i64,
+    max_live: Option<i64>,
+) -> Result<(), TaskRepoError> {
+    let Some(max) = max_live else {
+        return Ok(());
+    };
+    let live = tx.query_row(LIVE_LEASES_SQL, [now_ms], |r| r.get(0))?;
+    if live >= max {
+        return Err(TaskRepoError::ConcurrencyLimitReached { live, max });
+    }
+    Ok(())
+}
+
 /// The two SQL texts differ only in their `WHERE`, so the binding and the decoding
 /// are written once here rather than copied per entry point.
 fn take_lease(
@@ -1984,11 +2039,7 @@ impl<'a> TaskRepository<'a> {
     ///
     /// Any SQLite error.
     pub fn live_leases(&self, now_ms: i64) -> Result<i64, TaskRepoError> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE lease_holder IS NOT NULL AND lease_expires_at_ms > ?1;",
-            [now_ms],
-            |r| r.get(0),
-        )?)
+        live_leases_on(self.conn, now_ms)
     }
 
     fn read_rows(&self, sql: &str) -> Result<Vec<TaskRow>, TaskRepoError> {
@@ -2022,7 +2073,41 @@ impl<'a> TaskRepository<'a> {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<ClaimOutcome, TaskRepoError> {
+        self.claim_inner(worker, now_ms, lease_ms, None)
+    }
+
+    /// [`Self::claim`] with the engine's live-lease ceiling enforced **inside**
+    /// the claim transaction.
+    ///
+    /// The ceiling is not a hint: when `max_live` live leases already exist, no
+    /// new lease is created and [`TaskRepoError::ConcurrencyLimitReached`] is
+    /// reported. Both the count and the claim happen under one `BEGIN IMMEDIATE`,
+    /// so concurrent callers cannot each observe a free slot and all take it.
+    /// An expired lease does not count: the query uses the same unexpired-only
+    /// predicate as [`Self::live_leases`].
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error, or `ConcurrencyLimitReached` when the ceiling is full.
+    pub fn claim_with_budget(
+        &mut self,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+        max_live: i64,
+    ) -> Result<ClaimOutcome, TaskRepoError> {
+        self.claim_inner(worker, now_ms, lease_ms, Some(max_live))
+    }
+
+    fn claim_inner(
+        &mut self,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+        max_live: Option<i64>,
+    ) -> Result<ClaimOutcome, TaskRepoError> {
         let tx = self.tx()?;
+        enforce_lease_ceiling(&tx, now_ms, max_live)?;
 
         let Some((id, kind, lease_expires_at_ms, attempts, claim_generation)) =
             take_lease(&tx, worker, now_ms, lease_ms, None)?
@@ -2101,7 +2186,37 @@ impl<'a> TaskRepository<'a> {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<TargetedClaimOutcome, TaskRepoError> {
+        self.claim_specific_inner(id, worker, now_ms, lease_ms, None)
+    }
+
+    /// [`Self::claim_specific`] with the engine's live-lease ceiling enforced
+    /// inside the same transaction as the targeted claim. Narrowing the choice
+    /// to one task must not open a second path around the ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Any SQLite error, or `ConcurrencyLimitReached` when the ceiling is full.
+    pub fn claim_specific_with_budget(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+        max_live: i64,
+    ) -> Result<TargetedClaimOutcome, TaskRepoError> {
+        self.claim_specific_inner(id, worker, now_ms, lease_ms, Some(max_live))
+    }
+
+    fn claim_specific_inner(
+        &mut self,
+        id: &TaskId,
+        worker: &str,
+        now_ms: i64,
+        lease_ms: i64,
+        max_live: Option<i64>,
+    ) -> Result<TargetedClaimOutcome, TaskRepoError> {
         let tx = self.tx()?;
+        enforce_lease_ceiling(&tx, now_ms, max_live)?;
 
         let taken = take_lease(&tx, worker, now_ms, lease_ms, Some(id))?;
         let Some((taken_id, kind, lease_expires_at_ms, attempts, claim_generation)) = taken else {

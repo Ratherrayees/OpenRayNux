@@ -1022,3 +1022,189 @@ fn a_task_committed_before_a_crash_is_visible_after_it() {
     assert_eq!(row, ("pending".to_owned(), 0));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A documented concurrency ceiling is an **invariant**, not a target.
+///
+/// The engine used to read `live_leases()` before the claim's `BEGIN IMMEDIATE`,
+/// so N+1 concurrent callers could each observe a count below N and all proceed;
+/// the ceiling was exceeded by however many callers overlapped in that window.
+/// The V-68 fixture accidentally depended on that (A-040), and this case is the
+/// deterministic test the engine defectneeds on its own.
+///
+/// The interleaving is forced without adding hooks to production code: the test
+/// holds an external `BEGIN IMMEDIATE` while every caller reads the count and
+/// queues at its own `BEGIN`. None can see another's claim before all have
+/// passed the check. The callers signal once their engines are built; a short
+/// wait after the last signal only lets them reach their own BEGIN, which is a
+/// local operation -- the external lock is what makes the window deterministic.
+#[test]
+fn concurrent_claims_never_exceed_the_configured_lease_capacity() {
+    const CAPACITY: i64 = 3;
+    const CALLERS: usize = (CAPACITY + 1) as usize;
+
+    let d = dir("claim-capacity");
+    let path = db_in(&d);
+
+    let mut e = engine(&path);
+    for i in 0..CALLERS {
+        e.enqueue_new(
+            &NewTask::new(tid(&format!("t{i}")), TaskKind::Query, NOW),
+            NOW,
+        )
+        .expect("enqueue");
+    }
+    drop(e);
+
+    // Hold the write lock: every caller's capacity read and queue-up happen
+    // before any of them can create a lease.
+    let holder = rusqlite::Connection::open(&path).expect("holder open");
+    Pragma::critical().apply(&holder).expect("holder pragmas");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("holder begin");
+
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..CALLERS {
+        let path = path.clone();
+        let started = std::sync::Arc::clone(&started);
+        handles.push(std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&path).expect("worker open");
+            Pragma::critical().apply(&conn).expect("worker pragmas");
+            let limits = EngineLimits {
+                max_concurrent_leases: CAPACITY,
+                ..EngineLimits::documented()
+            };
+            let mut e = DurableEngine::new(conn, limits).expect("worker engine");
+            started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            e.claim_task(&format!("w{w}"), NOW)
+        }));
+    }
+
+    while started.load(std::sync::atomic::Ordering::SeqCst) < CALLERS {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(holder); // release once every caller has passed the capacity check
+
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("worker must not panic"))
+        .collect();
+    let claimed = outcomes.iter().filter(|o| matches!(o, Ok(Some(_)))).count();
+
+    // The engine must create exactly the number of leases its limit allows,
+    // even though every caller observed zero live leases before the first write.
+    assert_eq!(
+        claimed as i64, CAPACITY,
+        "the capacity ceiling must be enforced atomically: {outcomes:?}"
+    );
+
+    // And the database agrees: no more than the ceiling is live.
+    let conn = rusqlite::Connection::open(&path).expect("reopen");
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE lease_holder IS NOT NULL AND lease_expires_at_ms > ?1;",
+            [NOW],
+            |r| r.get(0),
+        )
+        .expect("count live leases");
+    assert_eq!(live, CAPACITY, "the ceiling must hold in durable state");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The targeted claim path must enforce the same ceiling as the generic one.
+///
+/// `claim_task_id` used to check capacity before its own `BEGIN IMMEDIATE` too,
+/// which made it a second way around the limit. This is the same forced
+/// interleaving as the generic case, with a distinct task named by every caller:
+/// only the ceiling allows or refuses each one, never which task was chosen.
+#[test]
+fn targeted_claims_never_exceed_the_configured_lease_capacity() {
+    const CAPACITY: i64 = 3;
+    const CALLERS: usize = (CAPACITY + 1) as usize;
+
+    let d = dir("targeted-claim-capacity");
+    let path = db_in(&d);
+
+    let mut e = engine(&path);
+    let ids: Vec<_> = (0..CALLERS)
+        .map(|i| {
+            let id = tid(&format!("t{i}"));
+            e.enqueue_new(&NewTask::new(id.clone(), TaskKind::Query, NOW), NOW)
+                .expect("enqueue");
+            id
+        })
+        .collect();
+    drop(e);
+
+    let holder = rusqlite::Connection::open(&path).expect("holder open");
+    Pragma::critical().apply(&holder).expect("holder pragmas");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("holder begin");
+
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for (w, id) in ids.iter().enumerate() {
+        let path = path.clone();
+        let id = id.clone();
+        let started = std::sync::Arc::clone(&started);
+        handles.push(std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&path).expect("worker open");
+            Pragma::critical().apply(&conn).expect("worker pragmas");
+            let limits = EngineLimits {
+                max_concurrent_leases: CAPACITY,
+                ..EngineLimits::documented()
+            };
+            let mut e = DurableEngine::new(conn, limits).expect("worker engine");
+            started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            e.claim_task_id(&id, &format!("w{w}"), NOW)
+        }));
+    }
+
+    while started.load(std::sync::atomic::Ordering::SeqCst) < CALLERS {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(holder);
+
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("worker must not panic"))
+        .collect();
+    let claimed = outcomes
+        .iter()
+        .filter(|o| matches!(o, Ok(orxnud_task::engine::ClaimAttempt::Claimed(_))))
+        .count();
+    assert_eq!(
+        claimed as i64, CAPACITY,
+        "the targeted claim path must enforce the same ceiling: {outcomes:?}"
+    );
+
+    // The refusal is a retryable capacity conflict, not a different reason.
+    let refusals: Vec<_> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Err(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refusals.len(), 1, "exactly one caller must be refused");
+    assert!(
+        refusals[0].kind.is_retryable(),
+        "a full capacity is retryable, not a defect: {:?}",
+        refusals[0]
+    );
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen");
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE lease_holder IS NOT NULL AND lease_expires_at_ms > ?1;",
+            [NOW],
+            |r| r.get(0),
+        )
+        .expect("count live leases");
+    assert_eq!(live, CAPACITY, "the ceiling must hold in durable state");
+    let _ = std::fs::remove_dir_all(&d);
+}
