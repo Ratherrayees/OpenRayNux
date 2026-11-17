@@ -355,6 +355,18 @@ jobs:
           --test s31_alias_safety
           --test s31_windows_identity
 
+      # The Windows fail-closed restore boundary: this platform cannot flush a
+      # directory entry, so the public restore API must refuse before staging or
+      # publishing an intent, while preserving the live database's logical state.
+      # Narrowly filtered so only this library unit test runs, not the store suite.
+      - name: Windows restore durability refusal
+        run: >-
+          cargo test
+          -p orxnud-store
+          --lib
+          --
+          recovery::scenarios::windows_restore_refuses_before_staging_and_preserves_logical_state
+
       # The platform dispatch itself: that a host without a sandbox backend refuses a
       # Tier-1 execution, and that `SandboxSpec`'s default working directory is
       # absolute on this platform. Both are platform-neutral assertions that a

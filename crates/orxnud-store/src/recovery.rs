@@ -403,7 +403,14 @@ impl Durability {
 pub fn fsync_file(p: &Path) -> Result<(), RecoveryError> {
     #[cfg(test)]
     record::note("fsync_file", p);
-    let f = std::fs::File::open(p).map_err(|source| RecoveryError::Io {
+    // On Windows `File::open` yields a read-only handle, and `sync_all` bottoms out in
+    // `FlushFileBuffers`, which rejects a handle without write access. Open with write
+    // access there; on Unix keep the read-only open so its permissions are not broadened.
+    #[cfg(windows)]
+    let opened = std::fs::OpenOptions::new().write(true).open(p);
+    #[cfg(not(windows))]
+    let opened = std::fs::File::open(p);
+    let f = opened.map_err(|source| RecoveryError::Io {
         what: format!("open {} to flush it", p.display()),
         source,
     })?;
@@ -1886,6 +1893,110 @@ mod scenarios {
             format!("{refused:?}").contains("outstanding restore"),
             "{refused:?}"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The public Windows restore API must fail closed before any destructive work when
+    /// directory-entry durability is unavailable. This exercises the real platform
+    /// condition — no injected fault — and compares *logical* state because the guard's
+    /// WAL checkpoint may change physical bytes without changing the data.
+    #[cfg(windows)]
+    #[test]
+    fn windows_restore_refuses_before_staging_and_preserves_logical_state() {
+        let d = scratch("windows-refusal");
+        let db = db_with(&d, "state.db", "LIVE");
+        let source = db_with(&d, "source.db", "RESTORED");
+        let live_digest_before = digest_of(&db);
+
+        // A non-vacuous fixture: restoring the source would change the live state.
+        assert_ne!(
+            digest_of(&source),
+            live_digest_before,
+            "the restore source must differ from the live database"
+        );
+        assert!(
+            !intent_path_for(&db).exists(),
+            "precondition: the target must have no restore intent"
+        );
+        assert!(
+            !staging_path_for(&db).exists(),
+            "precondition: the target must have no staged image"
+        );
+
+        // This snapshot is usable in-process because `fsync_dir` is a no-op on the
+        // unsupported Windows path. That is not a claim of crash-durable publication.
+        let snapshot = {
+            let source_conn = Connection::open(&source).expect("open source");
+            crate::backup::Backup::take(&source_conn, &source, &orxnud_platform_fs::OsIdentity)
+                .expect("snapshot")
+        };
+
+        // The public production entry point: guard acquisition (ownership, sidecar
+        // verification, WAL checkpoint) then the durability refusal before staging.
+        let err = snapshot
+            .restore_coordinated(&db, &orxnud_platform_fs::OsIdentity)
+            .expect_err("the public restore must refuse on this platform");
+        assert!(
+            err.to_string()
+                .contains("directory entries cannot be flushed on this platform"),
+            "the public error must report the missing directory-entry durability: {err}"
+        );
+
+        // The refusal precedes both the staged image and the intent's publication.
+        assert!(
+            !intent_path_for(&db).exists(),
+            "no restore intent may exist after the refusal: {err}"
+        );
+        assert!(
+            !staging_path_for(&db).exists(),
+            "no staging file may exist after the refusal: {err}"
+        );
+
+        // The checkpoint can change physical bytes, so compare logical content instead.
+        assert_eq!(
+            digest_of(&db),
+            live_digest_before,
+            "the live database's logical state must be unchanged by the refusal: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The writable-handle fix must not change file contents, and must coexist with a
+    /// live SQLite connection: the restore guard still holds one when `fsync_file(target)`
+    /// runs at the end of `install_staged`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_fsync_file_uses_writable_handle_and_preserves_contents() {
+        let d = scratch("fsync-file");
+
+        // A. Flushing a plain file leaves its bytes untouched.
+        let path = d.join("bytes.bin");
+        std::fs::write(&path, b"known bytes that must survive a flush").expect("write");
+        let before = std::fs::read(&path).expect("read before");
+        fsync_file(&path).expect("flush plain file");
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(
+            after, before,
+            "flushing must not change the file's contents"
+        );
+
+        // B. Flushing works while SQLite still holds the database open.
+        let db = d.join("live.db");
+        let conn = Connection::open(&db).expect("open database");
+        conn.execute_batch("CREATE TABLE audit_note (id INTEGER PRIMARY KEY, t TEXT);")
+            .expect("table");
+        conn.execute("INSERT INTO audit_note VALUES (1,?1);", ["LIVE"])
+            .expect("insert");
+        let digest_before = digest_of(&db);
+        fsync_file(&db).expect("flush a database that is still open");
+        assert_eq!(
+            digest_of(&db),
+            digest_before,
+            "flushing while the guard's connection is open must preserve logical state"
+        );
+
+        drop(conn);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
