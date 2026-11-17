@@ -4,21 +4,25 @@ Status: **Stages 1–4c delivered. Both 4c wirings are in production: the contin
 (`task/continue`, ADR-0047) and the observation/disclosure path (ADR-0048).**
 
 Header, counts and the sections touched by the 2026-10-23/24 remediation were
-re-measured against the current worktree at `HEAD` (`1e1f8cf`). The
-latest full local gate run (2026-11-05) is **2001 run, 2001 passed, 0 failed, 6
-skipped, 2 leaky** (`cargo nextest run --workspace`, as run by gate G9; the leak count
-is process accounting, not a test failure). The suite tracks **36 coverage paths**, all
-verified on that run (`verified=36 reduced=0 not-exercised=0 missing=0`); G12 remains a
-documented skip because no release tag is available. This is local Linux verification,
-not Windows verification.
-Gate G9 does **not** accept a `cargo test --workspace` run as equivalent; that old
-claim and the "1652"/"1655" counts are stale. CI has **six jobs** (see §8), but no
-hosted run is recorded against this tree. The historical `v95_concurrency` failure
-under load is still open and undiagnosed. The separate `V-68`
-`n_workers_sharing_a_file_produce_exactly_one_winner_per_task` load-sensitive test
-recurred once on 2026-10-24 and passed on the recorded green rerun; `docs/12` V-68 records
-the occurrence. See
-[§8](#-8-ci-state-the-tool-install-problem-is-resolved-one-test-flake-is-not).
+re-measured against `main` at **`b069595`** (tree `0afc96da`), the merge of PR #8.
+The latest full local gate run is **2048 run, 2048 passed, 0 failed, 6 skipped**
+(`cargo nextest run --workspace`, as run by gate G9; a "leaky" count varies between runs
+and is process accounting, not a test failure). The boundary-gate self-tests are
+**181** (`all 181 boundary-gate self-tests pass`), and G12 remains a documented
+skip because no release tag is available.
+CI has **six jobs** (see §8), and a hosted run **is** recorded against this exact tree:
+[run 44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788)
+on `b069595`, all six jobs green, G9 **1892 run, 1892 passed, 116 skipped**. The 116 are
+the ADR-0046 scope exclusions on a hosted runner that cannot isolate — the hosted run is
+not evidence about the Tier-1 sandbox suites. Gate G9 does **not** accept a
+`cargo test --workspace` run as equivalent; the old "1652"/"1655"/"2001" counts are stale.
+`main` is **protected**: six required status checks, `strict`, pull request required, no
+force pushes or branch deletion, merge commits the only merge method.
+**V-68 is closed**, not open: A-040 diagnosed it (the fixture claimed 12 tasks against a
+concurrency budget of 8 and depended on a non-atomic check), and A-041 closed the separate
+engine defect that diagnosis exposed. PRs #4–#8 are merged with their original history
+preserved. The historical `v95_concurrency` failure under load has no new occurrence in
+these records. See [§8](#-8-ci-state-the-tool-install-problem-is-resolved-one-test-flake-is-not).
 
 OpenRayNux is a local-first personal AI operating layer: one long-lived Rust process owning
 the user's time, data and integrations, with several surfaces driving the *same* governed
@@ -204,16 +208,21 @@ the surfaces listed last, and nothing else.
   the dispatcher, not to the transport.
 * Also absent: no GUI or Tauri application, no TUI, no MCP surface, no messaging, no local
   ASR/TTS, no general shell capability, no unrestricted filesystem capability, no Windows
-  sandbox backend, no actor runtime beyond the local authority model.
+  sandbox backend, no actor runtime beyond the local authority model. The **TUI is the next
+  mandatory deliverable** for the 2026-11-30 MVP, not a deferred enhancement: a narrow
+  Ratatui client over the existing IPC and protocol, with no policy, storage or domain logic
+  duplicated in the surface.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**2001 tests run, 2001 passed, 0 failed, 6 skipped** in the latest full local gate
-(2026-11-05), with 2 *leaky* results. The leak detector reports processes that outlive
+**2048 tests run, 2048 passed, 0 failed, 6 skipped** in the latest full local gate on
+`b069595`, with a varying *leaky* count. The leak detector reports processes that outlive
 their test; the count varies between runs and is not a test failure. All 6 skips are
-`#[ignore]`d child-process entry points, not tests. No hosted run is recorded against
-this tree; on a host that cannot isolate, gate G9 excludes the Tier-1 sandbox-evidence
-suites and prints which it excluded and why.
+`#[ignore]`d child-process entry points, not tests. A hosted run **is** recorded against
+this exact tree ([44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788)):
+all six jobs green, G9 **1892 run, 1892 passed, 116 skipped**. On a hosted runner that
+cannot isolate, gate G9 excludes the Tier-1 sandbox-evidence suites and prints which it
+excluded and why — those 116 exclusions are not evidence about the sandbox.
 
 **Two caveats that a green run does not carry, found 2026-10-10.** The enforcement and
 resource suites `println!` and `return` when the host cannot delegate cgroups
@@ -266,28 +275,44 @@ evidence and is marked **`partially fixed`**, because G3 still matches platform-
 literally and is defeated by `use std::env::consts as host; … host::OS` — a real residual
 bypass, recorded rather than closed over.
 
-**So the next engineering milestone is no longer "define V-96".** Standing candidates, in
-the register's own terms:
+**So the next engineering milestone is no longer "define V-96".** The previous four-step
+plan was built on a false premise and withdrawn; the current order was decided after PRs
+#4–#8 landed and `main` went green and protected:
 
-1. **Close G3 properly** — resolve platform API paths through imports rather than matching
-   them literally, so the aliasing bypass above cannot pass. Small, bounded, and the
-   remaining half of an already-defined milestone.
-2. **The actor model beyond one local human** (V-70), which is the largest unanswered
-   question about who may authorise what.
-3. **Positive Tier-1 isolation evidence on a machine that can produce it.** Hosted runners
-   cannot, and this repository currently has no lane that distinguishes "sandbox proven"
-   from "environment measured" — see §6 and §8.
-4. **The `linux-gates` timeout defect in §8**, and the interrupted `v95_concurrency` flake.
+1. **Documentation reconciliation** — this index. One accurate project status against
+   `b069595`, without touching the protected audit documents.
+2. **F-26b investigation** — re-establish the restore/checkpoint failure sequence against
+   the current source, define the recovery invariant, and design deterministic
+   failure-injection tests. A focused investigation first, not an implementation; kept
+   separate from S-11, F-26c and S-31. See `docs/12` F-26b.
+3. **TUI vertical slice** — the mandatory 2026-11-30 MVP deliverable. A narrow Ratatui
+   client over the existing IPC and protocol: daemon status and task listing, task and
+   proposal inspection, approval preview and approval actions, execution results and a
+   visible `NeedsVerification` state. No policy, storage or domain logic in the surface.
+4. **Remaining F-26 / S-11 / S-31 review** — establish the release safety boundaries.
 
-None of these is decided here. The point of this section is that the previous four-step
-plan was built on a false premise and has been withdrawn.
+The enforced constraint is that another extended round of verification-infrastructure work
+must not consume the MVP time: the next milestone has to demonstrate that a human can use
+the governed system through its required interface. The other candidates above remain
+recorded in `docs/12` but are not the decided order.
 
-## 8. CI state: the tool-install problem is resolved, one test flake is not
+## 8. CI state: the tool-install problem is resolved, and the load-sensitive test is fixed
 
-**Current tree (2026-10-24): six jobs** — `linux-gates`, `windows-check`,
-`windows-portability`, `sandbox-integration`, `resource-enforcement`, `portable-core`.
-No hosted run is recorded against this tree. The local full gate and the repaired
-delegated resource lane are the current evidence; the history below is preserved.
+**Current tree (`b069595`, tree `0afc96da`): six jobs** — `Linux gates (G1-G17 + G2d)`,
+`Windows cargo check (nightly)`, `Windows portability tests`,
+`Tier-1 sandbox (production configuration)`, `cgroup resource enforcement (delegated)`,
+`Portable core builds for wasm32`. Hosted evidence on this exact commit:
+[run 44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788),
+**all six jobs green**, G9 `1892 run, 1892 passed, 116 skipped`. `main` is **protected**
+with all six checks required, `strict`, pull requests required, and no force pushes or
+branch deletion. The history below is preserved.
+
+**V-68 is closed**, with two distinct records: A-040 diagnosed the fixture-observation
+failure (12 claimed tasks against a budget of 8, with the extra claims slipping past a
+non-atomic check — the tasks were never lost, they stayed `pending`), and A-041 closed the
+engine defect it exposed (`max_concurrent_leases` is now checked inside the claim's own
+`BEGIN IMMEDIATE`, on the generic and targeted paths). PR #7 and PR #8 carry the two
+fixes; the occurrence records in `docs/12` were kept as written.
 
 **`linux-gates` passes on `main` as of `c5934970`.** It did not, for a while, and the
 failure mode was misleading enough to be worth recording.
@@ -342,10 +367,12 @@ which is exactly the property that makes it worth writing down.
 
 ### Everything else is green
 
-`windows-check` (MSVC), `windows-portability`, `portable-core` (wasm32) and
-`sandbox-integration` (Tier-1) pass. G12 is skipped for want of a release tag to compare
-against. Local: 1655/1655, and `CI=true ./scripts/ci-gates.sh` passes end to end in about 21
-seconds on a warm target directory.
+`Windows cargo check` (MSVC), `Windows portability`, `Portable core builds` (wasm32) and
+`Tier-1 sandbox` all pass on `b069595` — hosted run
+[44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788), six for
+six. G12 is skipped for want of a release tag to compare against. Local: 2048/2048, and
+`CI=true ./scripts/ci-gates.sh` passes end to end in about 27 seconds on a warm target
+directory.
 
 ---
 
@@ -420,4 +447,5 @@ scripts/run-sandbox-tests.sh --host       # the Tier-1 suites, on a capable host
 scripts/run-resource-tests.sh             # cgroup enforcement, in a delegated container
 ```
 
-Last research/verification date: **2026-10-24**.
+Last research/verification date: **2026-11-17** (index reconciled against `main` at
+`b069595`, hosted run 44101262788).
