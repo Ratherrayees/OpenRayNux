@@ -1276,7 +1276,9 @@ failure/restart scenarios are now implemented and tested** -- see the A-012 row 
 scenario-by-scenario evidence. F-26b stays open because the *platform* requirement is
 unmet: the protocol refuses to restore where directory durability cannot be established,
 and Windows crash durability has no evidence. The table above is retained as the
-pre-roll-forward record it is.
+pre-roll-forward record it is. **A-042 re-establishes the sequence against the current source,
+states the recovery invariant, and designs the remaining Windows tests; it changes no code and
+does not close this finding.**
 
 ### F-26c — the hard-link alias bypass is now rejected (partially closed)
 
@@ -5352,6 +5354,109 @@ F-26c, F-26b/S-30, S-11 and S-31 are unaffected.
 | **event** | any change to `claim_task_at`, `claim_task_id`, `TaskRepository::claim*`, `enforce_lease_ceiling`, `LIVE_LEASES_SQL`, or the meaning of a live lease |
 | **date** | 2026-11-17 |
 | **severity** | **Medium.** A documented concurrency ceiling that is not enforced atomically is a limit that holds only while callers do not overlap -- which is precisely when it matters. The failure is silent in the direction that matters: every caller sees a successful claim, and nothing records that the ceiling was exceeded. |
+
+### A-042 — F-26b: the recovery invariant, re-established against the current source
+
+**This is an investigation, not a fix.** F-26b stays **OPEN**; nothing in this entry changes the
+restore path, the tests, or the status of S-11, F-26c or S-31. The F-26b row's table is explicitly
+a *pre-roll-forward* record — its line numbers no longer name the current source — so this entry
+re-establishes the sequence from the code as it stands at `c21e28c`, states the invariant, and
+designs the remaining tests.
+
+**The sequence, as it actually runs now.** The public entry `restore_coordinated` (`backup.rs`)
+acquires a `RestoreGuard`, then calls the crate-private `restore`. The guard takes exclusive
+cross-process ownership **before** any checkpoint, verifies both sidecars against aliasing, then
+runs `PRAGMA wal_checkpoint(TRUNCATE)` and refuses with `BackupError::Busy` if any reader is
+present. The checkpoint is **state-preserving**: it folds committed frames into the main file but
+does not change the database's logical content, and no sidecar is deleted. The `restore` then:
+
+| # | Operation | Why it is here |
+|---|---|---|
+| 1 | `Durability::require()` | refuse on a platform that cannot make an intent durable, before staging or install |
+| 2 | stage a full copy beside the database | nothing live is touched |
+| 3 | `0600` the staged image, then verify its logical digest | an unverified or readable image is never named by an intent |
+| 4 | `fsync_file(staging)` → `fsync_dir(parent)` → `publish_intent` | contents, then the *name*, then the durable commitment |
+| 5 | `install_staged(db_path, staging, digest)` | the one implementation shared by rollback and crash roll-forward |
+| 6 | `clear_intent`, discard prepared debris | idempotent: a crash before this simply repeats the install |
+
+The F-26b concern — post-snapshot data entering the live database before the copy — is therefore
+**narrower than the old table suggests, but not imaginary**. The checkpoint at guard acquisition
+still precedes the intent; if a later step fails, the live database holds its *pre-restore logical
+state* with the WAL absorbed, not the snapshot. The protocol never reports that as a successful
+restore: the logical digest is the gate. What remains unestablished is whether the **intent
+survives a crash** on every platform, because that is what makes step 5 replayable.
+
+**The recovery invariant, stated explicitly.** For a restore of snapshot `S` to live database `D`:
+
+1. **No false success.** `restore` reports `Ok` only when a logical digest read from `D` after
+   install equals the digest of `S`. `integrity_check`, `schema_meta` and a byte-comparison were
+   each measured to pass while the database was logically wrong; none of them can close this.
+2. **The intent is the commit point.** An intent naming a staged image is published only after the
+   image's contents **and its parent directory entry** are durable. From publication until the
+   intent is cleared, any interruption is completed by `complete_outstanding_restore` on the next
+   open, and every install is idempotent. No observer may read `D` as restored before publication.
+3. **Pre-commit failures are logically state-preserving.** A failure before publication leaves
+   `D` logically equivalent to its pre-restore state. The guard's checkpoint changes bytes, not
+   logical content — "state-preserving" is about logical content, not byte identity.
+4. **Platform precondition.** If the durability of the intent's directory entry cannot be
+   established, the restore refuses. On Windows `std::fs::File::open` rejects a directory, so
+   `Durability::report().directory_flushed` is false and `Durability::require()` refuses. The
+   refusal occurs after the state-preserving checkpoint but **before staging, intent publication
+   or install**, so it cannot destroy a recovery point.
+
+**What is already proven (do not recreate it).** Nine deterministic failure/restart scenarios are
+implemented in `recovery.rs` (A-012), with one-shot, per-thread `#[cfg(test)]` fault seams at
+`BeforeIntentPublish`, `AfterIntentPublish`, `DuringCopy`, `BeforeFinalize`,
+`DuringVerification`, `BeforeClearIntent` and `DirectoryFlush`, and every test asserts its fault
+actually fired. Two tests pin the directory-durability discipline on Linux:
+`the_staged_images_parent_directory_is_flushed_before_the_intent_is_published` asserts the
+**order** in the operation log (file flush, then directory flush, then publish), and
+`a_failed_directory_flush_prevents_progression_to_destructive_work` asserts that a `DirectoryFlush`
+fault leaves the live database's logical state unchanged, publishes no intent, and leaves only
+abandoned staging debris (`RestoreState::Prepared`). Those are the Linux evidence; they are not
+the gap.
+
+**The remaining evidence gaps and their test design.**
+
+1. **Windows refusal, not Windows recovery.** Today there is no `cfg(windows)` test anywhere in
+   `recovery.rs` or `backup.rs`. The missing deterministic test calls `restore_coordinated` on a
+   Windows runner against a fresh database with a known logical digest and a valid snapshot, and
+   asserts **all four** of: (a) the error is `DurabilityUnavailable` and names directory entries;
+   (b) `intent_path_for` does not exist; (c) no staging file was published; (d) re-reading `D`
+   yields the same logical digest as before the call. That last assertion is what distinguishes
+   "refused before anything destructive" from a refusal that already corrupted the state — and
+   it matters precisely because the guard's checkpoint runs before the refusal. The existing
+   Windows CI job can run it unchanged.
+2. **Windows crash recovery is not a test to write yet — it is a primitive to supply.** With
+   native directory durability absent, there is no Windows restore to interrupt, so a
+   "Windows crash mid-restore" test would be vacuous. The required primitive is
+   `FlushFileBuffers` on a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; until that
+   exists, `fsync_dir` must remain a documented no-op behind `Durability::require()`'s refusal.
+   When it lands, the seven fault seams and the nine scenarios are already cross-platform
+   (`#[cfg(test)]`, no environment variables, no public entry point), so the design is to run the
+   **same** scenario suite on Windows and assert the same four invariant clauses — not to invent
+   a Windows-specific recovery protocol.
+3. **Directory durability on Linux needs no new test** for this entry: the ordering and fault
+   tests above are the deterministic evidence, and the fault test asserts its firing.
+
+**What was deliberately not done.** No code, test or platform primitive was changed; F-26b stays
+OPEN for the same reason as before — the platform requirement is unmet. No failure injection was
+added to production code (the seams are `#[cfg(test)]` only, one-shot and per-thread, and each
+test asserts it fired). No status was altered for S-11, F-26c or S-31; each keeps its own record.
+The F-26b row's pre-roll-forward table is retained as history, not rewritten.
+
+**Not claimed.** That a Windows crash mid-restore is covered today — it cannot be, because
+Windows restores refuse before the commit point. That directory flushing works on Windows via
+`std`; it does not, and the code says so. That the guard's checkpoint leaves the file byte-identical;
+it is logically state-preserving only. That the four clauses have been proven on Windows; clause
+4 is a code-level refusal and clauses 1–3 are proven on Linux, with the Windows test above
+designed but not yet implemented.
+
+| | |
+|---|---|
+| **event** | any change to `restore_coordinated`, `RestoreGuard::acquire*`, `Durability`, `fsync_dir`, `publish_intent`, `install_staged`, or any new Windows directory-durability primitive |
+| **date** | 2026-11-17 |
+| **severity** | **Medium, unchanged from F-26b.** The data-integrity question is unresolved on Windows, but the current code fails closed there: it refuses rather than restore without a durable intent. The risk is that this remains a platform gap indefinitely, not that the Linux protocol has a known hole. |
 
 ## 3. The three highest-risk claims
 
