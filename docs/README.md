@@ -4,15 +4,15 @@ Status: **Stages 1–4c delivered. Both 4c wirings are in production: the contin
 (`task/continue`, ADR-0047) and the observation/disclosure path (ADR-0048).**
 
 Header, counts and the sections touched by the 2026-10-23/24 remediation were
-re-measured against `main` at **`b069595`** (tree `0afc96da`), the merge of PR #8.
-The latest full local gate run is **2048 run, 2048 passed, 0 failed, 6 skipped**
+re-measured against `main` at **`e0f6784`** (tree `52bc70da`), the merge of PR #11.
+The latest full local gate run is **2054 run, 2054 passed, 0 failed, 6 skipped**
 (`cargo nextest run --workspace`, as run by gate G9; a "leaky" count varies between runs
 and is process accounting, not a test failure). The boundary-gate self-tests are
 **181** (`all 181 boundary-gate self-tests pass`), and G12 remains a documented
 skip because no release tag is available.
 CI has **six jobs** (see §8), and a hosted run **is** recorded against this exact tree:
-[run 44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788)
-on `b069595`, all six jobs green, G9 **1892 run, 1892 passed, 116 skipped**. The 116 are
+[run 44121245140](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44121245140)
+on `e0f6784`, all six jobs green, G9 **1898 run, 1898 passed, 116 skipped**. The 116 are
 the ADR-0046 scope exclusions on a hosted runner that cannot isolate — the hosted run is
 not evidence about the Tier-1 sandbox suites. Gate G9 does **not** accept a
 `cargo test --workspace` run as equivalent; the old "1652"/"1655"/"2001" counts are stale.
@@ -41,7 +41,7 @@ capability set. One surface ships today.
 
 | | |
 |---|---|
-| Workspace | 16 Rust crates, 1.98.1, gate-enforced dependency direction |
+| Workspace | 17 Rust crates, 1.98.1, gate-enforced dependency direction |
 | Storage | SQLite (bundled, ≥ 3.51.3), schema at **v15** (`CURRENT_VERSION`, `migration.rs:510`), snapshot-protected migrations |
 | Task engine | Durable, hand-rolled; passes all 12 ADR-0029 properties from a second test binary |
 | Governance | 9-stage dispatcher; `CapabilityInvocation` cannot be constructed outside `orxnud-policy` |
@@ -218,12 +218,12 @@ the surfaces listed last, and nothing else.
 
 ## 6. Where the evidence is, and what it does not prove
 
-**2048 tests run, 2048 passed, 0 failed, 6 skipped** in the latest full local gate on
-`b069595`, with a varying *leaky* count. The leak detector reports processes that outlive
+**2054 tests run, 2054 passed, 0 failed, 6 skipped** in the latest full local gate on
+`e0f6784`, with a varying *leaky* count. The leak detector reports processes that outlive
 their test; the count varies between runs and is not a test failure. All 6 skips are
 `#[ignore]`d child-process entry points, not tests. A hosted run **is** recorded against
-this exact tree ([44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788)):
-all six jobs green, G9 **1892 run, 1892 passed, 116 skipped**. On a hosted runner that
+this exact tree ([44121245140](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44121245140)):
+all six jobs green, G9 **1898 run, 1898 passed, 116 skipped**. On a hosted runner that
 cannot isolate, gate G9 excludes the Tier-1 sandbox-evidence suites and prints which it
 excluded and why — those 116 exclusions are not evidence about the sandbox.
 
@@ -282,8 +282,9 @@ bypass, recorded rather than closed over.
 plan was built on a false premise and withdrawn; the current order was decided after PRs
 #4–#8 landed and `main` went green and protected:
 
-1. **Documentation reconciliation** — this index. One accurate project status against
-   `b069595`, without touching the protected audit documents.
+1. **Documentation reconciliation — landed (PR #9).** That PR reconciled this index
+   against `b069595` without touching the protected audit documents; this snapshot has since
+   been re-measured against `e0f6784` after the F-26b record (PR #10) and the TUI (PR #11).
 2. **F-26b investigation** — re-establish the restore/checkpoint failure sequence against
    the current source, define the recovery invariant, and design deterministic
    failure-injection tests. A focused investigation first, not an implementation; kept
@@ -301,12 +302,12 @@ recorded in `docs/12` but are not the decided order.
 
 ## 8. CI state: the tool-install problem is resolved, and the load-sensitive test is fixed
 
-**Current tree (`b069595`, tree `0afc96da`): six jobs** — `Linux gates (G1-G17 + G2d)`,
+**Current tree (`e0f6784`, tree `52bc70da`): six jobs** — `Linux gates (G1-G17 + G2d)`,
 `Windows cargo check (nightly)`, `Windows portability tests`,
 `Tier-1 sandbox (production configuration)`, `cgroup resource enforcement (delegated)`,
 `Portable core builds for wasm32`. Hosted evidence on this exact commit:
-[run 44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788),
-**all six jobs green**, G9 `1892 run, 1892 passed, 116 skipped`. `main` is **protected**
+[run 44121245140](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44121245140),
+**all six jobs green**, G9 `1898 run, 1898 passed, 116 skipped`. `main` is **protected**
 with all six checks required, `strict`, pull requests required, and no force pushes or
 branch deletion. The history below is preserved.
 
@@ -371,9 +372,9 @@ which is exactly the property that makes it worth writing down.
 ### Everything else is green
 
 `Windows cargo check` (MSVC), `Windows portability`, `Portable core builds` (wasm32) and
-`Tier-1 sandbox` all pass on `b069595` — hosted run
-[44101262788](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44101262788), six for
-six. G12 is skipped for want of a release tag to compare against. Local: 2048/2048, and
+`Tier-1 sandbox` all pass on `e0f6784` — hosted run
+[44121245140](https://github.com/Ratherrayees/OpenRayNux/actions/runs/44121245140), six for
+six. G12 is skipped for want of a release tag to compare against. Local: 2054/2054, and
 `CI=true ./scripts/ci-gates.sh` passes end to end in about 27 seconds on a warm target
 directory.
 
@@ -451,4 +452,4 @@ scripts/run-resource-tests.sh             # cgroup enforcement, in a delegated c
 ```
 
 Last research/verification date: **2026-11-17** (index reconciled against `main` at
-`b069595`, hosted run 44101262788).
+`e0f6784`, hosted run 44121245140).
