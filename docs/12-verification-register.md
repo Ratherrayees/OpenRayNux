@@ -377,7 +377,7 @@ no-payload Tier-1 bundle are unaffected, that the disclosure cannot be a constan
 exposure text carries the `hidepid` condition. **Not claimed:** no mutation testing was run.
 
 **Credential handling is a separate risk, and credential redaction does not mitigate this exposure.** `CREDENTIAL_ENV` remains the only channel carrying anything secret and is redacted throughout; that is a distinct and still-latent concern. It does **not** reduce this row: the payload is not a credential and never passes through the redacted path, and because `spec.env` is rendered as `--setenv K V` **argv pairs**, any bundle that populated `env` would place that value in the same world-readable `cmdline`. The two exposures must not be described as one mitigated problem. Adding a stdin channel means changing `SandboxSpec` and the supervisor; that change is specified but **unbuilt**. |
-| **V-68** | ****`orxnud-task`'s `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` fails intermittently under full-workspace parallel load -- now 12 recorded occurrences, and the cause is still undiagnosed**** | Observed once in `./scripts/ci-gates.sh` while 1004 tests ran concurrently; passed 13/13 in isolation and in 8 consecutive `cargo nextest run -p orxnud-task` runs. **The slice that first observed this changed no file in `orxnud-task` or `orxnud-store`; the later occurrences were observed in slices that do touch `orxnud-store`, but only `crates/orxnud-store/tests/s30_restore_not_public.rs`, a different file in a different crate from the failing test. `orxnud-task` is untouched by all of them.** | **milestone:** before relying on a full-workspace green run as evidence -- re-read 2026-10-05| 2026-10-24 | **Low, pre-existing, and not this slice's to fix.** Recorded rather than dismissed because a suite that is intermittently red cannot distinguish a real regression from load, which is exactly the value it is being relied on for. It is a concurrency test over a shared file, so the likely cause is timing under CPU contention rather than a logic error — but "likely" is a guess, and the honest next step is to reproduce it under deliberate contention and read what the failure actually says. Left alone here: this slice changed nothing in `orxnud-task`, and a drive-by fix to a task-engine concurrency test would be a worse change than the flake. Corrected 2026-10-05, because the entry understated its own subject. It said "observed once" with a 13/13 isolation pass rate; the commit that introduced multi-step composition recorded the same test failing **twice more** in full runs while passing **8/8** in isolation, and V-42 records a fourth. So: 4 occurrences across V-42 and V-68, and the isolation pass count fell from 13/13 to 8/8. The cause is still not known -- it is a concurrency test over a shared file, so timing under CPU contention is a *guess*, and this register does not record guesses as findings. What is now measured and stable: the full-workspace suite is green, and has been on every run since, including 1360/1360 locally and 1244/1244 on a hosted runner under the G9 scope ADR-0046 defines. A suite that is intermittently red cannot distinguish a regression from load, so this stays open until someone reproduces it under deliberate contention and reads what it says. **A fifth occurrence was observed on 2026-10-24**, in the first full gate run after the PLAT-007 probe regression test was added: the 1997-test run failed with "every task must be claimed exactly once" (`left: 10`, `right: 12`), then passed 5/5 in isolation, and the next full gate was 1997/1997 green. The cause remains undiagnosed, and this row stays open.
+| **V-68** | ****`orxnud-task`'s `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` fails intermittently under full-workspace parallel load -- now 12 recorded occurrences; the cause is diagnosed and corrected in A-040**** | Observed once in `./scripts/ci-gates.sh` while 1004 tests ran concurrently; passed 13/13 in isolation and in 8 consecutive `cargo nextest run -p orxnud-task` runs. **The slice that first observed this changed no file in `orxnud-task` or `orxnud-store`; the later occurrences were observed in slices that do touch `orxnud-store`, but only `crates/orxnud-store/tests/s30_restore_not_public.rs`, a different file in a different crate from the failing test. `orxnud-task` is untouched by all of them.** | **milestone:** before relying on a full-workspace green run as evidence -- re-read 2026-10-05| 2026-10-24 | **Low, pre-existing, and not this slice's to fix.** Recorded rather than dismissed because a suite that is intermittently red cannot distinguish a real regression from load, which is exactly the value it is being relied on for. It is a concurrency test over a shared file, so the likely cause is timing under CPU contention rather than a logic error — but "likely" is a guess, and the honest next step is to reproduce it under deliberate contention and read what the failure actually says. Left alone here: this slice changed nothing in `orxnud-task`, and a drive-by fix to a task-engine concurrency test would be a worse change than the flake. Corrected 2026-10-05, because the entry understated its own subject. It said "observed once" with a 13/13 isolation pass rate; the commit that introduced multi-step composition recorded the same test failing **twice more** in full runs while passing **8/8** in isolation, and V-42 records a fourth. So: 4 occurrences across V-42 and V-68, and the isolation pass count fell from 13/13 to 8/8. The cause is still not known -- it is a concurrency test over a shared file, so timing under CPU contention is a *guess*, and this register does not record guesses as findings. What is now measured and stable: the full-workspace suite is green, and has been on every run since, including 1360/1360 locally and 1244/1244 on a hosted runner under the G9 scope ADR-0046 defines. A suite that is intermittently red cannot distinguish a regression from load, so this stays open until someone reproduces it under deliberate contention and reads what it says. **A fifth occurrence was observed on 2026-10-24**, in the first full gate run after the PLAT-007 probe regression test was added: the 1997-test run failed with "every task must be claimed exactly once" (`left: 10`, `right: 12`), then passed 5/5 in isolation, and the next full gate was 1997/1997 green. The cause remains undiagnosed, and this row stays open.
 
 **A sixth occurrence was observed on 2026-11-14**, during the S-30 cache-key work: one `cargo nextest run --workspace --all-targets --no-fail-fast` of 2043 tests failed on this test, while the same run passed 3/3 in isolation, 3/3 in three subsequent full-suite runs with the same change, and 2/2 in two full-suite runs at the parent commit. The slice changed one file, `crates/orxnud-store/tests/s30_restore_not_public.rs` -- so unlike the earlier occurrences, which changed no file in `orxnud-task` or `orxnud-store`, this one DID touch a file in `orxnud-store`, though it is a test file in a different crate from the failing one and it added no subprocess work to the suite (the probe's `cargo vendor` and `cargo check` were already present before it). That difference is stated rather than glossed: it is the only respect in which this occurrence is not obviously identical to the previous five, and it is not enough to attribute the failure, so the cause remains undiagnosed and this row stays open. |
 
@@ -432,10 +432,20 @@ and it is the strongest evidence yet that the trigger is **load**, not the conte
 tree: the tree carries no S-30 probe, and no file in `orxnud-task` is changed by any of the
 three layers. The cause remains undiagnosed, and this row stays open.
 
-The count of **this** row's occurrences is now **twelve confirmed** as of 2026-11-16, and the
-cause is still undiagnosed. The unattributed failure recorded above is NOT among them. The
-rate, not the exact integer, is the finding: the flake continues to occur under
-full-workspace parallel load, and the count is the number observed up to this date.
+**A thirteenth observation, and then the diagnosis.** While verifying the final merge, the
+same test failed again under deliberate load, and this time it was instrumented rather than
+recorded. It is counted here as an observation of the same flake and is the one that produced
+the diagnosis: **the fixture claimed twelve tasks against the engine's concurrency budget of
+eight.** The task never disappeared; the workers ran out of attempts on `ConcurrencyConflict`
+refusals while the tasks sat `pending`. Every detail, and the two defects this separates, is in
+**A-040**.
+
+The count of **this** row's occurrences is now **thirteen confirmed** as of 2026-11-16, and the
+cause is **diagnosed** in A-040: the fixture's budget did not cover the tasks it claimed, and
+the budget check is not atomic with the claim, so the fixture's assertion was only ever
+satisfiable by a race. The unattributed failure recorded above is NOT among them. The rate, not
+the exact integer, is what the row was about: the flake continues to occur under full-workspace
+parallel load, and the count is the number observed up to this date.
 
 | **V-69** | **An approval carries no approver identity anywhere, so it is a bearer token that proves parameters but not consent** | `ApprovalRecord` (`crates/orxnud-domain/src/approval.rs`) has fields `actor_label`, capability, target, params, issued/expires, risk, digest — no approver. `canonical_bytes` (`crates/orxnud-policy/src/digest.rs`) binds `actor.label()`, `actor.authority_root()`, capability, target, params and the time bounds: the *proposer's* identity is inside the digest, the approver's is not. `actor_label` is written to the record and to `task_approvals.actor_label` and is **never read at dispatch** (`grep` finds no comparison outside tests). `Decision::Gate.approver` is *derived* at `engine.rs:396` from the proposer's `authority_root()` — an inference where evidence belongs | **milestone:** before any actor other than `Human` reaches the dispatcher, and **release:** on any change to `canonical_bytes`, `ApprovalRecord`, or the `can_grant` enforcement at `engine.rs:266` | 2026-10-03 | **High, latent, and it becomes live the moment a delegated actor exists.** Not exploitable today: with one local user behind a 0700 socket, minting an approval on request is equivalent to that user consenting. The reason it is High anyway is the *shape* of the failure. `capability/approve` answers any caller, and the runtime hardcodes the approver to the local human, so a pipeline built on this would let an AI-side workflow obtain its own approval through the same endpoint and every stage would report success — a **false demonstration of governance**, which is worse than no delegation because it would be trusted. The load-bearing consequence is that `can_grant()` is currently enforced in exactly one non-test place and only refuses an actor with neither grant capability nor an authority root; it cannot check *who approved* because there is nothing to check. **Now implemented.** ADR-0037 (D1, D2) landed: the record carries an explicit `approver`, `canonical_bytes` binds both parties under a `v2` prefix, `authorise` refuses a non-granting approver and an approver who is not the proposer's authority root, and `issue_approval` refuses to mint without `can_grant()`. Verified by mutation: removing the approver from the digest fails `the_digest_binds_the_approver_so_one_consent_cannot_be_replayed_by_another`. Demonstrated end-to-end on the governed task path, where a proposal delegated by the local human is approved with `actor_label: ai`, `approver: human`, `authority_root: local`. |
 | **V-70** | **An `Actor` arriving over local IPC is an asserted principal, not an authenticated identity, and the type does not say so** | `Actor` derives `Serialize, Deserialize` (`crates/orxnud-domain/src/actor.rs`), so `Actor { user: "H" }` can be sent by any caller. `crates/orxnud-daemon/src/runtime.rs:560` hardcodes `local_actor()` and never reads an actor from the request, so nothing depends on this yet | **release:** any move to multi-user access, any transport beyond the local socket, or any code that starts treating a deserialised `Actor` as proof of identity | 2026-10-03 | **Medium, and it is a hazard rather than a defect.** Nothing is wrong today: the practical boundary is the 0700 Unix socket plus the single-user local model, and the runtime not accepting an actor at all is the strongest possible current posture. The risk is entirely in what comes next — `Actor` being `Deserialize` is easy to later read as "the daemon knows who this is", which is the same class of mistake ADR-0034 caught in `CapabilityInvocation`. Three things must stay distinct in naming, docs and tests: *principal assertion* ≠ *principal authentication* ≠ *principal authorization*. Recorded so that multi-user work starts by naming the boundary rather than inheriting an ambiguity. Settled as a constraint by ADR-0037 (D6); deliberately **not** fixed, because multi-user authentication is out of scope and inventing a half-measure now would be worse than the honest gap. |
@@ -5189,6 +5199,88 @@ has the sources locally, so the vendoring step succeeds offline.
 | **event** | any change to `crates/orxnud-store/tests/s30_restore_not_public.rs`, to the probe it compiles, to `Backup::restore`'s visibility, or to `CARGO_TERM_COLOR` in CI |
 | **date** | 2026-11-13; the colour sensitivity corrected 2026-11-16 after the first hosted run |
 | **severity** | **Low for behaviour, Medium for the record.** The test's verdict was never wrong — it was correct about the mechanism every time — but it could report a false failure for a reason unrelated to what it checks, and a test that fails for the wrong reason trains people to ignore it. The colour defect was the same kind of failure: a false failure for a reason unrelated to the mechanism, found only because the change was finally run on the hosted runner it is meant to run on. |
+
+### A-040 — V-68's cause: the fixture claimed more tasks than the engine's concurrency budget, and the budget check is not atomic
+
+**This closes the test-reliability half of V-68 and records a separate, still-open engine
+defect.** The V-68 row said "the cause is still undiagnosed" and speculated that "it is a
+concurrency test over a shared file, so the likely cause is timing under CPU contention rather
+than a logic error". The fixture's own comment blamed `SQLITE_BUSY` under six writers. **Both
+were wrong**, and this entry corrects them. The twelve occurrence records are kept exactly as
+they were written; the diagnosis is new evidence about them, not a replacement for them.
+
+**What was measured.** The failure was reproduced under controlled parallel load and instrumented
+from inside the workers, so each claim attempt's outcome and the database's final state were
+recorded rather than inferred:
+
+| Condition | Runs | Failed | Claimed |
+|---|---|---|---|
+| in isolation, unmodified | 6 | **0** | 12/12 |
+| under load (48 busy loops on 16 cores), unmodified | 14 | **7** | 8, 9, 11 — never 12 |
+| under load, **fixture budget raised to 12** | 8 | **0** | 12/12 |
+
+The third row is the control: the same fixture under the same load, with one variable changed.
+It is what turns a correlation into a cause.
+
+**The tasks were never lost.** The instrumented summary in a failing run:
+
+```
+TRACE SUMMARY claims=9  pending=3 running=9  leased=9
+TRACE SUMMARY claims=8  pending=4 running=8  leased=8
+TRACE SUMMARY claims=12 pending=0 running=12 leased=12
+```
+
+The "missing" tasks are **still `pending`**. Nothing was scheduled twice, nothing was reclaimed,
+no cleanup ran, no lease expired: the workers simply ran out of attempts, each attempt being
+refused with `concurrency limit reached: 8 live leases of 8`. Because
+`EngineErrorKind::is_retryable` classifies `ConcurrencyConflict` as retryable, the fixture's
+retry slept 20 ms and **spent another iteration on the same refusal**, and nothing in the
+fixture ever completes a task to free a slot. So the classification is a **test-observation
+error**, and the earlier "timing under CPU contention" reading was right about the *trigger*
+(load) and wrong about the *mechanism* (the shared-file implementation was never at fault).
+
+**The mechanism.** `EngineLimits::documented()` sets `max_concurrent_leases: 8`, while the
+fixture enqueued and asserted **12**. The engine's budget check is `live_leases()` -- a `SELECT`
+on the shared connection (`task_repo.rs`) -- performed in `claim_task_at` **before** the claim's
+`BEGIN IMMEDIATE` transaction (`task_repo.rs`'s `tx()`). The read and the write are therefore
+not atomic, and the passing run's own trace shows the consequence: `live_before=9`, `10`, `11`,
+`12` against a budget of `8`, with the refusals reporting "9 live leases of 8" and "12 live
+leases of 8". The fixture's assertion was only ever satisfiable because enough claims slipped
+through that window; under load the windows widen and fewer slip.
+
+**The fix, and what it does not weaken.** The fixture now uses `claim_limits()` --
+`max_concurrent_leases: CLAIM_TASKS` with every other limit the documented one -- so the
+assertion "every task is claimed exactly once" is about **claiming** rather than about winning a
+race with the budget. The assertion itself is unchanged, as are the worker count, the attempt
+count and the database check; no parallelism was reduced and no error was swallowed. A new case,
+`the_concurrent_claim_fixture_budget_covers_its_tasks`, claims the tasks **one at a time on one
+connection** -- where nothing can slip -- so it pins the relationship the concurrency test relies
+on without relying on the race. **Mutation-checked**: with `claim_limits()` reverted to the
+documented limits, that case fails (exit 1) while the concurrency test still passes load-free,
+which is exactly the gap it exists to close.
+
+**The separate defect, still open.** `max_concurrent_leases` is documented as a ceiling, and it
+is not enforced atomically: the budget check is a read outside the claim's write transaction, so
+concurrent callers can each observe a count below the ceiling and all proceed. This is a real
+engine defect, independent of the test, and it is **not** fixed here. It needs its own change,
+with its own failing test first -- N+1 tasks with a budget of N must yield exactly N claims,
+deterministically -- because it touches the claim path, which is authority-adjacent and
+therefore carries the weight ADR-0006 and the G2d gate give it. Until then, `max_concurrent_leases`
+must be read as a *target* that the engine usually keeps, not as an invariant it guarantees.
+
+**What was deliberately not done.** No limit in `EngineLimits::documented()` was changed; the
+documented 8 is untouched, and the fixture opts into a larger budget for itself. No gate was
+weakened, no test was skipped or made conditional, and no parallelism was reduced. The occurrence
+records were not rewritten.
+
+**Not claimed.** The engine-side atomicity defect is open. The three unmaintained zbus-family
+crates, F-26c, F-26b/S-30, S-11 and S-31 are unaffected and remain as recorded elsewhere.
+
+| | |
+|---|---|
+| **event** | any change to `EngineLimits::documented`, to `claim_task_at`'s budget check, to `TaskRepo::claim`'s transaction, or to the concurrent-claim fixture |
+| **date** | 2026-11-16 |
+| **severity** | **Low for behaviour, Medium for the record, and Medium for the engine defect it exposes.** The test was wrong about its own subject: it asserted a property it could only reach through a race, and the register said the cause was unknown when it was a documented budget. A suite that fails for a reason unrelated to what it checks trains people to discount it, and this one had already been discounted as "a flake" in twelve records. The engine defect is Medium on its own terms: a documented ceiling that is not enforced atomically is a ceiling that holds only while callers do not overlap. |
 
 ## 3. The three highest-risk claims
 

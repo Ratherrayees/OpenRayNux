@@ -31,6 +31,38 @@ use orxnud_task::{DurableEngine, EngineLimits, Scheduler};
 const NOW: i64 = 1_767_225_600_000;
 const HOUR: i64 = 3_600_000;
 
+/// The concurrent-claim fixture's shape.
+///
+/// The engine's documented concurrency budget is **8 live leases**
+// (`EngineLimits::documented`). A fixture that enqueues and claims more tasks
+// than that does not test claiming: every claim past the eighth is refused with
+// `ConcurrencyConflict`, which is retryable, so the retry sleeps and spends
+// another attempt on the same refusal -- while nothing in the fixture completes a
+// task, so no slot is ever freed. Whether the remaining tasks get claimed at all
+// then depends on how many claims slip past the budget check before it is read
+// again, because that read is outside the claim's write transaction. That is the
+// defect recorded in **A-040**; under whole-suite load the windows widen, fewer
+// claims slip, and the assertion fails with the tasks still `pending`.
+///
+/// These constants exist so that the relationship is explicit and can be
+// asserted without relying on the race:
+// `the_concurrent_claim_fixture_budget_covers_its_tasks`.
+const CLAIM_TASKS: i64 = 12;
+const CLAIM_WORKERS: usize = 6;
+const CLAIM_ATTEMPTS_PER_WORKER: usize = 4;
+
+/// The limits the concurrent-claim fixture drives.
+///
+// At least `CLAIM_TASKS` live leases, so that the fixture's assertion -- "every
+// task is claimed exactly once" -- is about CLAIMING rather than about winning a
+// race with the concurrency budget. Every other limit is the documented one.
+fn claim_limits() -> EngineLimits {
+    EngineLimits {
+        max_concurrent_leases: CLAIM_TASKS,
+        ..EngineLimits::documented()
+    }
+}
+
 /// A scratch directory, unique per **call** so the suite can run in parallel.
 ///
 /// Uniqueness used to be per *tag*, which assumed a tag names exactly one test. Two
@@ -741,7 +773,7 @@ fn n_workers_sharing_a_file_produce_exactly_one_winner_per_task() {
     let path = db_in(&d);
 
     let mut e = engine(&path);
-    for i in 0..12 {
+    for i in 0..CLAIM_TASKS {
         e.enqueue_new(
             &NewTask::new(tid(&format!("t{i}")), TaskKind::Query, NOW),
             NOW,
@@ -752,30 +784,39 @@ fn n_workers_sharing_a_file_produce_exactly_one_winner_per_task() {
 
     let claimed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let mut handles = Vec::new();
-    for w in 0..6 {
+    for w in 0..CLAIM_WORKERS {
         let path = path.clone();
         let claimed = std::sync::Arc::clone(&claimed);
         handles.push(std::thread::spawn(move || {
             let conn = rusqlite::Connection::open(&path).expect("worker open");
             Pragma::critical().apply(&conn).expect("worker pragmas");
-            let mut e =
-                DurableEngine::new(conn, EngineLimits::documented()).expect("worker engine");
-            for _ in 0..4 {
+            let mut e = DurableEngine::new(conn, claim_limits()).expect("worker engine");
+            for _ in 0..CLAIM_ATTEMPTS_PER_WORKER {
                 match e.claim_task(&format!("w{w}"), NOW) {
                     Ok(Some(row)) => {
                         claimed.lock().expect("lock").push(row.row.id.to_string());
                     }
                     Ok(None) => {}
-                    // A `SQLITE_BUSY` under six writers is a *retryable* conflict, and
-                    // the test ignored errors, so a claim that lost the race on the
-                    // busy timeout silently vanished. That made this test fail
-                    // intermittently under whole-suite load: fewer than 12 tasks were
-                    // claimed, and the assertion blamed the engine for a scheduling
-                    // artifact.
+                    // A retryable conflict is a real possibility under six writers,
+                    // and the test used to ignore errors entirely, so a claim that
+                    // lost the race on the busy timeout silently vanished. A real
+                    // worker retries, so the fixture does too.
                     //
-                    // A real worker retries a retryable conflict, so the fixture now
-                    // does too. `EngineErrorKind::is_retryable` is the existing
-                    // classification, so this does not invent a policy.
+                    // The busy timeout is NOT what made this test fail under
+                    // whole-suite load. The cause was the CONCURRENCY BUDGET: the
+                    // documented limits allow 8 live leases, the fixture claims 12,
+                    // and every claim past the eighth was refused with
+                    // `ConcurrencyConflict` -- which is retryable, so the retry
+                    // slept and spent another attempt on the same refusal, while
+                    // nothing completed a task to free a slot. The tasks were never
+                    // lost: they stayed `pending`. The later claims only ever landed
+                    // because the budget check is a read OUTSIDE the claim's write
+                    // transaction, so enough claims slipped past it; under load,
+                    // fewer slipped, and the assertion failed. See **A-040**.
+                    //
+                    // So the fixture's budget now covers the tasks it claims, and
+                    // `the_concurrent_claim_fixture_budget_covers_its_tasks` pins
+                    // that relationship without relying on the race.
                     Err(e) if e.kind.is_retryable() => {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
@@ -789,13 +830,14 @@ fn n_workers_sharing_a_file_produce_exactly_one_winner_per_task() {
     }
 
     let ids = claimed.lock().expect("lock").clone();
-    assert_eq!(ids.len(), 12, "every task must be claimed exactly once");
+    let tasks = CLAIM_TASKS as usize;
+    assert_eq!(ids.len(), tasks, "every task must be claimed exactly once");
     let mut unique = ids.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), 12, "no task may be claimed twice: {ids:?}");
+    assert_eq!(unique.len(), tasks, "no task may be claimed twice: {ids:?}");
 
-    // And the database agrees: 12 running tasks, none running *and* claimable.
+    // And the database agrees: every task running, none running *and* claimable.
     let conn = rusqlite::Connection::open(&path).expect("reopen");
     let running: i64 = conn
         .query_row(
@@ -804,7 +846,67 @@ fn n_workers_sharing_a_file_produce_exactly_one_winner_per_task() {
             |r| r.get(0),
         )
         .expect("count");
-    assert_eq!(running, 12);
+    assert_eq!(running, CLAIM_TASKS);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The fixture's concurrency budget must cover every task it claims.
+///
+// `n_workers_sharing_a_file_produce_exactly_one_winner_per_task` enqueues
+// `CLAIM_TASKS` tasks and asserts that every one of them is claimed. That
+// assertion is only reachable if the engine's concurrency budget allows that
+// many live leases: a claim past the ceiling is refused with
+// `ConcurrencyConflict`, which `is_retryable` calls retryable, so a fixture that
+// retries spends its attempts on refusals while nothing completes a task to free
+// a slot -- and the tasks stay `pending`.
+//
+// The documented budget is 8 and the fixture claimed 12, and the test passed
+// anyway, because the budget check is a read OUTSIDE the claim's write
+// transaction: enough claims slipped past it to reach 12, and under whole-suite
+// load fewer slipped and the assertion failed (A-040). So the fixture now uses
+// `claim_limits()`, and this case pins the relationship that makes its assertion
+// reachable -- WITHOUT relying on the race, by claiming one task at a time on
+// one connection, where nothing can slip. Against the documented budget of 8 it
+// fails at the ninth claim.
+#[test]
+fn the_concurrent_claim_fixture_budget_covers_its_tasks() {
+    let d = dir("concurrent-claim-budget");
+    let path = db_in(&d);
+
+    let mut e = engine(&path);
+    for i in 0..CLAIM_TASKS {
+        e.enqueue_new(
+            &NewTask::new(tid(&format!("t{i}")), TaskKind::Query, NOW),
+            NOW,
+        )
+        .expect("enqueue");
+    }
+    drop(e);
+
+    let conn = rusqlite::Connection::open(&path).expect("worker open");
+    Pragma::critical().apply(&conn).expect("worker pragmas");
+    let mut e = DurableEngine::new(conn, claim_limits()).expect("engine");
+
+    for i in 0..CLAIM_TASKS {
+        let claimed = e
+            .claim_task(&format!("w{}", i as usize % CLAIM_WORKERS), NOW)
+            .expect("the claim must not fail");
+        assert!(
+            claimed.is_some(),
+            "task {i} of {CLAIM_TASKS} is not claimable under the fixture's own limits, \
+             so the concurrency fixture's assertion would not be reachable"
+        );
+    }
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen");
+    let running: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE state='running';",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(running, CLAIM_TASKS, "every task must be running");
     let _ = std::fs::remove_dir_all(&d);
 }
 
