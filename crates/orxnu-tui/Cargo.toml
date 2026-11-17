@@ -1,0 +1,23 @@
+[package]
+name = "orxnu-tui"
+description = "OpenRayNux TUI. A thin terminal client over the approved IPC and protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# The dependency rule is the CLI's (docs-03 §2, IR-2): a surface may speak the wire
+# vocabulary and own a transport, but nothing that could carry a domain rule.
+# `orxnuctl` is depended on ONLY for its client module -- the same socket, frames and
+# version negotiation the shipped CLI uses, so this crate never writes a second
+# implementation of where a frame ends. It has no task, policy, store or daemon
+# types of its own; task/proposal state arrives as the daemon's JSON and is rendered,
+# never recomputed.
+[dependencies]
+orxnuctl = { workspace = true }
+serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
