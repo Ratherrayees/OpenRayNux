@@ -25,6 +25,7 @@
 
 use std::fmt;
 
+pub mod approval;
 pub mod client;
 pub mod provider;
 pub mod schedule;
