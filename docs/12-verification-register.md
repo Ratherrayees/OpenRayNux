@@ -35,6 +35,204 @@ below. Every V-ID cited anywhere in `docs/` is present here, with the single exc
 **V-44**, which is cited in `09-decisions.md` and `README.md` *as* the deliberately-unused
 identifier.
 
+## 2026-11-18 reconciliation against `main` at `358b547` (PR #14)
+
+This section records a read-then-write reconciliation of the rows named below against the
+merged source and measured local/CI evidence. It supersedes the stale portions of those
+rows; the row bodies are retained as history, per the freshness policy above. The protected
+audit ledger remains local-only and is not present in this repository.
+
+**Baseline.** `main = 358b547` (tree `ab1b8c9e`), merge of PR #14. The local checkout was
+fast-forwarded from `4164fa3` on 2026-11-18 after verifying ancestry and a clean tree. PR
+#14 changed `orxnud-store`'s `fsync_file` unconditionally (portable write-open), added two
+`#[cfg(windows)]` recovery tests and one Windows CI step; other Linux-relevant source is
+unchanged from `e0f6784`. Hosted evidence: run **44298832443**, schedule event, six jobs
+green, recorded G9 1898 passed / 116 skipped. Local host: Fedora 44, kernel
+`7.3.4-200.fc44.x86_64`, rustc/cargo 1.98.1, bwrap **0.12.0**, cgroup v2 controllers
+delegated, unprivileged user namespaces available.
+
+**V-107 — dependency remediated, with a reproducibility boundary.** The stale row says the
+lane installs Bookworm bubblewrap 0.8.0 via `apt-get`. `scripts/run-sandbox-tests.sh` now
+builds **0.13.1** from a pinned upstream archive (`bubblewrap_0.13.1.orig.tar.xz`, SHA-256
+`0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d`), verifies the digest
+before extraction, builds without setuid, asserts a Meson `assume_kernel` of empty, checks
+file/mode/version/PATH, refuses a package-owned or foreign binary at the default path, and
+asserts the `env -i` lookup the supervisor actually performs. Upstream confirms
+CVE-2026-87766 / GHSA-pxhw-h44j-8pfx affects versions **before 0.12.0** and was fixed in
+0.12.0 by `openat2`/`RESOLVE_IN_ROOT`; the published 0.13.1 checksum matches the pin.
+Hosted run 44298832443 confirms checksum, reported version and unprivileged lookup. This is
+a **source pin, not a reproducible build**: build dependencies still resolve from live
+Bookworm repositories (S-24). The host's 0.12.0 is a separate, also-fixed version used by
+`--host` runs.
+
+**V-67 — split into three distinct statuses.** The row's headline ("no stdin channel",
+payload in argv, "not fixed") is stale and contradicted by its own later amendment. The
+payload half is fixed and locally executed: `ORXNUD-STDIN/1` framing, a dedicated stdin
+writer that closes after the payload, bounded length checks, and
+`the_payload_does_not_appear_in_the_bwrap_argument_vector`. On this host the write-text,
+read-text, governed-path and isolation suites passed 17/17, 11/11, 41/41 and 26/26.
+The **credential half remains open and separate**: `SandboxSpec.env` is rendered into
+bwrap `--setenv K V` argv by `build_command`, so a credential-bearing Tier-1 capability
+would expose its value in argv; no such capability ships (ADR-0054 Decision 5), so the
+R-1 condition cannot be exercised end to end. `filesystem/write-text` stays refused by
+default even with a valid approval; no operator switch enables it. Do not close V-67 as a
+single item.
+
+**V-108 — configuration gap retained, old exploit neutralised by bwrap ≥ 0.12.0.** The
+original finding required a helper beneath the workspace, a symlink supplied by workspace
+content, and a usable original-host `/oldroot` source during setup under 0.8.0. The first
+condition is still true in source: `prepare_state_paths()` has no helper-outside-workspace
+assertion, and read-text still emits `[workspace, helper]` read-only grants in that order.
+Bubblewrap 0.12.0+ confines setup-time path resolution to the sandbox root, so the specific
+`/oldroot` symlink escape does not apply to either the local 0.12.0 host or the 0.13.1 CI
+lane. A minimal disposable reproduction against 0.12.0 produced no host escape (bwrap
+refused during setup); that is negative evidence with a fixture caveat, not an exploit
+proof. The explicit separation invariant is still warranted independently of the CVE.
+
+**V-109 — unchanged core facts; TUI recovery path improved.** The refusal chain, spent
+approval, `not-performed` warrant, restart recovery and `task/cancel` exit are unchanged.
+The TUI now exposes `task/cancel` and renders the daemon's actual cancellation response.
+On the original `cli_e2e` startup failures: three controlled runs under CPU saturation
+reproduced `a_sandbox_refusal_recovers_on_the_next_daemon_start` failing at
+`cli_e2e.rs:533` ("connect to the daemon"). The harness's `await_socket` waits for the
+socket *file* and then sleeps a fixed 300 ms rather than confirming a successful RPC, and
+`spawn_daemon_without_bwrap` returns an unguarded `Child`, so a panic at that point leaks
+the daemon. This explains the leaked test daemon and one reproduced case; the other ten
+originally failing tests were not reproduced and remain the same class of startup-timing
+issue, not a diagnosed product defect.
+
+**TUI evidence added in this reconciliation window (uncommitted work).** Phase 1 and 1.1
+added a shared, terminal-agnostic approval workflow in `orxnuctl::approval`, a one-step TUI
+task workflow using daemon-issued claim generations, immediate rendering of the daemon's
+`uncertainty` fields, disclosure details in the review pane, and six Ratatui rendering
+tests. Local verification: fmt clean, strict Clippy clean, 127 CLI+TUI tests, 73 daemon
+regression tests, full gates with G9 2072/2072 (2 leaky, 6 skipped), G12 skipped.
+
+**Phase 1.3 evidence, added 2026-11-18 (same uncommitted working tree).** Terminal-safety
+and state-consistency corrections were applied to the five authorized paths — bounded
+Unicode-safe display sanitization (F-04), a typed allowlisted approval payload (F-05), a
+shared open-review guard (F-06), sanitization of all untrusted TUI fields (F-07), and
+selective test-gap closure (F-09). The README evidence wording was also clarified. Fresh
+verification on that working tree: `cargo fmt --check` and strict Clippy clean; **144**
+CLI+TUI tests passed (up from 127); **73** daemon regression tests passed; full gates
+passed with G9 **2089 run, 2089 passed (2 leaky), 6 skipped** and G12 skipped for want of a
+release tag. These are working-tree figures on 2026-11-18, not results from clean `main`
+and not hosted CI figures. The leaky count is process accounting and has varied between 1
+and 2 across runs; the historical 2072/2072 figure above is retained as the Phase 1/1.1
+record. F-08 (pre-existing sequential terminal cleanup) remains separate and unresolved.
+
+**Phase 1.4 evidence, added 2026-11-18 (same uncommitted working tree).** Correctness and
+approval-outcome corrections were applied: numeric daemon fields now render from strict
+`Value::Number` values and the status key is `protocol` (SEC-01); failed approval
+submissions are classified as definite daemon refusal, definite non-submission, or
+conservative `Transport`/`Malformed` "outcome unknown", with the review consumed and no
+automatic retry (SEC-02); the vacuous CLI canary test was replaced with hostiles injected
+into the renderer's input (SEC-03); review confirmation is refused when the production
+layout cannot display every review field, while decline stays available (RISK-01); and
+proposal-ID input entry is guarded while a review is open (RISK-03). Fresh verification:
+`cargo fmt --check` and strict Clippy clean; **157** CLI+TUI tests (up from 144) and **73**
+daemon regression tests passed; full gates passed with G9 **2102 run, 2102 passed (2 leaky),
+6 skipped** and G12 skipped for want of a release tag. Focused tests for status rendering,
+each approval-outcome class, review geometry, the proposal-input guard and the CLI canary
+each passed individually. These are working-tree figures, not clean-`main` or hosted CI
+results; earlier 2072/2089 figures are retained as historical records. Remaining limits:
+ZWJ/ZWNJ are escaped and may alter legitimate shaping; truncated grapheme clusters can be
+split; `TestBackend` does not prove terminal-emulator byte behavior; `Transport` errors do
+not distinguish write from read failure, so the conservative unknown classification is
+used; and F-08 remains unresolved.
+
+**Phase 1.5 evidence, added 2026-11-18 (same uncommitted working tree).** The geometry gate
+was rebuilt on Ratatui's own `WordWrapper`: a private `review_paragraph` supplies both the
+rendered paragraph and an offscreen-buffer row-count probe, replacing the underestimating
+`div_ceil` heuristic (K1). `review_displayable` is now a private flag with a false default,
+changed only by an event-loop-driven setter, so a direct app-method confirmation before
+measurement is refused. CLI `render_recipient` now routes the daemon label through the
+shared `safe_recipient` policy, and its canary tests inject hostile values into the exact
+`recipient` field production reads (K2/K3). Fresh verification: `cargo fmt --check` and
+strict Clippy clean; **163** CLI+TUI tests and **73** daemon regression tests passed;
+full gates passed with G9 **2108 run, 2108 passed (1 leaky), 6 skipped** and G12 skipped.
+Focused tests covered the reported 169-cell path at inner widths 98–102 (measurement
+equals actual renderer rows plus borders), exact minimum and one-row-below geometry,
+double-width and escaped tokens, direct unmeasured confirmation, clipped confirmation,
+decline while clipped, and hostile CLI recipients. A controlled PTY run with the actual
+TUI binary and a test-only isolated daemon at 100x40 showed the 169-cell review with `y`
+refused and no approval issued; after resize to 180x40 the same `y` produced `approval
+issued`. This is a PTY result with a test-only daemon, not proof of every terminal
+emulator's byte-level behavior, and the production provider configuration was not
+exercised. Earlier 2072/2089/2102 figures are retained as historical working-tree records;
+F-08 remains unresolved.
+
+**Phase 1.6 evidence, added 2026-11-18 (same uncommitted working tree).** J1 was corrected:
+the daemon serializes ceilings and disclosure prose under `preview.disclosure`
+(`runtime.rs:4945-4966`), so both CLI `render_read_preview` and the TUI review pane now read
+all ceilings and limits/timing from that nested object; fixtures with top-level duplicates
+were removed, and tests assert decoys are ignored and missing nested fields stay missing.
+Long nested prose is escaped sentence-by-sentence with the shared sanitizer so no security
+fact is lost to the display bound. J2 was resolved structurally: the arbitrary public
+`set_review_displayable(bool)` was replaced by `ReviewGeometry::from_measurement(...)` and
+`App::set_review_geometry`, so confirmation eligibility is derived from measured pane
+dimensions and cannot be asserted directly; the renderer-derived calculation remains the
+single source. J3's canaries were moved into the `recipient` field that `render_recipient`
+actually reads. Fresh verification: `cargo fmt --check` and strict Clippy clean; **170**
+CLI+TUI tests and **73** daemon regression tests passed; full gates passed with G9 **2115
+run, 2115 passed (2 leaky), 6 skipped** and G12 skipped. Focused runs for nested ceilings,
+top-level decoys, missing nested fields, hostile nested strings, review decoys, the J2 API
+and the CLI canary each passed. Earlier 2072/2089/2102/2108 figures remain historical
+working-tree records; F-08 remains unresolved. Remaining limits: measured PTY evidence is
+not universal emulator proof, Unicode classification is a targeted policy, and the daemon
+projection is trusted for the recipient label's structure.
+
+**Phase 1.7 evidence, added 2026-11-18 (same uncommitted working tree).** J1 was completed:
+the CLI and TUI now share `orxnuctl::task::safe_disclosure_prose`, which splits the daemon's
+real multi-sentence `preview.disclosure.limits`/`timing` text at sentence/clause boundaries
+and applies the bounded sanitizer to each segment, so every security-relevant fact is shown
+by both interfaces. Tests use the exact production prose and assert the 32768-byte/8-entry
+limit, the "skipped entirely, not truncated" statement, limits and timing; hostile long
+prose is escaped, decoys ignored, missing nested fields stay missing, and an oversized
+disclosure fails closed because the renderer-derived geometry cannot fit. The J2
+clarification below records the public API accurately. Fresh verification: `cargo fmt
+--check` and strict Clippy clean; **175** CLI+TUI tests and **73** daemon regression tests
+passed; full gates passed with G9 **2120 run, 2120 passed (2 leaky), 6 skipped** and G12
+skipped. Focused runs for production prose, CLI/TUI parity, hostile long prose, fail-closed
+oversized disclosure, nested decoys and the 169-cell geometry regression each passed. A
+controlled PTY run with the actual TUI binary and an isolated `Runtime::start_with` daemon
+(the only persisted transcript: `/tmp/opencode/p17-pty-transcript.txt`) showed the 169-cell
+review, the 32768/8-entry disclosure text, `y` refused with an outcome-not-submitted notice,
+and no approval issued. PTY output is not proof of every terminal emulator's byte-level
+behavior; no production provider configuration was exercised. Earlier 2072/2089/2102/2108/
+2115 figures remain historical working-tree records; F-08 remains unresolved.
+
+**Clarification added 2026-11-18 (Phase 1.7) to the J2 disposition above.** The phrase
+"J2 was resolved structurally" described the removal of the arbitrary public boolean
+setter, not an unforgeable security capability. `ReviewGeometry`, its
+`from_measurement` constructor and `App::set_review_geometry` remain public
+(`app.rs:140-155`, `:512-513`), and an external caller can supply dimensions of its
+choosing. The production TUI event loop derives those dimensions from the shared
+Ratatui renderer measurement on every iteration, the confirmation gate defaults closed,
+and `decide_review` checks the stored result. The public API therefore represents a
+UI/application invariant, not a security capability: constructing a favourable
+measurement does not grant approval authority, bypass daemon challenge validation or
+submit an approval without a human pressing `y`. Historical wording is retained per the
+freshness policy; this paragraph is the current, precise disposition.
+
+**Correction added 2026-11-18 after the final verification audit.** The earlier sentence in
+this section said that the live model-initiated file-read TUI flow was **not** verified. That
+accurately described the evidence available when the section was first written: the shipped
+daemon refuses a local plaintext provider (`provider-plaintext-refused`), and no production
+plaintext override exists. The flow has since been exercised against an isolated test-only
+daemon constructed through the public `Runtime::start_with` seam with a custom read-proposing
+provider, using the shipped TUI binary driven through a PTY and a temporary state root, with no
+real credentials, no keyring access, no external provider contact and no production TLS policy
+change. The review pane displayed the operation, path, sanitized recipient and disclosure
+constraints; neither the challenge nor the file sentinel appeared before approval; `y`
+confirmation was required; execution returned an uncertain verdict; and the TUI immediately
+displayed `NeedsVerification — human-adjudication` with the statement that the daemon had not
+established the effect. The run ended without an error or leftover test process. This verifies
+the disclosure-review flow against that isolated test-only daemon only: it does **not**
+establish that a production plaintext HTTP provider is allowed, that the production provider
+configuration was exercised, or that every provider or TLS configuration works. The shipped
+daemon's plaintext-provider refusal remains intact.
+
 **Three numbering gaps, all deliberate**, recorded rather than renumbered because
 renumbering would break every existing citation, and because a silent gap is
 indistinguishable from an omission — which is precisely the failure this register exists to

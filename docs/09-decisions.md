@@ -7424,3 +7424,28 @@ terminal concerns remain out of scope for this slice.
 **Revisit conditions.** A second surface needing the same transport should move the client out
 of `orxnuctl` into a shared crate rather than duplicate it here. A protocol method that lists
 proposals should replace the manual id input.
+
+### Amendment — 2026-11-18: shared approval workflow and the one-step task workflow
+
+This amendment records a change to the first slice; it does not rewrite the decision above.
+The TUI now reuses `orxnuctl` for two things, not only the client module: the staged approval
+workflow in `orxnuctl::approval`, and the CLI's request client. That module owns the
+protocol-level sequence — inspect, classify, obtain a fresh challenge-bearing preview, submit
+the challenge and `confirmed: true` — but no terminal input, rendering or confirmation UI.
+The CLI keeps its line-oriented prompt; the TUI renders the fresh preview in a review pane and
+requires an explicit decision: `y` confirms and `d` declines. The key handling and the rendered
+hints in the review pane and footer agree on that mapping. A decline sends no approval. The
+daemon still validates and consumes the challenge, so the security authority has not moved.
+
+The stated consequence that "one socket implementation remains" still holds: both surfaces use
+the same transport. The stated architectural boundary also still holds: the TUI has no domain,
+store, task-engine, policy, capability or daemon type and computes no verdict. It does now hold
+one piece of daemon-issued state — the `claim_generation` from a specific `task/claim` response,
+kept with that task and worker — because `task/propose`, `task/ai-propose` and `task/complete`
+must present the generation they actually received. It is never derived from `task/list` and
+never fabricated.
+
+The slice now covers creating and claiming a one-step task, requesting an AI proposal,
+reviewing and approving it, executing it, completing it, and cancelling it. Multi-step
+continuation, proposal listing, execution history, provider credential setup, full CLI parity
+and unresolved-effect adjudication remain out of scope and are decided separately.
