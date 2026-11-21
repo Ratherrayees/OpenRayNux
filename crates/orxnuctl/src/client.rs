@@ -37,6 +37,33 @@ use serde_json::Value;
 /// peer from making the CLI allocate without limit.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Where a client failure occurred, so callers can tell a pre-send failure from an
+/// ambiguous one without changing the [`ClientError`] they observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOrigin {
+    /// The request could not be encoded; nothing was sent.
+    RequestEncoding,
+    /// The reply could not be decoded; the request may have been executed.
+    ResponseDecoding,
+    /// Writing or reading the request failed; the outcome is ambiguous.
+    Transport,
+    /// The daemon answered with an explicit JSON-RPC error.
+    Refusal,
+    /// No connection could be established; nothing was sent.
+    PreSendUnavailable,
+    /// The caller could not provide a more precise origin.
+    Unknown,
+}
+
+/// A client failure together with the stage at which it occurred.
+#[derive(Debug)]
+pub struct CallFailure {
+    /// Where the failure occurred.
+    pub origin: CallOrigin,
+    /// The original client error, unchanged.
+    pub error: ClientError,
+}
+
 /// Why a request could not be completed.
 ///
 /// Each variant is a fact a user can act on differently, which is why they are
@@ -156,8 +183,19 @@ impl Client {
     /// [`ClientError`] for every failure: unreachable, unreadable, wrong version, or
     /// a refusal the daemon returned.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+        self.call_staged(method, params)
+            .map_err(|failure| failure.error)
+    }
+
+    /// As [`Self::call`], but reports where the failure occurred.
+    pub fn call_staged(&self, method: &str, params: Value) -> Result<Value, CallFailure> {
         let request = Request::new(RequestId::Text("1".to_owned()), method).with_params(params);
-        self.send(&request)?.into_result().map_err(|e| refusal(&e))
+        self.send_staged(&request)?
+            .into_result()
+            .map_err(|e| CallFailure {
+                origin: CallOrigin::Refusal,
+                error: refusal(&e),
+            })
     }
 
     /// Sends a request and returns the whole response, error or not.
@@ -169,9 +207,19 @@ impl Client {
     ///
     /// As [`Self::call`], except that a JSON-RPC error is returned rather than raised.
     pub fn send(&self, request: &Request) -> Result<Response, ClientError> {
-        let frame = request.encode().map_err(protocol)?;
-        let bytes = self.exchange(&frame)?;
-        Response::decode(&bytes).map_err(|e| ClientError::Malformed(e.to_string()))
+        self.send_staged(request).map_err(|failure| failure.error)
+    }
+
+    fn send_staged(&self, request: &Request) -> Result<Response, CallFailure> {
+        let frame = request.encode().map_err(|e| CallFailure {
+            origin: CallOrigin::RequestEncoding,
+            error: protocol(e),
+        })?;
+        let bytes = self.exchange_staged(&frame)?;
+        Response::decode(&bytes).map_err(|e| CallFailure {
+            origin: CallOrigin::ResponseDecoding,
+            error: ClientError::Malformed(e.to_string()),
+        })
     }
 
     /// The version the daemon speaks, refusing one this build cannot use.
@@ -210,29 +258,36 @@ impl Client {
     /// request/response per connection by design, and reusing a socket would mean
     /// owning its framing state in the client — which is the duplication this crate
     /// exists to avoid.
-    fn exchange(&self, frame: &[u8]) -> Result<Vec<u8>, ClientError> {
+    fn exchange_staged(&self, frame: &[u8]) -> Result<Vec<u8>, CallFailure> {
         let endpoint = self.endpoint.clone();
         let endpoint_label = endpoint.display().to_string();
         let frame = frame.to_vec();
 
         runtime().block_on(async move {
-            let mut stream = orxnud_platform_ipc::connect(&endpoint).await.map_err(|e| {
-                ClientError::Unavailable {
-                    endpoint: endpoint_label,
-                    reason: transport_reason(&e),
-                }
+            let mut stream =
+                orxnud_platform_ipc::connect(&endpoint)
+                    .await
+                    .map_err(|e| CallFailure {
+                        origin: CallOrigin::PreSendUnavailable,
+                        error: ClientError::Unavailable {
+                            endpoint: endpoint_label,
+                            reason: transport_reason(&e),
+                        },
+                    })?;
+            stream.write_line(&frame).await.map_err(|e| CallFailure {
+                origin: CallOrigin::Transport,
+                error: ClientError::Transport(transport_reason(&e)),
             })?;
-            stream
-                .write_line(&frame)
-                .await
-                .map_err(|e| ClientError::Transport(transport_reason(&e)))?;
             stream
                 .read_line_bounded(MAX_RESPONSE_BYTES)
                 .await
                 // A daemon that hangs up instead of answering is a transport failure,
                 // and `peer_io` already classified it as a peer disconnect -- so this
                 // is a well-typed "no answer", not an unexplained EOF.
-                .map_err(|e| ClientError::Transport(transport_reason(&e)))
+                .map_err(|e| CallFailure {
+                    origin: CallOrigin::Transport,
+                    error: ClientError::Transport(transport_reason(&e)),
+                })
         })
     }
 }

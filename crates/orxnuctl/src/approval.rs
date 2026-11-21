@@ -26,7 +26,74 @@
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, ClientError};
+use crate::client::{CallFailure, CallOrigin, Client, ClientError};
+
+/// The protocol step at which an approval workflow failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalStage {
+    /// Validating the caller's approval payload, before any RPC.
+    Payload,
+    /// The inspection-only preview.
+    InspectPreview,
+    /// The fresh challenge-bearing preview for a file read.
+    ChallengePreview,
+    /// An `capability/approve` submission.
+    ApprovalSubmission,
+}
+
+/// Where an approval failure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalFailureOrigin {
+    /// The request could not be encoded; nothing was sent.
+    RequestEncoding,
+    /// The reply could not be decoded; the request may have been executed.
+    ResponseDecoding,
+    /// Writing or reading the request failed; the outcome is ambiguous.
+    Transport,
+    /// The daemon answered with an explicit error.
+    Refusal,
+    /// No connection could be established; nothing was sent.
+    PreSendUnavailable,
+    /// A local validation check rejected the response or request.
+    LocalValidation,
+    /// The caller could not provide a more precise origin.
+    Unknown,
+}
+
+/// An approval failure with its stage and origin, carrying the original error once.
+#[derive(Debug)]
+pub struct ApprovalFailure {
+    /// The protocol step that failed.
+    pub stage: ApprovalStage,
+    /// Where the failure originated.
+    pub origin: ApprovalFailureOrigin,
+    /// The original client error, unchanged.
+    pub error: ClientError,
+}
+
+fn from_call(stage: ApprovalStage, failure: CallFailure) -> ApprovalFailure {
+    let origin = match failure.origin {
+        CallOrigin::RequestEncoding => ApprovalFailureOrigin::RequestEncoding,
+        CallOrigin::ResponseDecoding => ApprovalFailureOrigin::ResponseDecoding,
+        CallOrigin::Transport => ApprovalFailureOrigin::Transport,
+        CallOrigin::Refusal => ApprovalFailureOrigin::Refusal,
+        CallOrigin::PreSendUnavailable => ApprovalFailureOrigin::PreSendUnavailable,
+        CallOrigin::Unknown => ApprovalFailureOrigin::Unknown,
+    };
+    ApprovalFailure {
+        stage,
+        origin,
+        error: failure.error,
+    }
+}
+
+fn from_local(stage: ApprovalStage, error: ClientError) -> ApprovalFailure {
+    ApprovalFailure {
+        stage,
+        origin: ApprovalFailureOrigin::LocalValidation,
+        error,
+    }
+}
 
 /// What the daemon says a proposal is, and therefore what the caller must do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,11 +323,34 @@ pub fn safe_recipient(label: &str) -> Option<String> {
 pub trait PreviewRequests {
     /// Performs one request and returns its `result` value.
     fn call(&self, method: &str, params: Value) -> Result<Value, ClientError>;
+
+    /// As [`Self::call`], with failure provenance for callers that need it.
+    ///
+    /// Implementations that cannot provide a precise origin conservatively report
+    /// [`CallOrigin::Unknown`].
+    fn call_staged(&self, method: &str, params: Value) -> Result<Value, CallFailure> {
+        self.call(method, params).map_err(|error| {
+            let origin = match &error {
+                ClientError::Refused { .. } => CallOrigin::Refusal,
+                ClientError::Unavailable { .. } => CallOrigin::PreSendUnavailable,
+                ClientError::Transport(_) => CallOrigin::Transport,
+                ClientError::Malformed(_) => CallOrigin::ResponseDecoding,
+                ClientError::InvalidParams { .. } | ClientError::VersionMismatch { .. } => {
+                    CallOrigin::Unknown
+                }
+            };
+            CallFailure { origin, error }
+        })
+    }
 }
 
 impl PreviewRequests for Client {
     fn call(&self, method: &str, params: Value) -> Result<Value, ClientError> {
         Client::call(self, method, params)
+    }
+
+    fn call_staged(&self, method: &str, params: Value) -> Result<Value, CallFailure> {
+        Client::call_staged(self, method, params)
     }
 }
 
@@ -440,65 +530,94 @@ const FORGED_PAYLOAD_KEYS: [&str; 8] = [
 /// A failed request, a malformed or inconsistent reply, a caller-supplied
 /// authority-bearing field, or a non-interactive caller facing a disclosure. No
 /// approval is submitted on any of those paths.
-pub fn begin_approval(
+pub fn begin_approval_staged(
     requests: &impl PreviewRequests,
     interactive: bool,
     proposal_id: &str,
     payload: Value,
-) -> Result<ApprovalStart, ClientError> {
-    let request = ApprovalRequest::from_payload(proposal_id, &payload)?;
+) -> Result<ApprovalStart, ApprovalFailure> {
+    let request = ApprovalRequest::from_payload(proposal_id, &payload)
+        .map_err(|e| from_local(ApprovalStage::Payload, e))?;
 
-    let inspected = requests.call(
-        "capability/preview",
-        json!({ "proposal": proposal_id, "inspect_only": true }),
-    )?;
-    check_preview_id(&inspected, proposal_id)?;
-    let kind =
-        classify_proposal(&inspected).map_err(|why| ClientError::InvalidParams { detail: why })?;
+    let inspected = requests
+        .call_staged(
+            "capability/preview",
+            json!({ "proposal": proposal_id, "inspect_only": true }),
+        )
+        .map_err(|f| from_call(ApprovalStage::InspectPreview, f))?;
+    check_preview_id(&inspected, proposal_id)
+        .map_err(|e| from_local(ApprovalStage::InspectPreview, e))?;
+    let kind = classify_proposal(&inspected).map_err(|why| {
+        from_local(
+            ApprovalStage::InspectPreview,
+            ClientError::InvalidParams { detail: why },
+        )
+    })?;
     if kind != ProposalKind::ModelInitiatedFileRead {
-        let reply = requests.call("capability/approve", request.into_value())?;
+        let reply = requests
+            .call_staged("capability/approve", request.into_value())
+            .map_err(|f| from_call(ApprovalStage::ApprovalSubmission, f))?;
         return Ok(ApprovalStart::Submitted { reply });
     }
 
     if !interactive {
-        return Err(ClientError::InvalidParams {
-            detail: "approving a model-generated file read needs an interactive \
-                      confirmation: the read's contents may be disclosed to the \
-                      model provider, and that has to be accepted by a person."
-                .to_owned(),
-        });
+        return Err(from_local(
+            ApprovalStage::ChallengePreview,
+            ClientError::InvalidParams {
+                detail: "approving a model-generated file read needs an interactive \
+                          confirmation: the read's contents may be disclosed to the \
+                          model provider, and that has to be accepted by a person."
+                    .to_owned(),
+            },
+        ));
     }
 
-    let fresh = requests.call("capability/preview", json!({ "proposal": proposal_id }))?;
-    check_preview_id(&fresh, proposal_id)?;
-    let fresh_kind =
-        classify_proposal(&fresh).map_err(|why| ClientError::InvalidParams { detail: why })?;
+    let fresh = requests
+        .call_staged("capability/preview", json!({ "proposal": proposal_id }))
+        .map_err(|f| from_call(ApprovalStage::ChallengePreview, f))?;
+    check_preview_id(&fresh, proposal_id)
+        .map_err(|e| from_local(ApprovalStage::ChallengePreview, e))?;
+    let fresh_kind = classify_proposal(&fresh).map_err(|why| {
+        from_local(
+            ApprovalStage::ChallengePreview,
+            ClientError::InvalidParams { detail: why },
+        )
+    })?;
     if fresh_kind != ProposalKind::ModelInitiatedFileRead {
-        return Err(ClientError::InvalidParams {
-            detail: "the proposal changed between the inspection and the review; \
-                      nothing was approved."
-                .to_owned(),
-        });
+        return Err(from_local(
+            ApprovalStage::ChallengePreview,
+            ClientError::InvalidParams {
+                detail: "the proposal changed between the inspection and the review; \
+                          nothing was approved."
+                    .to_owned(),
+            },
+        ));
     }
     if fresh["preview"]
         .get("approval_allowed")
         .and_then(Value::as_bool)
         != Some(true)
     {
-        return Err(ClientError::InvalidParams {
-            detail: fresh["preview"]
-                .get("blocked_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("this read cannot currently be approved")
-                .to_owned(),
-        });
+        return Err(from_local(
+            ApprovalStage::ChallengePreview,
+            ClientError::InvalidParams {
+                detail: fresh["preview"]
+                    .get("blocked_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("this read cannot currently be approved")
+                    .to_owned(),
+            },
+        ));
     }
     let challenge = fresh["preview"]
         .get("challenge")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            ClientError::Malformed(
-                "the preview carried no challenge, so the read cannot be reviewed".to_owned(),
+            from_local(
+                ApprovalStage::ChallengePreview,
+                ClientError::Malformed(
+                    "the preview carried no challenge, so the read cannot be reviewed".to_owned(),
+                ),
             )
         })?
         .to_owned();
@@ -517,6 +636,17 @@ pub fn begin_approval(
     }))
 }
 
+/// Compatibility wrapper returning the original [`ClientError`] to existing callers.
+pub fn begin_approval(
+    requests: &impl PreviewRequests,
+    interactive: bool,
+    proposal_id: &str,
+    payload: Value,
+) -> Result<ApprovalStart, ClientError> {
+    begin_approval_staged(requests, interactive, proposal_id, payload)
+        .map_err(|failure| failure.error)
+}
+
 /// Finishes a reviewed approval, or declines it without sending anything.
 ///
 /// `confirmed: false` means the person said no, cancelled, or the review was abandoned.
@@ -526,19 +656,30 @@ pub fn begin_approval(
 /// # Errors
 ///
 /// The request failing. A decline is not an error.
-pub fn submit_review(
+pub fn submit_review_staged(
     requests: &impl PreviewRequests,
     review: Review,
     confirmed: bool,
-) -> Result<Option<Value>, ClientError> {
+) -> Result<Option<Value>, ApprovalFailure> {
     if !confirmed {
         return Ok(None);
     }
     let mut payload = review.request.into_value();
     payload["challenge"] = json!(review.challenge);
     payload["confirmed"] = json!(true);
-    let reply = requests.call("capability/approve", payload)?;
+    let reply = requests
+        .call_staged("capability/approve", payload)
+        .map_err(|f| from_call(ApprovalStage::ApprovalSubmission, f))?;
     Ok(Some(reply))
+}
+
+/// Compatibility wrapper returning the original [`ClientError`] to existing callers.
+pub fn submit_review(
+    requests: &impl PreviewRequests,
+    review: Review,
+    confirmed: bool,
+) -> Result<Option<Value>, ClientError> {
+    submit_review_staged(requests, review, confirmed).map_err(|failure| failure.error)
 }
 
 #[cfg(test)]
@@ -1007,5 +1148,43 @@ mod tests {
                 "no RPC may be sent for {payload}"
             );
         }
+    }
+
+    #[test]
+    fn staged_inspect_failure_reports_stage_and_origin() {
+        let recorder = Recorder::new(vec![Err(ClientError::Malformed("bad frame".to_owned()))]);
+        let failure = begin_approval_staged(&recorder, true, "p-1", json!({ "proposal": "p-1" }))
+            .expect_err("a failed preview is an error");
+        assert_eq!(failure.stage, ApprovalStage::InspectPreview);
+        assert_eq!(failure.origin, ApprovalFailureOrigin::ResponseDecoding);
+    }
+
+    #[test]
+    fn staged_submission_failure_reports_refusal_origin() {
+        let recorder = Recorder::new(vec![
+            Ok(inspection("direct-proposal", false, "file-write")),
+            Err(ClientError::Refused {
+                code: -32042,
+                message: "refused".to_owned(),
+                reason: Some("approval-required".to_owned()),
+                detail: None,
+            }),
+        ]);
+        let failure = begin_approval_staged(&recorder, true, "p-1", json!({ "proposal": "p-1" }))
+            .expect_err("a refused approval is an error");
+        assert_eq!(failure.stage, ApprovalStage::ApprovalSubmission);
+        assert_eq!(failure.origin, ApprovalFailureOrigin::Refusal);
+    }
+
+    #[test]
+    fn begin_approval_wrapper_preserves_the_original_error() {
+        let recorder = Recorder::new(vec![Err(ClientError::Transport("peer lost".to_owned()))]);
+        let staged = begin_approval_staged(&recorder, true, "p-1", json!({ "proposal": "p-1" }))
+            .expect_err("a transport failure is an error");
+        assert_eq!(staged.origin, ApprovalFailureOrigin::Transport);
+        let recorder = Recorder::new(vec![Err(ClientError::Transport("peer lost".to_owned()))]);
+        let plain = begin_approval(&recorder, true, "p-1", json!({ "proposal": "p-1" }))
+            .expect_err("a transport failure is an error");
+        assert_eq!(plain, staged.error);
     }
 }

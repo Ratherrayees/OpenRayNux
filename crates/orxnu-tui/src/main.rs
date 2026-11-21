@@ -76,8 +76,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 }
             }
             Input::None => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
+                KeyCode::Char('q') => {
                     app.should_quit = true;
+                }
+                KeyCode::Esc => {
+                    if app.review.is_some() {
+                        app.hide_review();
+                    } else {
+                        app.should_quit = true;
+                    }
                 }
                 KeyCode::Char('r') => app.refresh(),
                 KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
@@ -87,7 +94,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                 KeyCode::Char('w') => app.begin_worker_input(),
                 KeyCode::Char('l') => app.claim_selected(),
                 KeyCode::Char('p') => app.ai_propose_selected(),
-                KeyCode::Char('a') => app.request_approval(),
+                KeyCode::Char('a') => {
+                    if !app.reopen_review() {
+                        app.request_approval();
+                    }
+                }
                 KeyCode::Char('y') => app.decide_review(true),
                 KeyCode::Char('d') => app.decide_review(false),
                 KeyCode::Char('e') => app.execute_previewed(),
@@ -121,7 +132,7 @@ fn layout_chunks(area: Rect, review_open: bool) -> Vec<Rect> {
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
-    let chunks = layout_chunks(frame.area(), app.review.is_some());
+    let chunks = layout_chunks(frame.area(), app.review_is_visible());
 
     render_status(frame, chunks[0], app);
     let body = Layout::default()
@@ -130,10 +141,12 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .split(chunks[1]);
     render_tasks(frame, body[0], app);
     render_detail(frame, body[1], app);
-    if let Some(review) = &app.review {
+    if app.review_is_visible()
+        && let Some(review) = &app.review
+    {
         render_review(frame, chunks[2], review);
     }
-    let footer = if app.review.is_some() { 3 } else { 2 };
+    let footer = if app.review_is_visible() { 3 } else { 2 };
     render_footer(frame, chunks[footer], app);
 }
 
@@ -196,6 +209,53 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // The execution verdict and its uncertainty are the most safety-critical text on
+    // this screen. Place them first so a short pane cannot push them off the bottom.
+    if let Some(verdict) = &app.verdict {
+        lines.push(Line::from("Execution verdict (as reported)"));
+        lines.push(Line::from(format!(
+            "  verified={} refuted={} undetermined={}",
+            field(verdict, "verified"),
+            field(verdict, "refuted"),
+            field(verdict, "undetermined"),
+        )));
+        let uncertainty = verdict.get("uncertainty");
+        let task_state = uncertainty
+            .and_then(|u| u.get("task_state"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let awaiting = safe_text(
+            uncertainty
+                .and_then(|u| u.get("awaiting"))
+                .and_then(Value::as_str)
+                .unwrap_or("not reported by the daemon"),
+        );
+        // Any undetermined outcome is unresolved, even when the daemon did not send a
+        // structured uncertainty object. Never show it as success. The warning is
+        // placed before the free-text result so a long explanation cannot push it
+        // below the visible pane.
+        if task_state == "needs-verification"
+            || awaiting == "human-adjudication"
+            || field(verdict, "undetermined") == "true"
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  NeedsVerification — {awaiting}; the daemon has NOT established the \
+                     effect. Treat this as unresolved, not success."
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        let explanation = field(verdict, "result");
+        if explanation != "?" {
+            lines.push(Line::from(format!("  result: {explanation}")));
+        }
+        lines.push(Line::from(" "));
+    }
+
     if let Some(task) = app.selected_task() {
         lines.push(Line::from("Selected task"));
         for key in [
@@ -244,42 +304,37 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             for key in [
                 "capability",
                 "target",
-                "action",
+                "operation",
+                "path",
                 "approval_allowed",
                 "blocked_reason",
             ] {
                 lines.push(Line::from(format!("  {key}: {}", field(p, key))));
             }
-        }
-    }
-    if let Some(verdict) = &app.verdict {
-        lines.push(Line::from(" "));
-        lines.push(Line::from(format!(
-            "Execution verdict (as reported): verified={} refuted={} undetermined={}",
-            field(verdict, "verified"),
-            field(verdict, "refuted"),
-            field(verdict, "undetermined"),
-        )));
-        let uncertainty = verdict.get("uncertainty");
-        let task_state = uncertainty
-            .and_then(|u| u.get("task_state"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let awaiting = uncertainty
-            .and_then(|u| u.get("awaiting"))
-            .and_then(Value::as_str)
-            .unwrap_or("(not reported)");
-        if task_state == "needs-verification" || awaiting == "human-adjudication" {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "NeedsVerification — {}; the daemon has NOT established the effect. \
-                     Treat this as unresolved, not success.",
-                    safe_text(awaiting)
-                ),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            if let Some(recipient) = p
+                .get("recipient")
+                .and_then(Value::as_str)
+                .and_then(safe_recipient)
+            {
+                lines.push(Line::from(format!("  recipient: {recipient}")));
+            }
+            if let Some(summary) = p
+                .get("disclosure")
+                .and_then(|d| d.get("summary"))
+                .and_then(Value::as_str)
+            {
+                lines.push(Line::from(format!(
+                    "  summary: {}",
+                    safe_disclosure_prose(summary)
+                )));
+            }
+            if let Some(read_only) = p
+                .get("disclosure")
+                .and_then(|d| d.get("read_only"))
+                .and_then(Value::as_bool)
+            {
+                lines.push(Line::from(format!("  read_only: {read_only}")));
+            }
         }
     }
 
@@ -341,6 +396,16 @@ fn review_lines(review: &orxnuctl::approval::Review) -> Vec<Line<'static>> {
     {
         lines.push(Line::from(format!("  blocked:    {}", safe_text(reason))));
     }
+    if let Some(summary) = p
+        .and_then(|p| p.get("disclosure"))
+        .and_then(|d| d.get("summary"))
+        .and_then(Value::as_str)
+    {
+        lines.push(Line::from(format!(
+            "  summary:    {}",
+            safe_disclosure_prose(summary)
+        )));
+    }
     lines.push(Line::from(
         "  Approving MAY disclose this file's contents to the model provider that asked for it.",
     ));
@@ -364,10 +429,6 @@ fn review_lines(review: &orxnuctl::approval::Review) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        "  y confirm and submit the approval   |   d decline (sends nothing)",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
     lines
 }
 
@@ -424,10 +485,23 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, review: &orxnuctl::approval:
     );
 }
 
+/// A notice is informational text, never a capability. Bound it so a long daemon
+/// answer cannot push the key hints out of the fixed footer.
+fn footer_notice(text: &str, max: usize) -> String {
+    let safe = safe_text(text);
+    if safe.chars().count() <= max {
+        return safe;
+    }
+    let marker = "…[notice truncated]…";
+    let budget = max.saturating_sub(marker.chars().count());
+    let prefix: String = safe.chars().take(budget).collect();
+    format!("{prefix}{marker}")
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut text = match &app.notice {
-        Some(n) if n.is_error => format!(" ERROR: {}", safe_text(&n.text)),
-        Some(n) => format!(" {}", safe_text(&n.text)),
+        Some(n) if n.is_error => format!(" ERROR: {}", footer_notice(&n.text, 96)),
+        Some(n) => format!(" {}", footer_notice(&n.text, 96)),
         None => String::from(" Ready"),
     };
     if app.input != Input::None {
@@ -439,7 +513,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Input::None => "",
         };
         text.push_str(&format!("\n > {}{}", safe_text(&app.buffer), kind));
-    } else if app.review.is_some() {
+    } else if let Some(reason) = app.review_confirmation_reason() {
+        // Never advertise a confirmation the gate will refuse, and say why.
+        text.push_str(&format!(
+            "\n confirmation unavailable: {reason} | d decline"
+        ));
+    } else if app.review_is_visible() {
         text.push_str("\n y confirm | d decline (no approval sent)");
     } else {
         text.push_str(&format!(
@@ -519,6 +598,7 @@ mod tests {
                     "effective_bytes": 32768,
                     "read_only": true,
                     "disclosure_possible": true,
+                    "summary": "filesystem/read-text reads a file and does not write one.",
                     "limits": "an oversized observation is skipped whole",
                     "timing": "only the immediately following step is eligible",
                 },
@@ -571,7 +651,11 @@ mod tests {
     }
 
     fn render_detail_text(app: &App) -> String {
-        let backend = TestBackend::new(120, 20);
+        render_detail_text_at(app, 120, 20)
+    }
+
+    fn render_detail_text_at(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| render_detail(frame, frame.area(), app))
@@ -673,7 +757,6 @@ mod tests {
             "8",
             "skipped whole",
             "immediately following step",
-            "d decline",
         ] {
             assert!(
                 text.contains(expected),
@@ -1098,10 +1181,10 @@ mod tests {
                 rendered_rows + 2,
                 "inner={inner}: measurement must equal renderer rows plus borders"
             );
-            let pane = layout_chunks(Rect::new(0, 0, inner + 2, 40), true)[2];
-            assert_eq!(pane.height, 13, "a 40-row terminal gives a 13-row pane");
+            let pane = layout_chunks(Rect::new(0, 0, inner + 2, 27), true)[2];
+            assert_eq!(pane.height, 12, "a 27-row terminal gives a 12-row pane");
             assert_eq!(
-                review_fits(Rect::new(0, 0, inner + 2, 40), &review),
+                review_fits(Rect::new(0, 0, inner + 2, 27), &review),
                 rendered_rows + 2 <= pane.height as usize,
                 "inner={inner}: gate must follow the renderer"
             );
@@ -1157,6 +1240,153 @@ mod tests {
             review_required_height(&escaped_review, inner + 2) as usize,
             rows + 2,
             "escaped control tokens are counted by the renderer, not by scalar guessing"
+        );
+    }
+
+    #[test]
+    fn verdict_and_result_are_rendered_before_task_details() {
+        let mut app = App::new();
+        app.verdict = Some(json!({
+            "verified": false,
+            "refuted": false,
+            "undetermined": true,
+            "result": "the daemon could not establish the effect"
+        }));
+        app.tasks = vec![json!({"id": "t1", "state": "running"})];
+        let text = render_detail_text(&app);
+        let verdict_at = text.find("Execution verdict").expect("verdict shown");
+        let task_at = text.find("Selected task").expect("task shown");
+        let result_at = text.find("result:").expect("result shown");
+        assert!(
+            verdict_at < task_at,
+            "safety verdict must be above task fields"
+        );
+        assert!(
+            result_at > verdict_at && result_at < task_at,
+            "result belongs to the verdict block"
+        );
+        assert!(
+            text.contains("NeedsVerification"),
+            "undetermined must be a visible warning"
+        );
+    }
+
+    #[test]
+    fn an_undetermined_verdict_without_uncertainty_still_warns() {
+        let mut app = App::new();
+        app.verdict = Some(json!({"verified": false, "refuted": false, "undetermined": true}));
+        let text = render_detail_text(&app);
+        assert!(text.contains("NeedsVerification"), "{text}");
+        assert!(text.contains("NOT established the effect"), "{text}");
+        assert!(text.contains("not reported by the daemon"), "{text}");
+    }
+
+    #[test]
+    fn detail_preview_uses_operation_not_action() {
+        let mut app = App::new();
+        app.preview = Some(json!({"preview": {
+            "capability": "filesystem/read-text",
+            "operation": "file-read",
+            "target": "notes.txt"
+        }}));
+        let text = render_detail_text(&app);
+        assert!(text.contains("operation: file-read"), "{text}");
+        assert!(!text.contains("action:"), "{text}");
+    }
+
+    #[test]
+    fn footer_hides_confirmation_when_the_review_is_not_displayable() {
+        let app = App::new();
+        let mut app = app;
+        let review = review_of("provider.example", "a.txt", "challenge");
+        app.review = Some(review);
+        app.set_review_geometry(ReviewGeometry::from_measurement(10, 5, 20));
+        let text = render_footer_text(&app);
+        assert!(text.contains("confirmation unavailable"), "{text}");
+        assert!(!text.contains("y confirm"), "{text}");
+        assert!(
+            text.contains("d decline"),
+            "decline must stay available: {text}"
+        );
+    }
+
+    #[test]
+    fn review_pane_does_not_advertise_a_disabled_confirmation() {
+        let review = review_of("provider.example", "a.txt", "challenge");
+        let text = render_review_text(&review);
+        assert!(text.contains("REVIEW REQUIRED"), "{text}");
+        assert!(
+            !text.contains("y confirm"),
+            "the pane must not advertise y: {text}"
+        );
+        assert!(!text.contains("confirm and submit"), "{text}");
+    }
+
+    #[test]
+    fn warning_is_rendered_before_a_long_result_text() {
+        let mut app = App::new();
+        app.verdict = Some(json!({
+            "verified": false,
+            "refuted": false,
+            "undetermined": true,
+            "result": "R".repeat(150)
+        }));
+        let text = render_detail_text(&app);
+        let warning_at = text.find("NeedsVerification").expect("warning shown");
+        let result_at = text.find("result:").expect("result shown");
+        assert!(
+            warning_at < result_at,
+            "the warning must precede the free-text result"
+        );
+    }
+
+    #[test]
+    fn uncertainty_warning_is_visible_at_minimum_pane_height() {
+        let mut app = App::new();
+        app.verdict = Some(json!({
+            "verified": false,
+            "refuted": false,
+            "undetermined": true,
+            "result": "R".repeat(150)
+        }));
+        // Minimum supported terminal: 3 status + Min(8) body + 4 footer = 15 rows.
+        let text = render_detail_text_at(&app, 80, 15);
+        assert!(text.contains("NeedsVerification"), "{text}");
+        assert!(text.contains("established the effect"), "{text}");
+        assert!(text.contains("unresolved"), "{text}");
+        assert!(
+            text.contains("human-adjudication") || text.contains("not reported"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn footer_distinguishes_incomplete_disclosure_from_geometry() {
+        let mut fresh = preview("provider.example", "a.txt", Some("challenge"));
+        fresh["preview"]["disclosure"]["limits"] = json!("Z".repeat(200));
+        let review = review_from_previews(preview("provider.example", "a.txt", None), fresh);
+        let mut app = App::new();
+        app.review = Some(review);
+        app.set_review_geometry(ReviewGeometry::from_measurement(10, 5, 20));
+        let text = render_footer_text(&app);
+        assert!(text.contains("incomplete"), "{text}");
+        assert!(!text.contains("resize"), "{text}");
+        assert!(!text.contains("y confirm"), "{text}");
+        assert!(text.contains("d decline"), "{text}");
+    }
+
+    #[test]
+    fn footer_notice_is_bounded_and_key_hints_survive() {
+        let mut app = App::new();
+        app.notice = Some(orxnu_tui::Notice {
+            text: "X".repeat(500),
+            is_error: false,
+        });
+        let text = render_footer_text(&app);
+        assert!(text.contains("notice truncated"), "{text}");
+        assert!(
+            text.contains("q quit"),
+            "key hints must survive a long notice: {text}"
         );
     }
 }

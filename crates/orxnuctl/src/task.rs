@@ -297,18 +297,37 @@ pub fn safe_disclosure_prose(value: &str) -> String {
 /// confirmation when this is false; a truncation marker alone is not informed review.
 #[must_use]
 pub fn disclosure_prose_complete(preview: &Value) -> bool {
-    let Some(disclosure) = preview.get("preview").and_then(|p| p.get("disclosure")) else {
-        return true;
+    let Some(disclosure) = preview
+        .get("preview")
+        .and_then(|p| p.get("disclosure"))
+        .and_then(Value::as_object)
+    else {
+        return false;
     };
-    ["limits", "timing"].into_iter().all(|key| {
-        disclosure
-            .get(key)
-            .and_then(Value::as_str)
-            .is_none_or(|value| {
-                value
-                    .split_inclusive(['.', ','])
-                    .all(|segment| !approval::exceeds_display_limit(segment))
-            })
+    for key in [
+        "read_ceiling_bytes",
+        "observation_ceiling_bytes",
+        "max_entries",
+        "effective_bytes",
+    ] {
+        if disclosure.get(key).and_then(Value::as_u64).is_none() {
+            return false;
+        }
+    }
+    let mut prose = Vec::new();
+    for key in ["summary", "limits", "timing"] {
+        let Some(value) = disclosure.get(key).and_then(Value::as_str) else {
+            return false;
+        };
+        if value.is_empty() {
+            return false;
+        }
+        prose.push(value);
+    }
+    prose.iter().all(|value| {
+        value
+            .split_inclusive(['.', ','])
+            .all(|segment| !approval::exceeds_display_limit(segment))
     })
 }
 
@@ -1033,6 +1052,7 @@ mod disclosure_preview_tests {
                     "effective_bytes": 32768,
                     "read_only": true,
                     "disclosure_possible": true,
+                    "summary": "filesystem/read-text reads a file and does not write one.",
                     "limits": "an observation that does not fit the applicable budget is skipped entirely, not truncated",
                     "timing": "eligibility is limited to the immediately following logical step",
                 },
@@ -1167,6 +1187,32 @@ mod disclosure_preview_tests {
             !disclosure_prose_complete(&preview),
             "a delimiter-free overlong clause must be reported as incomplete"
         );
+    }
+
+    #[test]
+    fn missing_or_malformed_disclosure_is_not_complete() {
+        let mut preview = read_preview();
+        preview["preview"]
+            .as_object_mut()
+            .expect("object")
+            .remove("disclosure");
+        assert!(!disclosure_prose_complete(&preview));
+        let mut preview = read_preview();
+        preview["preview"]["disclosure"]
+            .as_object_mut()
+            .expect("object")
+            .remove("summary");
+        assert!(!disclosure_prose_complete(&preview));
+        let mut preview = read_preview();
+        preview["preview"]["disclosure"]["max_entries"] = json!("eight");
+        assert!(!disclosure_prose_complete(&preview));
+    }
+
+    #[test]
+    fn zero_ceiling_values_remain_complete() {
+        let mut preview = read_preview();
+        preview["preview"]["disclosure"]["effective_bytes"] = json!(0);
+        assert!(disclosure_prose_complete(&preview));
     }
 
     #[test]
